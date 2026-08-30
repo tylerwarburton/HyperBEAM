@@ -387,7 +387,13 @@ snapshot(Base, _Req, Opts) ->
         not_found ->
             {error, <<"Cannot snapshot Lua state: state not initialized.">>};
         State ->
-            {ok, #{ <<"body">> => term_to_binary(luerl:externalize(State)) }}
+            % Compress the serialized Luerl state. The snapshot is the whole
+            % interpreter heap and is highly repetitive (~5.6x on measured game
+            % state), so compression is a large, cheap size win. `binary_to_term'
+            % on restore (see ~line 417) auto-decompresses, so this is fully
+            % transparent to the read path. (local patch over upstream edge.)
+            {ok, #{ <<"body">> =>
+                term_to_binary(luerl:externalize(State), [compressed]) }}
     end.
 
 %% @doc Restore the Lua state from a snapshot, if it exists.
