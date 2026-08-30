@@ -1,0 +1,7 @@
+[Unit]
+Description=HyperBEAM storage maintenance (log sizes + prune disposable gw-cache)
+After=hyperbeam.service
+
+[Service]
+Type=oneshot
+ExecStart=/root/HyperBEAM/tools/gw-cache-maintain.sh

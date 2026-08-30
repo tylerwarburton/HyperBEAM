@@ -1,0 +1,74 @@
+{
+  "gateway": "https://arweave.net",
+  "node-host": "hyperbeam.tylerw.ai",
+  "process-snapshot-time": 900,
+  "process-snapshot-slots": 20,
+  "process-now-from-cache": true,
+  "trusted-devices": {
+    "token@1.0": "vucDtiNHWzUXJ625HtiFXrdlzvUAigUgkTWe8dwUvOs",
+    "process-outbox@1.0": "HOcPV7wxMHYb3rSQ3EfykQhHx_b8waRWhXolhcBNgHo",
+    "security@1.0": "ARgymad5oYZcWPpxuV-A9hoSgmm4ElgPIvxMwmeh674"
+  },
+  "store": [
+    {
+      "store-module": "hb_store_lmdb",
+      "name": "cache-mainnet/lmdb",
+      "ao-types": "store-module=\"atom\""
+    },
+    {
+      "store-module": "hb_store_fs",
+      "name": "cache-mainnet",
+      "ao-types": "store-module=\"atom\""
+    },
+    {
+      "store-module": "hb_store_arweave",
+      "name": "cache-arweave",
+      "remote-index": "true",
+      "arweave-node": "https://arweave.net",
+      "index-store": [
+        {
+          "store-module": "hb_store_lmdb",
+          "name": "cache-mainnet/gw-cache",
+          "capacity": 128849018880,
+          "ao-types": "store-module=\"atom\", capacity=\"integer\""
+        }
+      ],
+      "local-store": [
+        {
+          "store-module": "hb_store_lmdb",
+          "name": "cache-mainnet/gw-cache",
+          "capacity": 128849018880,
+          "ao-types": "store-module=\"atom\", capacity=\"integer\""
+        }
+      ],
+      "ao-types": "store-module=\"atom\", remote-index=\"atom\""
+    },
+    {
+      "store-module": "hb_store_gateway",
+      "subindex": [
+        { "name": "Data-Protocol", "value": "ao" }
+      ],
+      "local-store": [
+        {
+          "store-module": "hb_store_lmdb",
+          "name": "cache-mainnet/gw-cache",
+          "capacity": 128849018880,
+          "ao-types": "store-module=\"atom\", capacity=\"integer\""
+        }
+      ],
+      "ao-types": "store-module=\"atom\""
+    },
+    {
+      "store-module": "hb_store_gateway",
+      "local-store": [
+        {
+          "store-module": "hb_store_lmdb",
+          "name": "cache-mainnet/gw-cache",
+          "capacity": 128849018880,
+          "ao-types": "store-module=\"atom\", capacity=\"integer\""
+        }
+      ],
+      "ao-types": "store-module=\"atom\""
+    }
+  ]
+}

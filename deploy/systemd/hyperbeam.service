@@ -1,0 +1,19 @@
+[Unit]
+Description=HyperBEAM node (permaweb edge, rocksdb+genesis_wasm) on :10000
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/HyperBEAM
+Environment=HB_PORT=10000
+Environment=HB_KEY=/root/HyperBEAM/arweave-keyfile-A19Lb486Yq73LzCYLa3Pswt5QmXjCjGv2Dik3Bpdguk.json
+Environment=HB_CONFIG=/root/HyperBEAM/node-config.json
+ExecStart=/root/HyperBEAM/_build/rocksdb+genesis_wasm/rel/hb/bin/hb foreground
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
