@@ -387,7 +387,24 @@ snapshot(Base, _Req, Opts) ->
         not_found ->
             {error, <<"Cannot snapshot Lua state: state not initialized.">>};
         State ->
-            {ok, #{ <<"body">> => term_to_binary(luerl:externalize(State)) }}
+            % The externalized interpreter heap is large and highly repetitive,
+            % so `term_to_binary/2' with `compressed' shrinks a big snapshot by
+            % roughly an order of magnitude. Compression is write CPU wasted on
+            % a heap small enough to store cheaply, so the plain serialization
+            % is sized first and compressed only once it reaches
+            % `lua_snapshot_compress_after' bytes (0 to always compress).
+            % `normalize/3' reads either form back through `binary_to_term/1',
+            % which decompresses transparently, so the restore path is unchanged.
+            Externalized = luerl:externalize(State),
+            Plain = term_to_binary(Externalized),
+            Threshold = hb_opts:get(lua_snapshot_compress_after, 65536, Opts),
+            case byte_size(Plain) >= Threshold of
+                true ->
+                    {ok, #{ <<"body">> =>
+                        term_to_binary(Externalized, [compressed]) }};
+                false ->
+                    {ok, #{ <<"body">> => Plain }}
+            end
     end.
 
 %% @doc Restore the Lua state from a snapshot, if it exists.
@@ -514,6 +531,60 @@ decode_params([Tref|Rest], State, Opts) ->
     [Decoded|decode_params(Rest, State, Opts)].
 
 %%% Tests
+snapshot_restores_through_normalize_test() ->
+    {ok, Script} = file:read_file("test/test.lua"),
+    Base = #{
+        <<"device">> => <<"lua@5.3a">>,
+        <<"module">> => #{
+            <<"content-type">> => <<"application/lua">>,
+            <<"body">> => Script
+        }
+    },
+    {ok, Initialized} = hb_ao:resolve(Base, <<"init">>, #{}),
+    % Snapshot the state under a compression setting, restore the body through
+    % `normalize/3', and read a value the restored interpreter computes.
+    Restore =
+        fun(SnapshotOpts) ->
+            {ok, Snapshot} =
+                hb_ao:resolve(Initialized, <<"snapshot">>, SnapshotOpts),
+            Body = hb_ao:get(<<"body">>, Snapshot, #{}),
+            {ok, Normalized} =
+                hb_ao:resolve(
+                    Base#{ <<"snapshot">> => #{ <<"body">> => Body } },
+                    <<"normalize">>,
+                    #{}
+                ),
+            hb_ao:get(<<"assoctable/b">>, Normalized, #{})
+        end,
+    % A forced-compressed snapshot (threshold 0) and a forced-plain one (a
+    % threshold above the heap) both restore to the same working interpreter.
+    ?assertEqual(2, Restore(#{ <<"lua-snapshot-compress-after">> => 0 })),
+    ?assertEqual(2, Restore(#{ <<"lua-snapshot-compress-after">> => 1 bsl 30 })).
+
+snapshot_compression_shrinks_body_test() ->
+    {ok, Script} = file:read_file("test/test.lua"),
+    Base = #{
+        <<"device">> => <<"lua@5.3a">>,
+        <<"module">> => #{
+            <<"content-type">> => <<"application/lua">>,
+            <<"body">> => Script
+        }
+    },
+    {ok, Initialized} = hb_ao:resolve(Base, <<"init">>, #{}),
+    SnapshotBody =
+        fun(SnapshotOpts) ->
+            {ok, Snapshot} =
+                hb_ao:resolve(Initialized, <<"snapshot">>, SnapshotOpts),
+            hb_ao:get(<<"body">>, Snapshot, #{})
+        end,
+    Compressed = SnapshotBody(#{ <<"lua-snapshot-compress-after">> => 0 }),
+    Plain = SnapshotBody(#{ <<"lua-snapshot-compress-after">> => 1 bsl 30 }),
+    % Compression shrinks the stored body; both forms still deserialize back
+    % into a Luerl state, since restore reads either through `binary_to_term/1'.
+    ?assert(byte_size(Compressed) < byte_size(Plain)),
+    ?assert(is_tuple(luerl:internalize(binary_to_term(Compressed)))),
+    ?assert(is_tuple(luerl:internalize(binary_to_term(Plain)))).
+
 simple_invocation_test() ->
     {ok, Script} = file:read_file("test/test.lua"),
     Base = #{
