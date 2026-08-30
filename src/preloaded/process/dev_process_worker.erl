@@ -48,10 +48,21 @@ compute_cached(ProcID, not_found, Opts) ->
         _ -> false
     end;
 compute_cached(ProcID, RawSlot, Opts) ->
-    case dev_process_cache:read(ProcID, hb_util:int(RawSlot), Opts) of
+    % A slot reference can arrive HTTP-wrapped as a typed-result map
+    % (e.g. #{<<"ao-result">> => <<"body">>, <<"body">> => <<"243">>}) rather
+    % than the bare scalar. Unwrap it before coercion, and treat any value that
+    % still won't coerce as simply "not cached" instead of letting hb_util:int/1
+    % raise a function_clause -> 500 on an as-yet-uncomputed slot. An uncomputed
+    % slot is a queue, not a fault. (local patch over upstream edge.)
+    case (catch dev_process_cache:read(ProcID, slot_scalar(RawSlot), Opts)) of
         {ok, _Msg} -> true;
         _ -> false
     end.
+
+slot_scalar(S) when is_map(S) ->
+    hb_util:int(maps:get(maps:get(<<"ao-result">>, S, <<"body">>), S, S));
+slot_scalar(S) ->
+    hb_util:int(S).
 
 process_to_group_name(Base, Opts) ->
     Initialized = lib_process:ensure_process_key(Base, Opts),
