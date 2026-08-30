@@ -250,7 +250,16 @@ target_slot(Req, Opts) ->
 compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
     case hb_ao:get(<<"at-slot">>, Base, Opts#{ <<"hashpath">> => ignore }) of
         CurrentSlot when CurrentSlot == TargetSlot ->
-            % We reached the target height so we force a snapshot and return.
+            % We reached the target height and return. The snapshot here is
+            % gated on the configured cadence (`process_snapshot_slots' /
+            % `process_snapshot_time') instead of being forced every slot:
+            % forcing a full-state snapshot on every latest slot dumps the
+            % entire process heap (100s of MB for large Luerl/WASM processes)
+            % on every action, blocking the node for seconds per slot and
+            % filling disk. Cadence-gating leaves a resume point (first compute
+            % always snapshots; then every interval) while cold-resume replays
+            % only the slots since the last snapshot. (local override of the
+            % upstream force-snapshot behavior.)
             ?event(compute_short,
                 {reached_target_slot_returning_state,
                     {proc_id, ProcID},
@@ -258,7 +267,7 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
                 },
                 Opts
             ),
-            store_result(true, ProcID, TargetSlot, Base, Req, Opts),
+            store_result(false, ProcID, TargetSlot, Base, Req, Opts),
             {ok, without_snapshot(lib_process:as_process(Base, Opts), Opts)};
         CurrentSlot when CurrentSlot < TargetSlot ->
             % Compute the next state transition.
