@@ -80,7 +80,8 @@ start(ProcID, Proc, Opts) ->
                             remote_confirmation,
                             Opts
                         ),
-                    opts => Opts
+                    opts => Opts,
+                    uploader => spawn(fun() -> uploader(Opts) end)
                 }
             )
         end
@@ -186,6 +187,7 @@ server(State) ->
             server(State);
         stop ->
             ?event({stopping_scheduler_server, {proc_id, maps:get(id, State)}}),
+            maps:get(uploader, State) ! stop,
             ok
     end.
 
@@ -264,16 +266,39 @@ do_assign(State, Message, ReplyPID) ->
             ),
             ?event(writes_complete),
             ?event(uploading_message),
-            hb_client_remote:upload(Message, Opts),
-            hb_client_remote:upload(Assignment, Opts),
-            ?event(uploads_complete),
-            maybe_inform_recipient(
-                remote_confirmation,
-                ReplyPID,
-                Message,
-                Assignment,
-                State
-            )
+            % Uploading is a network round trip; running it from the loop
+            % holds the next slot behind the current slot's upload. Hand the
+            % uploads to a single uploader process that drains them off the
+            % loop, in slot order. The slot, commitment, and local cache write
+            % are synchronous above, so ordering and `local_confirmation' are
+            % unaffected; `remote_confirmation' informs from the uploader.
+            % When the uploader has fallen behind the bundler -- its mailbox
+            % has grown past `scheduler_upload_queue_max', or it is gone --
+            % upload on the loop instead, so a slow bundler becomes
+            % backpressure on the caller rather than unbounded memory.
+            Uploader = maps:get(uploader, State),
+            Max = hb_opts:get(scheduler_upload_queue_max, 64, Opts),
+            case erlang:process_info(Uploader, message_queue_len) of
+                {message_queue_len, Pending} when Pending < Max ->
+                    Uploader !
+                        {upload,
+                            Message,
+                            Assignment,
+                            maps:get(mode, State),
+                            ReplyPID
+                        };
+                _ ->
+                    hb_client_remote:upload(Message, Opts),
+                    hb_client_remote:upload(Assignment, Opts),
+                    ?event(uploads_complete),
+                    maybe_inform_recipient(
+                        remote_confirmation,
+                        ReplyPID,
+                        Message,
+                        Assignment,
+                        State
+                    )
+            end
         end,
     case hb_opts:get(scheduling_mode, sync, Opts) of
         aggressive ->
@@ -313,6 +338,42 @@ maybe_inform_recipient(Mode, ReplyPID, Message, Assignment, State) ->
     case maps:get(mode, State) of
         Mode -> ReplyPID ! {scheduled, Message, Assignment};
         _ -> ok
+    end.
+
+%% @doc Drain assignment uploads to the bundler, off the scheduling loop and in
+%% the order they were sequenced. Uploading is a network round trip; run from
+%% the loop it would bound a process's assignment rate to upload latency. A
+%% single uploader per server keeps uploads in slot order and holds the
+%% in-flight upload count to one. Upload failures are swallowed, so a slow or
+%% failed bundler never stalls or crashes the scheduler. `remote_confirmation'
+%% is informed from here, after the upload.
+uploader(Opts) ->
+    receive
+        {upload, Message, Assignment, Mode, ReplyPID} ->
+            try
+                hb_client_remote:upload(Message, Opts),
+                hb_client_remote:upload(Assignment, Opts),
+                ?event(uploads_complete),
+                maybe_inform_recipient(
+                    remote_confirmation,
+                    ReplyPID,
+                    Message,
+                    Assignment,
+                    #{ mode => Mode }
+                )
+            catch
+                Class:Reason:Stack ->
+                    ?event(error,
+                        {upload_failed,
+                            {class, Class},
+                            {reason, Reason},
+                            {trace, Stack}
+                        }
+                    )
+            end,
+            uploader(Opts);
+        stop ->
+            ok
     end.
 
 %% @doc Find the hashpath of the base state upon which a new assignment should
@@ -368,7 +429,41 @@ new_proc_test() ->
         #{ current := 2 },
         dev_scheduler_server:info(dev_scheduler_registry:find(ID))
     ).
-    
+
+%% @doc Assignments are sequenced on the loop while their uploads are drained
+%% off it, so a run of scheduling requests still advances the slot by one each
+%% time and leaves every assignment in the local cache -- independently of
+%% whether the bundler upload has completed.
+async_upload_preserves_sequence_test() ->
+    Wallet = ar_wallet:new(),
+    Proc = hb_message:commit(
+        #{ <<"data">> => <<"test">>, <<"random-key">> => rand:uniform(10000) },
+        #{ <<"priv-wallet">> => Wallet }
+    ),
+    ID = hb_message:id(Proc, all),
+    dev_scheduler_registry:find(ID, Proc),
+    Messages =
+        [
+            hb_message:commit(
+                #{ <<"data">> => <<"message">>, <<"index">> => N },
+                #{ <<"priv-wallet">> => Wallet }
+            )
+        ||
+            N <- lists:seq(1, 5)
+        ],
+    lists:foreach(fun(Message) -> schedule(ID, Message) end, Messages),
+    State = dev_scheduler_server:info(dev_scheduler_registry:find(ID)),
+    % The five messages land on slots 0..4 in order.
+    ?assertMatch(#{ current := 4 }, State),
+    % Every assignment is readable from the local cache, written on the loop
+    % and not gated on the upload.
+    Opts = maps:get(opts, State),
+    lists:foreach(
+        fun(Slot) ->
+            ?assertMatch({ok, _}, dev_scheduler_cache:read(ID, Slot, Opts))
+        end,
+        lists:seq(0, 4)
+    ).
 
 benchmark_test() ->
     BenchTime = 1,

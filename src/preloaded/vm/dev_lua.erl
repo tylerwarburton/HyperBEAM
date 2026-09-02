@@ -387,11 +387,11 @@ snapshot(Base, _Req, Opts) ->
         not_found ->
             {error, <<"Cannot snapshot Lua state: state not initialized.">>};
         State ->
-            % Compress the serialized Luerl state. The snapshot is the whole
-            % interpreter heap and is highly repetitive (~5.6x on measured game
-            % state), so compression is a large, cheap size win. `binary_to_term'
-            % on restore (see ~line 417) auto-decompresses, so this is fully
-            % transparent to the read path. (local patch over upstream edge.)
+            % The externalized interpreter heap is large and highly
+            % repetitive, so `term_to_binary/2' with `compressed' shrinks the
+            % stored snapshot by roughly an order of magnitude. `normalize/3'
+            % reads it back through `binary_to_term/1', which decompresses
+            % transparently, so the restore path is unchanged.
             {ok, #{ <<"body">> =>
                 term_to_binary(luerl:externalize(State), [compressed]) }}
     end.
@@ -520,6 +520,28 @@ decode_params([Tref|Rest], State, Opts) ->
     [Decoded|decode_params(Rest, State, Opts)].
 
 %%% Tests
+snapshot_is_compressed_and_deserializes_test() ->
+    {ok, Script} = file:read_file("test/test.lua"),
+    Base = #{
+        <<"device">> => <<"lua@5.3a">>,
+        <<"module">> => #{
+            <<"content-type">> => <<"application/lua">>,
+            <<"body">> => Script
+        }
+    },
+    % `init' leaves the live interpreter heap in the message's `priv', so the
+    % snapshot has state to serialize while the message keeps the device.
+    {ok, Initialized} = hb_ao:resolve(Base, <<"init">>, #{}),
+    {ok, Snapshot} = hb_ao:resolve(Initialized, <<"snapshot">>, #{}),
+    Body = hb_ao:get(<<"body">>, Snapshot, #{}),
+    % The body is a compressed external term -- `term_to_binary/2' tags a
+    % compressed payload with the `131, 80' magic -- that still deserializes
+    % back into a Luerl state through `binary_to_term/1', so `normalize/3''s
+    % restore path is unaffected.
+    ?assert(is_binary(Body)),
+    ?assertMatch(<<131, 80, _/binary>>, Body),
+    ?assert(is_tuple(luerl:internalize(binary_to_term(Body)))).
+
 simple_invocation_test() ->
     {ok, Script} = file:read_file("test/test.lua"),
     Base = #{
