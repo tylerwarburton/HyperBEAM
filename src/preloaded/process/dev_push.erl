@@ -8,6 +8,18 @@
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
+%% @doc The keys that an outbox carries as its own metadata rather than as
+%% entries to push downstream. `hb_message:normalize_commitments/3' recurses
+%% into every submessage, so the outbox map is given its own `commitments' key,
+%% and the AO-Core and structured-field keys are legal on any message. Iterating
+%% them as if they were entries pushes messages the process never emitted. This
+%% is the same exclusion that every other walk of a message-as-collection
+%% applies: see `hb_util:message_to_ordered_key/1' and `dev_trie''s
+%% `RESERVED_KEYS'.
+-define(OUTBOX_NON_ENTRY_KEYS,
+    ?AO_CORE_KEYS ++ [<<"commitments">>, <<"ao-types">>, <<"device">>]
+).
+
 %% @doc Push either a message or an assigned slot number. If a `Process' is
 %% provided in the `body' of the request, it will be scheduled (initializing
 %% it if it does not exist). Otherwise, the message specified by the given
@@ -238,10 +250,7 @@ do_push(PrimaryProcess, Assignment, Opts) ->
                                 <<"message">> => Msg
                             }
                     end,
-                    hb_util:lower_case_keys(
-                        hb_ao:normalize_keys(hb_private:reset(Outbox)),
-                        Opts
-                    ),
+                    outbox_entries(Outbox, Opts),
                     Opts
                 ),
             {ok, maps:merge(Downstream, AdditionalRes#{
@@ -252,6 +261,27 @@ do_push(PrimaryProcess, Assignment, Opts) ->
             ?event(push, {push_failed_to_find_outbox, {error, Error}}, Opts),
             {error, Error}
     end.
+
+%% @doc Return the outbox entries that should be pushed downstream, discarding
+%% the result metadata that shares the map with them. The outbox arrives as part
+%% of a computed result, so it carries that result's `commitments' and `status'
+%% alongside the messages the process actually emitted.
+outbox_entries(Outbox, Opts) ->
+    Normalized = hb_ao:normalize_keys(hb_private:reset(Outbox)),
+    % Normalize the names the process gave its entries, but do not descend into
+    % the entries themselves. `hb_util:lower_case_keys/2' recurses through every
+    % nested map, and the keys of a message's `commitments' are base64url
+    % commitment IDs, which are case-sensitive: lower-casing them yields IDs
+    % that no longer name the commitments they identify, so a pushed entry
+    % carries signatures that can no longer be verified downstream.
+    Entries =
+        hb_maps:fold(
+            fun(Key, Msg, Acc) -> maps:put(hb_util:to_lower(Key), Msg, Acc) end,
+            #{},
+            Normalized,
+            Opts
+        ),
+    hb_maps:without(?OUTBOX_NON_ENTRY_KEYS, Entries, Opts).
 
 target_process_not_found(Target) ->
     #{
@@ -1859,3 +1889,56 @@ oracle_script() ->
         
         """
     >>.
+
+%% @doc A computed result's outbox shares its map with the result's own
+%% metadata. Only the messages the process emitted may be pushed: iterating the
+%% metadata delivers messages that were never sent, and hands the push path a
+%% commitment map in place of a message.
+outbox_entries_excludes_result_metadata_test() ->
+    Outbox =
+        #{
+            <<"mint">> =>
+                #{
+                    <<"target">> => <<"target-process-id">>,
+                    <<"action">> => <<"Mint">>
+                },
+            <<"commitments">> =>
+                #{
+                    <<"commitment-id">> =>
+                        #{ <<"commitment-device">> => <<"httpsig@1.0">> }
+                },
+            <<"ao-types">> => <<"quantity=\"integer\"">>,
+            <<"device">> => <<"message@1.0">>,
+            <<"hashpath">> => <<"a-hashpath">>
+        },
+    ?assertEqual(
+        [<<"mint">>],
+        lists:sort(maps:keys(outbox_entries(Outbox, #{})))
+    ).
+
+%% @doc The names a process gives its outbox entries are normalized, but the
+%% entries themselves must be delivered as they were emitted. A signed entry
+%% carries its own `commitments', keyed by case-sensitive base64url commitment
+%% IDs; rewriting their case leaves the entry carrying signatures that no longer
+%% match the IDs that name them.
+outbox_entries_preserve_entry_commitment_ids_test() ->
+    CommitmentID = <<"aXnLbjnJtgIsjZXS3hSqNLaj2okwHy3N7A1ZpogrnVI">>,
+    Outbox =
+        #{
+            <<"Mint">> =>
+                #{
+                    <<"target">> => <<"target-process-id">>,
+                    <<"commitments">> =>
+                        #{
+                            CommitmentID =>
+                                #{ <<"type">> => <<"rsa-pss-sha512">> }
+                        }
+                }
+        },
+    Entries = outbox_entries(Outbox, #{}),
+    ?assertEqual([<<"mint">>], maps:keys(Entries)),
+    Entry = maps:get(<<"mint">>, Entries),
+    ?assertEqual(
+        [CommitmentID],
+        maps:keys(maps:get(<<"commitments">>, Entry))
+    ).
