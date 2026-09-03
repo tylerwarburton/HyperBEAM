@@ -762,19 +762,27 @@ resolve_stage(11, Base, Req, Res, ExecName, Opts) ->
     % unregister ourselves from the group.
     hb_persistent:unregister_notify(ExecName, Req, Res, Opts),
     resolve_stage(12, Base, Req, Res, ExecName, Opts);
-resolve_stage(12, _Base, _Req, {ok, Res} = Res, ExecName, Opts) ->
+resolve_stage(12, _Base, _Req, {ok, Res} = FullRes, ExecName, Opts) ->
     ?event_debug(debug_ao_core, {stage, 12, ExecName, maybe_spawn_worker}, Opts),
-    % Check if we should fork out a new worker process for the current execution
+    % Check if we should fork out a new worker process for the current execution.
+    % `ungrouped_exec' is the sentinel for "this resolution was never registered
+    % under a name", so there is nothing for a worker to be found under: spawning
+    % one would leak a process per request and collide every caller onto a single
+    % bogus group.
     case
-        {is_map(Res), hb_opts:get(spawn_worker, false, Opts#{ <<"prefer">> => local })}
+        {
+            is_map(Res),
+            ExecName =/= ungrouped_exec,
+            hb_opts:get(spawn_worker, false, Opts#{ <<"prefer">> => local })
+        }
     of
-        {A, B} when (A == false) or (B == false) ->
-            Res;
-        {_, _} ->
+        {true, true, SpawnWorker} when SpawnWorker =/= false ->
             % Spawn a worker for the current execution
             WorkerPID = hb_persistent:start_worker(ExecName, Res, Opts),
             hb_persistent:forward_work(WorkerPID, Opts),
-            Res
+            FullRes;
+        _ ->
+            FullRes
     end;
 resolve_stage(12, _Base, _Req, OtherRes, _ExecName, _Opts) ->
     ?event_debug(debug_ao_core, {stage, 12, _ExecName, abnormal_status_skip_spawning}, _Opts),
