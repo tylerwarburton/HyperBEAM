@@ -95,7 +95,7 @@ server(GroupName, Base, Opts) ->
             server(
                 GroupName,
                 case Res of
-                    {ok, Res} -> Res;
+                    {ok, NewBase} when is_map(NewBase) -> NewBase;
                     _ -> Base
                 end,
                 Opts
