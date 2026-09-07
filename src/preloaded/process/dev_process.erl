@@ -236,14 +236,39 @@ compute(Base, Req, Opts) ->
     end.
 
 %% @doc Return the slot requested by a `compute' request, or `not_found'.
+%%
+%% A slot reference can arrive HTTP-wrapped as a typed-result map (e.g.
+%% `#{<<"ao-result">> => <<"body">>, <<"body">> => <<"243">>}') rather than as
+%% the bare scalar, because a path segment such as `compute&slot=243' is parsed
+%% into a sub-message. Unwrap it here, at the single point that produces the
+%% value, so every caller receives a scalar and no caller needs an unwrapper of
+%% its own. Callers still coerce with `hb_util:int/1' as before.
+%%
+%% Previously `compute/3' passed the map straight into `hb_util:int/1', raising
+%% a `function_clause' that killed the process worker. The next request then
+%% cold-resumed from the last snapshot: one full re-execution of the preceding
+%% slot in the steady state, and up to `process-snapshot-slots' of replay after
+%% a gap. Measured on this node before the fix: 171 worker deaths in 26 minutes,
+%% an execution factor of 1.99, and read latency of 474ms per replayed slot
+%% (r=0.982) reaching 77 seconds at depth 141. (local patch over upstream edge.)
 target_slot(Req, Opts) ->
-    hb_ao:get_first(
-        [
-            {{as, <<"message@1.0">>, Req}, <<"compute">>},
-            {{as, <<"message@1.0">>, Req}, <<"slot">>}
-        ],
-        Opts
+    unwrap_slot(
+        hb_ao:get_first(
+            [
+                {{as, <<"message@1.0">>, Req}, <<"compute">>},
+                {{as, <<"message@1.0">>, Req}, <<"slot">>}
+            ],
+            Opts
+        )
     ).
+
+%% @doc Unwrap an HTTP typed-result map to the scalar it carries. Any other
+%% term -- including `not_found', which both callers depend on -- is returned
+%% untouched.
+unwrap_slot(Slot) when is_map(Slot) ->
+    maps:get(maps:get(<<"ao-result">>, Slot, <<"body">>), Slot, Slot);
+unwrap_slot(Slot) ->
+    Slot.
 
 %% @doc Continually get and apply the next assignment from the scheduler until
 %% we reach the target slot that the user has requested.

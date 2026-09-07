@@ -122,8 +122,18 @@ find_or_register(GroupName, _Base, _Req, Opts) ->
                     {infinite_recursion, GroupName};
                 _ ->
                     ?event({register_resolver, {group, GroupName}}),
-                    register_groupname(GroupName, Opts),
-                    {leader, GroupName}
+                    case register_groupname(GroupName, Opts) of
+                        ok ->
+                            {leader, GroupName};
+                        error ->
+                            ?event({register_race_lost, {group, GroupName}}),
+                            case find_execution(GroupName, Opts) of
+                                {ok, Leader} when Leader =/= Self ->
+                                    {wait, Leader};
+                                _ ->
+                                    {leader, GroupName}
+                            end
+                    end
             end
     end.
 
