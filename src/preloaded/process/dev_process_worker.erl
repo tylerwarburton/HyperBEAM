@@ -27,7 +27,9 @@ group(Base, Req, Opts) ->
 %% else is serialised through the worker keyed on the process ID.
 compute_group(Base, Req, Opts) ->
     ProcID = process_to_group_name(Base, Opts),
-    case compute_cached(ProcID, dev_process:target_slot(Req, Opts), Opts) of
+    TargetSlot =
+        slot_number(dev_process:target_slot(Req, slot_read_opts(Opts))),
+    case compute_cached(ProcID, TargetSlot, Opts) of
         true ->
             ?event(worker,
                 {compute_cache_hit_bypassing_queue,
@@ -84,7 +86,7 @@ server(GroupName, Base, Opts) ->
     ?event(worker, {waiting_for_req, {group, GroupName}}),
     receive
         {resolve, Listener, GroupName, Req, ListenerOpts} ->
-            TargetSlot = hb_ao:get(<<"slot">>, Req, Opts),
+            TargetSlot = read_slot(Req, not_found, Opts),
             ?event(worker,
                 {work_received,
                     {group, GroupName},
@@ -168,8 +170,16 @@ notify_compute(GroupName, SlotToNotify, Res, Opts) ->
     notify_compute(GroupName, SlotToNotify, Res, Opts, 0).
 notify_compute(GroupName, SlotToNotify, Res, Opts, Count) ->
     ?event({notifying_of_computed_slot, {group, GroupName}, {slot, SlotToNotify}}),
+    % A listener's request carries the slot in the spelling it arrived from
+    % HTTP in -- a binary -- while the slot just computed is an integer, and a
+    % receive pattern cannot coerce. Both spellings are bound before the
+    % receive so the selective match covers each. A request for any OTHER slot
+    % has to stay in the mailbox, which is why this is a guard on a selective
+    % receive and not a test after the fact.
+    BinSlotToNotify = hb_util:bin(SlotToNotify),
     receive
-        {resolve, Listener, GroupName, #{ <<"slot">> := SlotToNotify }, _ListenerOpts} ->
+        {resolve, Listener, GroupName, #{ <<"slot">> := Slot }, _ListenerOpts}
+                when Slot =:= SlotToNotify; Slot =:= BinSlotToNotify ->
             send_notification(Listener, GroupName, SlotToNotify, Res),
             notify_compute(GroupName, SlotToNotify, Res, Opts, Count + 1);
         {resolve, Listener, GroupName, Msg, _ListenerOpts}

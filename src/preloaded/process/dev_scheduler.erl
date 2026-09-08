@@ -295,6 +295,29 @@ check_lookahead_and_local_cache(Base, ProcID, TargetSlot, Opts) when is_map(Base
             check_lookahead_and_local_cache(LookaheadWorker, ProcID, TargetSlot, Opts)
     end;
 check_lookahead_and_local_cache(Worker, ProcID, TargetSlot, Opts) when is_pid(Worker) ->
+    % Watch the lookahead worker while waiting on it. It exits SILENTLY when
+    % the slot it was sent to find is not in the local cache, which is the
+    % ordinary outcome: a lookahead is started for one slot AHEAD of the one
+    % just served, and on an interactive process that slot has not been
+    % scheduled yet. Without the monitor its caller then sits out the whole
+    % `?LOOKAHEAD_TIMEOUT' waiting for a message that was never sent.
+    %
+    % Nothing noticed while every resolution began from a base freshly loaded
+    % from the cache, because a dead lookahead pid was never carried into a
+    % second request. A persistent `dev_process_worker' carries one in the
+    % `priv' of the state it holds, into every request it serves -- so a warm
+    % worker paid the full timeout on EVERY message, which is the whole of the
+    % 1.5 s it was measured to add.
+    MRef = erlang:monitor(process, Worker),
+    try await_lookahead(Worker, MRef, ProcID, TargetSlot, Opts)
+    after erlang:demonitor(MRef, [flush])
+    end;
+check_lookahead_and_local_cache(undefined, ProcID, TargetSlot, Opts) ->
+    local_cache_assignment(ProcID, TargetSlot, Opts).
+
+%% @doc Wait for the lookahead worker named by `Worker' to answer, monitored so
+%% that its silent exit is an answer too.
+await_lookahead(Worker, MRef, ProcID, TargetSlot, Opts) ->
     receive
         {assignment, ProcID, OldSlot, _Assignment} when OldSlot < TargetSlot ->
             % The lookahead worker has found an assignment for a slot that is
@@ -315,13 +338,25 @@ check_lookahead_and_local_cache(Worker, ProcID, TargetSlot, Opts) when is_pid(Wo
             ?event(next_lookahead,
                 {lookahead_worker_succeeded, {slot, TargetSlot}}
             ),
-            {ok, NewWorker, Assignment}
+            {ok, NewWorker, Assignment};
+        {'DOWN', MRef, process, Worker, _Reason} ->
+            % The lookahead worker is gone without having sent us an
+            % assignment, so no assignment is coming and there is nothing left
+            % to wait for. Fall through to the local cache immediately rather
+            % than sitting out the timeout.
+            ?event(next_lookahead,
+                {lookahead_worker_finished_empty, {slot, TargetSlot}}
+            ),
+            local_cache_assignment(ProcID, TargetSlot, Opts)
     after ?LOOKAHEAD_TIMEOUT ->
         ?event(next_lookahead, {lookahead_read_timeout, {slot, TargetSlot}}),
         erlang:exit(Worker, timeout),
-        check_lookahead_and_local_cache(undefined, ProcID, TargetSlot, Opts)
-    end;
-check_lookahead_and_local_cache(undefined, ProcID, TargetSlot, Opts) ->
+        local_cache_assignment(ProcID, TargetSlot, Opts)
+    end.
+
+%% @doc Read an assignment for a slot out of the local cache, optionally
+%% starting a lookahead worker for the slot after it.
+local_cache_assignment(ProcID, TargetSlot, Opts) ->
     % The lookahead worker has not found an assignment for the target
     % slot yet, so we check our local cache.
     ?event(next_lookahead, {reading_local_cache, {slot, TargetSlot}}),
@@ -1440,7 +1475,58 @@ checkpoint(State) -> {ok, State}.
 
 %%% Tests
 
-%% @doc Generate a _transformed_ process message, not as they are generated 
+%% @doc Regression: a lookahead worker that finds nothing in the local cache
+%% exits without sending anything, and its caller used to wait out the whole
+%% `?LOOKAHEAD_TIMEOUT' for a message that had already not been sent.
+%%
+%% This is invisible while every resolution begins from a base freshly loaded
+%% from the cache, because a dead lookahead pid is never carried into a second
+%% request. A persistent `dev_process_worker' holds one in the `priv' of the
+%% state it keeps between requests, so it paid the full timeout on every single
+%% message -- 1.5 s against a 255 ms round trip.
+lookahead_worker_exit_does_not_stall_test() ->
+    application:ensure_all_started(hb),
+    Opts = #{ <<"store">> => hb_test_utils:test_store(hb_store_lmdb) },
+    % A worker that exits immediately, exactly as `spawn_lookahead_worker/3'
+    % does when `dev_scheduler_cache:read/3' answers `not_found'.
+    Worker = spawn(fun() -> ok end),
+    T0 = os:system_time(millisecond),
+    ?assertEqual(
+        not_found,
+        check_lookahead_and_local_cache(
+            Worker,
+            hb_util:human_id(crypto:strong_rand_bytes(32)),
+            1,
+            Opts
+        )
+    ),
+    Elapsed = os:system_time(millisecond) - T0,
+    ?assert(Elapsed < (?LOOKAHEAD_TIMEOUT div 2)).
+
+%% @doc A lookahead worker that DOES answer is still used, and still starts the
+%% next lookahead: the monitor must not swallow the assignment it was waiting
+%% for.
+lookahead_worker_answer_is_still_taken_test() ->
+    application:ensure_all_started(hb),
+    Opts = #{ <<"store">> => hb_test_utils:test_store(hb_store_lmdb) },
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Self = self(),
+    Assignment = #{ <<"slot">> => 1, <<"marker">> => <<"from-lookahead">> },
+    Worker =
+        spawn(
+            fun() ->
+                Self ! {assignment, ProcID, 1, Assignment},
+                % Exit straight after sending, as the real worker does. The
+                % assignment must still win over the `DOWN'.
+                ok
+            end
+        ),
+    ?assertMatch(
+        {ok, _NewWorker, Assignment},
+        check_lookahead_and_local_cache(Worker, ProcID, 1, Opts)
+    ).
+
+%% @doc Generate a _transformed_ process message, not as they are generated
 %% by users. See `dev_process' for examples of AO process messages.
 test_process() -> test_process(#{ <<"priv-wallet">> => hb:wallet()}).
 test_process(#{ <<"priv-wallet">> := Wallet})  ->
