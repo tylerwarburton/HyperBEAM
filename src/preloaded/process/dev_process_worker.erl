@@ -125,13 +125,58 @@ server(GroupName, Base, Opts) ->
         {ok, Base}
     end.
 
+%% @doc Read the slot a request is asking for, as an INTEGER.
+read_slot(Req, Default, Opts) ->
+    slot_number(hb_ao:get(<<"slot">>, Req, Default, slot_read_opts(Opts))).
+
+%% @doc The options to read a slot out of a request under.
+%%
+%% A worker inherits the options of the HTTP request that spawned it, and every
+%% response a node serves carries `force-message' (`http-extra-opts'). `hb_ao'
+%% honours it on the way out of `get/4' and `resolve/3' alike, so a literal
+%% comes back WRAPPED as `#{ <<"ao-result">> => <<"body">>, <<"body">> =>
+%% <<"9">> }'. A slot is always a literal, so this is never what a slot read
+%% wants -- and both places this module reads one hand the value straight to
+%% `hb_util:int/1', which has no clause for a map.
+%%
+%% The consequences were the whole of the per-process worker. `server/3' died
+%% of a `function_clause' on the FIRST request it was ever given, so a worker
+%% was spawned, sent one job, and killed by it -- never reused, while its
+%% waiter took a `DOWN' and re-ran the resolution itself. And once a worker did
+%% survive, `compute_group/3' -- reached from `hb_persistent:await/4', which
+%% unlike `find_or_register/3' does NOT strip the temporary options before
+%% calling the grouper -- died the same way, turning every read that found a
+%% live worker into a 500.
+slot_read_opts(Opts) ->
+    Opts#{ <<"force-message">> => false }.
+
+%% @doc Narrow a slot to the integer `dev_process' stores and compares it as.
+%%
+%% The type matters as much as the unwrapping: a slot arrives from HTTP as a
+%% binary, `dev_process' counts in integers, and `<<"9">> == 9' is false -- so
+%% a worker that notified `{slot, <<"9">>}' would be ignored by a waiter
+%% matching `RecvdSlot == 9', which would then block until the worker died.
+%%
+%% `not_found' and `any' are the two callers' defaults and pass through: they
+%% mean "no slot was asked for", which is a real request shape (`compute' with
+%% no slot serves the latest state).
+%%
+%% The map clause is kept even though this fork's `dev_process:target_slot/2'
+%% already unwraps one: `read_slot/3' reads a request directly through
+%% `hb_ao:get/4' and never passes through that unwrapper at all.
+slot_number(not_found) -> not_found;
+slot_number(any) -> any;
+slot_number(#{ <<"ao-result">> := <<"body">>, <<"body">> := Literal }) ->
+    slot_number(Literal);
+slot_number(Slot) -> hb_util:int(Slot).
+
 %% @doc Await a resolution from a worker executing the `process@1.0' device.
 await(Worker, GroupName, Base, Req, Opts) ->
     case hb_path:matches(<<"compute">>, hb_path:hd(Req, Opts)) of
         false -> 
             hb_persistent:default_await(Worker, GroupName, Base, Req, Opts);
         true ->
-            TargetSlot = hb_ao:get(<<"slot">>, Req, any, Opts),
+            TargetSlot = read_slot(Req, any, Opts),
             ?event({awaiting_compute, 
                 {worker, Worker},
                 {group, GroupName},
@@ -281,3 +326,123 @@ grouper_skips_when_slot_cached_test() ->
         ungrouped_exec,
         hb_persistent:group(M1, NoSlot, POpts)
     ).
+
+%% @doc Regression: every slot this module reads comes back through `hb_ao',
+%% which honours the caller's `force-message' -- and a worker inherits the
+%% options of the HTTP request that spawned it, where the node's
+%% `http-extra-opts' set exactly that. The slot arrived as
+%% `#{ <<"ao-result">> => <<"body">>, <<"body">> => <<"9">> }' and was handed
+%% to `hb_util:int/1', which has no clause for a map.
+slot_read_survives_forced_message_test() ->
+    Forced = #{ <<"force-message">> => true },
+    Req = #{ <<"path">> => <<"compute">>, <<"slot">> => <<"9">> },
+    % The integer, not the envelope -- and not the binary either: `dev_process'
+    % counts slots in integers, and a waiter matching `RecvdSlot == 9' would
+    % never see a notification carrying `<<"9">>'.
+    ?assertEqual(9, read_slot(Req, not_found, Forced)),
+    ?assert(is_integer(read_slot(Req, not_found, Forced))),
+    % Each caller's default survives a request that names no slot: `compute'
+    % without a slot is a real request shape (it serves the latest state).
+    ?assertEqual(any, read_slot(#{ <<"path">> => <<"compute">> }, any, Forced)),
+    ?assertEqual(
+        not_found,
+        read_slot(#{ <<"path">> => <<"compute">> }, not_found, Forced)
+    ),
+    % And an envelope that reaches us already built is unwrapped, however it
+    % got there.
+    ?assertEqual(
+        9,
+        slot_number(#{ <<"ao-result">> => <<"body">>, <<"body">> => <<"9">> })
+    ),
+    ?assertEqual(9, slot_number(<<"9">>)),
+    ?assertEqual(9, slot_number(9)),
+    ?assertEqual(any, slot_number(any)),
+    ?assertEqual(not_found, slot_number(not_found)).
+
+%% @doc Regression: `hb_persistent:await/4' calls the grouper with the FULL
+%% caller options -- unlike `find_or_register/3', which strips the temporary
+%% ones first. So `compute_group/3' saw `force-message' where the register path
+%% never did, and every read that found a live worker died there instead of
+%% waiting on it. The 500 was served in 4 ms, so the client simply retried, and
+%% the round trip became the client's backoff rather than the node's work.
+grouper_survives_forced_message_test() ->
+    test_init(),
+    Opts =
+        #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new()
+        },
+    M1 = hb_process_test_vectors:aos_process(Opts),
+    % The options a waiter arrives with: `process-workers' on, and
+    % `force-message' as every HTTP response sets it.
+    POpts = Opts#{ <<"process-workers">> => true, <<"force-message">> => true },
+    Uncached = #{ <<"path">> => <<"compute">>, <<"slot">> => <<"5">> },
+    ProcessGroup = hb_persistent:group(M1, Uncached, POpts),
+    ?assert(is_binary(ProcessGroup)),
+    ?assertNotEqual(ungrouped_exec, ProcessGroup),
+    % And the group name must not depend on how the slot was spelled: a
+    % waiter and the leader that registered the group have to agree.
+    ?assertEqual(
+        ProcessGroup,
+        hb_persistent:group(
+            M1,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 5 },
+            Opts#{ <<"process-workers">> => true }
+        )
+    ),
+    % A cached slot still steps out of the queue, with the slot spelled either
+    % way and `force-message' set.
+    {ok, _} =
+        dev_process_cache:write(
+            ProcessGroup,
+            5,
+            #{ <<"hello">> => <<"cached">> },
+            Opts
+        ),
+    ?assertEqual(ungrouped_exec, hb_persistent:group(M1, Uncached, POpts)).
+
+%% @doc Regression, end to end through the worker loop: a worker holding the
+%% options an HTTP request hands it must survive a `compute' request whose slot
+%% is spelled the way HTTP spells it -- a binary -- and must notify its
+%% listener with a slot that the listener's own `await/5' can match.
+worker_survives_forced_message_slot_test_() ->
+    {timeout, 60, fun() ->
+        test_init(),
+        Opts =
+            #{
+                <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+                <<"priv-wallet">> => ar_wallet:new()
+            },
+        Base = hb_process_test_vectors:aos_process(Opts),
+        hb_process_test_vectors:schedule_aos_call(Base, <<"return 1+1">>, Opts),
+        WorkerOpts =
+            Opts#{
+                <<"force-message">> => true,
+                <<"spawn-worker">> => false,
+                <<"process-workers">> => false
+            },
+        Group = <<"forced-message-slot-worker">>,
+        Self = self(),
+        Worker = spawn(fun() -> server(Group, Base, WorkerOpts) end),
+        MRef = erlang:monitor(process, Worker),
+        Worker !
+            {resolve,
+                Self,
+                Group,
+                #{ <<"path">> => <<"compute">>, <<"slot">> => <<"0">> },
+                WorkerOpts
+            },
+        receive
+            {resolved, _, Group, {slot, NotifiedSlot}, Res} ->
+                ?assertEqual(0, NotifiedSlot),
+                ?assertMatch({ok, _}, Res);
+            {'DOWN', MRef, process, Worker, Reason} ->
+                ?assertEqual(worker_stayed_alive, {worker_died, Reason})
+        after 30000 ->
+            ?assertEqual(worker_answered, timed_out)
+        end,
+        % And it is still there for the next request, which is the entire point
+        % of a persistent worker.
+        ?assert(is_process_alive(Worker)),
+        exit(Worker, normal)
+    end}.
