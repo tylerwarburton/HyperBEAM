@@ -25,6 +25,10 @@ RUN git config --global --add safe.directory /app \
     && touch /app/config.flat
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN rebar3 as rocksdb,genesis_wasm get-deps \
+    && patch --forward --batch -p1 \
+        -d _build/rocksdb+genesis_wasm/lib/luerl \
+        < patches/luerl-linear-gc.patch
 RUN rebar3 as rocksdb,genesis_wasm release 2>&1 | tail -80
 
 EXPOSE 10000
