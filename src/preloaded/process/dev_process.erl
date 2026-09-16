@@ -273,6 +273,8 @@ unwrap_slot(Slot) ->
 %% @doc Continually get and apply the next assignment from the scheduler until
 %% we reach the target slot that the user has requested.
 compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
+    compute_to_slot(ProcID, Base, Req, TargetSlot, Opts, false).
+compute_to_slot(ProcID, Base, Req, TargetSlot, Opts, Stored) ->
     case hb_ao:get(<<"at-slot">>, Base, Opts#{ <<"hashpath">> => ignore }) of
         CurrentSlot when CurrentSlot == TargetSlot ->
             % We reached the target height and return. The snapshot here is
@@ -292,7 +294,10 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
                 },
                 Opts
             ),
-            store_result(false, ProcID, TargetSlot, Base, Req, Opts),
+            case Stored of
+                false -> store_result(false, ProcID, TargetSlot, Base, Req, Opts);
+                true -> ok
+            end,
             {ok, without_snapshot(lib_process:as_process(Base, Opts), Opts)};
         CurrentSlot when CurrentSlot < TargetSlot ->
             % Compute the next state transition.
@@ -327,7 +332,8 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
                                 NewState,
                                 Req,
                                 TargetSlot,
-                                Opts
+                                Opts,
+                                true
                             );
                         {error, Error} ->
                             % Forward error details back to the caller.
@@ -616,7 +622,7 @@ should_snapshot(Slot, Res, Opts) ->
 
 %% @doc Calculate if we should snapshot based on the number of slots.
 should_snapshot_slots(Slot, Opts) ->
-    case hb_opts:get(process_snapshot_slots, ?DEFAULT_SNAPSHOT_SLOTS, Opts) of
+    case hb_opts:get(<<"process-snapshot-slots">>, ?DEFAULT_SNAPSHOT_SLOTS, Opts) of
         Undef when (Undef == undefined) or (Undef == <<"false">>) ->
             false;
         RawSnapshotSlots ->
@@ -627,7 +633,7 @@ should_snapshot_slots(Slot, Opts) ->
 %% @doc Calculate if we should snapshot based on the elapsed time since the last
 %% snapshot.
 should_snapshot_time(Res, Opts) ->
-    case hb_opts:get(process_snapshot_time, ?DEFAULT_SNAPSHOT_TIME, Opts) of
+    case hb_opts:get(<<"process-snapshot-time">>, ?DEFAULT_SNAPSHOT_TIME, Opts) of
         Undef when (Undef == undefined) or (Undef == <<"false">>) ->
             false;
         RawSecs ->
