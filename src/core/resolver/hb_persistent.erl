@@ -140,7 +140,18 @@ find_or_register(GroupName, _Base, _Req, Opts) ->
 %% @doc Unregister as the leader for an execution and notify waiting processes.
 unregister_notify(ungrouped_exec, _Req, _Res, _Opts) -> ok;
 unregister_notify(GroupName, Req, Res, Opts) ->
-    unregister_groupname(GroupName, Opts),
+    KeepForHandoff =
+        not is_atom(GroupName) andalso
+        case Res of
+            {ok, Msg} when is_map(Msg) ->
+                hb_opts:get(spawn_worker, false,
+                    Opts#{ <<"prefer">> => local }) =/= false;
+            _ -> false
+        end,
+    case KeepForHandoff of
+        true -> ok;
+        false -> unregister_groupname(GroupName, Opts)
+    end,
     notify(GroupName, Req, Res, Opts).
 
 %% @doc Find a group with the given name.
@@ -280,6 +291,7 @@ start_worker(Msg, Opts) ->
 start_worker(_, NotMsg, _) when not is_map(NotMsg) -> not_started;
 start_worker(GroupName, Msg, Opts) ->
     start(),
+    Parent = self(),
     ?event(worker_spawns,
         {starting_worker, {group, GroupName}, {msg, Msg}, {opts, Opts}}
     ),
@@ -324,6 +336,11 @@ start_worker(GroupName, Msg, Opts) ->
             )
         end
     ),
+    case hb_name:lookup(GroupName) of
+        Parent when not is_atom(GroupName) ->
+            ok = hb_name:handoff(GroupName, Parent, WorkerPID);
+        _ -> ok
+    end,
     WorkerPID.
 
 %% @doc A server function for handling persistent executions. 
