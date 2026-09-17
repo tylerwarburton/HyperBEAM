@@ -114,7 +114,10 @@ delta_metadata(Msg, Opts) ->
     end.
 
 should_checkpoint(ProcID, Slot, Msg, Opts) ->
-    HasSnapshot = hb_ao:get(<<"snapshot">>, Msg, not_found, Opts) =/= not_found,
+    % `snapshot' is also an exported process function. Resolving an absent key
+    % here would execute that function and build the full VM snapshot merely
+    % to test for its presence.
+    HasSnapshot = maps:is_key(<<"snapshot">>, Msg),
     Interval = delta_checkpoint_slots(Opts),
     MissingBase =
         Slot > 0 andalso
@@ -348,6 +351,34 @@ delta_roundtrip_test_() ->
             <<"priv-wallet">> => ar_wallet:new()
         })
     end}.
+
+snapshot_presence_is_structural_test() ->
+    application:ensure_all_started(hb),
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"process-delta-checkpoint-slots">> => 1000
+    },
+    ProcID = hb_util:encode(crypto:strong_rand_bytes(32)),
+    Results = #{ <<"output">> => #{ <<"data">> => <<"0">> } },
+    State = #{
+        <<"device">> => <<"test-device@1.0">>,
+        <<"at-slot">> => 0,
+        <<"results">> => Results
+    },
+    {ok, _} = write(
+        ProcID,
+        0,
+        with_delta(State, [], Results, Opts),
+        Opts
+    ),
+    ?assertNot(should_checkpoint(ProcID, 1, State, Opts)),
+    ?assert(should_checkpoint(
+        ProcID,
+        1,
+        State#{ <<"snapshot">> => #{} },
+        Opts
+    )).
 
 %% @doc Manual storage benchmark. Example:
 %% `HB_PROCESS_DELTA_BENCH=25:0,1000,4000 rebar3 device test -d dev_process'.
