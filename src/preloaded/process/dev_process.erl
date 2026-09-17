@@ -618,7 +618,31 @@ store_result(ForceSnapshot, ProcID, Slot, Res, Req, Opts) ->
 %% `process_snapshot_slots' option. If it is set, we check if the slot is
 %% a multiple of the interval. If either are true, we must snapshot.
 should_snapshot(Slot, Res, Opts) ->
-    should_snapshot_slots(Slot, Opts) orelse should_snapshot_time(Res, Opts).
+    case hb_private:get(
+        <<"process-cache-delta">>,
+        Res,
+        not_found,
+        Opts#{ <<"hashpath">> => ignore }
+    ) of
+        Delta when is_map(Delta) ->
+            should_snapshot_delta_slots(Slot, Opts);
+        _ ->
+            should_snapshot_slots(Slot, Opts) orelse
+                should_snapshot_time(Res, Opts)
+    end.
+
+%% @doc `lua@5.3b' public checkpoints and VM snapshots use one cadence. The
+%% production `lua@5.3a' cadence remains untouched.
+should_snapshot_delta_slots(Slot, Opts) ->
+    RawInterval = hb_opts:get(
+        <<"process-delta-checkpoint-slots">>,
+        1000,
+        Opts
+    ),
+    case hb_util:int(RawInterval) of
+        Interval when Interval > 0 -> Slot rem Interval == 0;
+        _ -> erlang:error({invalid_process_delta_checkpoint_slots, RawInterval})
+    end.
 
 %% @doc Calculate if we should snapshot based on the number of slots.
 should_snapshot_slots(Slot, Opts) ->
@@ -834,3 +858,22 @@ ensure_loaded(Base, Req, Opts) ->
 %% @doc Remove the `snapshot' key from a message and return it.
 without_snapshot(Msg, Opts) ->
     hb_ao:set(Msg, <<"snapshot">>, unset, Opts).
+
+%% @doc A 5.3b process uses the delta checkpoint cadence rather than the
+%% production 5.3a slot/time cadence.
+delta_snapshot_cadence_test() ->
+    Opts = #{
+        <<"process-snapshot-slots">> => 50,
+        <<"process-snapshot-time">> => 1,
+        <<"process-delta-checkpoint-slots">> => 1000
+    },
+    DeltaState = hb_private:set(
+        #{},
+        <<"process-cache-delta">>,
+        #{ <<"patches">> => [], <<"results">> => #{} },
+        Opts
+    ),
+    ?assert(should_snapshot(0, DeltaState, Opts)),
+    ?assertNot(should_snapshot(50, DeltaState, Opts)),
+    ?assertNot(should_snapshot(999, DeltaState, Opts)),
+    ?assert(should_snapshot(1000, DeltaState, Opts)).

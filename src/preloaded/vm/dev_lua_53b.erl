@@ -19,22 +19,11 @@
 -module(dev_lua_53b).
 -implements(<<"lua@5.3b">>).
 -export([info/1, init/3, compute/4, snapshot/3, normalize/3, functions/3]).
--export([head_to_head_benchmark/2]).
+-export([head_to_head_benchmark/2, incremental_gc_benchmark/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -define(LEGACY_LUA, <<"lua@5.3a">>).
--define(RESERVED_PATCH_KEYS, [
-    <<"at-slot">>,
-    <<"commitments">>,
-    <<"device">>,
-    <<"initialized">>,
-    <<"priv">>,
-    <<"process">>,
-    <<"results">>,
-    <<"snapshot">>
-]).
-
 %% @doc Expose Lua functions as device keys, using this module's compute path.
 info(Base) ->
     #{
@@ -112,11 +101,14 @@ process_response({ok, [Status, Encoded], NewState}, Base, Priv, Opts) ->
     case decode(Encoded, Opts) of
         Result when is_map(Result) ->
             case apply_result(Base, Result, Opts) of
-                {ok, Patched} ->
+                {ok, Patched, Delta} ->
                     {
                         hb_util:atom(Status),
                         Patched#{
-                            <<"priv">> => Priv#{ <<"state">> => NewState }
+                            <<"priv">> => Priv#{
+                                <<"state">> => NewState,
+                                <<"process-cache-delta">> => Delta
+                            }
                         }
                     };
                 Error -> Error
@@ -151,9 +143,12 @@ apply_result(Base, Result, Opts) ->
     Results = hb_ao:get(<<"results">>, Result, #{}, Opts),
     case {is_list(Patches), is_map(Results)} of
         {true, true} ->
-            case apply_patches(Base, Patches, Opts) of
+            case hb_process_delta:apply(Base, Patches, Results, Opts) of
                 {ok, Patched} ->
-                    {ok, hb_ao:set(Patched, <<"results">>, Results, Opts)};
+                    {ok, Patched, #{
+                        <<"patches">> => Patches,
+                        <<"results">> => Results
+                    }};
                 Error -> Error
             end;
         _ ->
@@ -163,53 +158,6 @@ apply_result(Base, Result, Opts) ->
                     <<"lua@5.3b requires list `patches' and message `results'.">>
             }}
     end.
-
-%% @doc Apply a list of `{path, value|delete}' messages in order.
-apply_patches(Base, [], _Opts) ->
-    {ok, Base};
-apply_patches(Base, [Patch | Rest], Opts) when is_map(Patch) ->
-    Path = hb_ao:get(<<"path">>, Patch, not_found, Opts),
-    case patch_path(Path) of
-        {ok, NormalizedPath} ->
-            Delete = hb_util:atom(hb_ao:get(<<"delete">>, Patch, false, Opts)),
-            case {Delete, hb_ao:get(<<"value">>, Patch, not_found, Opts)} of
-                {true, _} ->
-                    apply_patches(
-                        hb_ao:set(Base, NormalizedPath, unset, Opts),
-                        Rest,
-                        Opts
-                    );
-                {false, not_found} ->
-                    patch_error(<<"Patch is missing `value'.">>);
-                {false, Value} ->
-                    apply_patches(
-                        hb_ao:set(Base, NormalizedPath, Value, Opts),
-                        Rest,
-                        Opts
-                    )
-            end;
-        Error -> Error
-    end;
-apply_patches(_Base, _Patches, _Opts) ->
-    patch_error(<<"Every patch must be a message.">>).
-
-%% @doc Validate a patch path and reject process/runtime-owned keys.
-patch_path(Path) when is_binary(Path); is_list(Path) ->
-    case hb_path:term_to_path_parts(Path) of
-        [First | _] ->
-            Normalized = hb_ao:normalize_key(First),
-            case lists:member(Normalized, ?RESERVED_PATCH_KEYS) of
-                true -> patch_error(<<"Patch targets a runtime-owned key.">>);
-                false -> {ok, Path}
-            end;
-        [] -> patch_error(<<"Patch path cannot target the message root.">>)
-    end;
-patch_path(_) ->
-    patch_error(<<"Patch `path' must be a path string.">>).
-
-%% @doc Return a client-readable invalid-patch error.
-patch_error(Body) ->
-    {error, #{ <<"status">> => 422, <<"body">> => Body }}.
 
 %% @doc Decode a Lua value and normalize any message commitments it carries.
 decode(Value, Opts) ->
@@ -361,6 +309,66 @@ head_to_head_benchmark_report_test() ->
             io:format(user, "LUA53B_BENCH ~p~n", [Results])
     end.
 
+%% @doc Compare one full collection per call with a bounded incremental mark
+%% step over the same live heap and transient allocation stream.
+incremental_gc_benchmark(Iterations, Records, GarbagePerCall)
+        when Iterations > 0, Records >= 0, GarbagePerCall >= 0 ->
+    Script = iolist_to_binary(io_lib:format(
+        "Live = {}\n"
+        "for i = 1, ~B do Live[i] = { a=i, b={i,i+1}, c=tostring(i) } end\n"
+        "Counter = 0\n"
+        "local function allocate()\n"
+        "  local garbage = {}\n"
+        "  for i = 1, ~B do garbage[i] = { i, {i+1, i+2} } end\n"
+        "  garbage = nil\n"
+        "  Counter = Counter + 1\n"
+        "end\n"
+        "function run_full() allocate(); collectgarbage('collect'); return Counter end\n"
+        "function run_step() allocate(); return Counter, collectgarbage('step', 500) end\n"
+        "function check() collectgarbage('collect'); return Counter, #Live end\n",
+        [Records, GarbagePerCall]
+    )),
+    {ok, [], Full0} = luerl:do_dec(Script, luerl:init()),
+    {ok, [], Step0} = luerl:do_dec(Script, luerl:init()),
+    {FullTimes, FullState} = timed_luerl_calls(<<"run_full">>, Iterations, Full0),
+    {StepTimes, StepState} = timed_luerl_calls(<<"run_step">>, Iterations, Step0),
+    {ok, [Iterations, Records], _} =
+        luerl:call_function_dec([<<"check">>], [], FullState),
+    {ok, [Iterations, Records], _} =
+        luerl:call_function_dec([<<"check">>], [], StepState),
+    #{
+        <<"iterations">> => Iterations,
+        <<"live-records">> => Records,
+        <<"garbage-per-call">> => GarbagePerCall,
+        <<"full">> => latency_summary(FullTimes),
+        <<"incremental">> => latency_summary(StepTimes)
+    }.
+
+timed_luerl_calls(Function, Iterations, State0) ->
+    {State, RevTimes} = lists:foldl(
+        fun(_, {Prev, Times}) ->
+            {Micros, {ok, _, Next}} = timer:tc(
+                fun() -> luerl:call_function_dec([Function], [], Prev) end
+            ),
+            {Next, [Micros | Times]}
+        end,
+        {State0, []},
+        lists:seq(1, Iterations)
+    ),
+    {lists:reverse(RevTimes), State}.
+
+incremental_gc_benchmark_report_test() ->
+    case os:getenv("HB_LUERL_GC_BENCH") of
+        false -> ok;
+        Spec ->
+            [Iterations, Records, Garbage] = [
+                list_to_integer(Value)
+                || Value <- string:tokens(Spec, ":")
+            ],
+            Result = incremental_gc_benchmark(Iterations, Records, Garbage),
+            io:format(user, "LUERL_GC_BENCH ~p~n", [Result])
+    end.
+
 %% @doc The same Lua source produces equivalent public state and replies under
 %% full-message `5.3a' and request-only patch `5.3b' calling conventions.
 head_to_head_equivalence_test() ->
@@ -445,6 +453,134 @@ patch_validation_test() ->
     ?assertMatch(
         {error, #{ <<"status">> := 422 }},
         hb_ao:resolve(base(<<"lua@5.3b">>, ReservedScript), request(1), Opts)
+    ).
+
+%% @doc Exercise the 5.3b device through process@1.0: slot 0 is a checkpoint,
+%% slot 1 is a delta, and a cold request for slot 2 restores then replays.
+process_delta_restore_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Opts = #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"hashpath">> => ignore,
+            <<"spawn-worker">> => false,
+            <<"process-workers">> => false,
+            <<"process-delta-checkpoint-slots">> => 2
+        },
+        Process = delta_process(Opts),
+        {ok, _} = hb_cache:write(Process, Opts),
+        {ok, _} = hb_ao:resolve(Process, schedule_request(Process, 1, Opts), Opts),
+        {ok, _} = hb_ao:resolve(Process, schedule_request(Process, 2, Opts), Opts),
+        {ok, State1} = hb_ao:resolve(
+            Process,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 1 },
+            Opts
+        ),
+        ?assertEqual(<<"2">>, hb_ao:get(<<"count">>, State1, Opts)),
+        {ok, _} = hb_ao:resolve(Process, schedule_request(Process, 3, Opts), Opts),
+        % `Process' has no private VM state. Reaching slot 2 must restore the
+        % slot-0 VM snapshot, replay slot 1, then execute slot 2.
+        {ok, State2} = hb_ao:resolve(
+            Process,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 2 },
+            Opts
+        ),
+        ?assertEqual(<<"3">>, hb_ao:get(<<"count">>, State2, Opts)),
+        ?assertEqual(
+            <<"3">>,
+            hb_ao:get(<<"results/output/data">>, State2, Opts)
+        ),
+        {ok, Historical1} = hb_ao:resolve(
+            Process,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 1 },
+            Opts
+        ),
+        ?assertEqual(<<"2">>, hb_ao:get(<<"count">>, Historical1, Opts)),
+        ?assertEqual(
+            <<"2">>,
+            hb_ao:get(<<"results/output/data">>, Historical1, Opts)
+        )
+    end}.
+
+%% @doc Luerl's `step' collector advances a real multi-call mark cycle while
+%% allocations and reachable mutations continue between steps. Externalizing
+%% a pending VM safely cancels its heap snapshot instead of serializing it.
+incremental_gc_step_test() ->
+    Script = <<
+        "Kept = {}\n"
+        "function stepper(budget)\n"
+        "  local n = #Kept + 1\n"
+        "  Kept[n] = { value = n }\n"
+        "  local complete = collectgarbage('step', budget)\n"
+        "  return complete, n, Kept[n].value\n"
+        "end\n"
+        "function kept_count() return #Kept end\n"
+    >>,
+    {ok, [], State0} = luerl:do_dec(Script, luerl:init()),
+    {ok, [false, 1, 1], State1} =
+        luerl:call_function_dec([<<"stepper">>], [1], State0),
+    {CompletedAt, State2} = finish_gc_cycle(State1, 2, 1000),
+    {ok, [CompletedAt], State3} =
+        luerl:call_function_dec([<<"kept_count">>], [], State2),
+    {ok, [false, Next, Next], Pending} =
+        luerl:call_function_dec([<<"stepper">>], [1], State3),
+    External = luerl:externalize(Pending),
+    ?assertError(
+        {badkey, luerl_gc_step_cycle},
+        luerl:get_private(luerl_gc_step_cycle, External)
+    ),
+    Restored = luerl:internalize(External),
+    {ok, [true, AfterRestore, AfterRestore], _} =
+        luerl:call_function_dec([<<"stepper">>], [1000000], Restored),
+    ?assertEqual(Next + 1, AfterRestore).
+
+finish_gc_cycle(_State, Number, Limit) when Number > Limit ->
+    erlang:error(incremental_gc_did_not_complete);
+finish_gc_cycle(State, Number, Limit) ->
+    case luerl:call_function_dec([<<"stepper">>], [25], State) of
+        {ok, [true, Number, Number], Next} -> {Number, Next};
+        {ok, [false, Number, Number], Next} ->
+            finish_gc_cycle(Next, Number + 1, Limit)
+    end.
+
+delta_process(Opts) ->
+    Wallet = hb_opts:get(<<"priv-wallet">>, hb:wallet(), Opts),
+    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    hb_message:commit(
+        #{
+            <<"device">> => <<"process@1.0">>,
+            <<"type">> => <<"Process">>,
+            <<"scheduler-device">> => <<"scheduler@1.0">>,
+            <<"execution-device">> => <<"lua@5.3b">>,
+            <<"module">> => #{
+                <<"content-type">> => <<"application/lua">>,
+                <<"body">> => equivalent_script()
+            },
+            <<"authority">> => [Address],
+            <<"scheduler-location">> => Address,
+            <<"test-random-seed">> => 53
+        },
+        Opts
+    ).
+
+schedule_request(Process, Number, Opts) ->
+    ProcID = hb_message:id(Process, all, Opts),
+    hb_message:commit(
+        #{
+            <<"path">> => <<"schedule">>,
+            <<"method">> => <<"POST">>,
+            <<"body">> => hb_message:commit(
+                #{
+                    <<"target">> => ProcID,
+                    <<"type">> => <<"Message">>,
+                    <<"action">> => <<"Increment">>,
+                    <<"number">> => Number
+                },
+                Opts
+            )
+        },
+        Opts
     ).
 
 %% @doc One source supports both execution conventions for differential tests.
