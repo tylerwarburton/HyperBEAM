@@ -1152,6 +1152,7 @@ test_push_prompts_encoding_change() ->
                 % Include a gateway store so that we can get the legacynet 
                 % process when needed.
                 #{ <<"store-module">> => hb_store_gateway,
+                    <<"node">> => <<"https://arweave.net">>,
                     <<"store">> => #{
                         <<"store-module">> => hb_store_fs,
                         <<"name">> => <<"cache-TEST">>

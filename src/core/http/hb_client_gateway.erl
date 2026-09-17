@@ -183,9 +183,24 @@ do_location(Address, TagName, TagValues, Opts) ->
                             {id, ID}
                         }
                     ),
-                    result_to_message(ID, Item, Opts)
+                    location_result(result_to_message(ID, Item, Opts), Opts)
             end
     end.
+
+location_result({ok, Location}, Opts) ->
+    case hb_ao:get_first(
+        [
+            {Location, <<"url">>},
+            {Location, <<"location">>}
+        ],
+        not_found,
+        Opts
+    ) of
+        not_found -> {error, not_found};
+        _ -> {ok, Location}
+    end;
+location_result(Error, _Opts) ->
+    Error.
 
 %% @doc AO-Core devices are defined primarily by their specification IDs. To find
 %% compatible device implementations we must query for messages with the
@@ -609,6 +624,17 @@ ans104_no_data_item_test() ->
     ?event(gateway, {get_ans104_test, Res}),
     ?event(gateway, {signer, hb_message:signers(Res, #{})}),
     ?assert(true).
+
+%% @doc A location result must name an HTTP endpoint.
+location_requires_endpoint_test() ->
+    URL = #{ <<"url">> => <<"https://example.com">> },
+    Location = #{ <<"location">> => <<"https://example.com">> },
+    ?assertEqual({ok, URL}, location_result({ok, URL}, #{})),
+    ?assertEqual({ok, Location}, location_result({ok, Location}, #{})),
+    ?assertEqual(
+        {error, not_found},
+        location_result({ok, #{ <<"superseded-by">> => <<"id">> }}, #{})
+    ).
 
 %% @doc Test that we can get the scheduler location.
 scheduler_location_test() ->
