@@ -110,4 +110,3 @@ patch_path(_) ->
 
 patch_error(Body) ->
     {error, #{ <<"status">> => 422, <<"body">> => Body }}.
-
