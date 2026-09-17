@@ -237,13 +237,20 @@ compute(Base, Req, Opts) ->
 
 %% @doc Return the slot requested by a `compute' request, or `not_found'.
 target_slot(Req, Opts) ->
-    hb_ao:get_first(
-        [
-            {{as, <<"message@1.0">>, Req}, <<"compute">>},
-            {{as, <<"message@1.0">>, Req}, <<"slot">>}
-        ],
-        Opts
+    unwrap_slot(
+        hb_ao:get_first(
+            [
+                {{as, <<"message@1.0">>, Req}, <<"compute">>},
+                {{as, <<"message@1.0">>, Req}, <<"slot">>}
+            ],
+            Opts
+        )
     ).
+
+unwrap_slot(Slot) when is_map(Slot) ->
+    maps:get(maps:get(<<"ao-result">>, Slot, <<"body">>), Slot, Slot);
+unwrap_slot(Slot) ->
+    Slot.
 
 %% @doc Continually get and apply the next assignment from the scheduler until
 %% we reach the target slot that the user has requested.
@@ -794,3 +801,11 @@ ensure_loaded(Base, Req, Opts) ->
 %% @doc Remove the `snapshot' key from a message and return it.
 without_snapshot(Msg, Opts) ->
     hb_ao:set(Msg, <<"snapshot">>, unset, Opts).
+
+target_slot_unwraps_typed_result_test() ->
+    Req = #{ <<"path">> => <<"compute">>, <<"slot">> => <<"9">> },
+    ?assertEqual(
+        <<"9">>,
+        target_slot(Req, #{ <<"force-message">> => true })
+    ),
+    ?assertEqual(not_found, target_slot(#{ <<"path">> => <<"compute">> }, #{})).

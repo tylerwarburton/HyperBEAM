@@ -27,7 +27,9 @@ group(Base, Req, Opts) ->
 %% else is serialised through the worker keyed on the process ID.
 compute_group(Base, Req, Opts) ->
     ProcID = process_to_group_name(Base, Opts),
-    case compute_cached(ProcID, dev_process:target_slot(Req, Opts), Opts) of
+    TargetSlot =
+        slot_number(dev_process:target_slot(Req, slot_read_opts(Opts))),
+    case compute_cached(ProcID, TargetSlot, Opts) of
         true ->
             ?event(worker,
                 {compute_cache_hit_bypassing_queue,
@@ -48,7 +50,7 @@ compute_cached(ProcID, not_found, Opts) ->
         _ -> false
     end;
 compute_cached(ProcID, RawSlot, Opts) ->
-    case dev_process_cache:read(ProcID, hb_util:int(RawSlot), Opts) of
+    case (catch dev_process_cache:read(ProcID, hb_util:int(RawSlot), Opts)) of
         {ok, _Msg} -> true;
         _ -> false
     end.
@@ -76,7 +78,7 @@ server(GroupName, Base, Opts) ->
     ?event(worker, {waiting_for_req, {group, GroupName}}),
     receive
         {resolve, Listener, GroupName, Req, ListenerOpts} ->
-            TargetSlot = hb_ao:get(<<"slot">>, Req, Opts),
+            TargetSlot = read_slot(Req, not_found, Opts),
             ?event(worker,
                 {work_received,
                     {group, GroupName},
@@ -95,7 +97,7 @@ server(GroupName, Base, Opts) ->
             server(
                 GroupName,
                 case Res of
-                    {ok, Res} -> Res;
+                    {ok, NewBase} when is_map(NewBase) -> NewBase;
                     _ -> Base
                 end,
                 Opts
@@ -115,13 +117,27 @@ server(GroupName, Base, Opts) ->
         {ok, Base}
     end.
 
+%% @doc Read a request slot as the integer used by process state and cache
+%% paths. HTTP responses can otherwise wrap the literal under `ao-result'.
+read_slot(Req, Default, Opts) ->
+    slot_number(hb_ao:get(<<"slot">>, Req, Default, slot_read_opts(Opts))).
+
+slot_read_opts(Opts) ->
+    Opts#{ <<"force-message">> => false }.
+
+slot_number(not_found) -> not_found;
+slot_number(any) -> any;
+slot_number(#{ <<"ao-result">> := <<"body">>, <<"body">> := Literal }) ->
+    slot_number(Literal);
+slot_number(Slot) -> hb_util:int(Slot).
+
 %% @doc Await a resolution from a worker executing the `process@1.0' device.
 await(Worker, GroupName, Base, Req, Opts) ->
     case hb_path:matches(<<"compute">>, hb_path:hd(Req, Opts)) of
         false -> 
             hb_persistent:default_await(Worker, GroupName, Base, Req, Opts);
         true ->
-            TargetSlot = hb_ao:get(<<"slot">>, Req, any, Opts),
+            TargetSlot = read_slot(Req, any, Opts),
             ?event({awaiting_compute, 
                 {worker, Worker},
                 {group, GroupName},
@@ -160,8 +176,10 @@ notify_compute(GroupName, SlotToNotify, Res, Opts) ->
     notify_compute(GroupName, SlotToNotify, Res, Opts, 0).
 notify_compute(GroupName, SlotToNotify, Res, Opts, Count) ->
     ?event({notifying_of_computed_slot, {group, GroupName}, {slot, SlotToNotify}}),
+    BinSlotToNotify = hb_util:bin(SlotToNotify),
     receive
-        {resolve, Listener, GroupName, #{ <<"slot">> := SlotToNotify }, _ListenerOpts} ->
+        {resolve, Listener, GroupName, #{ <<"slot">> := Slot }, _ListenerOpts}
+                when Slot =:= SlotToNotify; Slot =:= BinSlotToNotify ->
             send_notification(Listener, GroupName, SlotToNotify, Res),
             notify_compute(GroupName, SlotToNotify, Res, Opts, Count + 1);
         {resolve, Listener, GroupName, Msg, _ListenerOpts}
@@ -263,3 +281,77 @@ grouper_skips_when_slot_cached_test() ->
         ungrouped_exec,
         hb_persistent:group(M1, NoSlot, POpts)
     ).
+
+slot_read_survives_forced_message_test() ->
+    Forced = #{ <<"force-message">> => true },
+    Req = #{ <<"path">> => <<"compute">>, <<"slot">> => <<"9">> },
+    ?assertEqual(9, read_slot(Req, not_found, Forced)),
+    ?assertEqual(any, read_slot(#{ <<"path">> => <<"compute">> }, any, Forced)),
+    ?assertEqual(
+        not_found,
+        read_slot(#{ <<"path">> => <<"compute">> }, not_found, Forced)
+    ),
+    ?assertEqual(
+        9,
+        slot_number(#{ <<"ao-result">> => <<"body">>, <<"body">> => <<"9">> })
+    ).
+
+grouper_survives_forced_message_test() ->
+    test_init(),
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+        <<"priv-wallet">> => ar_wallet:new()
+    },
+    Base = hb_process_test_vectors:aos_process(Opts),
+    Forced = Opts#{
+        <<"process-workers">> => true,
+        <<"force-message">> => true
+    },
+    BinarySlot = #{ <<"path">> => <<"compute">>, <<"slot">> => <<"5">> },
+    Group = hb_persistent:group(Base, BinarySlot, Forced),
+    ?assert(is_binary(Group)),
+    ?assertEqual(
+        Group,
+        hb_persistent:group(
+            Base,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 5 },
+            Opts#{ <<"process-workers">> => true }
+        )
+    ).
+
+worker_survives_forced_message_slot_test_() ->
+    {timeout, 60, fun() ->
+        test_init(),
+        Opts = #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new()
+        },
+        Base = hb_process_test_vectors:aos_process(Opts),
+        hb_process_test_vectors:schedule_aos_call(Base, <<"return 1+1">>, Opts),
+        WorkerOpts = Opts#{
+            <<"force-message">> => true,
+            <<"spawn-worker">> => false,
+            <<"process-workers">> => false
+        },
+        Group = <<"forced-message-slot-worker">>,
+        Worker = spawn(fun() -> server(Group, Base, WorkerOpts) end),
+        MRef = erlang:monitor(process, Worker),
+        Worker ! {
+            resolve,
+            self(),
+            Group,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => <<"0">> },
+            WorkerOpts
+        },
+        receive
+            {resolved, _, Group, {slot, Slot}, Res} ->
+                ?assertEqual(0, Slot),
+                ?assertMatch({ok, _}, Res);
+            {'DOWN', MRef, process, Worker, Reason} ->
+                ?assertEqual(worker_stayed_alive, {worker_died, Reason})
+        after 30000 ->
+            ?assertEqual(worker_answered, timed_out)
+        end,
+        ?assert(is_process_alive(Worker)),
+        exit(Worker, normal)
+    end}.
