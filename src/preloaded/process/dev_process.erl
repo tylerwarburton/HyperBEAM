@@ -252,7 +252,8 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
 compute_to_slot(ProcID, Base, Req, TargetSlot, Opts, Stored) ->
     case hb_ao:get(<<"at-slot">>, Base, Opts#{ <<"hashpath">> => ignore }) of
         CurrentSlot when CurrentSlot == TargetSlot ->
-            % We reached the target height so we force a snapshot and return.
+            % We reached the target height, so store it if the preceding walk
+            % did not already do so and return.
             ?event(compute_short,
                 {reached_target_slot_returning_state,
                     {proc_id, ProcID},
@@ -261,7 +262,15 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts, Stored) ->
                 Opts
             ),
             case Stored of
-                false -> store_result(true, ProcID, TargetSlot, Base, Req, Opts);
+                false ->
+                    store_result(
+                        force_target_snapshot(TargetSlot, TargetSlot, Opts),
+                        ProcID,
+                        TargetSlot,
+                        Base,
+                        Req,
+                        Opts
+                    );
                 true -> ok
             end,
             {ok, without_snapshot(lib_process:as_process(Base, Opts), Opts)};
@@ -374,7 +383,7 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                 timer:tc(
                     fun() ->
                         store_result(
-                            Slot == TargetSlot,
+                            force_target_snapshot(Slot, TargetSlot, Opts),
                             ProcID,
                             Slot,
                             NewProcStateMsgWithSlot,
@@ -576,6 +585,15 @@ store_result(ForceSnapshot, ProcID, Slot, Res, Req, Opts) ->
     dev_process_cache:write(ProcID, Slot, ResMaybeWithSnapshot, Opts),
     ?event(compute, {caching_completed, {proc_id, ProcID}, {slot, Slot}}, Opts),
     hb_maps:without([<<"snapshot">>], ResMaybeWithSnapshot, Opts).
+
+%% @doc Should a requested target slot force a snapshot rather than use the
+%% configured slot and time cadence? Defaults to the existing force-on-target
+%% behavior.
+force_target_snapshot(Slot, TargetSlot, Opts) ->
+    Slot == TargetSlot andalso
+        hb_util:atom(
+            hb_opts:get(<<"process-force-target-snapshot">>, true, Opts)
+        ).
 
 %% @doc Should we snapshot a new full state result? First, we check if the 
 %% `process_snapshot_time' option is set. If it is, we check if the elapsed time
@@ -799,3 +817,21 @@ ensure_loaded(Base, Req, Opts) ->
 %% @doc Remove the `snapshot' key from a message and return it.
 without_snapshot(Msg, Opts) ->
     hb_ao:set(Msg, <<"snapshot">>, unset, Opts).
+
+target_snapshot_policy_test() ->
+    ?assert(force_target_snapshot(3, 3, #{})),
+    ?assertNot(force_target_snapshot(2, 3, #{})),
+    ?assertNot(
+        force_target_snapshot(
+            3,
+            3,
+            #{ <<"process-force-target-snapshot">> => false }
+        )
+    ),
+    ?assertNot(
+        force_target_snapshot(
+            3,
+            3,
+            #{ <<"process-force-target-snapshot">> => <<"false">> }
+        )
+    ).
