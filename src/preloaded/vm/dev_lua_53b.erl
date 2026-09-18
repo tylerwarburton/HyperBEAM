@@ -607,6 +607,93 @@ worker_started_from_cached_state_restores_vm_test_() ->
         exit(Worker, kill)
     end}.
 
+%% @doc A `now' read over HTTP is served from the process cache and must not
+%% write the state back to the store. HTTP requests run under the node's
+%% default `cache-control: always', which made every `now' read, and every key
+%% read from its result, re-serialize, re-hash and write the whole process
+%% state -- although the delta cache already holds it durably.
+now_http_read_does_not_store_state_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Opts = #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"port">> => 10000 + rand:uniform(20000),
+            <<"process-now-from-cache">> => true,
+            <<"process-delta-checkpoint-slots">> => 1000
+        },
+        Node = hb_http_server:start_node(Opts),
+        Process = delta_process(Opts),
+        {ok, _} = hb_cache:write(Process, Opts),
+        Schedule =
+            fun(N) ->
+                {ok, _} =
+                    hb_ao:resolve(Process, schedule_request(Process, N, Opts), Opts)
+            end,
+        Compute =
+            fun(Slot) ->
+                {ok, _} =
+                    hb_ao:resolve(
+                        Process,
+                        #{ <<"path">> => <<"compute">>, <<"slot">> => Slot },
+                        Opts
+                    )
+            end,
+        lists:foreach(Schedule, [1, 2, 3]),
+        Compute(2),
+        ProcID = hb_util:human_id(hb_message:id(Process, all, Opts)),
+        Get =
+            fun(Path) ->
+                hb_http:get(
+                    Node,
+                    <<"/", ProcID/binary, "~process@1.0/", Path/binary>>,
+                    Opts
+                )
+            end,
+        {Reads, StateWrites} =
+            count_state_writes(
+                fun() ->
+                    [
+                        Get(<<"now/count">>),
+                        Get(<<"now/last-action">>),
+                        Get(<<"compute/count?slot=1">>)
+                    ]
+                end
+            ),
+        ?assertMatch(
+            [{ok, <<"3">>}, {ok, <<"Increment">>}, {ok, <<"2">>}],
+            Reads
+        ),
+        ?assertEqual(0, StateWrites),
+        % `now' still follows newly computed slots.
+        Schedule(4),
+        Compute(3),
+        ?assertMatch({ok, <<"4">>}, Get(<<"now/count">>))
+    end}.
+
+%% @doc Run `Fun' and count the `hb_cache:write/2' calls, in any process, whose
+%% message is a process state (it carries `last-action').
+count_state_writes(Fun) ->
+    MatchSpec =
+        [{['$1', '_'],
+            [{is_map, '$1'}, {is_map_key, <<"last-action">>, '$1'}],
+            []}],
+    erlang:trace_pattern({hb_cache, write, 2}, MatchSpec, [global]),
+    erlang:trace(all, true, [call, {tracer, self()}]),
+    Res =
+        try Fun()
+        after
+            erlang:trace(all, false, [call]),
+            erlang:trace_pattern({hb_cache, write, 2}, false, [global])
+        end,
+    {Res, count_trace_messages(0)}.
+
+count_trace_messages(N) ->
+    receive
+        {trace, _, call, {hb_cache, write, _}} -> count_trace_messages(N + 1)
+    after 100 -> N
+    end.
+
 wait_for_worker(_Group, 0) -> erlang:error(no_process_worker);
 wait_for_worker(Group, Tries) ->
     case hb_name:lookup(Group) of
