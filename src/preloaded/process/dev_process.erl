@@ -712,7 +712,14 @@ now(RawBase, Req, Opts) ->
             LatestKnown = dev_process_cache:latest(ProcessID, [], Opts),
             case LatestKnown of
                 {ok, LatestSlot, RawLatestMsg} ->
-                    LatestMsg = without_snapshot(RawLatestMsg, Opts),
+                    % Marked as a cache hit: it is public state only (never a
+                    % base to compute from), and the store already holds it,
+                    % so result caching must not write it back on every read.
+                    LatestMsg =
+                        mark_cached_state(
+                            without_snapshot(RawLatestMsg, Opts),
+                            Opts
+                        ),
                     ?event(compute_cache,
                         {serving_latest_cached_state,
                             {proc_id, ProcessID},
