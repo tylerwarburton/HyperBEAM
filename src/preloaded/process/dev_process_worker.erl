@@ -480,8 +480,14 @@ worker_survives_forced_message_slot_test_() ->
                 WorkerOpts
             },
         receive
-            {resolved, _, Group, {slot, NotifiedSlot}, Res} ->
+            {resolved, _, Group, {slot, NotifiedSlot}, Notification} ->
                 ?assertEqual(0, NotifiedSlot),
+                Res = resolve_notification(
+                    Notification,
+                    Group,
+                    NotifiedSlot,
+                    WorkerOpts
+                ),
                 ?assertMatch({ok, _}, Res);
             {'DOWN', MRef, process, Worker, Reason} ->
                 ?assertEqual(worker_stayed_alive, {worker_died, Reason})
