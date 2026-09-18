@@ -180,7 +180,22 @@ notify_compute(GroupName, SlotToNotify, Res, Opts, Count) ->
 
 send_notification(Listener, GroupName, SlotToNotify, Res) ->
     ?event({sending_notification, {group, GroupName}, {slot, SlotToNotify}}),
-    Listener ! {resolved, self(), GroupName, {slot, SlotToNotify}, Res}.
+    Listener ! {
+        resolved,
+        self(),
+        GroupName,
+        {slot, SlotToNotify},
+        public_result(Res)
+    }.
+
+%% @doc A process worker keeps private execution state in its own recursive
+%% loop. A listener only needs the public process result. Sending `priv' here
+%% copies the complete resident VM into the listener's heap after every slot,
+%% even though the HTTP response removes it later.
+public_result({ok, Msg}) when is_map(Msg) ->
+    {ok, hb_private:reset(Msg)};
+public_result(Res) ->
+    Res.
 
 %% @doc Stop a worker process.
 stop(Worker) ->
@@ -213,6 +228,25 @@ grouper_test() ->
     ?event({group_samples, {g1, G1}, {g2, G2}, {g3, G3}}),
     ?assertEqual(G1, G2),
     ?assertNotEqual(G1, G3).
+
+worker_notification_is_public_test() ->
+    Group = make_ref(),
+    Secret = #{ <<"vm">> => lists:seq(1, 1000) },
+    Full = #{
+        <<"counter">> => <<"1">>,
+        <<"priv">> => Secret
+    },
+    send_notification(self(), Group, 1, {ok, Full}),
+    receive
+        {resolved, _, Group, {slot, 1}, {ok, Public}} ->
+            ?assertEqual(<<"1">>, maps:get(<<"counter">>, Public)),
+            ?assertNot(maps:is_key(<<"priv">>, Public))
+    after 1000 ->
+        ?assert(false)
+    end,
+    % Sanitising the listener response must not alter the state retained by
+    % the worker for its next request.
+    ?assertEqual(Secret, maps:get(<<"priv">>, Full)).
 
 %% @doc `compute' requests whose result is already in the local cache
 %% should bypass the per-process worker queue (returning the
