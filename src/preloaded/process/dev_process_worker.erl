@@ -134,7 +134,7 @@ await(Worker, GroupName, Base, Req, Opts) ->
                         {target, TargetSlot},
                         {group, GroupName}
                     }),
-                    Res;
+                    resolve_notification(Res, GroupName, RecvdSlot, Opts);
                 {resolved, _, GroupName, {slot, RecvdSlot}, _Res} ->
                     ?event(debug_compute, {waiting_again,
                         {target, TargetSlot},
@@ -185,16 +185,23 @@ send_notification(Listener, GroupName, SlotToNotify, Res) ->
         self(),
         GroupName,
         {slot, SlotToNotify},
-        public_result(Res)
+        notification_result(Res)
     }.
 
-%% @doc A process worker keeps private execution state in its own recursive
-%% loop. A listener only needs the public process result. Sending `priv' here
-%% copies the complete resident VM into the listener's heap after every slot,
-%% even though the HTTP response removes it later.
-public_result({ok, Msg}) when is_map(Msg) ->
-    {ok, hb_private:reset(Msg)};
-public_result(Res) ->
+%% @doc A process worker keeps the complete result in its recursive loop and
+%% has already made the public result durable before it notifies listeners.
+%% Passing the result itself copies the resident VM -- or, after stripping
+%% `priv', still copies the complete public process map -- into every listener's
+%% heap. Send a cache marker instead, so the worker can start its next slot while
+%% each listener reads the public result from the process cache.
+notification_result({ok, Msg}) when is_map(Msg) ->
+    cached;
+notification_result(Res) ->
+    Res.
+
+resolve_notification(cached, GroupName, Slot, Opts) ->
+    dev_process_cache:read(GroupName, Slot, Opts);
+resolve_notification(Res, _GroupName, _Slot, _Opts) ->
     Res.
 
 %% @doc Stop a worker process.
@@ -230,15 +237,21 @@ grouper_test() ->
     ?assertNotEqual(G1, G3).
 
 worker_notification_is_public_test() ->
-    Group = make_ref(),
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+        <<"priv-wallet">> => ar_wallet:new()
+    },
+    Group = hb_util:encode(crypto:strong_rand_bytes(32)),
     Secret = #{ <<"vm">> => lists:seq(1, 1000) },
     Full = #{
         <<"counter">> => <<"1">>,
         <<"priv">> => Secret
     },
+    {ok, _} = dev_process_cache:write(Group, 1, Full, Opts),
     send_notification(self(), Group, 1, {ok, Full}),
     receive
-        {resolved, _, Group, {slot, 1}, {ok, Public}} ->
+        {resolved, _, Group, {slot, 1}, Notification} ->
+            {ok, Public} = resolve_notification(Notification, Group, 1, Opts),
             ?assertEqual(<<"1">>, maps:get(<<"counter">>, Public)),
             ?assertNot(maps:is_key(<<"priv">>, Public))
     after 1000 ->
