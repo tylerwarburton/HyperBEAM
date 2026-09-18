@@ -503,6 +503,117 @@ process_delta_restore_test_() ->
         )
     end}.
 
+%% @doc A persistent process worker that is asked for a slot it has already
+%% computed answers from the process cache. That cached state is public only:
+%% it carries no Luerl VM. The worker must keep its own live state rather than
+%% adopt the cached one, or its next slot runs against a freshly initialized VM
+%% and every Lua global silently resets while the slot counter continues.
+worker_keeps_live_vm_after_cached_read_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Opts = #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"spawn-worker">> => true,
+            <<"process-workers">> => true,
+            <<"await-inprogress">> => named,
+            <<"process-delta-checkpoint-slots">> => 1000
+        },
+        Process = delta_process(Opts),
+        {ok, _} = hb_cache:write(Process, Opts),
+        [
+            {ok, _} = hb_ao:resolve(Process, schedule_request(Process, N, Opts), Opts)
+        ||
+            N <- lists:seq(1, 3)
+        ],
+        {ok, State2} = hb_ao:resolve(
+            Process,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 2 },
+            Opts
+        ),
+        ?assertEqual(<<"3">>, hb_ao:get(<<"count">>, State2, Opts)),
+        Group = hb_util:human_id(hb_message:id(Process, all, Opts)),
+        Worker = wait_for_worker(Group, 50),
+        % Ask the live worker for a slot it has already computed, exactly as
+        % `hb_persistent:await/4' does for a request grouped before the slot
+        % reached the cache.
+        Worker ! {
+            resolve,
+            self(),
+            Group,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 1 },
+            Opts
+        },
+        receive
+            {resolved, _, Group, {slot, 1}, {ok, State1}} ->
+                ?assertEqual(<<"2">>, hb_ao:get(<<"count">>, State1, Opts))
+        after 10000 -> erlang:error(worker_did_not_answer)
+        end,
+        {ok, _} = hb_ao:resolve(Process, schedule_request(Process, 4, Opts), Opts),
+        {ok, State3} = hb_ao:resolve(
+            Process,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 3 },
+            Opts
+        ),
+        % Slot 3 is the fourth execution. A reset VM would report `2' here.
+        ?assertEqual(<<"4">>, hb_ao:get(<<"count">>, State3, Opts))
+    end}.
+
+%% @doc A worker can be spawned with the result of a request that was served
+%% from the process cache. It must restore a real VM before computing, rather
+%% than continue from the public-only cached state.
+worker_started_from_cached_state_restores_vm_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Opts = #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"spawn-worker">> => false,
+            <<"process-workers">> => false,
+            <<"process-delta-checkpoint-slots">> => 1000
+        },
+        Process = delta_process(Opts),
+        {ok, _} = hb_cache:write(Process, Opts),
+        [
+            {ok, _} = hb_ao:resolve(Process, schedule_request(Process, N, Opts), Opts)
+        ||
+            N <- lists:seq(1, 4)
+        ],
+        {ok, _} = hb_ao:resolve(
+            Process,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 2 },
+            Opts
+        ),
+        % A second request for slot 2 is a cache hit: public state, no VM.
+        {ok, Cached} = hb_ao:resolve(
+            Process,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 2 },
+            Opts
+        ),
+        Group = hb_util:human_id(hb_message:id(Process, all, Opts)),
+        Worker = hb_persistent:start_worker(Group, Cached, Opts),
+        Worker ! {
+            resolve,
+            self(),
+            Group,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 3 },
+            Opts
+        },
+        receive
+            {resolved, _, Group, {slot, 3}, {ok, State3}} ->
+                ?assertEqual(<<"4">>, hb_ao:get(<<"count">>, State3, Opts))
+        after 20000 -> erlang:error(worker_did_not_answer)
+        end,
+        exit(Worker, kill)
+    end}.
+
+wait_for_worker(_Group, 0) -> erlang:error(no_process_worker);
+wait_for_worker(Group, Tries) ->
+    case hb_name:lookup(Group) of
+        Pid when is_pid(Pid) -> Pid;
+        _ -> timer:sleep(100), wait_for_worker(Group, Tries - 1)
+    end.
+
 %% @doc Luerl's `step' collector advances a real multi-call mark cycle while
 %% allocations and reachable mutations continue between steps. Externalizing
 %% a pending VM safely cancels its heap snapshot instead of serializing it.
