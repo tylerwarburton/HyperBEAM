@@ -468,7 +468,7 @@ worker_survives_forced_message_slot_test_() ->
                 <<"spawn-worker">> => false,
                 <<"process-workers">> => false
             },
-        Group = process_to_group_name(Base, Opts),
+        Group = hb_util:encode(crypto:strong_rand_bytes(32)),
         Self = self(),
         Worker = spawn(fun() -> server(Group, Base, WorkerOpts) end),
         MRef = erlang:monitor(process, Worker),
