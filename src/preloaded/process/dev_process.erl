@@ -43,7 +43,7 @@
 -device_libraries([lib_process]).
 %%% Public API
 -export([info/1, as/3, compute/3, schedule/3, slot/3, now/3, push/3, snapshot/3]).
--export([target_slot/2]).
+-export([target_slot/2, is_cached_state/1]).
 -export([default_device/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("include/hb.hrl").
@@ -217,7 +217,7 @@ compute(Base, Req, Opts) ->
                             {result, Result}
                         }
                     ),
-                    {ok, without_snapshot(Result, Opts)};
+                    {ok, mark_cached_state(without_snapshot(Result, Opts), Opts)};
                 {error, not_found} ->
                     {ok, Loaded} = ensure_loaded(ProcBase, Req, Opts),
                     ?event(compute,
@@ -853,6 +853,18 @@ ensure_loaded(Base, Req, Opts) ->
                     init(Base, Req, Opts)
             end
     end.
+
+%% @doc Mark a state that was read back from the process cache. Cached states
+%% are public only: they carry no execution-device state (for Lua, no VM), so
+%% they are answers, never a base to compute the next slot from.
+mark_cached_state(Msg, Opts) ->
+    hb_private:set(Msg, #{ <<"process-cached-state">> => true }, Opts).
+
+%% @doc Return `true' if a state came from the process cache rather than from
+%% executing the process.
+is_cached_state(Msg) ->
+    maps:get(<<"process-cached-state">>, hb_private:from_message(Msg), false)
+        =:= true.
 
 %% @doc Remove the `snapshot' key from a message and return it.
 without_snapshot(Msg, Opts) ->

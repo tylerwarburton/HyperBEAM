@@ -74,7 +74,8 @@ process_to_group_name(Base, Opts) ->
 %% @doc Spawn a new worker process. This is called after the end of the first
 %% execution of `hb_ao:resolve/3', so the state we are given is the
 %% already current.
-server(GroupName, Base, Opts) ->
+server(GroupName, RawBase, Opts) ->
+    Base = live_base(RawBase),
     ServerOpts = Opts#{
         <<"await-inprogress">> => false,
         <<"spawn-worker">> => false,
@@ -102,14 +103,7 @@ server(GroupName, Base, Opts) ->
                 ),
             ?event(worker, {work_done, {group, GroupName}, {req, Req}, {res, Res}}),
             send_notification(Listener, GroupName, TargetSlot, Res),
-            server(
-                GroupName,
-                case Res of
-                    {ok, NewBase} when is_map(NewBase) -> NewBase;
-                    _ -> Base
-                end,
-                Opts
-            );
+            server(GroupName, next_base(Base, Res), Opts);
         stop ->
             ?event(worker, {stopping, {group, GroupName}, {base, Base}}),
             exit(normal)
@@ -123,6 +117,27 @@ server(GroupName, Base, Opts) ->
         ),
         % Return the current process state.
         {ok, Base}
+    end.
+
+%% @doc Choose the state the worker continues from after a request. A request
+%% for a slot that is already cached is answered from the process cache, and
+%% that answer is public state only: continuing from it would execute the next
+%% slot against a freshly initialized VM, silently resetting every value the
+%% execution device keeps outside the published message.
+next_base(Base, {ok, NewBase}) when is_map(NewBase) ->
+    case dev_process:is_cached_state(NewBase) of
+        true -> Base;
+        false -> NewBase
+    end;
+next_base(Base, _) -> Base.
+
+%% @doc A worker may be started with the result of a cache hit. It then has no
+%% live execution state, so it starts from the process definition instead and
+%% restores from the last full snapshot on its first compute.
+live_base(Base) ->
+    case dev_process:is_cached_state(Base) of
+        true -> maps:get(<<"process">>, Base, Base);
+        false -> Base
     end.
 
 %% @doc Read the slot a request is asking for, as an INTEGER.
