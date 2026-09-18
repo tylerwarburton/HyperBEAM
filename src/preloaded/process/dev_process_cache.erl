@@ -22,7 +22,16 @@ read(ProcID, SlotRef, Opts) ->
         not_found ->
             Path = path(ProcID, SlotRef, Opts),
             case hb_cache:read(Path, Opts) of
-                {ok, Stored} -> materialize(ProcID, Stored, Opts);
+                {ok, Stored} ->
+                    case materialize(ProcID, Stored, Opts) of
+                        {ok, Msg} when is_integer(SlotRef) ->
+                            % Keep the rebuilt state, so the next read of the
+                            % latest slot does not replay the delta chain
+                            % again. `hot_put' never replaces a newer slot.
+                            hot_put(ProcID, SlotRef, Msg, Opts),
+                            {ok, Msg};
+                        Res -> Res
+                    end;
                 Other -> Other
             end
     end.
@@ -185,22 +194,21 @@ hot_read(ProcID, SlotRef, Opts) when is_integer(SlotRef) ->
     end;
 hot_read(_ProcID, _SlotRef, _Opts) -> not_found.
 
+%% @doc Hold the newest known state of a process. An older slot never replaces
+%% a newer one: a replay after a restart writes old slots while readers want
+%% the latest, and letting the replay evict it sends every read back down the
+%% delta chain.
 hot_put(ProcID, Slot, Msg, Opts) ->
     ensure_hot_cache(),
-    Entry = {hot_key(ProcID, Opts), Slot, Msg},
-    try ets:insert(?HOT_CACHE, Entry) of
-        true -> ok
+    Key = hot_key(ProcID, Opts),
+    try ets:lookup(?HOT_CACHE, Key) of
+        [{Key, Newer, _}] when Newer > Slot -> ok;
+        _ -> ets:insert(?HOT_CACHE, {Key, Slot, Msg}), ok
     catch error:badarg ->
-        % The short-lived process that first created the table may have exited
-        % between `ensure' and `insert'. Recreate once; the durable delta was
-        % already written, so losing this acceleration never loses state.
-        ensure_hot_cache(),
-        try ets:insert(?HOT_CACHE, Entry)
-        catch error:badarg -> false
-        end,
+        % Losing this acceleration never loses state: the durable delta or
+        % checkpoint was already written.
         ok
-    end,
-    ok.
+    end.
 
 hot_key(ProcID, Opts) ->
     {
@@ -208,13 +216,36 @@ hot_key(ProcID, Opts) ->
         hb_opts:get(<<"process-cache-scope">>, local, Opts)
     }.
 
+%% @doc Make sure the hot cache table exists. It is owned by a dedicated
+%% process that never exits: an ETS table dies with its owner, and the first
+%% caller is often a short-lived HTTP request, which used to take the whole
+%% hot cache with it when it finished -- leaving every `now' read to rebuild
+%% the latest state from the delta chain.
 ensure_hot_cache() ->
     case ets:whereis(?HOT_CACHE) of
         undefined ->
-            try ets:new(?HOT_CACHE, [named_table, public, set]) of
-                _ -> ok
-            catch error:badarg -> ok
-            end;
+            Parent = self(),
+            Ref = make_ref(),
+            {Owner, Mon} =
+                spawn_monitor(
+                    fun() ->
+                        try ets:new(?HOT_CACHE, [named_table, public, set]) of
+                            _ ->
+                                Parent ! {Ref, created},
+                                receive after infinity -> ok end
+                        catch error:badarg ->
+                            % Another caller created it first.
+                            Parent ! {Ref, exists}
+                        end
+                    end
+                ),
+            receive
+                {Ref, _} -> ok;
+                {'DOWN', Mon, process, Owner, _} -> ok
+            after 5000 -> ok
+            end,
+            erlang:demonitor(Mon, [flush]),
+            ok;
         _ -> ok
     end.
 
@@ -351,6 +382,41 @@ delta_roundtrip_test_() ->
             <<"priv-wallet">> => ar_wallet:new()
         })
     end}.
+
+%% @doc The hot cache must outlive whichever process happened to create it (in
+%% production, usually a short-lived HTTP request), must never let an older
+%% slot evict a newer one, and must keep a state rebuilt from the delta chain
+%% so the next read of that slot does not rebuild it again.
+hot_cache_survives_creator_and_keeps_newest_test() ->
+    application:ensure_all_started(hb),
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"process-delta-checkpoint-slots">> => 1000
+    },
+    ProcID = hb_util:encode(crypto:strong_rand_bytes(32)),
+    Results = #{ <<"output">> => #{ <<"data">> => <<"0">> } },
+    State0 = #{ <<"at-slot">> => 0, <<"count">> => <<"0">>, <<"results">> => Results },
+    {ok, _} = write(ProcID, 0, with_delta(State0, [], Results, Opts), Opts),
+    Patches = [#{ <<"path">> => <<"/count">>, <<"value">> => <<"1">> }],
+    {ok, State1} = hb_process_delta:apply(State0, Patches, Results, 1, Opts),
+    % A short-lived process writes slot 1 and exits.
+    {Writer, Mon} =
+        spawn_monitor(fun() ->
+            {ok, _} = write(ProcID, 1, with_delta(State1, Patches, Results, Opts), Opts)
+        end),
+    receive {'DOWN', Mon, process, Writer, normal} -> ok end,
+    ?assertMatch({ok, _}, hot_read(ProcID, 1, Opts)),
+    % An older slot never replaces the newest.
+    hot_put(ProcID, 0, State0, Opts),
+    ?assertMatch({ok, _}, hot_read(ProcID, 1, Opts)),
+    ?assertEqual(not_found, hot_read(ProcID, 0, Opts)),
+    % Drop the entry: the next read rebuilds slot 1 from its delta once, and
+    % keeps it.
+    ets:delete(?HOT_CACHE, hot_key(ProcID, Opts)),
+    {ok, Rebuilt} = read(ProcID, 1, Opts),
+    ?assertEqual(<<"1">>, hb_ao:get(<<"count">>, Rebuilt, Opts)),
+    ?assertMatch({ok, _}, hot_read(ProcID, 1, Opts)).
 
 snapshot_presence_is_structural_test() ->
     application:ensure_all_started(hb),
