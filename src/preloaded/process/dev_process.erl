@@ -761,6 +761,21 @@ push(Base, Req, Opts) ->
 %% @doc Ensure that the process message we have in memory is live and
 %% up-to-date.
 ensure_loaded(Base, Req, Opts) ->
+    case is_cached_state(Base) of
+        true ->
+            % A state read back from the cache (or sent to a listener) is
+            % public only: it has no execution-device state, so it must never
+            % be computed onward. Restore from the process definition instead.
+            ensure_loaded_state(
+                hb_maps:get(<<"process">>, Base, Base, Opts),
+                Req,
+                Opts
+            );
+        false ->
+            ensure_loaded_state(Base, Req, Opts)
+    end.
+
+ensure_loaded_state(Base, Req, Opts) ->
     % Get the nonce we are currently on and the inbound nonce.
     TargetSlot = hb_ao:get(<<"slot">>, Req, undefined, Opts),
     ProcID = lib_process:process_id(Base, #{}, Opts),

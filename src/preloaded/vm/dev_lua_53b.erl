@@ -694,6 +694,116 @@ count_trace_messages(N) ->
     after 100 -> N
     end.
 
+%% @doc A push computes its process inside another resolution. That compute
+%% must leave a persistent worker behind, so the next push computes one slot
+%% from the live VM instead of restoring the last snapshot and replaying every
+%% slot since -- which after a restart made every write replay ~1,000 slots.
+push_leaves_worker_for_next_push_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Opts = #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"spawn-worker">> => true,
+            <<"process-workers">> => true,
+            <<"await-inprogress">> => named,
+            <<"process-delta-checkpoint-slots">> => 1000,
+            <<"port">> => 10000 + rand:uniform(20000)
+        },
+        Node = hb_http_server:start_node(Opts),
+        Process = delta_process(Opts),
+        {ok, _} = hb_cache:write(Process, Opts),
+        Group = hb_util:human_id(hb_message:id(Process, all, Opts)),
+        Schedule =
+            fun(N) ->
+                {ok, _} =
+                    hb_ao:resolve(Process, schedule_request(Process, N, Opts), Opts)
+            end,
+        % Exactly what clients send after a write: `GET .../push&slot=N'.
+        Push =
+            fun(Slot) ->
+                {ok, _} =
+                    hb_http:get(
+                        Node,
+                        <<"/", Group/binary, "~process@1.0/push&slot=",
+                            (integer_to_binary(Slot))/binary>>,
+                        Opts
+                    )
+            end,
+        lists:foreach(Schedule, [1, 2, 3, 4]),
+        % The first push catches up from the start: slots 1-3 as deltas.
+        ?assertEqual(3, count_slot_computes(fun() -> Push(3) end)),
+        Worker = wait_for_worker(Group, 50),
+        Schedule(5),
+        % The next push is served by that worker: exactly one slot.
+        ?assertEqual(1, count_slot_computes(fun() -> Push(4) end)),
+        ?assertEqual(Worker, hb_name:lookup(Group)),
+        {ok, State} =
+            hb_ao:resolve(
+                Process,
+                #{ <<"path">> => <<"compute">>, <<"slot">> => 4 },
+                Opts
+            ),
+        ?assertEqual(<<"5">>, hb_ao:get(<<"count">>, State, Opts)),
+        exit(Worker, kill)
+    end}.
+
+%% @doc Run `Fun' and count, in any process, the slots it computes and stores
+%% (each slot that is not a checkpoint is stored as one delta envelope).
+count_slot_computes(Fun) ->
+    MatchSpec =
+        [{['$1', '_'],
+            [{is_map, '$1'}, {is_map_key, <<"cache-format">>, '$1'}],
+            []}],
+    erlang:trace_pattern({hb_cache, write, 2}, MatchSpec, [global]),
+    erlang:trace(all, true, [call, {tracer, self()}]),
+    try Fun()
+    after
+        erlang:trace(all, false, [call]),
+        erlang:trace_pattern({hb_cache, write, 2}, false, [global])
+    end,
+    count_trace_messages(0).
+
+%% @doc A public state -- a cache hit, or what a worker now sends its
+%% listeners -- carries no VM. Computing onward from one must restore the VM
+%% from the process, not run the next slot against a fresh one.
+compute_from_public_state_restores_vm_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Opts = #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"spawn-worker">> => false,
+            <<"process-workers">> => false,
+            <<"process-delta-checkpoint-slots">> => 1000
+        },
+        Process = delta_process(Opts),
+        {ok, _} = hb_cache:write(Process, Opts),
+        [
+            {ok, _} = hb_ao:resolve(Process, schedule_request(Process, N, Opts), Opts)
+        ||
+            N <- lists:seq(1, 3)
+        ],
+        Compute =
+            fun(Base, Slot) ->
+                hb_ao:resolve(
+                    Base,
+                    #{ <<"path">> => <<"compute">>, <<"slot">> => Slot },
+                    Opts
+                )
+            end,
+        {ok, _} = Compute(Process, 1),
+        % A second read of slot 1 is a cache hit: public state, no VM.
+        {ok, Public} = Compute(Process, 1),
+        ?assertEqual(
+            true,
+            maps:get(<<"process-cached-state">>, hb_private:from_message(Public))
+        ),
+        {ok, State2} = Compute(Public, 2),
+        % Slot 2 is the third execution. A fresh VM would report `1'.
+        ?assertEqual(<<"3">>, hb_ao:get(<<"count">>, State2, Opts))
+    end}.
+
 wait_for_worker(_Group, 0) -> erlang:error(no_process_worker);
 wait_for_worker(Group, Tries) ->
     case hb_name:lookup(Group) of
