@@ -209,7 +209,7 @@ do_push(PrimaryProcess, Assignment, Opts) ->
                                         <<"source">> => RawMsgToPush
                                     }
                             end,
-                        case hb_cache:read(Target, Opts) of
+                        case read_target(Target, Opts) of
                             {ok, DownstreamProcess} ->
                                 push_result_message(
                                     DownstreamProcess,
@@ -282,6 +282,77 @@ outbox_entries(Outbox, Opts) ->
             Opts
         ),
     hb_maps:without(?OUTBOX_NON_ENTRY_KEYS, Entries, Opts).
+
+%% @doc Find the process an outbox entry targets. Most targets of a token,
+%% vault or pair are wallets (Credit-Notice, Debit-Notice), which are not
+%% messages at all: a full store read misses locally and then walks every
+%% remote store (three GraphQL gateways here, 0.7-3.6 s) before failing, once
+%% per entry, on every push. Read local stores first -- every process this node
+%% runs is there -- and remember remote misses for a bounded time
+%% (`push-target-miss-ttl' seconds, default 300), so a wallet costs one remote
+%% walk per TTL rather than one per message. A process that exists only
+%% remotely is still found, and a miss is retried after the TTL.
+read_target(Target, Opts) ->
+    case hb_cache:read(Target, hb_store:scope(Opts, local)) of
+        {ok, Msg} -> {ok, Msg};
+        _ ->
+            case recent_miss(Target, Opts) of
+                true -> {error, not_found};
+                false ->
+                    case hb_cache:read(Target, Opts) of
+                        {ok, Msg} -> {ok, Msg};
+                        Miss ->
+                            remember_miss(Target),
+                            Miss
+                    end
+            end
+    end.
+
+-define(TARGET_MISSES, dev_push_target_misses).
+
+recent_miss(Target, Opts) ->
+    TTL = hb_util:int(hb_opts:get(<<"push-target-miss-ttl">>, 300, Opts)),
+    ensure_miss_table(),
+    try ets:lookup(?TARGET_MISSES, Target) of
+        [{Target, At}] -> erlang:monotonic_time(second) - At < TTL;
+        [] -> false
+    catch error:badarg -> false
+    end.
+
+remember_miss(Target) ->
+    ensure_miss_table(),
+    try ets:insert(?TARGET_MISSES, {Target, erlang:monotonic_time(second)})
+    catch error:badarg -> ok
+    end,
+    ok.
+
+%% @doc The table is owned by a process that never exits: a table dies with its
+%% owner, and the first caller is usually a short-lived request.
+ensure_miss_table() ->
+    case ets:whereis(?TARGET_MISSES) of
+        undefined ->
+            Parent = self(),
+            Ref = make_ref(),
+            {Owner, Mon} =
+                spawn_monitor(
+                    fun() ->
+                        try ets:new(?TARGET_MISSES, [named_table, public, set]) of
+                            _ ->
+                                Parent ! {Ref, created},
+                                receive after infinity -> ok end
+                        catch error:badarg -> Parent ! {Ref, exists}
+                        end
+                    end
+                ),
+            receive
+                {Ref, _} -> ok;
+                {'DOWN', Mon, process, Owner, _} -> ok
+            after 5000 -> ok
+            end,
+            erlang:demonitor(Mon, [flush]),
+            ok;
+        _ -> ok
+    end.
 
 target_process_not_found(Target) ->
     #{
@@ -1903,6 +1974,77 @@ oracle_script() ->
         
         """
     >>.
+
+%% @doc Outbox targets are looked up locally first, and a target that no store
+%% has -- a wallet -- is remembered, so it costs one remote walk per TTL rather
+%% than one per message. A process that exists only remotely is still found.
+read_target_skips_remote_for_known_misses_test() ->
+    application:ensure_all_started(hb),
+    RemoteDir =
+        <<"cache-TEST/push-remote-",
+            (hb_util:encode(crypto:strong_rand_bytes(8)))/binary>>,
+    Remote = #{
+        <<"store-module">> => hb_store_fs,
+        <<"name">> => RemoteDir,
+        <<"scope">> => remote
+    },
+    Local = hb_test_utils:test_store(hb_store_lmdb),
+    Opts = #{
+        <<"store">> => [Local, Remote],
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"push-target-miss-ttl">> => 300
+    },
+    LocalMsg = #{ <<"type">> => <<"Process">>, <<"n">> => <<"local">> },
+    {ok, LocalID} = hb_cache:write(LocalMsg, Opts#{ <<"store">> => [Local] }),
+    RemoteMsg = #{ <<"type">> => <<"Process">>, <<"n">> => <<"remote">> },
+    {ok, RemoteID} = hb_cache:write(RemoteMsg, Opts#{ <<"store">> => [Remote] }),
+    Wallet = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    RemoteReads =
+        fun(Fun) ->
+            erlang:trace_pattern({hb_store_fs, '_', '_'}, true, [call_count]),
+            Fun(),
+            Count =
+                lists:sum(
+                    [
+                        case erlang:trace_info({hb_store_fs, F, A}, call_count) of
+                            {call_count, C} when is_integer(C) -> C;
+                            _ -> 0
+                        end
+                    ||
+                        {F, A} <- [{read, 3}, {type, 3}, {resolve, 3}, {list, 3}]
+                    ]
+                ),
+            erlang:trace_pattern({hb_store_fs, '_', '_'}, false, [call_count]),
+            Count
+        end,
+    % A process this node has is found without touching a remote store.
+    ?assertEqual(0,
+        RemoteReads(fun() -> {ok, _} = read_target(LocalID, Opts) end)),
+    % A wallet walks the remote stores once...
+    ?assert(
+        RemoteReads(fun() -> {error, not_found} = read_target(Wallet, Opts) end)
+            > 0
+    ),
+    % ...and then not again within the TTL.
+    ?assertEqual(0,
+        RemoteReads(
+            fun() -> {error, not_found} = read_target(Wallet, Opts) end
+        )
+    ),
+    % After the TTL, a miss is retried.
+    ?assert(
+        RemoteReads(
+            fun() ->
+                {error, not_found} =
+                    read_target(
+                        Wallet,
+                        Opts#{ <<"push-target-miss-ttl">> => 0 }
+                    )
+            end
+        ) > 0
+    ),
+    % A process held only remotely is still delivered to.
+    ?assertMatch({ok, #{}}, read_target(RemoteID, Opts)).
 
 %% @doc A computed result's outbox shares its map with the result's own
 %% metadata. Only the messages the process emitted may be pushed: iterating the

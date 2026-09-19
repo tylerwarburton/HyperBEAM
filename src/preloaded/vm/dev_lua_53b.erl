@@ -764,6 +764,59 @@ count_slot_computes(Fun) ->
     end,
     count_trace_messages(0).
 
+%% @doc A worker computing a slot for a listener that runs under
+%% `cache-control: always' (every HTTP request) stores only what the process
+%% cache stores -- a small delta -- and never writes the whole state.
+worker_compute_does_not_store_whole_state_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Opts = #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"spawn-worker">> => true,
+            <<"process-workers">> => true,
+            <<"await-inprogress">> => named,
+            <<"process-delta-checkpoint-slots">> => 1000
+        },
+        Process = delta_process(Opts),
+        {ok, _} = hb_cache:write(Process, Opts),
+        Group = hb_util:human_id(hb_message:id(Process, all, Opts)),
+        [
+            {ok, _} = hb_ao:resolve(Process, schedule_request(Process, N, Opts), Opts)
+        ||
+            N <- lists:seq(1, 3)
+        ],
+        {ok, _} =
+            hb_ao:resolve(
+                Process,
+                #{ <<"path">> => <<"compute">>, <<"slot">> => 1 },
+                Opts
+            ),
+        Worker = wait_for_worker(Group, 50),
+        ListenerOpts = Opts#{ <<"cache-control">> => [<<"always">>] },
+        {Res, Writes} =
+            count_state_writes(
+                fun() ->
+                    Worker !
+                        {
+                            resolve,
+                            self(),
+                            Group,
+                            #{ <<"path">> => <<"compute">>, <<"slot">> => 2 },
+                            ListenerOpts
+                        },
+                    receive
+                        {resolved, _, Group, {slot, 2}, R} -> R
+                    after 20000 -> erlang:error(worker_did_not_answer)
+                    end
+                end
+            ),
+        {ok, State} = Res,
+        ?assertEqual(<<"3">>, hb_ao:get(<<"count">>, State, Opts)),
+        ?assertEqual(0, Writes),
+        exit(Worker, kill)
+    end}.
+
 %% @doc A public state -- a cache hit, or what a worker now sends its
 %% listeners -- carries no VM. Computing onward from one must restore the VM
 %% from the process, not run the next slot against a fresh one.
