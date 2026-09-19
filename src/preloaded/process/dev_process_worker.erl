@@ -258,7 +258,33 @@ notify_compute(GroupName, SlotToNotify, Res, Opts, Count) ->
 
 send_notification(Listener, GroupName, SlotToNotify, Res) ->
     ?event({sending_notification, {group, GroupName}, {slot, SlotToNotify}}),
-    Listener ! {resolved, self(), GroupName, {slot, SlotToNotify}, Res}.
+    Listener ! {
+        resolved,
+        self(),
+        GroupName,
+        {slot, SlotToNotify},
+        public_result(Res)
+    }.
+
+%% @doc The result a listener receives. The worker's state carries the whole
+%% execution-device state in `priv' (for Lua, the VM: hundreds of MB for a
+%% large process), and a message send copies all of it into every listener's
+%% heap, after every slot. A listener only needs the public result, so send
+%% that -- keeping the hashpath, which later resolution steps use -- and mark
+%% it as a cached state, so that it is never computed onward as though it had
+%% a VM (`dev_process:ensure_loaded/3', `live_base/1', `next_base/2').
+public_result({ok, Msg}) when is_map(Msg) ->
+    Priv = hb_private:from_message(Msg),
+    {ok,
+        Msg#{
+            <<"priv">> =>
+                (maps:with([<<"hashpath">>], Priv))#{
+                    <<"process-cached-state">> => true
+                }
+        }
+    };
+public_result(Res) ->
+    Res.
 
 %% @doc Stop a worker process.
 stop(Worker) ->
@@ -278,6 +304,31 @@ info_test() ->
     ?assert(is_function(Grouper, 3)),
     {module, Mod} = erlang:fun_info(Grouper, module),
     ?assertMatch(<<"_hb_device_", _/binary>>, atom_to_binary(Mod, utf8)).
+
+%% @doc Listeners receive the public result, marked as a cached state, with
+%% its hashpath -- never the execution-device state in `priv'.
+worker_notification_is_public_test() ->
+    Group = make_ref(),
+    VM = #{ <<"state">> => lists:seq(1, 100000) },
+    Full = #{
+        <<"counter">> => <<"1">>,
+        <<"priv">> => VM#{ <<"hashpath">> => <<"hp">> }
+    },
+    send_notification(self(), Group, 1, {ok, Full}),
+    receive
+        {resolved, _, Group, {slot, 1}, {ok, Public}} ->
+            ?assertEqual(<<"1">>, maps:get(<<"counter">>, Public)),
+            ?assertEqual(
+                #{ <<"hashpath">> => <<"hp">>, <<"process-cached-state">> => true },
+                maps:get(<<"priv">>, Public)
+            ),
+            ?assert(dev_process:is_cached_state(Public))
+    after 1000 -> erlang:error(no_notification)
+    end,
+    send_notification(self(), Group, 2, {error, boom}),
+    receive {resolved, _, Group, {slot, 2}, Err} -> ?assertEqual({error, boom}, Err)
+    after 1000 -> erlang:error(no_notification)
+    end.
 
 grouper_test() ->
     test_init(),
