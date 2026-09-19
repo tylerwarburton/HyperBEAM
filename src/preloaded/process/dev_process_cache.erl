@@ -10,6 +10,7 @@
 -define(DELTA_FORMAT, <<"process-delta@1.0">>).
 -define(DELTA_META, <<"process-cache-delta">>).
 -define(HOT_CACHE, dev_process_delta_hot_cache).
+-define(RECENT_CACHE, dev_process_delta_recent_cache).
 -define(DEFAULT_DELTA_CHECKPOINT_SLOTS, 1000).
 
 %% @doc Read the result of a process at a given slot.
@@ -46,8 +47,12 @@ write(ProcID, Slot, Msg, Opts) ->
 %% @doc Preserve the original full-message cache behavior.
 write_full(ProcID, Slot, Msg, Opts) ->
     % Write the item to the cache in the root of the store.
-    {ok, Root} = hb_cache:write(hb_private:reset(Msg), Opts),
+    PublicMsg = hb_private:reset(Msg),
+    {ok, Root} = hb_cache:write(PublicMsg, Opts),
     ok = link_result(ProcID, Slot, Root, Root, Opts),
+    % Keep the hot cache's newest entry current for every process: `latest'
+    % answers from it.
+    hot_put(ProcID, Slot, PublicMsg, Opts),
     {ok, path(ProcID, Slot, Opts)}.
 
 %% @doc Store a full public checkpoint or a small ordered delta. The Lua VM
@@ -189,7 +194,11 @@ hot_read(ProcID, SlotRef, Opts) when is_integer(SlotRef) ->
     Key = hot_key(ProcID, Opts),
     try ets:lookup(?HOT_CACHE, Key) of
         [{Key, SlotRef, Msg}] -> {ok, Msg};
-        _ -> not_found
+        _ ->
+            case ets:lookup(?RECENT_CACHE, {Key, SlotRef}) of
+                [{_, Msg}] -> {ok, Msg};
+                [] -> not_found
+            end
     catch error:badarg -> not_found
     end;
 hot_read(_ProcID, _SlotRef, _Opts) -> not_found.
@@ -202,12 +211,36 @@ hot_put(ProcID, Slot, Msg, Opts) ->
     ensure_hot_cache(),
     Key = hot_key(ProcID, Opts),
     try ets:lookup(?HOT_CACHE, Key) of
-        [{Key, Newer, _}] when Newer > Slot -> ok;
-        _ -> ets:insert(?HOT_CACHE, {Key, Slot, Msg}), ok
+        [{Key, Newer, _}] when Newer > Slot ->
+            recent_put(Key, Slot, Newer, Msg, Opts);
+        _ ->
+            ets:insert(?HOT_CACHE, {Key, Slot, Msg}),
+            recent_put(Key, Slot, Slot, Msg, Opts)
     catch error:badarg ->
         % Losing this acceleration never loses state: the durable delta or
         % checkpoint was already written.
         ok
+    end.
+
+%% @doc Also keep the last `process-hot-cache-slots' (default 32) states of a
+%% process. A `compute&slot=N' read for a recent slot that is no longer the
+%% newest -- every client settling its own write while others advance the
+%% process -- otherwise rebuilt slot N by replaying every delta back to the
+%% last checkpoint (up to ~1,000 full-state patch applications, seconds of CPU
+%% per read). With the window, it is a lookup, or a replay of a few deltas
+%% from the nearest kept slot.
+recent_put(Key, Slot, Newest, Msg, Opts) ->
+    Window = hb_util:int(hb_opts:get(<<"process-hot-cache-slots">>, 32, Opts)),
+    Oldest = Newest - Window + 1,
+    case Window > 0 andalso Slot >= Oldest of
+        false -> ok;
+        true ->
+            ets:insert(?RECENT_CACHE, {{Key, Slot}, Msg}),
+            ets:select_delete(
+                ?RECENT_CACHE,
+                [{{{Key, '$1'}, '_'}, [{'<', '$1', Oldest}], [true]}]
+            ),
+            ok
     end.
 
 hot_key(ProcID, Opts) ->
@@ -231,6 +264,10 @@ ensure_hot_cache() ->
                     fun() ->
                         try ets:new(?HOT_CACHE, [named_table, public, set]) of
                             _ ->
+                                ets:new(
+                                    ?RECENT_CACHE,
+                                    [named_table, public, ordered_set]
+                                ),
                                 Parent ! {Ref, created},
                                 receive after infinity -> ok end
                         catch error:badarg ->
@@ -272,7 +309,30 @@ path(ProcID, Ref, PathSuffix, _Opts) ->
 latest(ProcID, Opts) -> latest(ProcID, [], Opts).
 latest(ProcID, RequiredPath, Opts) ->
     latest(ProcID, RequiredPath, undefined, Opts).
+latest(ProcID, RawRequiredPath, undefined, RawOpts)
+        when RawRequiredPath == undefined; RawRequiredPath == [] ->
+    % The newest state this node has written for the process is held in the
+    % hot cache (every delta write and every rebuilt read puts it there, and an
+    % older slot never replaces a newer one). Answer from it, instead of
+    % listing every slot the process has ever computed -- thousands of store
+    % entries, parsed and sorted, on every `now' read.
+    case hot_newest(ProcID, RawOpts) of
+        {ok, Slot, Msg} -> {ok, Slot, Msg};
+        not_found -> latest_from_store(ProcID, RawRequiredPath, undefined, RawOpts)
+    end;
 latest(ProcID, RawRequiredPath, Limit, RawOpts) ->
+    latest_from_store(ProcID, RawRequiredPath, Limit, RawOpts).
+
+hot_newest(ProcID, Opts) ->
+    ensure_hot_cache(),
+    Key = hot_key(ProcID, Opts),
+    try ets:lookup(?HOT_CACHE, Key) of
+        [{Key, Slot, Msg}] -> {ok, Slot, Msg};
+        [] -> not_found
+    catch error:badarg -> not_found
+    end.
+
+latest_from_store(ProcID, RawRequiredPath, Limit, RawOpts) ->
     Scope = hb_opts:get(<<"process-cache-scope">>, local, RawOpts),
     % Normalize the store descriptor to a list of stores.
     UnscopedStore =
@@ -410,13 +470,62 @@ hot_cache_survives_creator_and_keeps_newest_test() ->
     % An older slot never replaces the newest.
     hot_put(ProcID, 0, State0, Opts),
     ?assertMatch({ok, _}, hot_read(ProcID, 1, Opts)),
-    ?assertEqual(not_found, hot_read(ProcID, 0, Opts)),
+    ?assertMatch({ok, 1, _}, hot_newest(ProcID, Opts)),
     % Drop the entry: the next read rebuilds slot 1 from its delta once, and
     % keeps it.
     ets:delete(?HOT_CACHE, hot_key(ProcID, Opts)),
     {ok, Rebuilt} = read(ProcID, 1, Opts),
     ?assertEqual(<<"1">>, hb_ao:get(<<"count">>, Rebuilt, Opts)),
     ?assertMatch({ok, _}, hot_read(ProcID, 1, Opts)).
+
+%% @doc `latest' answers from the hot cache without listing every slot, and a
+%% read of a recent slot that is no longer the newest does not replay the delta
+%% chain back to the checkpoint.
+recent_slots_are_served_without_replay_test() ->
+    application:ensure_all_started(hb),
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"process-delta-checkpoint-slots">> => 1000,
+        <<"process-hot-cache-slots">> => 8
+    },
+    ProcID = hb_util:encode(crypto:strong_rand_bytes(32)),
+    Results = #{ <<"output">> => #{ <<"data">> => <<"0">> } },
+    State0 = #{ <<"at-slot">> => 0, <<"count">> => <<"0">>, <<"results">> => Results },
+    {ok, _} = write(ProcID, 0, with_delta(State0, [], Results, Opts), Opts),
+    lists:foldl(
+        fun(Slot, Prev) ->
+            Count = integer_to_binary(Slot),
+            Patches = [#{ <<"path">> => <<"/count">>, <<"value">> => Count }],
+            {ok, Next} = hb_process_delta:apply(Prev, Patches, Results, Slot, Opts),
+            {ok, _} = write(ProcID, Slot, with_delta(Next, Patches, Results, Opts), Opts),
+            Next
+        end,
+        State0,
+        lists:seq(1, 20)
+    ),
+    Calls =
+        fun(MFA, Fun) ->
+            erlang:trace_pattern(MFA, true, [call_count]),
+            Res = Fun(),
+            {call_count, N} = erlang:trace_info(MFA, call_count),
+            erlang:trace_pattern(MFA, false, [call_count]),
+            {Res, N}
+        end,
+    {{ok, 20, Latest}, 0} =
+        Calls({hb_cache, list_numbered, 2}, fun() -> latest(ProcID, Opts) end),
+    ?assertEqual(<<"20">>, hb_ao:get(<<"count">>, Latest, Opts)),
+    % Slot 15 is inside the 8-slot window: no delta is replayed.
+    {{ok, Recent}, 0} =
+        Calls({hb_process_delta, apply, 5}, fun() -> read(ProcID, 15, Opts) end),
+    ?assertEqual(<<"15">>, hb_ao:get(<<"count">>, Recent, Opts)),
+    % Slot 5 is outside it: rebuilt from the checkpoint, and still correct.
+    {{ok, Old}, Replayed} =
+        Calls({hb_process_delta, apply, 5}, fun() -> read(ProcID, 5, Opts) end),
+    ?assertEqual(<<"5">>, hb_ao:get(<<"count">>, Old, Opts)),
+    ?assert(Replayed > 0),
+    % A historical read never replaces the newest state.
+    ?assertMatch({ok, 20, _}, latest(ProcID, Opts)).
 
 snapshot_presence_is_structural_test() ->
     application:ensure_all_started(hb),
