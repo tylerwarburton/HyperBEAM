@@ -894,6 +894,36 @@ without_snapshot(Msg, Opts) ->
 
 %% @doc A 5.3b process uses the delta checkpoint cadence rather than the
 %% production 5.3a slot/time cadence.
+%% @doc A process definition is verified once, not on every request; a
+%% different (tampered) definition is still verified and rejected.
+process_id_verifies_once_test() ->
+    application:ensure_all_started(hb),
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+        <<"priv-wallet">> => ar_wallet:new()
+    },
+    Process = hb_process_test_vectors:aos_process(Opts),
+    Base = #{ <<"process">> => Process },
+    Verifies =
+        fun(Fun) ->
+            erlang:trace_pattern({hb_message, verify, 3}, true, [call_count]),
+            Res = Fun(),
+            {call_count, N} = erlang:trace_info({hb_message, verify, 3}, call_count),
+            erlang:trace_pattern({hb_message, verify, 3}, false, [call_count]),
+            {Res, N}
+        end,
+    {ID, _} = Verifies(fun() -> lib_process:process_id(Base, #{}, Opts) end),
+    ?assertEqual(hb_message:id(Process, signed, Opts), ID),
+    ?assertEqual(
+        {ID, 0},
+        Verifies(fun() -> lib_process:process_id(Base, #{}, Opts) end)
+    ),
+    Tampered = Process#{ <<"scheduler-location">> => <<"someone-else">> },
+    ?assertThrow(
+        {process_not_verified, _},
+        lib_process:process_id(#{ <<"process">> => Tampered }, #{}, Opts)
+    ).
+
 delta_snapshot_cadence_test() ->
     Opts = #{
         <<"process-snapshot-slots">> => 50,
