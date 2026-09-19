@@ -123,7 +123,7 @@ do_push(PrimaryProcess, Assignment, Opts) ->
             hb_ao:resolve(
                 {as, <<"process@1.0">>, PrimaryProcess},
                     #{ <<"path">> => <<"compute/results">>, <<"slot">> => Slot },
-                    Opts#{ <<"hashpath">> => ignore }
+                    compute_opts(Opts)
                 )
         catch
             Class:Reason:Trace ->
@@ -507,6 +507,20 @@ push_downstream_local(TargetID, NextSlotOnProc, Origin, Opts) ->
         Req,
         Opts#{ <<"cache-control">> => <<"always">> }
     ).
+
+%% @doc Options for computing the pushed slot. A push computes its process
+%% from inside another resolution, and `hb_ao' strips `spawn-worker' from
+%% nested resolutions, so the computed state was never handed to a persistent
+%% worker: it was discarded, and the next push restored the process from its
+%% last VM snapshot and replayed every slot since. When the node runs process
+%% workers, let this compute leave one behind. Inside a worker
+%% `process-workers' is false, so a worker never spawns another.
+compute_opts(Opts) ->
+    Base = Opts#{ <<"hashpath">> => ignore },
+    case hb_opts:get(<<"process-workers">>, false, Opts) of
+        true -> Base#{ <<"spawn-worker">> => true };
+        _ -> Base
+    end.
 
 %% @doc Normalise the `max-depth' value supplied by the caller. Accepts a
 %% non-negative integer (verbatim or as a binary), returns `undefined' when
