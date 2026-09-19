@@ -122,15 +122,36 @@ find_or_register(GroupName, _Base, _Req, Opts) ->
                     {infinite_recursion, GroupName};
                 _ ->
                     ?event({register_resolver, {group, GroupName}}),
-                    register_groupname(GroupName, Opts),
-                    {leader, GroupName}
+                    case register_groupname(GroupName, Opts) of
+                        ok ->
+                            {leader, GroupName};
+                        error ->
+                            ?event({register_race_lost, {group, GroupName}}),
+                            case find_execution(GroupName, Opts) of
+                                {ok, Leader} when Leader =/= Self ->
+                                    {wait, Leader};
+                                _ ->
+                                    {leader, GroupName}
+                            end
+                    end
             end
     end.
 
 %% @doc Unregister as the leader for an execution and notify waiting processes.
 unregister_notify(ungrouped_exec, _Req, _Res, _Opts) -> ok;
 unregister_notify(GroupName, Req, Res, Opts) ->
-    unregister_groupname(GroupName, Opts),
+    KeepForHandoff =
+        not is_atom(GroupName) andalso
+        case Res of
+            {ok, Msg} when is_map(Msg) ->
+                hb_opts:get(spawn_worker, false,
+                    Opts#{ <<"prefer">> => local }) =/= false;
+            _ -> false
+        end,
+    case KeepForHandoff of
+        true -> ok;
+        false -> unregister_groupname(GroupName, Opts)
+    end,
     notify(GroupName, Req, Res, Opts).
 
 %% @doc Find a group with the given name.
@@ -270,6 +291,7 @@ start_worker(Msg, Opts) ->
 start_worker(_, NotMsg, _) when not is_map(NotMsg) -> not_started;
 start_worker(GroupName, Msg, Opts) ->
     start(),
+    Parent = self(),
     ?event(worker_spawns,
         {starting_worker, {group, GroupName}, {msg, Msg}, {opts, Opts}}
     ),
@@ -314,6 +336,11 @@ start_worker(GroupName, Msg, Opts) ->
             )
         end
     ),
+    case hb_name:lookup(GroupName) of
+        Parent when not is_atom(GroupName) ->
+            ok = hb_name:handoff(GroupName, Parent, WorkerPID);
+        _ -> ok
+    end,
     WorkerPID.
 
 %% @doc A server function for handling persistent executions. 
@@ -344,10 +371,10 @@ default_worker(GroupName, Base, Opts) ->
                 false ->
                     % Register for the new (Base) group.
                     case Res of
-                        {ok, Res} ->
-                            NewGroupName = group(Res, undefined, Opts),
+                        {ok, NewBase} when is_map(NewBase) ->
+                            NewGroupName = group(NewBase, undefined, Opts),
                             register_groupname(NewGroupName, Opts),
-                            default_worker(NewGroupName, Res, Opts);
+                            default_worker(NewGroupName, NewBase, Opts);
                         _ ->
                             % If the result is not ok, we should either ignore
                             % the error and stay on the existing group,
@@ -425,6 +452,11 @@ test_device(Base) ->
                         }
                     }
                 end
+            end,
+        increment =>
+            fun(M1, _M2) ->
+                Count = hb_maps:get(<<"count">>, M1, 0, #{}),
+                {ok, M1#{ <<"count">> => Count + 1 }}
             end,
         self =>
             fun(M1, #{ <<"wait">> := Wait }) ->
@@ -518,3 +550,84 @@ spawn_after_execution_test() ->
     ?assertNotEqual(Res1, Res2),
     ?assertNotEqual(Res2, Res3),
     ?assert(T1 - T0 >= (3*TestTime)).
+
+%% @doc A resolution that asks for a worker must leave one running once it
+%% returns. `hb_ao:resolve/3' spawns the worker in its final stage, after
+%% unregistering itself as leader, so the worker is the only thing that can
+%% carry the execution's state past the end of the request.
+spawn_worker_outlives_resolution_test() ->
+    start(),
+    Base = #{ <<"device">> => test_device() },
+    Req = #{ <<"path">> => <<"slow_key">>, <<"wait">> => 50 },
+    Opts =
+        #{
+            <<"spawn-worker">> => true,
+            <<"static-worker">> => true,
+            <<"hashpath">> => ignore
+        },
+    GroupName = group(Base, Req, Opts),
+    ?assertNotEqual(ungrouped_exec, GroupName),
+    {ok, _} = hb_ao:resolve(Base, Req, Opts),
+    Worker = await_registration(GroupName, 100),
+    ?assert(is_pid(Worker)),
+    ?assert(erlang:is_process_alive(Worker)),
+    exit(Worker, normal).
+
+%% @doc An execution whose group name is the `ungrouped_exec' sentinel was
+%% never registered under a name, so there is nothing for a later resolution to
+%% find. Spawning a worker for it would leak a process per request, all
+%% registered under the one sentinel.
+ungrouped_execution_spawns_no_worker_test() ->
+    start(),
+    Base = #{ <<"device">> => test_device() },
+    Req = #{ <<"path">> => <<"slow_key">>, <<"wait">> => 10 },
+    Opts =
+        #{
+            <<"spawn-worker">> => true,
+            <<"await-inprogress">> => false,
+            <<"hashpath">> => ignore
+        },
+    {ok, _} = hb_ao:resolve(Base, Req, Opts),
+    receive after 50 -> ok end,
+    ?assertEqual(undefined, hb_name:lookup(ungrouped_exec)).
+
+%% @doc A non-static worker must carry the state it just computed into the
+%% next request, so that a sequence of resolutions accumulates rather than
+%% each one restarting from the state the worker was spawned with.
+worker_advances_state_between_requests_test() ->
+    start(),
+    GroupName = {?MODULE, make_ref()},
+    Base =
+        #{
+            <<"device">> =>
+                test_device(#{ grouper => fun(_, _, _) -> GroupName end })
+        },
+    Opts = #{ <<"hashpath">> => ignore },
+    Worker = start_worker(GroupName, Base, Opts),
+    Req = #{ <<"path">> => <<"increment">> },
+    Worker ! {resolve, self(), GroupName, Req, Opts},
+    First = await_resolution(GroupName),
+    Worker ! {resolve, self(), GroupName, Req, Opts},
+    Second = await_resolution(GroupName),
+    ?assertEqual(1, hb_maps:get(<<"count">>, First, not_found, #{})),
+    ?assertEqual(2, hb_maps:get(<<"count">>, Second, not_found, #{})),
+    ?assert(erlang:is_process_alive(Worker)),
+    exit(Worker, normal).
+
+%% @doc Receive the result a worker sends back for a group.
+await_resolution(GroupName) ->
+    receive
+        {resolved, _, GroupName, _, {ok, Res}} -> Res
+    after 5000 ->
+        throw(worker_sent_no_result)
+    end.
+
+%% @doc Wait for a group name to be claimed, returning the registered process.
+await_registration(_GroupName, 0) -> undefined;
+await_registration(GroupName, Retries) ->
+    case hb_name:lookup(GroupName) of
+        undefined ->
+            receive after 10 -> ok end,
+            await_registration(GroupName, Retries - 1);
+        PID -> PID
+    end.

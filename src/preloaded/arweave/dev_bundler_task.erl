@@ -151,7 +151,7 @@ execute_task(#task{type = post_proof, data = Proof, opts = Opts} = Task) ->
         case Response of
             {ok, _} -> {ok, proof_posted};
             {error, Reason} -> {error, Reason};
-            {failure, Reason} = Reason -> {error, Reason}
+            {failure, Reason} -> {error, Reason}
         end
     catch
         _:Err:_Stack ->

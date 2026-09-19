@@ -1,0 +1,345 @@
+diff --git a/src/luerl.erl b/src/luerl.erl
+index 5f92f10..a7f00d2 100644
+--- a/src/luerl.erl
++++ b/src/luerl.erl
+@@ -508 +508 @@ externalize(S) ->
+-    luerl_lib_math:externalize(S).
++    luerl_lib_math:externalize(luerl_heap:gc_cancel(S)).
+diff --git a/src/luerl_heap.erl b/src/luerl_heap.erl
+index 93449c5..4591172 100644
+--- a/src/luerl_heap.erl
++++ b/src/luerl_heap.erl
+@@ -31 +31 @@
+--export([gc/1,
++-export([gc/1,gc_step/2,gc_count/1,gc_cancel/1,
+@@ -47,0 +48,3 @@
++-define(GC_STEP_BASELINE, luerl_gc_step_baseline).
++-define(GC_STEP_CYCLE, luerl_gc_step_cycle).
++
+@@ -591,0 +595,74 @@ set_env_var(#eref{i=N}, Index, Val, #luerl{envs=Est0}=St) ->
++%% gc_step(Budget, State) -> {CycleCompleted, State}.
++%% Incremental snapshot-at-the-beginning mark/sweep. The cycle keeps the
++%% immutable heap maps and roots that existed when it began. Objects allocated
++%% later are never swept by that cycle; objects reachable at its start remain
++%% marked even if Lua drops them while the cycle advances. This makes mutation
++%% between steps safe without a write barrier, at the cost of retaining some
++%% floating garbage until the following cycle.
++gc_step(RawBudget, St0) ->
++    Budget =
++        case RawBudget of
++            N when is_integer(N), N > 0 -> N;
++            _ -> 1000
++        end,
++    Cycle =
++        case maps:get(?GC_STEP_CYCLE, St0#luerl.private, undefined) of
++            undefined -> new_gc_cycle(St0);
++            Existing -> Existing
++        end,
++    advance_gc_cycle(Cycle, Budget, St0).
++
++gc_cancel(St) ->
++    St#luerl{
++        private=maps:remove(?GC_STEP_CYCLE, St#luerl.private)
++    }.
++
++%% Approximate the memory reported by Lua's collectgarbage("count") in KiB.
++gc_count(St) ->
++    erlang:external_size(St) / 1024.
++
++object_count(#luerl{
++        tabs=#tstruct{data=Tabs},
++        envs=#tstruct{data=Envs},
++        usds=#tstruct{data=Usds},
++        fncs=#tstruct{data=Fncs}
++    }) ->
++    table_count(Tabs) + table_count(Envs) +
++        table_count(Usds) + table_count(Fncs).
++
++table_count(Data) ->
++    ?FOLD_TABLES(fun(_, _, Count) -> Count + 1 end, 0, Data).
++
++new_gc_cycle(#luerl{
++        tabs=#tstruct{data=Tt0},
++        envs=#tstruct{data=Et0},
++        usds=#tstruct{data=Ut0},
++        fncs=#tstruct{data=Ft0},
++        g=G,stk=Stk,cs=Cs,meta=Meta
++    }) ->
++    Root = [Meta#meta.nil,Meta#meta.boolean,Meta#meta.number,Meta#meta.string,
++            G|Stk],
++    {
++        Root,
++        [Cs],
++        #gct{t=Tt0,s=#{}},
++        #gct{t=Et0,s=#{}},
++        #gct{t=Ut0,s=#{}},
++        #gct{t=Ft0,s=#{}}
++    }.
++
++advance_gc_cycle({Todo,More,GcT,GcE,GcU,GcF}, Budget, St) ->
++    case mark_step(Todo, More, GcT, GcE, GcU, GcF, Budget) of
++        {pending,NextTodo,NextMore,NextT,NextE,NextU,NextF} ->
++            NextCycle =
++                {NextTodo,NextMore,NextT,NextE,NextU,NextF},
++            Private1 = maps:put(?GC_STEP_CYCLE, NextCycle, St#luerl.private),
++            {false,St#luerl{private=Private1}};
++        {done,DoneT,DoneE,DoneU,DoneF} ->
++            Collected = sweep_cycle(DoneT, DoneE, DoneU, DoneF, St),
++            Private0 = maps:remove(?GC_STEP_CYCLE, Collected#luerl.private),
++            Baseline = object_count(Collected),
++            Private1 = maps:put(?GC_STEP_BASELINE, Baseline, Private0),
++            {true,Collected#luerl{private=Private1}}
++    end.
++
+@@ -601,4 +678,4 @@ gc(#luerl{tabs=#tstruct{data=Tt0,free=Tf0}=Tab0,
+-    GcT = #gct{t=Tt0,s=[]},
+-    GcE = #gct{t=Et0,s=[]},
+-    GcU = #gct{t=Ut0,s=[]},
+-    GcF = #gct{t=Ft0,s=[]},
++    GcT = #gct{t=Tt0,s=#{}},
++    GcE = #gct{t=Et0,s=#{}},
++    GcU = #gct{t=Ut0,s=#{}},
++    GcF = #gct{t=Ft0,s=#{}},
+@@ -617 +694,12 @@ gc(#luerl{tabs=#tstruct{data=Tt0,free=Tf0}=Tab0,
+-    St#luerl{tabs=Tab1,envs=Env1,usds=Usd1,fncs=Fnc1}.
++    LiveCount =
++        maps:size(SeenT) + maps:size(SeenE) +
++            maps:size(SeenU) + maps:size(SeenF),
++    Private0 = maps:remove(?GC_STEP_CYCLE, St#luerl.private),
++    Private1 = maps:put(?GC_STEP_BASELINE, LiveCount, Private0),
++    St#luerl{
++        tabs=Tab1,
++        envs=Env1,
++        usds=Usd1,
++        fncs=Fnc1,
++        private=Private1
++    }.
+@@ -628 +716 @@ mark([#tref{i=T}|Todo], More, #gct{t=Tt,s=Ts0}=GcT, GcE, GcU, GcF) ->
+-    case ordsets:is_element(T, Ts0) of
++    case maps:is_key(T, Ts0) of
+@@ -632 +720 @@ mark([#tref{i=T}|Todo], More, #gct{t=Tt,s=Ts0}=GcT, GcE, GcU, GcF) ->
+-            Ts1 = ordsets:add_element(T, Ts0),
++            Ts1 = Ts0#{ T => true },
+@@ -644 +732 @@ mark([#eref{i=F}|Todo], More, GcT, #gct{t=Et,s=Es0}=GcE, GcU, GcF) ->
+-    case ordsets:is_element(F, Es0) of
++    case maps:is_key(F, Es0) of
+@@ -648 +736 @@ mark([#eref{i=F}|Todo], More, GcT, #gct{t=Et,s=Es0}=GcE, GcU, GcF) ->
+-            Es1 = ordsets:add_element(F, Es0),
++            Es1 = Es0#{ F => true },
+@@ -654 +742 @@ mark([#usdref{i=U}|Todo], More, GcT, GcE, #gct{s=Us0}=GcU, GcF) ->
+-    case ordsets:is_element(U, Us0) of
++    case maps:is_key(U, Us0) of
+@@ -658 +746 @@ mark([#usdref{i=U}|Todo], More, GcT, GcE, #gct{s=Us0}=GcU, GcF) ->
+-           Us1 = ordsets:add_element(U, Us0),
++           Us1 = Us0#{ U => true },
+@@ -666 +754 @@ mark([#funref{i=F,env=Erefs}|ToDo], More, GcT, GcE, GcU,
+-    case ordsets:is_element(F, Fs0) of
++    case maps:is_key(F, Fs0) of
+@@ -671 +759 @@ mark([#funref{i=F,env=Erefs}|ToDo], More, GcT, GcE, GcU,
+-            Fs1 = ordsets:add_element(F, Fs0),
++            Fs1 = Fs0#{ F => true },
+@@ -707,0 +796,161 @@ mark([], [], #gct{s=St}, #gct{s=Se}, #gct{s=Su}, #gct{s=Sf}) ->
++%% The incremental form of mark/6. A budget counts inspected heap values, so a
++%% Lua call can choose its latency/throughput tradeoff without exposing the
++%% collector's internal work lists.
++mark_step(Todo, More, GcT, GcE, GcU, GcF, 0) ->
++    {pending,Todo,More,GcT,GcE,GcU,GcF};
++mark_step([{in_table,_}|Todo], More, GcT, GcE, GcU, GcF, Budget) ->
++    mark_step(Todo, More, GcT, GcE, GcU, GcF, Budget - 1);
++mark_step([#tref{i=T}|Todo], More, #gct{t=Tt,s=Ts0}=GcT,
++          GcE, GcU, GcF, Budget) ->
++    case maps:is_key(T, Ts0) of
++        true ->
++            mark_step(Todo, More, GcT, GcE, GcU, GcF, Budget - 1);
++        false ->
++            Ts1 = Ts0#{ T => true },
++            #table{a=Arr,d=Dict,meta=Meta} = ?GET_TABLE(T, Tt),
++            Aes = array:sparse_to_list(Arr),
++            Des = ttdict:to_list(Dict),
++            mark_step(
++                [Meta|Todo],
++                [[{in_table,T}],Des,Aes,[{in_table,-T}]|More],
++                GcT#gct{s=Ts1},
++                GcE,
++                GcU,
++                GcF,
++                Budget - 1
++            )
++    end;
++mark_step([#eref{i=F}|Todo], More, GcT, #gct{t=Et,s=Es0}=GcE,
++          GcU, GcF, Budget) ->
++    case maps:is_key(F, Es0) of
++        true ->
++            mark_step(Todo, More, GcT, GcE, GcU, GcF, Budget - 1);
++        false ->
++            Es1 = Es0#{ F => true },
++            Ses = tuple_to_list(?GET_TABLE(F, Et)),
++            mark_step(
++                Todo,
++                [Ses|More],
++                GcT,
++                GcE#gct{s=Es1},
++                GcU,
++                GcF,
++                Budget - 1
++            )
++    end;
++mark_step([#usdref{i=U}|Todo], More, GcT, GcE, #gct{s=Us0}=GcU,
++          GcF, Budget) ->
++    case maps:is_key(U, Us0) of
++        true ->
++            mark_step(Todo, More, GcT, GcE, GcU, GcF, Budget - 1);
++        false ->
++            Us1 = Us0#{ U => true },
++            mark_step(
++                Todo,
++                More,
++                GcT,
++                GcE,
++                GcU#gct{s=Us1},
++                GcF,
++                Budget - 1
++            )
++    end;
++mark_step([#funref{i=F,env=Erefs}|Todo], More, GcT, GcE, GcU,
++          #gct{t=Ft0,s=Fs0}=GcF, Budget) ->
++    case maps:is_key(F, Fs0) of
++        true ->
++            mark_step(
++                Todo,
++                [Erefs|More],
++                GcT,
++                GcE,
++                GcU,
++                GcF,
++                Budget - 1
++            );
++        false ->
++            Fs1 = Fs0#{ F => true },
++            Fdef = ?GET_TABLE(F, Ft0),
++            mark_step(
++                [Fdef|Todo],
++                [Erefs|More],
++                GcT,
++                GcE,
++                GcU,
++                GcF#gct{s=Fs1},
++                Budget - 1
++            )
++    end;
++mark_step([#lua_func{funrefs=Funrefs}|Todo], More,
++          GcT, GcE, GcU, GcF, Budget) ->
++    mark_step(
++        Todo,
++        [Funrefs|More],
++        GcT,
++        GcE,
++        GcU,
++        GcF,
++        Budget - 1
++    );
++mark_step([#call_frame{func=Funref,lvs=Lvs,env=Env}|Todo], More0,
++          GcT, GcE, GcU, GcF, Budget) ->
++    More1 = [ tuple_to_list(Lv) || Lv <- Lvs, is_tuple(Lv) ] ++
++        [Env|More0],
++    mark_step(
++        [Funref|Todo],
++        More1,
++        GcT,
++        GcE,
++        GcU,
++        GcF,
++        Budget - 1
++    );
++mark_step([#loop_frame{lvs=Lvs,stk=Stk,env=Env}|Todo], More0,
++          GcT, GcE, GcU, GcF, Budget) ->
++    More1 = [ tuple_to_list(Lv) || Lv <- Lvs, is_tuple(Lv) ] ++
++        [Stk,Env|More0],
++    mark_step(Todo, More1, GcT, GcE, GcU, GcF, Budget - 1);
++mark_step([#erl_func{}|Todo], More, GcT, GcE, GcU, GcF, Budget) ->
++    mark_step(Todo, More, GcT, GcE, GcU, GcF, Budget - 1);
++mark_step([#erl_mfa{}|Todo], More, GcT, GcE, GcU, GcF, Budget) ->
++    mark_step(Todo, More, GcT, GcE, GcU, GcF, Budget - 1);
++mark_step([#thread{}|Todo], More, GcT, GcE, GcU, GcF, Budget) ->
++    mark_step(Todo, More, GcT, GcE, GcU, GcF, Budget - 1);
++mark_step([#userdata{meta=Meta}|Todo], More,
++          GcT, GcE, GcU, GcF, Budget) ->
++    mark_step([Meta|Todo], More, GcT, GcE, GcU, GcF, Budget - 1);
++mark_step([{K,V}|Todo], More, GcT, GcE, GcU, GcF, Budget) ->
++    mark_step([K,V|Todo], More, GcT, GcE, GcU, GcF, Budget - 1);
++mark_step([_|Todo], More, GcT, GcE, GcU, GcF, Budget) ->
++    mark_step(Todo, More, GcT, GcE, GcU, GcF, Budget - 1);
++mark_step([], [Next|More], GcT, GcE, GcU, GcF, Budget) ->
++    mark_step(Next, More, GcT, GcE, GcU, GcF, Budget);
++mark_step([], [], GcT, GcE, GcU, GcF, _Budget) ->
++    {done,GcT,GcE,GcU,GcF}.
++
++%% Sweep only objects that existed at the beginning of this cycle. Current
++%% heap entries allocated since then are intentionally absent from Snapshot and
++%% survive until at least the next cycle.
++sweep_cycle(GcT, GcE, GcU, GcF,
++            #luerl{tabs=Tabs0,envs=Envs0,usds=Usds0,fncs=Fncs0}=St) ->
++    Tabs1 = sweep_tstruct(GcT, Tabs0),
++    Envs1 = sweep_tstruct(GcE, Envs0),
++    Usds1 = sweep_tstruct(GcU, Usds0),
++    Fncs1 = sweep_tstruct(GcF, Fncs0),
++    St#luerl{tabs=Tabs1,envs=Envs1,usds=Usds1,fncs=Fncs1}.
++
++sweep_tstruct(#gct{t=Snapshot,s=Seen},
++              #tstruct{data=Current0,free=Free0}=Current) ->
++    {Free1,Current1} =
++        ?FOLD_TABLES(
++            fun(K, _, {Free,Data}) ->
++                case maps:is_key(K, Seen) of
++                    true -> {Free,Data};
++                    false -> {[K|Free],?DEL_TABLE(K, Data)}
++                end
++            end,
++            {Free0,Current0},
++            Snapshot
++        ),
++    Current#tstruct{data=Current1,free=Free1}.
++
+@@ -718 +967 @@ filter_tables(Seen, Tf0, Tt0) ->
+-                               case ordsets:is_element(K, Seen) of
++                               case maps:is_key(K, Seen) of
+@@ -723 +972 @@ filter_tables(Seen, Tf0, Tt0) ->
+-    Tt1 = ?FILTER_TABLES(fun (K, _) -> ordsets:is_element(K, Seen) end, Tt0),
++    Tt1 = ?FILTER_TABLES(fun (K, _) -> maps:is_key(K, Seen) end, Tt0),
+@@ -730 +979 @@ filter_environment(Seen, Ef0, Et0) ->
+-                               case ordsets:is_element(K, Seen) of
++                               case maps:is_key(K, Seen) of
+@@ -735 +984 @@ filter_environment(Seen, Ef0, Et0) ->
+-    Et1 = ?FILTER_TABLES(fun (K, _) -> ordsets:is_element(K, Seen) end, Et0),
++    Et1 = ?FILTER_TABLES(fun (K, _) -> maps:is_key(K, Seen) end, Et0),
+@@ -742 +991 @@ filter_userdata(Seen, Uf0, Ut0) ->
+-                              case ordsets:is_element(K, Seen) of
++                              case maps:is_key(K, Seen) of
+@@ -748 +997 @@ filter_userdata(Seen, Uf0, Ut0) ->
+-    Ut1 = ?FILTER_TABLES(fun (K, _) -> ordsets:is_element(K, Seen) end, Ut0),
++    Ut1 = ?FILTER_TABLES(fun (K, _) -> maps:is_key(K, Seen) end, Ut0),
+@@ -754 +1003 @@ filter_funcdefs(Seen, Ff0, Ft0) ->
+-                                case ordsets:is_element(K, Seen) of
++                                case maps:is_key(K, Seen) of
+@@ -759 +1008 @@ filter_funcdefs(Seen, Ff0, Ft0) ->
+-    Ft1 = ?FILTER_TABLES(fun (K, _) -> ordsets:is_element(K, Seen) end, Ft0),
++    Ft1 = ?FILTER_TABLES(fun (K, _) -> maps:is_key(K, Seen) end, Ft0),
+diff --git a/src/luerl_lib_basic.erl b/src/luerl_lib_basic.erl
+index 6b52b62..9fd7aee 100644
+--- a/src/luerl_lib_basic.erl
++++ b/src/luerl_lib_basic.erl
+@@ -84 +84,13 @@ collectgarbage(_, [<<"collect">>|_], St) ->
+-    %% {[],St};					%No-op for the moment
++collectgarbage(_, [<<"step">>,RawBudget|_], St) ->
++    Budget =
++        case luerl_lib:arg_to_integer(RawBudget) of
++            N when is_integer(N), N > 0 -> N;
++            _ -> 1000
++        end,
++    {Complete,NextSt} = luerl_heap:gc_step(Budget, St),
++    {[Complete],NextSt};
++collectgarbage(_, [<<"step">>|_], St) ->
++    {Complete,NextSt} = luerl_heap:gc_step(1000, St),
++    {[Complete],NextSt};
++collectgarbage(_, [<<"count">>|_], St) ->
++    {[luerl_heap:gc_count(St)],St};

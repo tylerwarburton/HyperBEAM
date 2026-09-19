@@ -22,6 +22,19 @@
 %% Base is not used, such that it can specify cache control information about 
 %% itself, without affecting its outputs.
 maybe_store(Base, Req, Res, Opts) ->
+    case is_process_cached_state(Base) orelse is_process_cached_state(Res) of
+        true ->
+            % A process state read back from the process cache is already
+            % durable there (as a checkpoint or a delta chain). Writing it
+            % again re-serializes and re-hashes the whole state on every
+            % `now' read, and on every key read from it, for no new data.
+            ?event(caching, {skip_store, process_cached_state}),
+            not_caching;
+        false ->
+            maybe_store_by_settings(Base, Req, Res, Opts)
+    end.
+
+maybe_store_by_settings(Base, Req, Res, Opts) ->
     case derive_cache_settings([Res, Req], Opts) of
         #{ <<"store">> := true } ->
             ?event(caching, {caching_result, {base, Base}, {req, Req}, {res, Res}}),
@@ -80,6 +93,12 @@ lookup(Base, Req, Opts) ->
     end.
 
 %%% Internal functions
+
+%% @doc Is this a process state served from the process cache? The process
+%% device marks such states privately with `process-cached-state'.
+is_process_cached_state(Msg) ->
+    maps:get(<<"process-cached-state">>, hb_private:from_message(Msg), false)
+        =:= true.
 
 %% @doc Load an ID base required to execute the request.
 maybe_load_base(Base, Req, _Opts) when not ?IS_ID(Base) ->
@@ -422,3 +441,19 @@ cache_message_result_test() ->
     ?event({res2, Res2}),
     ?event({res3, Res3}),
     ?assertEqual(Res2, Res3).
+
+%% A process state served from the process cache is never written back, even
+%% when the node asks for every result to be stored.
+process_cached_state_not_stored_test() ->
+    Cached =
+        #{
+            <<"count">> => <<"1">>,
+            <<"priv">> => #{ <<"process-cached-state">> => true }
+        },
+    Always = #{ <<"cache-control">> => [<<"always">>] },
+    Now = #{ <<"path">> => <<"now">> },
+    ?assertEqual(not_caching, maybe_store(#{}, Now, Cached, Always)),
+    ?assertEqual(
+        not_caching,
+        maybe_store(Cached, #{ <<"path">> => <<"count">> }, <<"1">>, Always)
+    ).

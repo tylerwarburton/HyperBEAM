@@ -8,6 +8,18 @@
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
+%% @doc The keys that an outbox carries as its own metadata rather than as
+%% entries to push downstream. `hb_message:normalize_commitments/3' recurses
+%% into every submessage, so the outbox map is given its own `commitments' key,
+%% and the AO-Core and structured-field keys are legal on any message. Iterating
+%% them as if they were entries pushes messages the process never emitted. This
+%% is the same exclusion that every other walk of a message-as-collection
+%% applies: see `hb_util:message_to_ordered_key/1' and `dev_trie''s
+%% `RESERVED_KEYS'.
+-define(OUTBOX_NON_ENTRY_KEYS,
+    ?AO_CORE_KEYS ++ [<<"commitments">>, <<"ao-types">>, <<"device">>]
+).
+
 %% @doc Push either a message or an assigned slot number. If a `Process' is
 %% provided in the `body' of the request, it will be scheduled (initializing
 %% it if it does not exist). Otherwise, the message specified by the given
@@ -111,7 +123,7 @@ do_push(PrimaryProcess, Assignment, Opts) ->
             hb_ao:resolve(
                 {as, <<"process@1.0">>, PrimaryProcess},
                     #{ <<"path">> => <<"compute/results">>, <<"slot">> => Slot },
-                    Opts#{ <<"hashpath">> => ignore }
+                    compute_opts(Opts)
                 )
         catch
             Class:Reason:Trace ->
@@ -197,7 +209,7 @@ do_push(PrimaryProcess, Assignment, Opts) ->
                                         <<"source">> => RawMsgToPush
                                     }
                             end,
-                        case hb_cache:read(Target, Opts) of
+                        case read_target(Target, Opts) of
                             {ok, DownstreamProcess} ->
                                 push_result_message(
                                     DownstreamProcess,
@@ -238,10 +250,7 @@ do_push(PrimaryProcess, Assignment, Opts) ->
                                 <<"message">> => Msg
                             }
                     end,
-                    hb_util:lower_case_keys(
-                        hb_ao:normalize_keys(hb_private:reset(Outbox)),
-                        Opts
-                    ),
+                    outbox_entries(Outbox, Opts),
                     Opts
                 ),
             {ok, maps:merge(Downstream, AdditionalRes#{
@@ -251,6 +260,98 @@ do_push(PrimaryProcess, Assignment, Opts) ->
         {Err, Error} when Err == error; Err == failure ->
             ?event(push, {push_failed_to_find_outbox, {error, Error}}, Opts),
             {error, Error}
+    end.
+
+%% @doc Return the outbox entries that should be pushed downstream, discarding
+%% the result metadata that shares the map with them. The outbox arrives as part
+%% of a computed result, so it carries that result's `commitments' and `status'
+%% alongside the messages the process actually emitted.
+outbox_entries(Outbox, Opts) ->
+    Normalized = hb_ao:normalize_keys(hb_private:reset(Outbox)),
+    % Normalize the names the process gave its entries, but do not descend into
+    % the entries themselves. `hb_util:lower_case_keys/2' recurses through every
+    % nested map, and the keys of a message's `commitments' are base64url
+    % commitment IDs, which are case-sensitive: lower-casing them yields IDs
+    % that no longer name the commitments they identify, so a pushed entry
+    % carries signatures that can no longer be verified downstream.
+    Entries =
+        hb_maps:fold(
+            fun(Key, Msg, Acc) -> maps:put(hb_util:to_lower(Key), Msg, Acc) end,
+            #{},
+            Normalized,
+            Opts
+        ),
+    hb_maps:without(?OUTBOX_NON_ENTRY_KEYS, Entries, Opts).
+
+%% @doc Find the process an outbox entry targets. Most targets of a token,
+%% vault or pair are wallets (Credit-Notice, Debit-Notice), which are not
+%% messages at all: a full store read misses locally and then walks every
+%% remote store (three GraphQL gateways here, 0.7-3.6 s) before failing, once
+%% per entry, on every push. Read local stores first -- every process this node
+%% runs is there -- and remember remote misses for a bounded time
+%% (`push-target-miss-ttl' seconds, default 300), so a wallet costs one remote
+%% walk per TTL rather than one per message. A process that exists only
+%% remotely is still found, and a miss is retried after the TTL.
+read_target(Target, Opts) ->
+    case hb_cache:read(Target, hb_store:scope(Opts, local)) of
+        {ok, Msg} -> {ok, Msg};
+        _ ->
+            case recent_miss(Target, Opts) of
+                true -> {error, not_found};
+                false ->
+                    case hb_cache:read(Target, Opts) of
+                        {ok, Msg} -> {ok, Msg};
+                        Miss ->
+                            remember_miss(Target),
+                            Miss
+                    end
+            end
+    end.
+
+-define(TARGET_MISSES, dev_push_target_misses).
+
+recent_miss(Target, Opts) ->
+    TTL = hb_util:int(hb_opts:get(<<"push-target-miss-ttl">>, 300, Opts)),
+    ensure_miss_table(),
+    try ets:lookup(?TARGET_MISSES, Target) of
+        [{Target, At}] -> erlang:monotonic_time(second) - At < TTL;
+        [] -> false
+    catch error:badarg -> false
+    end.
+
+remember_miss(Target) ->
+    ensure_miss_table(),
+    try ets:insert(?TARGET_MISSES, {Target, erlang:monotonic_time(second)})
+    catch error:badarg -> ok
+    end,
+    ok.
+
+%% @doc The table is owned by a process that never exits: a table dies with its
+%% owner, and the first caller is usually a short-lived request.
+ensure_miss_table() ->
+    case ets:whereis(?TARGET_MISSES) of
+        undefined ->
+            Parent = self(),
+            Ref = make_ref(),
+            {Owner, Mon} =
+                spawn_monitor(
+                    fun() ->
+                        try ets:new(?TARGET_MISSES, [named_table, public, set]) of
+                            _ ->
+                                Parent ! {Ref, created},
+                                receive after infinity -> ok end
+                        catch error:badarg -> Parent ! {Ref, exists}
+                        end
+                    end
+                ),
+            receive
+                {Ref, _} -> ok;
+                {'DOWN', Mon, process, Owner, _} -> ok
+            after 5000 -> ok
+            end,
+            erlang:demonitor(Mon, [flush]),
+            ok;
+        _ -> ok
     end.
 
 target_process_not_found(Target) ->
@@ -477,6 +578,20 @@ push_downstream_local(TargetID, NextSlotOnProc, Origin, Opts) ->
         Req,
         Opts#{ <<"cache-control">> => <<"always">> }
     ).
+
+%% @doc Options for computing the pushed slot. A push computes its process
+%% from inside another resolution, and `hb_ao' strips `spawn-worker' from
+%% nested resolutions, so the computed state was never handed to a persistent
+%% worker: it was discarded, and the next push restored the process from its
+%% last VM snapshot and replayed every slot since. When the node runs process
+%% workers, let this compute leave one behind. Inside a worker
+%% `process-workers' is false, so a worker never spawns another.
+compute_opts(Opts) ->
+    Base = Opts#{ <<"hashpath">> => ignore },
+    case hb_opts:get(<<"process-workers">>, false, Opts) of
+        true -> Base#{ <<"spawn-worker">> => true };
+        _ -> Base
+    end.
 
 %% @doc Normalise the `max-depth' value supplied by the caller. Accepts a
 %% non-negative integer (verbatim or as a binary), returns `undefined' when
@@ -1859,3 +1974,127 @@ oracle_script() ->
         
         """
     >>.
+
+%% @doc Outbox targets are looked up locally first, and a target that no store
+%% has -- a wallet -- is remembered, so it costs one remote walk per TTL rather
+%% than one per message. A process that exists only remotely is still found.
+read_target_skips_remote_for_known_misses_test() ->
+    application:ensure_all_started(hb),
+    RemoteDir =
+        <<"cache-TEST/push-remote-",
+            (hb_util:encode(crypto:strong_rand_bytes(8)))/binary>>,
+    Remote = #{
+        <<"store-module">> => hb_store_fs,
+        <<"name">> => RemoteDir,
+        <<"scope">> => remote
+    },
+    Local = hb_test_utils:test_store(hb_store_lmdb),
+    Opts = #{
+        <<"store">> => [Local, Remote],
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"push-target-miss-ttl">> => 300
+    },
+    LocalMsg = #{ <<"type">> => <<"Process">>, <<"n">> => <<"local">> },
+    {ok, LocalID} = hb_cache:write(LocalMsg, Opts#{ <<"store">> => [Local] }),
+    RemoteMsg = #{ <<"type">> => <<"Process">>, <<"n">> => <<"remote">> },
+    {ok, RemoteID} = hb_cache:write(RemoteMsg, Opts#{ <<"store">> => [Remote] }),
+    Wallet = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    RemoteReads =
+        fun(Fun) ->
+            erlang:trace_pattern({hb_store_fs, '_', '_'}, true, [call_count]),
+            Fun(),
+            Count =
+                lists:sum(
+                    [
+                        case erlang:trace_info({hb_store_fs, F, A}, call_count) of
+                            {call_count, C} when is_integer(C) -> C;
+                            _ -> 0
+                        end
+                    ||
+                        {F, A} <- [{read, 3}, {type, 3}, {resolve, 3}, {list, 3}]
+                    ]
+                ),
+            erlang:trace_pattern({hb_store_fs, '_', '_'}, false, [call_count]),
+            Count
+        end,
+    % A process this node has is found without touching a remote store.
+    ?assertEqual(0,
+        RemoteReads(fun() -> {ok, _} = read_target(LocalID, Opts) end)),
+    % A wallet walks the remote stores once...
+    ?assert(
+        RemoteReads(fun() -> {error, not_found} = read_target(Wallet, Opts) end)
+            > 0
+    ),
+    % ...and then not again within the TTL.
+    ?assertEqual(0,
+        RemoteReads(
+            fun() -> {error, not_found} = read_target(Wallet, Opts) end
+        )
+    ),
+    % After the TTL, a miss is retried.
+    ?assert(
+        RemoteReads(
+            fun() ->
+                {error, not_found} =
+                    read_target(
+                        Wallet,
+                        Opts#{ <<"push-target-miss-ttl">> => 0 }
+                    )
+            end
+        ) > 0
+    ),
+    % A process held only remotely is still delivered to.
+    ?assertMatch({ok, #{}}, read_target(RemoteID, Opts)).
+
+%% @doc A computed result's outbox shares its map with the result's own
+%% metadata. Only the messages the process emitted may be pushed: iterating the
+%% metadata delivers messages that were never sent, and hands the push path a
+%% commitment map in place of a message.
+outbox_entries_excludes_result_metadata_test() ->
+    Outbox =
+        #{
+            <<"mint">> =>
+                #{
+                    <<"target">> => <<"target-process-id">>,
+                    <<"action">> => <<"Mint">>
+                },
+            <<"commitments">> =>
+                #{
+                    <<"commitment-id">> =>
+                        #{ <<"commitment-device">> => <<"httpsig@1.0">> }
+                },
+            <<"ao-types">> => <<"quantity=\"integer\"">>,
+            <<"device">> => <<"message@1.0">>,
+            <<"hashpath">> => <<"a-hashpath">>
+        },
+    ?assertEqual(
+        [<<"mint">>],
+        lists:sort(maps:keys(outbox_entries(Outbox, #{})))
+    ).
+
+%% @doc The names a process gives its outbox entries are normalized, but the
+%% entries themselves must be delivered as they were emitted. A signed entry
+%% carries its own `commitments', keyed by case-sensitive base64url commitment
+%% IDs; rewriting their case leaves the entry carrying signatures that no longer
+%% match the IDs that name them.
+outbox_entries_preserve_entry_commitment_ids_test() ->
+    CommitmentID = <<"aXnLbjnJtgIsjZXS3hSqNLaj2okwHy3N7A1ZpogrnVI">>,
+    Outbox =
+        #{
+            <<"Mint">> =>
+                #{
+                    <<"target">> => <<"target-process-id">>,
+                    <<"commitments">> =>
+                        #{
+                            CommitmentID =>
+                                #{ <<"type">> => <<"rsa-pss-sha512">> }
+                        }
+                }
+        },
+    Entries = outbox_entries(Outbox, #{}),
+    ?assertEqual([<<"mint">>], maps:keys(Entries)),
+    Entry = maps:get(<<"mint">>, Entries),
+    ?assertEqual(
+        [CommitmentID],
+        maps:keys(maps:get(<<"commitments">>, Entry))
+    ).
