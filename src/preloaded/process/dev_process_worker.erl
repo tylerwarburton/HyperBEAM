@@ -79,7 +79,14 @@ server(GroupName, RawBase, Opts) ->
     ServerOpts = Opts#{
         <<"await-inprogress">> => false,
         <<"spawn-worker">> => false,
-        <<"process-workers">> => false
+        <<"process-workers">> => false,
+        % The worker computes slots; `dev_process_cache' already stores each
+        % one durably (a delta, or a checkpoint). A listener's options -- an
+        % HTTP request's `cache-control: always' -- would otherwise make
+        % result caching serialize, hash and write the whole process state
+        % (and read its hashpath back) on every slot, inside the one process
+        % that every write to this process queues behind.
+        <<"cache-control">> => [<<"no-store">>, <<"no-cache">>]
     },
     % The maximum amount of time the worker will wait for a request before
     % checking the cache for a snapshot. Default: 5 minutes.
