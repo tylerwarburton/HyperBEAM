@@ -25,9 +25,10 @@
 
 -define(LEGACY_LUA, <<"lua@5.3a">>).
 %% @doc Expose Lua functions as device keys, using this module's compute path.
-info(Base) ->
+info(_Base) ->
     #{
         default => fun compute/4,
+        direct_message_keys => true,
         excludes =>
             [
                 <<"id">>,
@@ -40,7 +41,7 @@ info(Base) ->
                 <<"verify">>,
                 <<"encode">>,
                 <<"decode">>
-            ] ++ maps:keys(Base)
+            ]
     }.
 
 %% @doc Reuse the stable `lua@5.3a' VM initialization and sandbox.

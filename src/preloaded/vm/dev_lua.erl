@@ -31,9 +31,10 @@
 %% resolved by calling the Lua function in the module of the same name.
 %% Additionally, we exclude the `keys', `set', `encode' and `decode' functions
 %% which are `message@1.0' core functions, and Lua public utility functions.
-info(Base) ->
+info(_Base) ->
     #{
         default => fun compute/4,
+        direct_message_keys => true,
         excludes =>
             [
                 <<"id">>,
@@ -46,8 +47,7 @@ info(Base) ->
                 <<"verify">>,
                 <<"encode">>,
                 <<"decode">>
-            ] ++
-            maps:keys(Base)
+            ]
     }.
 
 %% @doc Initialize the device state, loading the script into memory if it is 

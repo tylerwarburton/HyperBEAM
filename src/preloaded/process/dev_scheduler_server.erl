@@ -425,14 +425,13 @@ uploader(Opts) ->
             ok
     end.
 
-%% @doc Upload one message and assignment without allowing remote failures to
-%% roll back a slot that has already been committed to the local schedule.
+%% @doc Upload the scheduler-signed assignment. Its body contains the committed
+%% source message, so a separate source upload is redundant. Remote failures do
+%% not roll back a slot that has already been committed to the local schedule.
 upload(Message, Assignment, Mode, ReplyPID, Opts) ->
     try
-        MessageResult = hb_client_remote:upload(Message, Opts),
         AssignmentResult = hb_client_remote:upload(Assignment, Opts),
-        case source_upload_succeeded(MessageResult)
-                andalso upload_succeeded(AssignmentResult) of
+        case upload_succeeded(AssignmentResult) of
             true ->
                 ?event(uploads_complete),
                 maybe_inform_recipient(
@@ -445,7 +444,6 @@ upload(Message, Assignment, Mode, ReplyPID, Opts) ->
             false ->
                 ?event(error,
                     {upload_failed,
-                        {message_result, MessageResult},
                         {assignment_result, AssignmentResult}
                     }
                 )
@@ -461,32 +459,25 @@ upload(Message, Assignment, Mode, ReplyPID, Opts) ->
             )
     end.
 
-%% @doc Confirm that every commitment-specific upload returned successfully.
-upload_succeeded({ok, Results}) when is_list(Results), Results =/= [] ->
-    lists:all(
+%% @doc Confirm that at least one configured publisher accepted the assignment
+%% and every other commitment either succeeded or has no configured bundler.
+upload_succeeded({ok, Results}) when is_list(Results) ->
+    lists:any(
         fun
             ({ok, _}) -> true;
             (_) -> false
         end,
         Results
-    );
-upload_succeeded(_) ->
-    false.
-
-%% @doc Source messages may use a commitment without a configured publisher.
-%% The successfully published assignment carries that committed message in its
-%% body, so this optional source upload does not invalidate publication.
-source_upload_succeeded({ok, Results}) when is_list(Results) ->
-    lists:all(
-        fun
-            ({ok, _}) -> true;
-            ({error, no_httpsig_bundler}) -> true;
-            (_) -> false
-        end,
-        Results
-    );
-source_upload_succeeded(_) ->
-    false.
+    ) andalso
+        lists:all(
+            fun
+                ({ok, _}) -> true;
+                ({error, no_httpsig_bundler}) -> true;
+                (_) -> false
+            end,
+            Results
+        );
+upload_succeeded(_) -> false.
 
 %% @doc Find the hashpath of the base state upon which a new assignment should
 %% be applied.
@@ -593,12 +584,18 @@ select_uploader_test() ->
 %% @doc Nested commitment upload errors must not count as confirmation.
 upload_succeeded_test() ->
     ?assert(upload_succeeded({ok, [{ok, #{ <<"status">> => 200 }}]})),
+    ?assert(
+        upload_succeeded(
+            {ok, [
+                {error, no_httpsig_bundler},
+                {ok, #{ <<"status">> => 200 }}
+            ]}
+        )
+    ),
     ?assertNot(upload_succeeded({ok, [{error, no_bundler}]})),
+    ?assertNot(upload_succeeded({ok, [{error, no_httpsig_bundler}]})),
     ?assertNot(upload_succeeded({ok, []})),
-    ?assertNot(upload_succeeded({error, timeout})),
-    ?assert(source_upload_succeeded({ok, [{error, no_httpsig_bundler}]})),
-    ?assert(source_upload_succeeded({ok, []})),
-    ?assertNot(source_upload_succeeded({ok, [{error, timeout}]})).
+    ?assertNot(upload_succeeded({error, timeout})).
 
 %% @doc A configured pool starts every worker and replaces a dead member.
 uploader_pool_respawns_test() ->

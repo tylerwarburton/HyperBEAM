@@ -58,8 +58,11 @@ message_to_fun(Msg, Key, Opts) ->
     message_to_fun(message_to_device(Msg, Opts), Msg, Key, Opts).
 message_to_fun(Dev, Msg, Key, Opts) ->
     Info = info(Dev, Msg, Opts),
-    % Is the key exported by the device?
-    Exported = is_exported(Info, Key, Opts),
+    % A device can opt into serving literal message keys through message@1.0.
+    DirectMessageKey =
+        maps:get(direct_message_keys, Info, false)
+            andalso hb_maps:is_key(hb_ao:normalize_key(Key), Msg, Opts),
+    Exported = not DirectMessageKey andalso is_exported(Info, Key, Opts),
 	?event(
         ao_devices,
         {message_to_fun,
