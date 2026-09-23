@@ -48,7 +48,7 @@ write(ProcID, Slot, Msg, Opts) ->
 write_full(ProcID, Slot, Msg, Opts) ->
     % Write the item to the cache in the root of the store.
     PublicMsg = hb_private:reset(Msg),
-    {ok, Root} = hb_cache:write(PublicMsg, Opts),
+    {ok, Root} = hb_cache:write(PublicMsg, storage_opts(Opts)),
     ok = link_result(ProcID, Slot, Root, Root, Opts),
     % Keep the hot cache's newest entry current for every process: `latest'
     % answers from it.
@@ -69,7 +69,7 @@ write_delta(ProcID, Slot, Msg, Delta, Opts) ->
     PublicMsg = hb_private:reset(Msg),
     case should_checkpoint(ProcID, Slot, Msg, Opts) of
         true ->
-            {ok, StoredRoot} = hb_cache:write(PublicMsg, Opts),
+            {ok, StoredRoot} = hb_cache:write(PublicMsg, storage_opts(Opts)),
             ok = link_result(ProcID, Slot, StoredRoot, StoredRoot, Opts),
             hot_put(ProcID, Slot, PublicMsg, Opts),
             {ok, path(ProcID, Slot, Opts)};
@@ -81,11 +81,16 @@ write_delta(ProcID, Slot, Msg, Delta, Opts) ->
                 <<"patches">> => Patches,
                 <<"results">> => Results
             },
-            {ok, StoredRoot} = hb_cache:write(Envelope, Opts),
+            {ok, StoredRoot} = hb_cache:write(Envelope, storage_opts(Opts)),
             ok = link_result(ProcID, Slot, StoredRoot, StoredRoot, Opts),
             hot_put(ProcID, Slot, PublicMsg, Opts),
             {ok, path(ProcID, Slot, Opts)}
     end.
+
+%% @doc Computed state is addressed by process/slot and state-ID aliases, not
+%% reverse queries. Skip that derived index while preserving all durable data.
+storage_opts(Opts) ->
+    Opts#{ <<"match-index">> => false }.
 
 %% @doc Atomically publish both cache aliases after their target is durable.
 link_result(ProcID, Slot, LogicalRoot, StoredRoot, Opts) ->
@@ -441,6 +446,110 @@ delta_roundtrip_test_() ->
             <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
             <<"priv-wallet">> => ar_wallet:new()
         })
+    end}.
+
+%% @doc Full checkpoints and deltas remain directly readable and replayable
+%% from cold storage without reverse-index entries. Ordinary cache data remains
+%% queryable through the match index.
+computed_writes_skip_match_index_and_replay_test_() ->
+    {timeout, 60, fun() ->
+        application:ensure_all_started(hb),
+        Store = hb_test_utils:test_store(hb_store_lmdb),
+        Opts = #{
+            <<"store">> => [Store],
+            <<"match-index">> => [Store],
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"process-delta-checkpoint-slots">> => 2
+        },
+        ProcID = hb_util:encode(crypto:strong_rand_bytes(32)),
+        Marker = hb_util:encode(crypto:strong_rand_bytes(32)),
+        Results0 = #{ <<"output">> => #{ <<"data">> => <<"0">> } },
+        FullProcID = hb_util:encode(crypto:strong_rand_bytes(32)),
+        FullMarker = <<"full-", Marker/binary>>,
+        FullState = #{
+            <<"at-slot">> => 0,
+            <<"full-marker">> => FullMarker,
+            <<"results">> => Results0
+        },
+        {ok, _} = write_full(FullProcID, 0, FullState, Opts),
+        {ok, ReadFull} = read(FullProcID, 0, Opts),
+        ?assertEqual(FullMarker, hb_ao:get(<<"full-marker">>, ReadFull, Opts)),
+        ?assertEqual(
+            {error, not_found},
+            hb_cache:match(#{ <<"full-marker">> => FullMarker }, Opts)
+        ),
+        State0 = #{
+            <<"at-slot">> => 0,
+            <<"count">> => <<"0">>,
+            <<"computed-marker">> => Marker,
+            <<"results">> => Results0
+        },
+        {ok, _} = write(
+            ProcID,
+            0,
+            with_delta(State0, [], Results0, Opts),
+            Opts
+        ),
+        {ok, Full0} = read(ProcID, 0, Opts),
+        ?assertEqual(Marker, hb_ao:get(<<"computed-marker">>, Full0, Opts)),
+        ?assertEqual(
+            {error, not_found},
+            hb_cache:match(#{ <<"computed-marker">> => Marker }, Opts)
+        ),
+        Patches1 = [#{ <<"path">> => <<"/count">>, <<"value">> => <<"1">> }],
+        Results1 = #{ <<"output">> => #{ <<"data">> => <<"1">> } },
+        {ok, State1} = hb_process_delta:apply(State0, Patches1, Results1, 1, Opts),
+        {ok, _} = write(
+            ProcID,
+            1,
+            with_delta(State1, Patches1, Results1, Opts),
+            Opts
+        ),
+        Patches2 = [#{ <<"path">> => <<"/count">>, <<"value">> => <<"2">> }],
+        Results2 = #{ <<"output">> => #{ <<"data">> => <<"2">> } },
+        {ok, State2} = hb_process_delta:apply(State1, Patches2, Results2, 2, Opts),
+        {ok, _} = write(
+            ProcID,
+            2,
+            with_delta(State2, Patches2, Results2, Opts),
+            Opts
+        ),
+        {ok, Full2} = read(ProcID, 2, Opts),
+        ?assertEqual(<<"2">>, hb_ao:get(<<"count">>, Full2, Opts)),
+        HotKey = hot_key(ProcID, Opts),
+        ets:delete(?HOT_CACHE, HotKey),
+        ets:delete(?RECENT_CACHE, {HotKey, 0}),
+        ets:delete(?RECENT_CACHE, {HotKey, 1}),
+        ets:delete(?RECENT_CACHE, {HotKey, 2}),
+        erlang:trace_pattern({hb_process_delta, apply, 5}, true, [call_count]),
+        {Cold1, Replayed} =
+            try
+                {ok, ColdRead} = read(ProcID, 1, Opts),
+                {call_count, ReplayCount} =
+                    erlang:trace_info({hb_process_delta, apply, 5}, call_count),
+                {ColdRead, ReplayCount}
+            after
+                erlang:trace_pattern(
+                    {hb_process_delta, apply, 5},
+                    false,
+                    [call_count]
+                )
+            end,
+        ?assert(Replayed > 0),
+        ?assertEqual(<<"1">>, hb_ao:get(<<"count">>, Cold1, Opts)),
+        ?assertEqual(
+            {error, not_found},
+            hb_cache:match(#{ <<"count">> => <<"2">> }, Opts)
+        ),
+        NormalMarker = <<"normal-", Marker/binary>>,
+        {ok, _} = hb_cache:write(
+            #{ <<"normal-marker">> => NormalMarker },
+            Opts
+        ),
+        ?assertMatch(
+            {ok, [_ | _]},
+            hb_cache:match(#{ <<"normal-marker">> => NormalMarker }, Opts)
+        )
     end}.
 
 %% @doc The hot cache must outlive whichever process happened to create it (in
