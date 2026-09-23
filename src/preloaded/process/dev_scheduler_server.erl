@@ -292,36 +292,38 @@ do_assign(State, Message, ReplyPID) ->
                 State
             ),
             ?event(writes_complete),
-            ?event(uploading_message),
-            % Uploading is a network round trip; running it from the loop
-            % holds the next slot behind the current slot's upload. Hand the
-            % uploads to a bounded pool that drains them off the loop. The
-            % default pool size of one preserves upload order. Operators can
-            % opt into parallel, content-addressed publication when one remote
-            % connection cannot keep up with local assignment throughput.
-            % Slot order, local persistence and `local_confirmation' are
-            % unaffected; `remote_confirmation' informs from the worker that
-            % published its assignment. The queued-message bound applies to
-            % the pool as a whole; each worker adds at most one in-flight item.
-            Max = hb_opts:get(scheduler_upload_queue_max, 64, Opts),
-            case select_uploader(maps:get(uploaders, State), Max) of
-                {ok, Uploader} ->
-                    Uploader !
-                        {upload,
-                            Message,
-                            Assignment,
-                            maps:get(mode, State),
-                            ReplyPID
-                        };
+            case hb_opts:get(scheduler_publish_remote, true, Opts) of
+                false ->
+                    ?event(remote_publication_disabled);
                 _ ->
-                    UploadOpts = upload_opts(Opts),
-                    upload(
-                        Message,
-                        Assignment,
-                        maps:get(mode, State),
-                        ReplyPID,
-                        UploadOpts
-                    )
+                    ?event(uploading_message),
+                    % Uploading is a network round trip; running it from the
+                    % loop holds the next slot behind the current slot's
+                    % upload. Hand uploads to a bounded pool that drains them
+                    % off the loop. The default pool size of one preserves
+                    % upload order. The queued-message bound applies to the
+                    % pool as a whole; each worker adds at most one in-flight
+                    % item.
+                    Max = hb_opts:get(scheduler_upload_queue_max, 64, Opts),
+                    case select_uploader(maps:get(uploaders, State), Max) of
+                        {ok, Uploader} ->
+                            Uploader !
+                                {upload,
+                                    Message,
+                                    Assignment,
+                                    maps:get(mode, State),
+                                    ReplyPID
+                                };
+                        _ ->
+                            UploadOpts = upload_opts(Opts),
+                            upload(
+                                Message,
+                                Assignment,
+                                maps:get(mode, State),
+                                ReplyPID,
+                                UploadOpts
+                            )
+                    end
             end
         end,
     case hb_opts:get(scheduling_mode, sync, Opts) of
@@ -366,6 +368,13 @@ maybe_inform_recipient(Mode, ReplyPID, Message, Assignment, State) ->
 
 %% @doc Start the configured number of monitored uploader processes.
 start_uploaders(Opts) ->
+    case hb_opts:get(scheduler_publish_remote, true, Opts) of
+        false -> [];
+        _ -> start_enabled_uploaders(Opts)
+    end.
+
+%% @doc Start uploaders when remote assignment publication is enabled.
+start_enabled_uploaders(Opts) ->
     Count =
         case hb_opts:get(scheduler_upload_workers, 1, Opts) of
             N when is_integer(N) andalso N > 0 -> N;
@@ -568,6 +577,57 @@ async_upload_preserves_sequence_test() ->
         lists:seq(0, 4)
     ).
 
+%% @doc Local-only scheduling starts no uploaders, never enters the upload
+%% function, and still persists ordered assignments before replying.
+remote_publication_disabled_preserves_local_schedule_test() ->
+    Wallet = ar_wallet:new(),
+    Opts = #{
+        <<"priv-wallet">> => Wallet,
+        <<"scheduling-mode">> => local_confirmation,
+        <<"scheduler-publish-remote">> => false
+    },
+    Proc = hb_message:commit(
+        #{ <<"data">> => <<"test">>, <<"random-key">> => rand:uniform(10000) },
+        Opts
+    ),
+    ID = hb_message:id(Proc, all, Opts),
+    Server = dev_scheduler_registry:find(ID, Proc, Opts),
+    ?assertMatch(#{ uploaders := [] }, dev_scheduler_server:info(Server)),
+    {module, hb_client_remote} = code:ensure_loaded(hb_client_remote),
+    1 = erlang:trace_pattern({hb_client_remote, upload, 2}, true, [local]),
+    1 = erlang:trace(Server, true, [call]),
+    try
+        Messages =
+            [
+                hb_message:commit(
+                    #{ <<"data">> => <<"message">>, <<"index">> => N },
+                    Opts
+                )
+            ||
+                N <- lists:seq(1, 5)
+            ],
+        lists:foreach(fun(Message) -> schedule(Server, Message) end, Messages),
+        ?assertMatch(#{ current := 4 }, dev_scheduler_server:info(Server)),
+        AssignmentIDs = lists:map(
+            fun(Slot) ->
+                {ok, Assignment} = dev_scheduler_cache:read(ID, Slot, Opts),
+                ?assertEqual(Slot, hb_ao:get(<<"slot">>, Assignment, Opts)),
+                hb_message:id(Assignment, all, Opts)
+            end,
+            lists:seq(0, 4)
+        ),
+        ?assertEqual(5, length(lists:usort(AssignmentIDs))),
+        receive
+            {trace, Server, call, {hb_client_remote, upload, _}} ->
+                erlang:error(remote_upload_called)
+        after 0 -> ok
+        end
+    after
+        erlang:trace(Server, false, [call]),
+        erlang:trace_pattern({hb_client_remote, upload, 2}, false, [local]),
+        dev_scheduler_server:stop(Server)
+    end.
+
 %% @doc The pool selects the shortest live queue and enforces a total bound.
 select_uploader_test() ->
     Hold = fun() -> receive stop -> ok end end,
@@ -597,7 +657,8 @@ upload_succeeded_test() ->
     ?assertNot(upload_succeeded({ok, []})),
     ?assertNot(upload_succeeded({error, timeout})).
 
-%% @doc A configured pool starts every worker and replaces a dead member.
+%% @doc Remote publication defaults to enabled: a configured pool starts every
+%% worker and replaces a dead member.
 uploader_pool_respawns_test() ->
     Wallet = ar_wallet:new(),
     Proc = hb_message:commit(
