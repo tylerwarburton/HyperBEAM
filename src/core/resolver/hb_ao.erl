@@ -460,35 +460,30 @@ resolve_stage(4, Base, Req, Opts) ->
     % group name.
     case hb_persistent:find_or_register(Base, Req, hb_maps:without(?TEMP_OPTS, Opts, Opts)) of
         {leader, ExecName} ->
-            % We are the leader for this resolution. Continue to the next stage.
-            case hb_opts:get(spawn_worker, false, Opts) of
-                true -> ?event(worker_spawns, {will_become, ExecName});
-                _ -> ok
-            end,
-            resolve_stage(5, Base, Req, ExecName, Opts);
+            % A request process is coupled to its HTTP listener. Hand the
+            % registered name to the detached worker before doing expensive
+            % work, so a client timeout cannot kill the only live process state.
+            case
+                {
+                    ExecName =/= ungrouped_exec,
+                    hb_opts:get(spawn_worker, false, Opts#{ <<"prefer">> => local }),
+                    hb_opts:get(process_workers, false, Opts) =/= false,
+                    hb_path:matches(<<"compute">>, hb_path:hd(Req, Opts))
+                }
+            of
+                {true, SpawnWorker, true, true} when SpawnWorker =/= false ->
+                    ?event(worker_spawns, {will_delegate, ExecName}),
+                    Worker = hb_persistent:start_worker(ExecName, Base, Opts),
+                    hb_persistent:forward_work(Worker, Opts),
+                    await_or_retry(Worker, Base, Req, Opts);
+                _ ->
+                    resolve_stage(5, Base, Req, ExecName, Opts)
+            end;
         {wait, Leader} ->
             % There is another executor of this resolution in-flight.
             % Bail execution, register to receive the response, then
             % wait.
-            case hb_persistent:await(Leader, Base, Req, Opts) of
-                {error, leader_died} ->
-                    ?event(
-                        ao_core,
-                        {leader_died_during_wait,
-                            {leader, Leader},
-                            {base, Base},
-                            {req, Req},
-                            {opts, Opts}
-                        },
-                        Opts
-                    ),
-                    % Re-try again if the group leader has died.
-                    resolve_stage(4, Base, Req, Opts);
-                Res ->
-                    % Now that we have the result, we can skip right to potential
-                    % recursion (step 11) in the outer-wrapper.
-                    Res
-            end;
+            await_or_retry(Leader, Base, Req, Opts);
         {infinite_recursion, GroupName} ->
             % We are the leader for this resolution, but we executing the 
             % computation again. This may plausibly be OK in _some_ cases,
@@ -512,6 +507,30 @@ resolve_stage(4, Base, Req, Opts) ->
                     error_infinite(Base, Req, Opts)
             end
     end.
+
+%% @doc Wait for a registered execution owner, retrying election if it dies.
+%%
+%% Both an already-resident worker and the worker created by a new leader use
+%% this path. A successful response has already completed the inner resolution,
+%% so it returns directly to the outer wrapper.
+await_or_retry(Worker, Base, Req, Opts) ->
+    case hb_persistent:await(Worker, Base, Req, Opts) of
+        {error, leader_died} ->
+            ?event(
+                ao_core,
+                {leader_died_during_wait,
+                    {leader, Worker},
+                    {base, Base},
+                    {req, Req},
+                    {opts, Opts}
+                },
+                Opts
+            ),
+            resolve_stage(4, Base, Req, Opts);
+        Res ->
+            Res
+    end.
+
 resolve_stage(5, Base, Req, ExecName, Opts) ->
     ?event_debug(debug_ao_core, {stage, 5, device_lookup}, Opts),
     % Device lookup: Find the Erlang function that should be utilized to 

@@ -458,6 +458,17 @@ test_device(Base) ->
                 Count = hb_maps:get(<<"count">>, M1, 0, #{}),
                 {ok, M1#{ <<"count">> => Count + 1 }}
             end,
+        compute =>
+            fun(M1, #{
+                <<"wait">> := Wait,
+                <<"notify">> := Notify
+            }) ->
+                Notify ! {slow_increment_started, self()},
+                receive after Wait ->
+                    Count = hb_maps:get(<<"count">>, M1, 0, #{}),
+                    {ok, M1#{ <<"count">> => Count + 1 }}
+                end
+            end,
         self =>
             fun(M1, #{ <<"wait">> := Wait }) ->
                 ?event({self_waiting, {wait, Wait}}),
@@ -552,9 +563,8 @@ spawn_after_execution_test() ->
     ?assert(T1 - T0 >= (3*TestTime)).
 
 %% @doc A resolution that asks for a worker must leave one running once it
-%% returns. `hb_ao:resolve/3' spawns the worker in its final stage, after
-%% unregistering itself as leader, so the worker is the only thing that can
-%% carry the execution's state past the end of the request.
+%% starts. The request waits on that detached worker, which carries the
+%% execution's state past the end of the request.
 spawn_worker_outlives_resolution_test() ->
     start(),
     Base = #{ <<"device">> => test_device() },
@@ -592,8 +602,10 @@ ungrouped_execution_spawns_no_worker_test() ->
     ?assertEqual(undefined, hb_name:lookup(ungrouped_exec)).
 
 %% @doc A non-static worker must carry the state it just computed into the
-%% next request, so that a sequence of resolutions accumulates rather than
-%% each one restarting from the state the worker was spawned with.
+%% next request after its listener has gone away. This is the live failure
+%% shape: a deep process compute outlives the HTTP client's headers timeout.
+%% The registered worker must remain alive and the next request must advance
+%% from its result rather than restart from the original base.
 worker_advances_state_between_requests_test() ->
     start(),
     GroupName = {?MODULE, make_ref()},
@@ -602,25 +614,50 @@ worker_advances_state_between_requests_test() ->
             <<"device">> =>
                 test_device(#{ grouper => fun(_, _, _) -> GroupName end })
         },
-    Opts = #{ <<"hashpath">> => ignore },
-    Worker = start_worker(GroupName, Base, Opts),
-    Req = #{ <<"path">> => <<"increment">> },
-    Worker ! {resolve, self(), GroupName, Req, Opts},
-    First = await_resolution(GroupName),
-    Worker ! {resolve, self(), GroupName, Req, Opts},
-    Second = await_resolution(GroupName),
-    ?assertEqual(1, hb_maps:get(<<"count">>, First, not_found, #{})),
-    ?assertEqual(2, hb_maps:get(<<"count">>, Second, not_found, #{})),
+    Opts =
+        #{
+            <<"spawn-worker">> => true,
+            <<"hashpath">> => ignore,
+            <<"worker-timeout">> => 5000,
+            <<"process-workers">> => true
+        },
+    Parent = self(),
+    Listener =
+        spawn(fun() ->
+            hb_ao:resolve(
+                Base,
+                #{
+                    <<"path">> => <<"compute">>,
+                    <<"wait">> => 200,
+                    <<"notify">> => Parent
+                },
+                Opts
+            )
+        end),
+    Worker =
+        receive
+            {slow_increment_started, PID} -> PID
+        after 5000 ->
+            erlang:error(worker_did_not_start)
+        end,
+    ?assertNotEqual(Listener, Worker),
+    ?assertEqual(Worker, hb_name:lookup(GroupName)),
+    exit(Listener, kill),
+    receive after 250 -> ok end,
     ?assert(erlang:is_process_alive(Worker)),
+    ?assertEqual(Worker, hb_name:lookup(GroupName)),
+    {ok, Second} =
+        hb_ao:resolve(
+            Base,
+            #{
+                <<"path">> => <<"compute">>,
+                <<"wait">> => 0,
+                <<"notify">> => Parent
+            },
+            Opts
+        ),
+    ?assertEqual(2, hb_maps:get(<<"count">>, Second, not_found, #{})),
     exit(Worker, normal).
-
-%% @doc Receive the result a worker sends back for a group.
-await_resolution(GroupName) ->
-    receive
-        {resolved, _, GroupName, _, {ok, Res}} -> Res
-    after 5000 ->
-        throw(worker_sent_no_result)
-    end.
 
 %% @doc Wait for a group name to be claimed, returning the registered process.
 await_registration(_GroupName, 0) -> undefined;
