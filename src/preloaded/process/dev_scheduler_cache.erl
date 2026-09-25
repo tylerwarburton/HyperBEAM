@@ -35,7 +35,7 @@ write(RawAssignment, RawOpts) ->
             {assignment, Assignment}
         }
     ),
-    case hb_cache:write(Assignment, Opts) of
+    case hb_cache:write(Assignment, storage_opts(Opts)) of
         {ok, _UnsignedID} ->
             % Create symlinks from the message on the process and the 
             % slot on the process to the underlying data.
@@ -56,6 +56,13 @@ write(RawAssignment, RawOpts) ->
             ?event(error, {failed_to_write_assignment, {reason, Reason}}),
             {error, Reason}
     end.
+
+%% @doc Assignments are addressed by process and slot, and read back through
+%% those paths. The reverse match index is a derived structure that no reader of
+%% an assignment consults, and it costs one entry per key per ID on every slot.
+%% Skip it while preserving all durable data.
+storage_opts(Opts) ->
+    Opts#{ <<"match-index">> => false }.
 
 %% @doc Write the initial assignment message to the cache.
 write_spawn(RawInitMessage, Opts) ->
@@ -157,6 +164,29 @@ latest(ProcID, RawOpts) ->
     end.
 
 %%% Tests
+
+%% @doc An assignment is written without a reverse match index, and stays fully
+%% readable by process and slot, which is how every reader reaches it.
+assignment_skips_match_index_test() ->
+    Store = hb_test_utils:test_store(hb_store_fs, <<"match-index-sched">>),
+    Opts = #{ <<"store">> => [Store] },
+    hb_store:start(Store),
+    Marker = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Assignment = #{
+        <<"variant">> => <<"ao.N.1">>,
+        <<"process">> => ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+        <<"slot">> => 1,
+        <<"hash-chain">> => Marker
+    },
+    ?assertEqual(ok, write(Assignment, Opts)),
+    % The durable data is intact and reachable by its addressed path.
+    ?assertMatch({ok, _}, read(ProcID, 1, Opts)),
+    ?assertMatch({1, _}, latest(ProcID, Opts)),
+    % The derived reverse index was not written.
+    ?assertEqual(
+        {error, not_found},
+        hb_cache:match(#{ <<"hash-chain">> => Marker }, Opts)
+    ).
 
 %% @doc Test that a volatile schedule is lost on restart.
 volatile_schedule_test() ->
