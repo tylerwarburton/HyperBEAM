@@ -11,7 +11,10 @@
 -define(DELTA_META, <<"process-cache-delta">>).
 -define(HOT_CACHE, dev_process_delta_hot_cache).
 -define(RECENT_CACHE, dev_process_delta_recent_cache).
+-define(REPLAY_CACHE, dev_process_delta_replay_cache).
 -define(DEFAULT_DELTA_CHECKPOINT_SLOTS, 1000).
+-define(DEFAULT_REPLAY_CACHE_SLOTS, 128).
+-define(DEFAULT_REPLAY_CACHE_LIMIT, 1024).
 
 %% @doc Read the result of a process at a given slot.
 read(ProcID, Opts) ->
@@ -202,7 +205,11 @@ hot_read(ProcID, SlotRef, Opts) when is_integer(SlotRef) ->
         _ ->
             case ets:lookup(?RECENT_CACHE, {Key, SlotRef}) of
                 [{_, Msg}] -> {ok, Msg};
-                [] -> not_found
+                [] ->
+                    case ets:lookup(?REPLAY_CACHE, {Key, SlotRef}) of
+                        [{_, Msg}] -> {ok, Msg};
+                        [] -> not_found
+                    end
             end
     catch error:badarg -> not_found
     end;
@@ -238,11 +245,51 @@ recent_put(Key, Slot, Newest, Msg, Opts) ->
     Window = hb_util:int(hb_opts:get(<<"process-hot-cache-slots">>, 32, Opts)),
     Oldest = Newest - Window + 1,
     case Window > 0 andalso Slot >= Oldest of
-        false -> ok;
+        false -> replay_put(Key, Slot, Msg, Opts);
         true ->
             ets:insert(?RECENT_CACHE, {{Key, Slot}, Msg}),
             ets:select_delete(
                 ?RECENT_CACHE,
+                [{{{Key, '$1'}, '_'}, [{'<', '$1', Oldest}], [true]}]
+            ),
+            ok
+    end.
+
+%% @doc Keep the states a replay rebuilds on its way to a historical slot.
+%% `recent_put' holds a window at the head of a process, so a read of a slot far
+%% behind the head -- a client walking back through history -- rebuilt every
+%% intermediate state and then discarded all of them, and the next read of a
+%% neighbouring slot replayed the same chain again from the last checkpoint.
+%% The window here follows the slot being rebuilt rather than the head, which is
+%% where a replay's working set actually is.
+%%
+%% Bounded twice: per process by `process-replay-cache-slots', and overall by
+%% `process-replay-cache-limit'. A large process holds hundreds of KB per entry,
+%% so the total is the figure that matters. Losing the table costs a replay,
+%% never state: every entry is derived from a durable delta or checkpoint.
+replay_put(Key, Slot, Msg, Opts) ->
+    Window = hb_util:int(
+        hb_opts:get(<<"process-replay-cache-slots">>,
+            ?DEFAULT_REPLAY_CACHE_SLOTS, Opts)
+    ),
+    Limit = hb_util:int(
+        hb_opts:get(<<"process-replay-cache-limit">>,
+            ?DEFAULT_REPLAY_CACHE_LIMIT, Opts)
+    ),
+    case Window > 0 of
+        false -> ok;
+        true ->
+            % A flush costs replays and never correctness, so the global bound
+            % is enforced bluntly rather than by tracking insertion order.
+            case ets:info(?REPLAY_CACHE, size) of
+                Size when is_integer(Size), Size >= Limit ->
+                    ets:delete_all_objects(?REPLAY_CACHE);
+                _ -> ok
+            end,
+            ets:insert(?REPLAY_CACHE, {{Key, Slot}, Msg}),
+            Oldest = Slot - Window + 1,
+            ets:select_delete(
+                ?REPLAY_CACHE,
                 [{{{Key, '$1'}, '_'}, [{'<', '$1', Oldest}], [true]}]
             ),
             ok
@@ -271,6 +318,10 @@ ensure_hot_cache() ->
                             _ ->
                                 ets:new(
                                     ?RECENT_CACHE,
+                                    [named_table, public, ordered_set]
+                                ),
+                                ets:new(
+                                    ?REPLAY_CACHE,
                                     [named_table, public, ordered_set]
                                 ),
                                 Parent ! {Ref, created},
@@ -438,6 +489,79 @@ process_cache_suite_test_() ->
             {Name, Opts} <- hb_store:test_stores()
         ]
     ).
+
+%% @doc A read of a slot below the head window keeps the states its replay
+%% rebuilt, so a read of a neighbouring historical slot does not walk the delta
+%% chain back to the checkpoint a second time.
+replay_cache_serves_neighbouring_slots_test_() ->
+    {timeout, 60, fun() ->
+        application:ensure_all_started(hb),
+        Store = hb_test_utils:test_store(hb_store_lmdb),
+        Opts = #{
+            <<"store">> => [Store],
+            <<"priv-wallet">> => ar_wallet:new(),
+            % Slot 0 is the only checkpoint, so every later slot is a delta.
+            <<"process-delta-checkpoint-slots">> => 1000,
+            % A head window of two leaves slot 10 well below it.
+            <<"process-hot-cache-slots">> => 2
+        },
+        ProcID = hb_util:encode(crypto:strong_rand_bytes(32)),
+        Results0 = #{ <<"output">> => #{ <<"data">> => <<"0">> } },
+        State0 = #{
+            <<"at-slot">> => 0,
+            <<"count">> => <<"0">>,
+            <<"results">> => Results0
+        },
+        {ok, _} =
+            write(ProcID, 0, with_delta(State0, [], Results0, Opts), Opts),
+        lists:foldl(
+            fun(Slot, State) ->
+                Bin = integer_to_binary(Slot),
+                Patches =
+                    [#{ <<"path">> => <<"/count">>, <<"value">> => Bin }],
+                Results = #{ <<"output">> => #{ <<"data">> => Bin } },
+                {ok, Next} =
+                    hb_process_delta:apply(State, Patches, Results, Slot, Opts),
+                {ok, _} =
+                    write(
+                        ProcID,
+                        Slot,
+                        with_delta(Next, Patches, Results, Opts),
+                        Opts
+                    ),
+                Next
+            end,
+            State0,
+            lists:seq(1, 12)
+        ),
+        % Drop every in-memory trace of the process, so the first read is cold.
+        HotKey = hot_key(ProcID, Opts),
+        ets:delete(?HOT_CACHE, HotKey),
+        ets:match_delete(?RECENT_CACHE, {{HotKey, '_'}, '_'}),
+        ets:match_delete(?REPLAY_CACHE, {{HotKey, '_'}, '_'}),
+        erlang:trace_pattern({hb_process_delta, apply, 5}, true, [call_count]),
+        Applies =
+            fun() ->
+                {call_count, N} =
+                    erlang:trace_info(
+                        {hb_process_delta, apply, 5},
+                        call_count
+                    ),
+                N
+            end,
+        Start = Applies(),
+        {ok, Slot10} = read(ProcID, 10, Opts),
+        Cold = Applies() - Start,
+        ?assertEqual(<<"10">>, hb_ao:get(<<"count">>, Slot10, Opts)),
+        % Cold read rebuilt the chain from the checkpoint.
+        ?assert(Cold >= 10),
+        {ok, Slot9} = read(ProcID, 9, Opts),
+        Warm = Applies() - Start - Cold,
+        ?assertEqual(<<"9">>, hb_ao:get(<<"count">>, Slot9, Opts)),
+        % Its base was rebuilt on the way to slot 10 and kept.
+        ?assertEqual(0, Warm),
+        erlang:trace_pattern({hb_process_delta, apply, 5}, false, [call_count])
+    end}.
 
 delta_roundtrip_test_() ->
     {timeout, 60, fun() ->
