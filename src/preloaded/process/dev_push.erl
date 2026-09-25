@@ -16,6 +16,9 @@
 %% is the same exclusion that every other walk of a message-as-collection
 %% applies: see `hb_util:message_to_ordered_key/1' and `dev_trie''s
 %% `RESERVED_KEYS'.
+-define(PUSH_WORKERS, dev_push_detached_workers).
+-define(DEFAULT_MAX_PUSH_WORKERS, 32).
+-define(DEFAULT_DETACHED_MAX_DEPTH, 16).
 -define(OUTBOX_NON_ENTRY_KEYS,
     ?AO_CORE_KEYS ++ [<<"commitments">>, <<"ao-types">>, <<"device">>]
 ).
@@ -104,24 +107,104 @@ detached_push(Process, Req, Opts) ->
     case hb_opts:get(push_in_worker, false, Opts) of
         true -> do_push(Process, Req, Opts);
         false ->
-            Caller = self(),
-            ServerID = erlang:get(server_id),
-            {Worker, Monitor} =
+            case admit_push_worker(Opts) of
+                false ->
+                    % At the bound, deliver in-line. That is the behaviour of a
+                    % node without detachment -- the push dies with its client
+                    % -- so refusing to detach is never worse than not having
+                    % this function at all.
+                    ?event(push, {push_worker_refused, {process, Process}}),
+                    do_push(Process, Req, Opts);
+                true ->
+                    Caller = self(),
+                    ServerID = erlang:get(server_id),
+                    WorkerOpts = detached_opts(Opts),
+                    {Worker, Monitor} =
+                        spawn_monitor(
+                            fun() ->
+                                hb_http_server:set_proc_server_id(ServerID),
+                                Caller !
+                                    {push_result,
+                                        self(),
+                                        run_push(Process, Req, WorkerOpts)
+                                    }
+                            end
+                        ),
+                    ets:insert(?PUSH_WORKERS, {Worker}),
+                    await_detached_push(Worker, Monitor)
+            end
+    end.
+
+%% @doc The options a detached worker runs under. Detaching removes the only
+%% cancellation the push path has: an in-line push stops when its client goes
+%% away, and a detached one has nothing that can stop it. A cyclic push graph --
+%% A pushes to B, B pushes back to A -- therefore recurses until the node runs
+%% out of memory. Give the worker a depth bound when the caller did not set one.
+%% The bound is applied here rather than in `do_push/3' because an in-line push
+%% is still cancellable and does not need it.
+detached_opts(Opts) ->
+    Base = Opts#{ <<"push-in-worker">> => true },
+    case hb_opts:get(push_max_depth, undefined, Opts) of
+        undefined ->
+            Base#{
+                <<"push-max-depth">> =>
+                    hb_opts:get(
+                        push_detached_max_depth,
+                        ?DEFAULT_DETACHED_MAX_DEPTH,
+                        Opts
+                    )
+            };
+        _Set -> Base
+    end.
+
+%% @doc Admit a detached push while the node is below its worker bound. A row
+%% is left behind by a worker that has exited, so the table is pruned before it
+%% is counted and the bound tracks live deliveries rather than history. Two
+%% callers can admit concurrently and overshoot by the number of callers racing;
+%% that is bounded and harmless, where an unbounded count is not.
+admit_push_worker(Opts) ->
+    Max =
+        hb_util:int(
+            hb_opts:get(push_max_workers, ?DEFAULT_MAX_PUSH_WORKERS, Opts)
+        ),
+    ensure_push_worker_table(),
+    try
+        Dead =
+            [ W || {W} <- ets:tab2list(?PUSH_WORKERS), not is_process_alive(W) ],
+        lists:foreach(fun(W) -> ets:delete(?PUSH_WORKERS, W) end, Dead),
+        Live = ets:info(?PUSH_WORKERS, size),
+        ?event(push, {push_workers, {live, Live}, {max, Max}}),
+        Live < Max
+    catch error:badarg -> false
+    end.
+
+%% @doc The table is owned by a process that never exits: a table dies with its
+%% owner, and the first caller is usually a short-lived request.
+ensure_push_worker_table() ->
+    case ets:whereis(?PUSH_WORKERS) of
+        undefined ->
+            Parent = self(),
+            Ref = make_ref(),
+            {Owner, Mon} =
                 spawn_monitor(
                     fun() ->
-                        hb_http_server:set_proc_server_id(ServerID),
-                        Caller !
-                            {push_result,
-                                self(),
-                                run_push(
-                                    Process,
-                                    Req,
-                                    Opts#{ <<"push-in-worker">> => true }
-                                )
-                            }
+                        try ets:new(?PUSH_WORKERS,
+                                [named_table, public, set]) of
+                            _ ->
+                                Parent ! {Ref, created},
+                                receive after infinity -> ok end
+                        catch error:badarg -> Parent ! {Ref, exists}
+                        end
                     end
                 ),
-            await_detached_push(Worker, Monitor)
+            receive
+                {Ref, _} -> ok;
+                {'DOWN', Mon, process, Owner, _} -> ok
+            after 5000 -> ok
+            end,
+            erlang:demonitor(Mon, [flush]),
+            ok;
+        _ -> ok
     end.
 
 %% @doc Execute a push, tagging the outcome so that a detached worker can
