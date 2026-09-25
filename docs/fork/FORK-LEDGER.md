@@ -159,6 +159,15 @@ scratch, superseded by the branches above. They are not authoritative.
 
 ---
 
+## 4b. Open work
+
+Two specs live beside this file. Both are designed and measured; neither is built.
+
+| doc | what | urgency |
+|---|---|---|
+| `STORE-GROWTH.md` | Bound the LMDB store. It grows ~38 GiB/day with no deletion path at any layer. A sorted reload alone recovers ~27 GiB at zero policy risk; a full compactor gets 97 -> ~40 GiB. **Neither bounds it** -- the signed assignment chain is a permanent root and this node is its sole custodian, so an assignment-archival decision is upstream of the compactor. | weeks of runway |
+| `OUTBOX-DURABILITY.md` | Make outbox delivery durable. The dominant loss source is closed (delivery no longer dies with the client connection), but there is no delivery record and no retry, so a node that stops mid-delivery still loses in-flight hops. Path is record -> resume -> cranker. | user-visible |
+
 ## 5. Rollback
 
 Prod runs one container off a tagged image. To roll back, retag and restart —
