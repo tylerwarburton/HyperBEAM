@@ -36,10 +36,12 @@ The 7 in-flight PR branches are rebased onto **current** `origin/edge`
 
 ## 2. Deployed divergence: the 44 commits on prod
 
-### 2a. Net-zero — experiments and their reverts (10 commits)
+### 2a. Experiments and their reverts (10 commits)
 
-These cancel out. They are kept in history because the reverts document *why*
-the approach failed; do not re-attempt them without reading both sides.
+These pairs cancel out *textually*, but do not read them as a dead end: the idea
+behind the first pair was re-landed 32 hours later in a corrected form that is
+deployed today. Read both sides plus the follow-up before re-attempting anything
+in this area.
 
 | Reverted | Original | Subject |
 |---|---|---|
@@ -49,9 +51,15 @@ the approach failed; do not re-attempt them without reading both sides.
 | `9b613d5f0` | `179782b74` | test(process-worker): use a process id for cache reads |
 | `2e4d851f7` | `d908a3182` | test(process-worker): derive the process cache key |
 
-**`8d4fab95f` is load-bearing for the audit.** The headline proposal (drain
-several consecutive slots per worker activation) depends on keeping worker state
-resident, which is exactly what this revert undid. Read it before Phase 2.
+**What `8d4fab95f` actually reverted, and what replaced it.** `89a2f1ffc`
+changed the notification *payload* sent to listeners, not the residency of
+worker state; the reverted risk was that a listener could be handed the VM. The
+corrected form landed as `be2c3bf4b` (*send listeners the public result, never
+the VM*), which is in §2b and is running in the deployed image. The failure
+worth reading before touching this area is not either perf commit but
+`b0669b4cf` (*never continue from a cached public state*): its diff shows the
+prior `server/3` adopted a cache-hit answer as live worker state, which is the
+production failure that motivates the guards around any multi-slot walk.
 
 ### 2b. Live local-only production changes (the throughput work)
 
