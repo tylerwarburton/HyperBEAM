@@ -56,7 +56,13 @@ integer — so a rollback has no on-chain effect and no state migration.
 ## 2026-09-25 — 2. Stop swapping the BEAM's live heap
 
 **Change:** set `vm.swappiness=1` host-wide (persisted in
-`/etc/sysctl.d/30-hyperbeam-swap.conf`), then drained existing swap.
+`/etc/sysctl.d/30-hyperbeam-swap.conf`), then drained existing swap with
+`swapoff -a && swapon -a` (42 s, 5.5 GB, with 59 GB available).
+
+**Result:** BEAM `RssAnon` 1.73 GB -> 5.67 GB, `VmSwap` 3.82 GB -> 0. The whole
+Erlang heap is resident. Swap remains enabled as an overflow reserve, at 0 used.
+Lifetime counters before the change, for later comparison: `pswpin` 17,683,430
+and `pswpout` 17,585,158 pages over 13 days of uptime.
 
 **Why not a container memory limit:** 41.7 GB of the container's RSS is clean,
 file-backed LMDB mmap. A `--memory` cap below the working set forces continuous

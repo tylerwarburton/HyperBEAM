@@ -7,11 +7,14 @@
 -export([compress_ecdsa_pubkey/1]).
 -include("include/ar.hrl").
 -include_lib("public_key/include/public_key.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 %%% @doc Utilities for manipulating wallets.
 
 -define(WALLET_DIR, ".").
 -define(WALLET_POOL_TARGET, 6).
+-define(CRT_TABLE, ar_wallet_crt_params).
+-define(CRT_TABLE_LIMIT, 64).
 
 %%% Public interface.
 
@@ -32,8 +35,9 @@ new_ecdsa() ->
     new({?ECDSA_SIGN_ALG, secp256k1}).
 
 generate_wallet(KeyType = {KeyAlg, PublicExpnt}) when KeyType =:= {rsa, 65537} ->
-    {[_, Pub], [_, Pub, Priv|_]} = {[_, Pub], [_, Pub, Priv|_]}
-        = crypto:generate_key(KeyAlg, {4096, PublicExpnt}),
+    {[_, Pub], [_, Pub, Priv, P1, P2, E1, E2, C]} =
+        crypto:generate_key(KeyAlg, {4096, PublicExpnt}),
+    remember_crt_params(Pub, {P1, P2, E1, E2, C}),
     {{KeyType, Priv, Pub}, {KeyType, Pub}};
 generate_wallet(KeyType = {KeyAlg, KeyCrv}) when KeyAlg =:= ?ECDSA_SIGN_ALG andalso KeyCrv =:= secp256k1 ->
     {OrigPub, Priv} = crypto:generate_key(ecdh, KeyCrv),
@@ -123,15 +127,7 @@ sign(Key, Data) ->
 %% @doc sign some data, hashed using the provided DigestType.
 %% RSA and ECDSA signatures use wallet-level wrappers.
 sign({{rsa, PublicExpnt}, Priv, Pub}, Data, DigestType) when PublicExpnt =:= 65537 ->
-    rsa_pss:sign(
-        Data,
-        DigestType,
-        #'RSAPrivateKey'{
-            publicExponent = PublicExpnt,
-            modulus = binary:decode_unsigned(Pub),
-            privateExponent = binary:decode_unsigned(Priv)
-        }
-    );
+    rsa_pss:sign(Data, DigestType, rsa_private_key(PublicExpnt, Priv, Pub));
 sign({{KeyAlg, KeyCrv}, Priv, _Pub}, Data, _DigestType)
         when KeyAlg =:= ?ECDSA_SIGN_ALG andalso KeyCrv =:= secp256k1 ->
     secp256k1_nif:sign(Data, Priv);
@@ -223,6 +219,7 @@ new_keyfile(KeyType, WalletName) ->
             {?RSA_SIGN_ALG, PublicExpnt} ->
                 {[Expnt, Pb], [Expnt, Pb, Prv, P1, P2, E1, E2, C]} =
                     crypto:generate_key(rsa, {?RSA_PRIV_KEY_SZ, PublicExpnt}),
+                remember_crt_params(Pb, {P1, P2, E1, E2, C}),
                 PrivKey = {KeyType, Prv, Pb},
                 Ky = to_json(PrivKey),
                 {Pb, Prv, Ky};
@@ -348,6 +345,7 @@ from_json(JsonBinary, Opts) ->
                 Pb = hb_util:decode(PubEncoded),
                 Prv = hb_util:decode(PrivEncoded),
                 KyType = {?RSA_SIGN_ALG, 65537},
+                remember_jwk_crt_params(Pb, Key, Opts),
                 {Pb, Prv, KyType}
         end,
     {{KeyType, Priv, Pub}, {KeyType, Pub}}.
@@ -401,3 +399,194 @@ compress_ecdsa_pubkey(<<4:8, PubPoint/binary>>) ->
             1 -> <<3:8>>
         end,
     iolist_to_binary([PubKeyHeader, X]).
+
+%% @doc Build the private key record for an RSA wallet, carrying the Chinese
+%% Remainder Theorem parameters when this node knows them for the key. They make
+%% `rsa_pss:sign/3' roughly three times faster, and it verifies its own result
+%% before returning it, so a key without them signs more slowly but never less
+%% correctly.
+rsa_private_key(PublicExpnt, Priv, Pub) ->
+    Base =
+        #'RSAPrivateKey'{
+            publicExponent = PublicExpnt,
+            modulus = binary:decode_unsigned(Pub),
+            privateExponent = binary:decode_unsigned(Priv)
+        },
+    case crt_params(Pub) of
+        not_found ->
+            Base;
+        {P, Q, DP, DQ, QInv} ->
+            Base#'RSAPrivateKey'{
+                prime1 = P,
+                prime2 = Q,
+                exponent1 = DP,
+                exponent2 = DQ,
+                coefficient = QInv
+            }
+    end.
+
+%% @doc Record the Chinese Remainder Theorem parameters of an RSA key against
+%% its modulus, given as the binaries that `crypto' and JWK fields both provide.
+%% These are secret key material: they stay in memory for the lifetime of the
+%% node and must never reach the AO-Core store, so they are held beside it
+%% rather than in it. A pair of primes that does not multiply to the modulus
+%% belongs to a different key and is refused. The table is bounded because
+%% `from_json/2' also parses keys supplied by callers, and a node registers its
+%% own key when it loads it at startup, ahead of any of those.
+remember_crt_params(Pub, {P, Q, DP, DQ, QInv}) ->
+    Params =
+        list_to_tuple(
+            [ crypto:bytes_to_integer(Param) || Param <- [P, Q, DP, DQ, QInv] ]
+        ),
+    Modulus = binary:decode_unsigned(Pub),
+    case element(1, Params) * element(2, Params) =:= Modulus of
+        true ->
+            ensure_crt_table(),
+            case ets:info(?CRT_TABLE, size) < ?CRT_TABLE_LIMIT of
+                true -> ets:insert(?CRT_TABLE, {key_id(Pub), Params}), ok;
+                false -> ok
+            end;
+        false ->
+            ok
+    end.
+
+%% @doc Record the Chinese Remainder Theorem parameters of a JWK RSA private
+%% key, if it carries the complete set that RFC 7518 section 6.3.2 defines. A
+%% key that omits any of them signs through the full-modulus path.
+remember_jwk_crt_params(Pub, Key, Opts) ->
+    Encoded =
+        [
+            hb_maps:get(Field, Key, undefined, Opts)
+        ||
+            Field <- [<<"p">>, <<"q">>, <<"dp">>, <<"dq">>, <<"qi">>]
+        ],
+    case lists:member(undefined, Encoded) of
+        true ->
+            ok;
+        false ->
+            remember_crt_params(
+                Pub,
+                list_to_tuple([ hb_util:decode(Param) || Param <- Encoded ])
+            )
+    end.
+
+%% @doc Look up the Chinese Remainder Theorem parameters held for a modulus.
+%% Returns `not_found' when the key was built without them, or before any key
+%% has registered any, in which case signing takes the full-modulus path.
+crt_params(Pub) ->
+    try ets:lookup(?CRT_TABLE, key_id(Pub)) of
+        [{_, Params}] -> Params;
+        [] -> not_found
+    catch
+        error:badarg -> not_found
+    end.
+
+%% @doc Identify a key by its modulus, without holding the modulus as a key.
+key_id(Pub) ->
+    crypto:hash(sha256, Pub).
+
+%% @doc The table is owned by a process that never exits: a table dies with its
+%% owner, and the first caller is usually a short-lived request.
+ensure_crt_table() ->
+    case ets:whereis(?CRT_TABLE) of
+        undefined ->
+            Parent = self(),
+            Ref = make_ref(),
+            {Owner, Mon} =
+                spawn_monitor(
+                    fun() ->
+                        try ets:new(?CRT_TABLE,
+                                [named_table, public, set,
+                                    {read_concurrency, true}]) of
+                            _ ->
+                                Parent ! {Ref, created},
+                                receive after infinity -> ok end
+                        catch error:badarg -> Parent ! {Ref, exists}
+                        end
+                    end
+                ),
+            receive
+                {Ref, _} -> ok;
+                {'DOWN', Mon, process, Owner, _} -> ok
+            after 5000 -> ok
+            end,
+            erlang:demonitor(Mon, [flush]),
+            ok;
+        _ -> ok
+    end.
+
+%%%===================================================================
+%%% Tests.
+%%%===================================================================
+
+%% @doc Generate a small RSA wallet for the tests and register its Chinese
+%% Remainder Theorem parameters, returning the wallet and the raw parameters.
+%% 2048 bits keeps the suite quick; none of this code depends on the key size.
+generate_test_key() ->
+    {[_, N], [_, N, D, P, Q, DP, DQ, QInv]} =
+        crypto:generate_key(rsa, {2048, 65537}),
+    KeyType = {?RSA_SIGN_ALG, 65537},
+    remember_crt_params(N, {P, Q, DP, DQ, QInv}),
+    {{{KeyType, D, N}, {KeyType, N}}, {P, Q, DP, DQ, QInv}}.
+
+%% @doc A key that carries its CRT parameters produces a signature that verifies
+%% against its public key.
+crt_signature_verifies_test() ->
+    {{PrivKey, PubKey}, _} = generate_test_key(),
+    Data = crypto:strong_rand_bytes(256),
+    ?assert(verify(PubKey, Data, sign(PrivKey, Data))).
+
+%% @doc The CRT and full-modulus paths compute the same function. Holding the
+%% PSS salt fixed makes the encoded message deterministic, so the two must
+%% agree byte-for-byte.
+crt_matches_full_modulus_test() ->
+    {{{_, PrivBin, PubBin}, _}, _} = generate_test_key(),
+    WithCRT = rsa_private_key(65537, PrivBin, PubBin),
+    WithoutCRT =
+        #'RSAPrivateKey'{
+            publicExponent = 65537,
+            modulus = binary:decode_unsigned(PubBin),
+            privateExponent = binary:decode_unsigned(PrivBin)
+        },
+    ?assertNotEqual(undefined, WithCRT#'RSAPrivateKey'.prime1),
+    Salt = crypto:strong_rand_bytes(32),
+    Digest = {digest, crypto:hash(sha256, <<"fixed message">>)},
+    ?assertEqual(
+        rsa_pss:sign(Digest, sha256, Salt, WithoutCRT),
+        rsa_pss:sign(Digest, sha256, Salt, WithCRT)
+    ).
+
+%% @doc A CRT parameter that does not hold yields a signature the public
+%% exponent rejects, so signing falls back to the full modulus, still correct.
+crt_fallback_on_bad_parameter_test() ->
+    {{PrivKey, PubKey}, {P, Q, DP, DQ, QInv}} = generate_test_key(),
+    {_, _, PubBin} = PrivKey,
+    % The primes still multiply to the modulus, so these are accepted, but the
+    % exchanged exponents produce the wrong residue for each prime.
+    remember_crt_params(PubBin, {P, Q, DQ, DP, QInv}),
+    Data = crypto:strong_rand_bytes(256),
+    ?assert(verify(PubKey, Data, sign(PrivKey, Data))).
+
+%% @doc Primes that do not multiply to the modulus belong to a different key and
+%% are refused, leaving that key to sign through the full modulus.
+mismatched_primes_refused_test() ->
+    {_, {P, Q, DP, DQ, QInv}} = generate_test_key(),
+    {[_, OtherN], _} = crypto:generate_key(rsa, {2048, 65537}),
+    remember_crt_params(OtherN, {P, Q, DP, DQ, QInv}),
+    ?assertEqual(not_found, crt_params(OtherN)).
+
+%% @doc A JWK that omits any CRT field registers nothing for the key.
+partial_jwk_crt_params_refused_test() ->
+    {[_, N], [_, N, D, P, Q, DP, DQ, _]} =
+        crypto:generate_key(rsa, {2048, 65537}),
+    Key =
+        #{
+            <<"n">> => hb_util:encode(N),
+            <<"d">> => hb_util:encode(D),
+            <<"p">> => hb_util:encode(P),
+            <<"q">> => hb_util:encode(Q),
+            <<"dp">> => hb_util:encode(DP),
+            <<"dq">> => hb_util:encode(DQ)
+        },
+    remember_jwk_crt_params(N, Key, #{}),
+    ?assertEqual(not_found, crt_params(N)).

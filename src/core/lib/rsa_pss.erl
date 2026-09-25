@@ -177,6 +177,29 @@ verify_legacy({digest, Digest}, DigestType, Signature, PublicKey=#'RSAPublicKey'
 %%%-------------------------------------------------------------------
 
 %% @private
+%% Two exponentiations over the half-size prime moduli cost roughly a third of
+%% one over the full modulus, so a key that carries its Chinese Remainder
+%% Theorem parameters signs through them. A faulty parameter would produce a
+%% structurally well-formed signature that no holder of the public key can
+%% verify, and an Arweave item derives its id from its signature, so the result
+%% is checked with the public exponent before it is returned. The check costs a
+%% small fraction of the saving and makes the fast path unable to be wrong: a
+%% key whose parameters do not hold signs through the clause below instead.
+dp(B, #'RSAPrivateKey'{modulus=N, publicExponent=PubExp, privateExponent=E,
+            prime1=P, prime2=Q, exponent1=DP, exponent2=DQ, coefficient=QInv})
+        when is_integer(PubExp), is_integer(P), is_integer(Q), is_integer(DP),
+                is_integer(DQ), is_integer(QInv) ->
+    M1 = crypto:bytes_to_integer(crypto:mod_pow(B, DP, P)),
+    M2 = crypto:bytes_to_integer(crypto:mod_pow(B, DQ, Q)),
+    % Erlang's `rem' truncates towards zero, so the difference of the two
+    % residues is lifted back into the positive residues before it is scaled.
+    H = (QInv * (((M1 - M2) rem P) + P)) rem P,
+    Signature = binary:encode_unsigned(M2 + (H * Q)),
+    Recovered = crypto:mod_pow(Signature, PubExp, N),
+    case crypto:bytes_to_integer(Recovered) =:= crypto:bytes_to_integer(B) of
+        true -> Signature;
+        false -> crypto:mod_pow(B, E, N)
+    end;
 dp(B, #'RSAPrivateKey'{modulus=N, privateExponent=E}) ->
     crypto:mod_pow(B, E, N).
 
