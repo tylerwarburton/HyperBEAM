@@ -86,8 +86,29 @@ moving the cadence from 1000 to 64 slots takes a single process from ~10 GiB/day
 to ~162 GiB/day, against a whole-node figure of ~30 GiB/day. That trades the
 storage problem for the latency one.
 
+**Final result**, nine consecutive historical slots never read before, on
+`replay-cache-v2`:
+
+```
+slot 13400 = 19.07 s     <- cold, pays the full walk
+slot 13401 =  0.10 s
+slot 13402 =  0.09 s
+slot 13403 =  0.10 s
+slot 13404 =  0.07 s
+slot 13405 =  0.08 s
+slot 13406 =  0.11 s
+slot 13407 =  0.26 s
+slot 13408 =  0.17 s
+TOTAL      = 20.1 s      (~104 s before)
+```
+
+Eight of nine reads are served from the cache. With the earlier count-based
+bound only five of nine were, because the bound was reached constantly and each
+flush dropped every process's window.
+
 **Known limit:** a first read into a cold region is unchanged, 16-31 s. Only
-repeated walks are removed.
+repeated walks are removed. Making the first walk cheap needs more checkpoints,
+which is the rejected alternative above.
 
 **Follow-up in the same work:** the global bound was initially a count of 1024
 entries. Live introspection showed 290 entries holding 96 MB - ~331 KB each -
