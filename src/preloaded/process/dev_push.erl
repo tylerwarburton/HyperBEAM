@@ -94,25 +94,29 @@ push_with_mode(Process, Req, Opts) ->
 %% Cowboy request process, which is killed the moment the client
 %% disconnects; the hop-by-hop delivery must not live there, or every
 %% outbox entry the recursion has not reached yet is silently dropped.
-%% The caller observes exactly what a direct call would yield, exceptions
-%% included: they are re-raised here with their original stacktrace.
-%% Recursive `/push'es raised by `push_downstream_local' already execute
-%% inside a detached process, so they run in-line.
+%% The caller observes the same result a direct call yields, and an exception
+%% is re-raised here with the worker's stacktrace -- the frames above `do_push'
+%% are the worker's, not the caller's.
+%% The first clause is the in-line case: a recursive `/push' raised by
+%% `push_downstream_local' is already running inside a worker, so it must not
+%% start another one.
 detached_push(Process, Req, Opts) ->
-    case hb_opts:get(push_detached, false, Opts) of
+    case hb_opts:get(push_in_worker, false, Opts) of
         true -> do_push(Process, Req, Opts);
         false ->
             Caller = self(),
+            ServerID = erlang:get(server_id),
             {Worker, Monitor} =
                 spawn_monitor(
                     fun() ->
+                        hb_http_server:set_proc_server_id(ServerID),
                         Caller !
                             {push_result,
                                 self(),
                                 run_push(
                                     Process,
                                     Req,
-                                    Opts#{ <<"push-detached">> => true }
+                                    Opts#{ <<"push-in-worker">> => true }
                                 )
                             }
                     end
@@ -228,7 +232,15 @@ do_push(PrimaryProcess, Assignment, Opts) ->
     % means unbounded; a non-negative integer decrements at each downstream
     % `/push' and skips the recursion (target still scheduled) when it
     % reaches `0'.
-    MaxDepth = parse_max_depth(hb_maps:get(<<"max-depth">>, Assignment, undefined, Opts)),
+    MaxDepth =
+        parse_max_depth(
+            hb_maps:get(
+                <<"max-depth">>,
+                Assignment,
+                hb_opts:get(push_max_depth, undefined, Opts),
+                Opts
+            )
+        ),
     ?event(push_depth, {depth, IncludeDepth, {assignment, Assignment}}),
     ?event(push,
         {push_compute_result,
@@ -1867,7 +1879,7 @@ test_push_survives_caller_death() ->
     end,
     % Every slot of the sender sleeps for seconds inside `compute', so this
     % kill lands long before the outbox reaches the receiver's scheduler.
-    timer:sleep(200),
+    timer:sleep(1000),
     Monitor = erlang:monitor(process, Caller),
     exit(Caller, shutdown),
     receive {'DOWN', Monitor, process, Caller, shutdown} -> ok
