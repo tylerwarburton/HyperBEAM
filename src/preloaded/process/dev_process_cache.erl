@@ -14,7 +14,7 @@
 -define(REPLAY_CACHE, dev_process_delta_replay_cache).
 -define(DEFAULT_DELTA_CHECKPOINT_SLOTS, 1000).
 -define(DEFAULT_REPLAY_CACHE_SLOTS, 128).
--define(DEFAULT_REPLAY_CACHE_LIMIT, 1024).
+-define(DEFAULT_REPLAY_CACHE_MB, 1536).
 
 %% @doc Read the result of a process at a given slot.
 read(ProcID, Opts) ->
@@ -264,27 +264,37 @@ recent_put(Key, Slot, Newest, Msg, Opts) ->
 %% where a replay's working set actually is.
 %%
 %% Bounded twice: per process by `process-replay-cache-slots', and overall by
-%% `process-replay-cache-limit'. A large process holds hundreds of KB per entry,
-%% so the total is the figure that matters. Losing the table costs a replay,
-%% never state: every entry is derived from a durable delta or checkpoint.
+%% `process-replay-cache-mb'. The global bound counts bytes rather than entries
+%% because entry size tracks process state size -- a game authority holds around
+%% 330 KB per entry where a small token process holds a fraction of that -- so a
+%% count bounds memory only by accident. The byte bound is set well above what
+%% concurrent replays hold -- eight processes were observed holding 713 entries
+%% in 593 MB -- because reaching it drops every process's window at once.
+%% Losing the table costs a replay, never state: every entry is derived from a
+%% durable delta or checkpoint.
 replay_put(Key, Slot, Msg, Opts) ->
     Window = hb_util:int(
         hb_opts:get(<<"process-replay-cache-slots">>,
             ?DEFAULT_REPLAY_CACHE_SLOTS, Opts)
     ),
-    Limit = hb_util:int(
-        hb_opts:get(<<"process-replay-cache-limit">>,
-            ?DEFAULT_REPLAY_CACHE_LIMIT, Opts)
+    LimitMB = hb_util:int(
+        hb_opts:get(<<"process-replay-cache-mb">>,
+            ?DEFAULT_REPLAY_CACHE_MB, Opts)
     ),
     case Window > 0 of
         false -> ok;
         true ->
-            % A flush costs replays and never correctness, so the global bound
-            % is enforced bluntly rather than by tracking insertion order.
-            case ets:info(?REPLAY_CACHE, size) of
-                Size when is_integer(Size), Size >= Limit ->
-                    ets:delete_all_objects(?REPLAY_CACHE);
-                _ -> ok
+            % A flush drops every process's window at once, so the bound is
+            % set where it is reached rarely. It costs replays, never state.
+            Held =
+                case ets:info(?REPLAY_CACHE, memory) of
+                    Words when is_integer(Words) ->
+                        Words * erlang:system_info(wordsize);
+                    _ -> 0
+                end,
+            case Held >= LimitMB * 1048576 of
+                true -> ets:delete_all_objects(?REPLAY_CACHE);
+                false -> ok
             end,
             ets:insert(?REPLAY_CACHE, {{Key, Slot}, Msg}),
             Oldest = Slot - Window + 1,

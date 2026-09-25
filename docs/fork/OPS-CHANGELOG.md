@@ -37,6 +37,70 @@ Audit that motivated these changes:
 
 ---
 
+## 2026-09-25 - 5. Historical slot reads: replay cache
+
+Commits `0025c376c` (match index) and `2a866ea2c` (replay cache). Images
+`runerealm-hb:crt-matchindex-v1` then `runerealm-hb:replay-cache-v1`. Rollback
+tags `rollback-pre-crt-matchindex-v1` and `rollback-pre-replay-cache-v1`.
+
+**Symptom:** under load, `compute&slot=N/results/output/data` reads for
+historical slots took 103-105 s (n=22, mean 72 s), all returning 200. Writes and
+pushes were unaffected, there was no backlog, and no errors.
+
+**Confirmed by experiment**, against a process with its head at 10806 and a
+checkpoint at 9000 - service time is linear in distance past the checkpoint:
+
+```
+slot 9001 (  1 delta )   0.22 s
+slot 9005 (  5 deltas)   0.59 s
+slot 9020 ( 20 deltas)   2.36 s
+slot 9060 ( 60 deltas)   8.08 s
+slot 9120 (120 deltas)  12.90 s        -> ~107-135 ms per delta
+```
+
+Extrapolated to a slot just before the next checkpoint (999 deltas) that is
+~107 s, which is the observed tail. The same table shows `process-snapshot-slots`
+is dead for these processes: slot 9060 cost 60 steps, not the 10 it would have
+cost if a checkpoint existed at 9050. `dev_process.erl:619` routes any
+delta-bearing result - which `lua@5.3b` always produces - to
+`should_snapshot_delta_slots/2`, which reads only
+`process-delta-checkpoint-slots`. That key is unset, so the compiled default of
+1000 applies and the configured 50 and 900 never execute.
+
+**Cause:** `recent_put/5` anchors its retention window to the head of the
+process, so the states a historical replay rebuilds are all below the window and
+were discarded as fast as they were built. Nine near-consecutive slots requested
+together each replayed the same chain from the same checkpoint.
+
+**Fix:** `replay_put/4` keeps those states in a window that follows the slot
+being rebuilt. Measured on the deployed build:
+
+```
+before:  cold 12060 = 12.13 s  ->  neighbour 12059 =  9.01 s
+         cold 12160 = 31.00 s  ->  neighbour 12159 = 25.99 s
+after :  cold 12560 = 16.35 s  ->  neighbour 12559 =  0.04 s
+```
+
+**Rejected alternative:** checkpointing more often. At the measured state size,
+moving the cadence from 1000 to 64 slots takes a single process from ~10 GiB/day
+to ~162 GiB/day, against a whole-node figure of ~30 GiB/day. That trades the
+storage problem for the latency one.
+
+**Known limit:** a first read into a cold region is unchanged, 16-31 s. Only
+repeated walks are removed.
+
+**Follow-up in the same work:** the global bound was initially a count of 1024
+entries. Live introspection showed 290 entries holding 96 MB - ~331 KB each -
+so a count bounds memory only by accident, and reaching it flushed every
+process's window at once. The bound now counts bytes
+(`process-replay-cache-mb`, default 512).
+
+**Rollback:** redeploy `rollback-pre-replay-cache-v1`, or revert the commit and
+rebuild. The cache is derived entirely from durable deltas and checkpoints, so
+there is no state migration either way.
+
+---
+
 ## 2026-09-25 - 4. Deploy script: swap ban and a stale image default
 
 `/opt/runerealm-hb/hb-prod.sh` (out of tree; backup
