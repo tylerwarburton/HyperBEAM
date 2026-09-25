@@ -10,7 +10,7 @@
 
 -module(hb_persistent).
 -export([start_monitor/0, start_monitor/1, stop_monitor/1]).
--export([find_or_register/3, unregister_notify/4, await/4, notify/4]).
+-export([find_or_register/3, unregister_notify/4, await/5, notify/4]).
 -export([group/3, start_worker/3, start_worker/2, forward_work/2]).
 -export([default_grouper/3, default_worker/3, default_await/5]).
 -include("include/hb.hrl").
@@ -103,6 +103,11 @@ do_monitor(Group, Last, Opts) ->
 %% explicitly disabled (the common case for internal/recursive resolves) we
 %% skip the grouper dispatch entirely: the leader short-circuit below would
 %% discard the computed group name anyway.
+%%
+%% A `wait' carries the group name the leader is registered under. The grouper
+%% answers from mutable state -- the process device's grouper reads the result
+%% cache -- so a name derived again elsewhere can differ, and a worker cannot
+%% serve a request enqueued under a name it does not hold.
 find_or_register(_Base, _Req, #{ <<"await-inprogress">> := false }) ->
     {leader, ungrouped_exec};
 find_or_register(Base, Req, Opts) ->
@@ -117,7 +122,7 @@ find_or_register(GroupName, _Base, _Req, Opts) ->
             case find_execution(GroupName, Opts) of
                 {ok, Leader} when Leader =/= Self ->
                     ?event({found_leader, GroupName, {leader, Leader}}),
-                    {wait, Leader};
+                    {wait, Leader, GroupName};
                 {ok, Leader} when Leader =:= Self ->
                     {infinite_recursion, GroupName};
                 _ ->
@@ -129,7 +134,7 @@ find_or_register(GroupName, _Base, _Req, Opts) ->
                             ?event({register_race_lost, {group, GroupName}}),
                             case find_execution(GroupName, Opts) of
                                 {ok, Leader} when Leader =/= Self ->
-                                    {wait, Leader};
+                                    {wait, Leader, GroupName};
                                 _ ->
                                     {leader, GroupName}
                             end
@@ -192,8 +197,10 @@ unregister_groupname(Groupname, _Opts) ->
 
 %% @doc If there was already an Erlang process handling this execution,
 %% we should register with them and wait for them to notify us of
-%% completion.
-await(Worker, Base, Req, Opts) ->
+%% completion. `GroupName' is the name the caller found or registered the
+%% worker under: it is the only name that worker's `receive' matches, and the
+%% grouper answers from mutable state, so it cannot be derived here instead.
+await(Worker, GroupName, Base, Req, Opts) ->
     % Get the device's await function, if it exists.
     AwaitFun =
         hb_maps:get(
@@ -202,9 +209,6 @@ await(Worker, Base, Req, Opts) ->
             fun default_await/5,
 			Opts
         ),
-    % Calculate the compute path that we will wait upon resolution of.
-    % Register with the process.
-    GroupName = group(Base, Req, Opts),
     % set monitor to a worker, so we know if it exits
     _Ref = erlang:monitor(process, Worker),
     Worker ! {resolve, self(), GroupName, Req, Opts},
@@ -668,3 +672,41 @@ await_registration(GroupName, Retries) ->
             await_registration(GroupName, Retries - 1);
         PID -> PID
     end.
+
+%% @doc The name a waiter enqueues under must be the name the worker it found
+%% registered under. A grouper answers from mutable state -- the process
+%% device's grouper reads the result cache -- and the resolver strips the
+%% temporary options before it picks a worker, so a name derived a second time
+%% can differ. No `receive' in the worker can match a name it does not serve,
+%% so the request is enqueued forever and the client hangs.
+await_enqueues_under_registered_group_test() ->
+    start(),
+    GroupName = {?MODULE, make_ref()},
+    Grouper =
+        fun(_Base, _Req, GrouperOpts) ->
+            case hb_maps:is_key(<<"force-message">>, GrouperOpts) of
+                true -> ungrouped_exec;
+                false -> GroupName
+            end
+        end,
+    Base = #{ <<"device">> => test_device(#{ grouper => Grouper }) },
+    Opts =
+        #{
+            <<"static-worker">> => true,
+            <<"hashpath">> => ignore,
+            <<"worker-timeout">> => 30000,
+            <<"force-message">> => true
+        },
+    Worker = start_worker(GroupName, Base, Opts),
+    ?assertEqual(Worker, await_registration(GroupName, 100)),
+    Ref = spawn_test_client(Base, #{ <<"path">> => <<"increment">> }, Opts),
+    receive
+        {result, Ref, Res} ->
+            ?assertMatch({ok, _}, Res),
+            {ok, Msg} = Res,
+            ?assertEqual(1, hb_maps:get(<<"count">>, Msg, not_found, Opts))
+    after 2000 ->
+        {messages, Stuck} = erlang:process_info(Worker, messages),
+        erlang:error({request_hung, {group, GroupName}, {mailbox, Stuck}})
+    end,
+    exit(Worker, normal).

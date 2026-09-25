@@ -475,15 +475,15 @@ resolve_stage(4, Base, Req, Opts) ->
                     ?event(worker_spawns, {will_delegate, ExecName}),
                     Worker = hb_persistent:start_worker(ExecName, Base, Opts),
                     hb_persistent:forward_work(Worker, Opts),
-                    await_or_retry(Worker, Base, Req, Opts);
+                    await_or_retry(Worker, ExecName, Base, Req, Opts);
                 _ ->
                     resolve_stage(5, Base, Req, ExecName, Opts)
             end;
-        {wait, Leader} ->
+        {wait, Leader, GroupName} ->
             % There is another executor of this resolution in-flight.
             % Bail execution, register to receive the response, then
             % wait.
-            await_or_retry(Leader, Base, Req, Opts);
+            await_or_retry(Leader, GroupName, Base, Req, Opts);
         {infinite_recursion, GroupName} ->
             % We are the leader for this resolution, but we executing the 
             % computation again. This may plausibly be OK in _some_ cases,
@@ -512,9 +512,11 @@ resolve_stage(4, Base, Req, Opts) ->
 %%
 %% Both an already-resident worker and the worker created by a new leader use
 %% this path. A successful response has already completed the inner resolution,
-%% so it returns directly to the outer wrapper.
-await_or_retry(Worker, Base, Req, Opts) ->
-    case hb_persistent:await(Worker, Base, Req, Opts) of
+%% so it returns directly to the outer wrapper. `GroupName' is the name the
+%% owner is registered under, carried from the lookup above: it is the only
+%% name that worker's `receive' can match.
+await_or_retry(Worker, GroupName, Base, Req, Opts) ->
+    case hb_persistent:await(Worker, GroupName, Base, Req, Opts) of
         {error, leader_died} ->
             ?event(
                 ao_core,

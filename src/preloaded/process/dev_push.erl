@@ -433,12 +433,45 @@ outbox_entries(Outbox, Opts) ->
     % carries signatures that can no longer be verified downstream.
     Entries =
         hb_maps:fold(
-            fun(Key, Msg, Acc) -> maps:put(hb_util:to_lower(Key), Msg, Acc) end,
+            fun(Key, Msg, Acc) ->
+                maps:put(
+                    hb_util:to_lower(Key),
+                    normalize_entry_target(Msg, Opts),
+                    Acc
+                )
+            end,
             #{},
             Normalized,
             Opts
         ),
     hb_maps:without(?OUTBOX_NON_ENTRY_KEYS, Entries, Opts).
+
+%% @doc Give an entry the lower-case `target' that the push path dispatches and
+%% reads on. A legacy AO process names the key `Target', and `hb_ao:get/4'
+%% lowers the key it is asked for but not the keys it searches, so such an entry
+%% matches no clause of the push walk and is answered `Target process not
+%% available.' without ever being delivered. Rename only that key: every other
+%% field is payload that the recipient reads under the name its sender chose.
+%% Fold with `hb_util_string:lowercase/1' rather than `hb_util:to_lower/1': a
+%% process names its own fields, `to_lower' throws on a name that is not valid
+%% UTF-8, and one such name would abort delivery of the whole outbox. `target'
+%% is ASCII, so the two agree on every key that can match.
+normalize_entry_target(Msg, Opts) when is_map(Msg) ->
+    maybe
+        false ?= hb_maps:is_key(<<"target">>, Msg, Opts),
+        [Key] ?=
+            [
+                K
+            ||
+                K <- hb_maps:keys(Msg, Opts),
+                is_binary(K),
+                hb_util_string:lowercase(K) == <<"target">>
+            ],
+        maps:put(<<"target">>, maps:get(Key, Msg), maps:remove(Key, Msg))
+    else
+        _ -> Msg
+    end;
+normalize_entry_target(Msg, _Opts) -> Msg.
 
 %% @doc Find the process an outbox entry targets. Most targets of a token,
 %% vault or pair are wallets (Credit-Notice, Debit-Notice), which are not
@@ -2411,6 +2444,39 @@ outbox_entries_preserve_entry_commitment_ids_test() ->
     Entries = outbox_entries(Outbox, #{}),
     ?assertEqual([<<"mint">>], maps:keys(Entries)),
     Entry = maps:get(<<"mint">>, Entries),
+    ?assertEqual(
+        [CommitmentID],
+        maps:keys(maps:get(<<"commitments">>, Entry))
+    ).
+
+%% @doc A legacy AO process names its outbox entry's target `Target'. The push
+%% walk dispatches on a lower-case `target' and `hb_ao:get/4' lowers only the
+%% key it is given, so an entry that keeps the capitalised spelling is answered
+%% with a 404 and never delivered. Such an entry is dispatchable, carries one
+%% spelling of the key downstream, and is otherwise untouched: its payload
+%% fields keep the case its sender chose, and its `commitments' keep their
+%% case-sensitive base64url IDs.
+outbox_entries_normalizes_legacy_target_key_test() ->
+    CommitmentID = <<"aXnLbjnJtgIsjZXS3hSqNLaj2okwHy3N7A1ZpogrnVI">>,
+    Outbox =
+        #{
+            <<"1">> =>
+                #{
+                    <<"Target">> => <<"target-process-id">>,
+                    <<"Action">> => <<"Ping">>,
+                    <<"Ta", 16#FF, "g">> => <<"raw">>,
+                    <<"commitments">> =>
+                        #{
+                            CommitmentID =>
+                                #{ <<"type">> => <<"rsa-pss-sha512">> }
+                        }
+                }
+        },
+    Entry = maps:get(<<"1">>, outbox_entries(Outbox, #{})),
+    ?assertMatch(#{ <<"target">> := <<"target-process-id">> }, Entry),
+    ?assertNot(maps:is_key(<<"Target">>, Entry)),
+    ?assertEqual(<<"Ping">>, maps:get(<<"Action">>, Entry)),
+    ?assertEqual(<<"raw">>, maps:get(<<"Ta", 16#FF, "g">>, Entry)),
     ?assertEqual(
         [CommitmentID],
         maps:keys(maps:get(<<"commitments">>, Entry))

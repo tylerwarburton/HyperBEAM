@@ -536,7 +536,7 @@ worker_keeps_live_vm_after_cached_read_test_() ->
         Group = hb_util:human_id(hb_message:id(Process, all, Opts)),
         Worker = wait_for_worker(Group, 50),
         % Ask the live worker for a slot it has already computed, exactly as
-        % `hb_persistent:await/4' does for a request grouped before the slot
+        % `hb_persistent:await/5' does for a request grouped before the slot
         % reached the cache.
         Worker ! {
             resolve,

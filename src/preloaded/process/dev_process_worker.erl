@@ -165,10 +165,9 @@ read_slot(Req, Default, Opts) ->
 %% of a `function_clause' on the FIRST request it was ever given, so a worker
 %% was spawned, sent one job, and killed by it -- never reused, while its
 %% waiter took a `DOWN' and re-ran the resolution itself. And once a worker did
-%% survive, `compute_group/3' -- reached from `hb_persistent:await/4', which
-%% unlike `find_or_register/3' does NOT strip the temporary options before
-%% calling the grouper -- died the same way, turning every read that found a
-%% live worker into a 500.
+%% survive, `compute_group/3' died the same way whenever it was called with
+%% caller options that `find_or_register/3' had not stripped, turning every
+%% read that found a live worker into a 500.
 slot_read_opts(Opts) ->
     Opts#{ <<"force-message">> => false }.
 
@@ -432,12 +431,12 @@ slot_read_survives_forced_message_test() ->
     ?assertEqual(any, slot_number(any)),
     ?assertEqual(not_found, slot_number(not_found)).
 
-%% @doc Regression: `hb_persistent:await/4' calls the grouper with the FULL
-%% caller options -- unlike `find_or_register/3', which strips the temporary
-%% ones first. So `compute_group/3' saw `force-message' where the register path
-%% never did, and every read that found a live worker died there instead of
-%% waiting on it. The 500 was served in 4 ms, so the client simply retried, and
-%% the round trip became the client's backoff rather than the node's work.
+%% @doc Regression: a grouper called with the FULL caller options -- rather
+%% than the ones `find_or_register/3' strips -- saw `force-message' where the
+%% register path never did, so `compute_group/3' died there and every read that
+%% found a live worker was answered with a 500 instead of waiting on it. That
+%% 500 was served in 4 ms, so the client simply retried, and the round trip
+%% became the client's backoff rather than the node's work.
 grouper_survives_forced_message_test() ->
     test_init(),
     Opts =
