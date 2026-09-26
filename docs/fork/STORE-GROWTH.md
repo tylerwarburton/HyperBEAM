@@ -500,3 +500,116 @@ shrinks), though the pages return to the free list and are reused.
 slow requests. Sampling the reader table over 48 s, with p99 reads at 14 s and a max of
 31.5 s in flight, found no reader in a transaction at any point. `hb_store_lmdb` uses
 short per-operation transactions, so slow reads do **not** inflate growth.
+
+## 15. Where the space really goes, and a retention planner (2026-09-26)
+
+Section 14 claimed "~94% derived" from an entries-per-write ratio. Direct
+measurement on the 149 GiB corpus refines that materially. **[M]**
+
+### Anatomy of a slot
+
+Sampling one busy process (`ZZUNq5...`, 64,601 slots):
+
+| slot | bytes | kind |
+|---|---|---|
+| 60000 | 21,429,945 | checkpoint |
+| 60001 | 24,320 | delta |
+| 60010 | 9,031 | delta |
+| 60100 | 11,719 | delta |
+| 61000 | 22,455,773 | checkpoint |
+| 63000 | 24,146,646 | checkpoint |
+| 64595 | 8,686 | delta |
+
+Checkpoints land every `process-delta-checkpoint-slots` (default 1000). Inside
+a 24.1 MB checkpoint, by top-level field:
+
+| field | bytes |
+|---|---|
+| `snapshot` | **18,876,953** (78%) |
+| `process` | 502,852 |
+| `module` | 500,603 |
+| `economystate` | 178,802 |
+| `economy` | 54,470 |
+| `leaderboard` | 22,133 |
+| `factions` | 16,131 |
+| (1,629 fields total) | |
+
+`snapshot` is `#{<<"body">> => Binary}` -- a single opaque Lua VM image. It is
+**not compressible** (gzip returns 99% of input) and shares **nothing** between
+consecutive checkpoints (zero identical values between slots 63000 and 64000).
+The actual game state -- players, economy, leaderboard, factions -- is under
+1 MB. The 1,629 fields are what explode into LMDB rows.
+
+### Corpus totals
+
+370 processes, 357 with slots, **1,985,934 computed slots** and 1,985,957
+assignment slots -- **1:1**, one computed state per assignment.
+
+| | pages | size |
+|---|---|---|
+| leaf | 25.2M | **96.6 GiB** |
+| overflow | 7.2M | **27.6 GiB** |
+| branch | 0.75M | 2.9 GiB |
+| free | 5.9M | 21.8 GiB |
+| **live** | | **127.1 GiB** |
+
+So roughly **23% VM snapshots** (the overflow pages) and **~73% delta
+field-explosion** (the leaf pages): ~48 KB of leaf pages per slot to hold
+~12 KB of logical delta, across ~325 rows of ~160 bytes.
+
+### `hb_store_gc:plan/2`
+
+New module, planning only -- it writes and deletes nothing, because **no delete
+primitive exists anywhere in the stack**. Enacting a plan means copying the
+retained set to a new store and swapping.
+
+Policy: retain every slot within `keep_recent` of the head (contiguously --
+the chain is backward-linked and `dev_process_cache` hard-matches, so a hole
+makes reads fail rather than degrade), plus one anchor every `anchor_every`
+slots below it.
+
+Against the corpus at `keep_recent = 1000`, `anchor_every = 10000`:
+
+| quantity | value | confidence |
+|---|---|---|
+| slots counted | 1,985,934 | **exact** |
+| slots retained | 202,502 | **exact** |
+| slots dropped | **1,783,432 (89.8%)** | **exact** |
+| checkpoints retained / dropped | 651 / 1,584 | **exact** |
+| bytes reclaimable | **~79%** (39 of 49 GiB logical) | projected |
+
+**The slot figures are counted; the byte figure is projected** from a sampled
+mean checkpoint size and must not be quoted as measured.
+
+### Unresolved discrepancy -- do not treat the byte projection as settled
+
+Projected logical total is 49 GiB against a 127.1 GiB live store, i.e. 2.6x
+on-disk amplification, which is consistent with 64.2% leaf fill plus ~160 B of
+overhead per small entry. But **overflow pages are 27.6 GiB while the sampled
+checkpoint mean (7.9 MB x 2,235 checkpoints, 78% snapshot) implies only
+~13.8 GiB of snapshots -- a 2x gap.** Either there are more checkpoints than
+the 1000-slot cadence implies, some processes checkpoint on a different
+cadence, or large `results` values also land in overflow. Resolve this before
+anyone sizes hardware or a retention window on the byte figure.
+
+### Estimator traps hit while building this
+
+- **Classifying checkpoints by the retention anchor rather than the writer's
+  cadence** priced ~1,600 real 24 MB checkpoints as 12 KB deltas and inflated
+  the corpus projection to 252 GB -- 1.7x the store's actual size. The writer's
+  cadence is not a policy choice; `project/4` now takes it separately.
+- **Sampling blind and splitting on a size threshold** let checkpoints
+  contaminate the delta mean. Sample the two kinds separately.
+- **Sampling checkpoints per process** is ~34 GB of reads and never finishes;
+  one global mean suffices. But **sampling the first few processes in list
+  order** gave a 5.7 MB mean against 14-24 MB measured on a large process --
+  list order is small processes first. Sample the *largest* processes: the mean
+  tracks game-state size and the big processes hold most of the bytes.
+- `hb_cache` writes to a second LMDB store silently persist nothing unless that
+  store's flush worker is started; `{ok, _}` is returned regardless.
+- `hb_opts:default_message()` carries no store, so cache listings return `[]`
+  and look like an empty store. Pass the LMDB store explicitly; the node's
+  configured `store` is a *list* (LMDB, then fs, then arweave/gateway) and the
+  latter two make remote calls.
+- The release runs in **embedded** mode, so `code:add_patha/1` returns
+  `{error, embedded}`. Load test modules with `code:load_binary/3`.
