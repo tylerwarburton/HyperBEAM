@@ -20,8 +20,26 @@ mdb_stat -ef, 2026-09-25 17:37 UTC                                        [M]
 
 - **1,459,788 slots across 343 processes** (max 121,542 on one), confirmed five
   independent ways. **350.5 entries and 69.8 KiB of file per slot.** **[M]**
-- Growth: **~38 GiB/day** long-run, ~88 GiB/day loaded, ~0.2 GiB/day idle. **[M]**
-- Runway on 419 G free: **~11 days at average, ~5 days loaded.** **[M]/[E]**
+- Growth: **~38 GiB/day** long-run average, **~0.2 GiB/day** idle, and **85-99
+  GiB/day under a 1,000-wallet load** measured on 2026-09-26. **[M]**
+- Runway on 411 G free: ~11 days at the long-run average, **~4 days under load.** **[M]**
+
+**The load figure changes what the compactor is for.** At 38 GiB/day the full
+compactor (97 -> ~40 GiB) buys months and lever 1 alone buys ~9 days. At 89
+GiB/day lever 1 buys **~7 hours** and the full compactor buys ~7 days.
+Compaction cannot keep pace with sustained load: it is a one-off reclaim, not a
+rate change. At this load level the archival decision in §8 is not the
+follow-up to compaction, it is the prerequisite.
+
+Isolated by measuring components separately over 90 s **[M]**: `store/lmdb`
+88.73 GiB/day against a filesystem loss of 99.48 GiB/day, so the LMDB store is
+**89%** of it and everything else 11%. Most of that remainder is `cache-http`
+under `store-all-signed: true`, which has **213,148 top-level directories**.
+Disabling that key is the only lever here that needs no build -- but note the
+audit found ~95% of POSTs carry `codec-device=ans104@1.0` and never reach the
+write site, so the real yield may be well under 11%, and `dev_auth_hook` is a
+second consumer writing to the **main** store with a test asserting
+recallability.
 - **There is no bloat in the free list.** 195,498 free pages is 0.77%; a
   `mdb_copy -c` recovers ~800 MB and is not worth running. **[M]**
 
