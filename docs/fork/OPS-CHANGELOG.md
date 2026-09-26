@@ -293,3 +293,47 @@ now `outbox-full-v1`.
 lines). Precise extraction on the status field shows **zero 429s**; the node's
 own limiter reporting 8245/8245 allowed was correct. Incidental `451`/`444`
 responses are WordPress-scanner background noise.
+
+### 2026-09-26 -- deploy `rewind-v2`: rewind fallback live
+
+**Change.** Built and deployed `runerealm-hb:rewind-v2` carrying
+`dev_process:rewind/4` (restart from the newest snapshot at or below a target
+slot instead of throwing `already_calculated_slot`) and `hb_store_gc`.
+`hb-prod.sh` default updated `outbox-full-v1` -> `rewind-v2`.
+
+**Result.** Up in 6 s. `match-index: false`, `swap.max = 0`, rewind present in
+the preloaded store, 33,150 entries intact. Five-minute watch: 0 restarts,
+RssAnon flat 118-126 MB, meta 200 in ~50 ms.
+
+**Rollback.** Set `IMAGE="${HB_IMAGE:-runerealm-hb:outbox-full-v1}"` in
+`/opt/runerealm-hb/hb-prod.sh` and `hb-prod.sh recreate`. Verified working: that
+exact rollback restored service in 6 s during this deploy.
+
+**Build gotcha -- preloaded devices are NOT in the release ebin.** `dev_process`
+is a preloaded device: it is compiled into the build-signed
+`_build/preloaded-store/data.mdb` and loaded at runtime as
+`'_hb_device_..._process'`, so `find ... -name dev_process.beam` returns nothing
+and checking ebin proves nothing. Verify a device change shipped by grepping the
+preloaded store for a marker from the new code, e.g.
+`strings /app/_build/preloaded-store/data.mdb | grep -c rewinding_to_earlier_slot`
+(old image: 0, new: 1). `rebar3 as rocksdb,genesis_wasm release` does rebuild it.
+
+**Caused ~7 minutes of downtime.** The image was committed from a container
+started with `--entrypoint sleep ... infinity`, and `docker commit` preserves the
+ENTRYPOINT, so the node ran `sleep /app/.../hb foreground` and crash-looped.
+`docker commit -c 'ENTRYPOINT []'` does **not** clear it (the committed image
+still showed `entrypoint=[sleep]`). A real `Dockerfile` with `ENTRYPOINT []` does.
+**Rules:** never build a deploy image by committing a container whose entrypoint
+was overridden; diff `docker inspect --format '{{.Config.Entrypoint}}
+{{.Config.Cmd}}'` against the known-good image before deploying; and smoke-test
+the image on a spare port first -- doing so afterwards caught the fix in 6 s
+without touching prod.
+
+**Pre-existing bug surfaced by the wipe (NOT introduced here).** A request for a
+process absent from the store returns **500 after ~96 s**:
+`hb_ao:ensure_message_loaded/2` (`hb_ao.erl:936`) `case_clause`s on
+`{error, not_found}`, and the ~96 s is the configured store list reaching
+`hb_store_arweave`/`hb_store_gateway` and hunting arweave.net first. Live
+processes answer in 0.003 s. Anything still polling a wiped process ID burns a
+worker for ~96 s per request. Not fixed: `dev_process` was patched, the fault is
+in the core resolver.
