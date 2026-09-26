@@ -273,3 +273,50 @@ asymptote.
 - Metrics cardinality: 10,205 unbounded `system_monitor_long_schedule_total`
   series dominate the scrape. Bound the MFA label before attaching any periodic
   scraper.
+
+---
+
+## 12. Note: the slot-draining verdict needs revisiting
+
+Not a storage matter, recorded here because it is the other half of the
+performance picture and the spec that concluded it is not in this repo.
+
+A research fleet concluded **"do not build slot draining"** on the grounds that
+its benefit class -- two or more requests queued simultaneously naming *distinct
+uncached slots above `at-slot`* -- was empty: it measured **matchable queue depth
+0**, 4 resident messages node-wide, and all 4 unmatchable (`ungrouped_exec` atom
+against a worker bound to a binary name).
+
+**Measured under real load on 2026-09-26, that premise is inverted [M]:**
+
+```
+worst single worker mailbox        1,220 (later 1,169, 1,050, 968)
+message shapes, 200 sampled        200/200 matchable_binary
+distinct slots, 200 sampled        200/200
+queued slot range                  14,733 - 15,033
+process at-slot                    14,732     <- every queued slot is AHEAD
+```
+
+Every queued request is for a slot the worker must still compute, every one is
+matchable, and every one names a distinct slot. That is exactly the stated
+benefit class, 1,000+ deep.
+
+Two reasons the original measurement came back empty:
+
+1. It sampled an **idle** node. The condition only exists under load.
+2. The unmatchable `ungrouped_exec` messages it *did* find were the
+   `hb_persistent:await/4` group-name defect, since fixed in `fcb314ed7`. With
+   that fixed, queued messages are matchable -- which is the precondition the
+   drain needs.
+
+Also worth recording, because it was misdiagnosed twice in one hour: **the
+bottleneck here is serialization, not CPU.** At the moment of the 1,220-deep
+mailbox, schedulers were 96-99% with run queue 44; twenty minutes later, with a
+968-deep mailbox, they were **48% with run queue 0**. The queue persists across
+both, because a single Erlang process occupies at most one scheduler regardless
+of how many are free. Raising or lowering `push-max-workers` does not move it.
+
+**Before building it, re-read the original spec's do-not list.** Its guards were
+derived carefully and remain valid -- particularly that a push-bearing request
+drained as a non-max member loses its outbox dispatch, which is the same class of
+silent loss this node already had. The verdict was wrong; the guards were not.
