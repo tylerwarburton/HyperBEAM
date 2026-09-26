@@ -264,3 +264,32 @@ available. The node stayed up and served 200s at 50-64 ms throughout.
 
 **Rollback:** none - deletion is irreversible. The data was a superseded copy of
 state that `store/lmdb` holds current. Accepted deliberately.
+
+### 2026-09-26 -- store wipe, restore, and `match-index: false` retained
+
+**Change.** Moved the 104 GiB LMDB store aside, ran the node on an empty store
+to measure `match-index: false` in isolation, found the node non-functional
+(process definitions were wiped with the history), and restored the original
+store. `match-index: false` kept in `node-config.json`.
+
+**Result.** Node healthy on the restored store: `/now/*` 200 at 19-23 ms,
+ZZUNq5 computed slot advancing past its pre-wipe head, eN7t at its pre-wipe
+24135. Growth 59.13 GiB/day at 10.4 writes/s = 68.3 KiB/write. ~6.9 days disk.
+
+**Rollback.** `match-index: false` -> `true` in
+`/opt/runerealm-hb/config/node-config.json` then `hb-prod.sh recreate`
+(config is read once at boot). The wipe itself is already rolled back; the
+empty store is kept at `/opt/runerealm-hb/store/lmdb.FRESH-TEST-20260926T053113Z`
+(86 MiB) and can be deleted.
+
+**Deploy footguns re-confirmed.** `hb-prod.sh start` after `stop` fails because
+the stopped container still holds the name -- only `recreate` removes it. And
+`recreate` without `HB_IMAGE` set uses the script's default, which had gone
+stale again and silently reverted the node to `outbox-detached-v1`; default is
+now `outbox-full-v1`.
+
+**Corrected earlier claim.** A reported burst of 429s was a grep artifact
+(matching the bare string `429`, which hits `duration:` and `body_size:` in log
+lines). Precise extraction on the status field shows **zero 429s**; the node's
+own limiter reporting 8245/8245 allowed was correct. Incidental `451`/`444`
+responses are WordPress-scanner background noise.

@@ -338,3 +338,74 @@ of how many are free. Raising or lowering `push-max-workers` does not move it.
 derived carefully and remain valid -- particularly that a push-bearing request
 drained as a non-max member loses its outbox dispatch, which is the same class of
 silent loss this node already had. The verdict was wrong; the guards were not.
+
+## 13. Wipe experiment and the corrected verdict (2026-09-26)
+
+**[M] = measured this session. The store was wiped and then restored; both
+halves of that are recorded here because the wipe's numbers are misleading.**
+
+### What the wipe showed, and why its headline number was wrong
+
+With `match-index: false` on an **empty** store the node grew **16.1 GiB/day**
+against an **85-99 GiB/day** loaded baseline. That 83% figure must not be
+quoted: it conflates two changes. A fresh store writes sequentially into a
+depth-4 tree at near-perfect leaf fill; the old store was depth 6 at 64.2%
+fill. Most of the improvement was the empty tree, not the index.
+
+The fix *is* active, and that part is solid: a full dump of all 562,669 keys on
+the fresh store found **zero `~match@1.0` keys**.
+
+### The wipe broke the node and does not self-heal
+
+Wiping took the **process definitions** along with the history, so processes
+could not be computed at all -- there was nothing to rebuild *from*. `/now/*`
+returned 500 for every process. The store was restored from
+`lmdb.WIPED-20260926T053113Z` and the node recovered fully.
+
+**A wipe is therefore not a growth strategy.** Any retention scheme must keep
+each process's definition and a contiguous delta chain from a checkpoint
+(see §5 on `latest_from_store/4` hard-matching).
+
+### Corrected steady-state figures on the restored store
+
+Measured over a clean 241 s window under live load, `match-index: false`:
+
+| quantity | value |
+|---|---|
+| growth | **59.13 GiB/day** |
+| scheduled writes | 10.4/s (2,530 POSTs, all 200) |
+| cost per scheduled write | **68.3 KiB** |
+| disk headroom | 409.5 GiB free = **~6.9 days** |
+
+`68.3 KiB/write` is *total* store growth per write -- assignment plus computed
+state plus deltas. It is not comparable to the assignment-only 65 -> 46 KiB/slot
+figure in §7; the assignment is only a slice of it.
+
+### The verdict that matters
+
+**`match-index: false` trims growth; it does not stop it.** It removes a
+derived structure no reader needs, and that is worth keeping, but the dominant
+per-slot cost is state and delta writes. At 59 GiB/day the node has ~7 days of
+disk.
+
+Growth cannot be *stopped* by any config flag. It needs the compactor plus an
+**archival decision**, and that decision is not an engineering choice: the node
+is the sole custodian of the signed assignment chain
+(`scheduler-publish-remote: false`, no uploaders, `store-arweave` empty). Until
+those assignments are published somewhere, deleting them destroys the only copy.
+
+### Measurement traps hit while producing the above
+
+- `~scheduler@1.0/slot` and `GET ~scheduler@1.0/schedule` return **500**;
+  `status` and all of `~process@1.0/*` return 200. The throw is in
+  `lib_process:verified_id/3` via `dev_scheduler:find_target_id/3` -- process-ID
+  *verification*, not a match/index lookup, so it is **unrelated to
+  `match-index: false`**. POST `/schedule` succeeds 2,530/2,530, so the write
+  path resolves the same process. No client uses the GET form; all 22 such 500s
+  were from this session's own probes. Pre-existing, left as a TODO.
+- Scraping a slot number out of that 500 page yields digits from the arweave
+  icon URLs in the HTML, which produced a bogus "slots +0" reading and a false
+  conclusion that growth was not slot-driven. **Parse slot counts only from a
+  200, or count schedule POSTs from the log instead.**
+- GiB/day is not comparable across load rates. Normalize to bytes per
+  scheduled write.
