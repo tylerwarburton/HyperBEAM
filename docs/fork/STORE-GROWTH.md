@@ -409,3 +409,94 @@ those assignments are published somewhere, deleting them destroys the only copy.
   200, or count schedule POSTs from the log instead.**
 - GiB/day is not comparable across load rates. Normalize to bytes per
   scheduled write.
+
+## 14. Where the space actually is (2026-09-26)
+
+Answering the operator's question directly: *what are assignments for, where is the
+space, and what is needed?*
+
+### The model is correct
+
+Keep (a) process definitions, (b) all messages **and their assignments**, (c) periodic
+checkpoints -- and every intermediate state is rebuildable. An **assignment** is the
+scheduler's small signed statement binding *message -> slot -> process* with a
+hash-chain link to slot N-1. It is not the message; it is the **ordering commitment**,
+and it is the part that makes this a chain rather than a database. Assignments are
+therefore **ledger, not garbage**: they are never the thing to delete.
+
+An earlier session note framed the blocker as "decide whether to archive old
+assignments." **That was the wrong question** -- it asked whether to discard the chain.
+The right question is how much of what we write is ledger versus derived.
+
+### Measured composition of the 148.8 GiB store
+
+From `mdb_stat -ef` (reliable, whole-store):
+
+| | pages | size | note |
+|---|---|---|---|
+| leaf | 25,218,193 | **96.2 GiB** | 645.4M entries, mean **~160 B/entry** |
+| overflow | 7,177,989 | **27.4 GiB** | values > ~2 KB: Lua snapshots, computed states |
+| branch | 751,912 | 2.9 GiB | b-tree interior, depth 6 |
+| free pages | 5,858,977 | **22.3 GiB** | reusable; file never shrinks |
+
+**The space is not in big state blobs.** Those are the 27.4 GiB of overflow. It is in
+**645 million ~160-byte rows** filling 96 GiB of leaf pages.
+
+### The decisive ratio
+
+Measured under load (2,491 scheduled writes, entries +710,834):
+
+> **285 LMDB entries per single scheduled game message.**
+
+A message explodes into roughly 8 entries (one per field, plus group markers and
+`link:` rows), so an assignment + message is order **16** entries. The remaining
+**~269 of 285 -- about 94% -- is derived**: computed state fields, delta envelopes,
+group markers and `link:` rows.
+
+This metric is immune to page reuse (it counts entries, not file bytes), which is why
+it is the one to trust.
+
+### What this changes
+
+**No archival decision is required to win most of this back.** The ledger is a small
+minority of what we store. The lever is to stop writing, and to GC, the derived
+material -- exactly the operator's model: keep definitions + messages + assignments +
+checkpoints, mark-and-sweep everything else.
+
+### Sampling caveat -- do not quote link/group percentages
+
+A bounded `mdb_dump | head` sample of ~150,000 keys showed `link:data/<ID43>`,
+`link:<ID43>`, `group`, bare integers and repeated constants (`httpsig@1.0`,
+`hmac-sha256`, `rsa-pss-sha512`, `ao.N.1`, `ans104@1.0`) as separate rows. **The
+proportions in that sample are not valid**: it is the first contiguous slice of the
+b-tree in key order, and structured keys such as `link:` sort together, so their share
+is an artifact of where the slice fell. The sample proves these row *types* exist and
+dominate the shape of the keyspace; it does not measure their share. The 285
+entries/write figure carries the quantitative claim instead.
+
+It did confirm **zero `match@` keys**, consistent with the full-keyspace dump on the
+fresh store: `match-index: false` is active.
+
+### Operator hazard found the hard way: stale LMDB readers
+
+A `mdb_stat -a` killed by a `timeout` left a **dead process holding a reader slot**
+(pid 1615455, pinned at txnid 63,989,561 while the node ran to 64,097,522 -- ~108,000
+transactions pinned). LMDB cannot recycle a page still visible to any reader, so the
+writer allocated fresh pages indefinitely:
+
+- growth went to **10.2 GiB per 240 s (~3.6 TiB/day)**, and apparent cost per write to
+  68.3 KiB, while leaf+overflow pages grew by only ~41k of 2.61M new pages -- the
+  giveaway that the new pages held no data
+- the store went **104 -> 148.8 GiB**; disk 409 -> 365 GiB free
+- `mdb_stat -rr` clears slots whose owner is dead, and fixed it immediately
+
+**Rules.** Never kill `mdb_dump`/`mdb_stat` mid-transaction -- and `| head` sends
+SIGPIPE, which does exactly that. After any bounded dump, run `mdb_stat -rr` and
+confirm zero readers hold a txn. Check `mdb_stat -r` for a dead pid before believing
+any growth measurement; the file over-extension it causes is permanent (LMDB never
+shrinks), though the pages return to the free list and are reused.
+
+**Refuted while investigating:** the node does *not* hold long read transactions during
+slow requests. Sampling the reader table over 48 s, with p99 reads at 14 s and a max of
+31.5 s in flight, found no reader in a transaction at any point. `hb_store_lmdb` uses
+short per-operation transactions, so slow reads do **not** inflate growth.
