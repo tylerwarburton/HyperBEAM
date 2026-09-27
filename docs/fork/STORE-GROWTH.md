@@ -631,3 +631,69 @@ anyone sizes hardware or a retention window on the byte figure.
   latter two make remote calls.
 - The release runs in **embedded** mode, so `code:add_patha/1` returns
   `{error, embedded}`. Load test modules with `code:load_binary/3`.
+
+## 16. The ledger is only 5% — collection CAN bound this store (2026-09-27)
+
+Measured on live process `-DoLi-Og1-bV` (41,276 slots) at 712 writes/60s
+(~1,025,280 slots/day), store 93.5 GiB live over 1,486,751 slots. **[M]**
+
+### Per-slot budget
+
+| component | bytes (logical) | share | fate |
+|---|---|---|---|
+| ledger (assignment + message) | **2,648** | **5.0%** | **irreducible** |
+| delta | 28,853 | 55.0% | collectable |
+| checkpoint, amortised over cadence 1000 | 20,972 | 40.0% | thinnable |
+| **total logical** | **52,473** | | |
+| on-disk measured | 65.9 KiB | | 1.3x amplification |
+
+Store composition confirms the split: **overflow (snapshots) 41%, leaf (rows) 57%**
+of 93.5 GiB live. **[M]**
+
+### This corrects a fear recorded earlier in this file
+
+§14 framed the open question as whether the signed chain was so large that no
+compactor could bound the store. **It is not.** An assignment is **2,648 bytes**.
+At ~1.03M slots/day the irreducible ledger costs **2.7 GB/day**, so 266 GB of
+free disk lasts **~98 days on ledger alone**. Against ~85 GiB/day today, full
+collection is a **~31x reduction**. Collection is decisively worth building.
+
+### Retention window economics (anchors ON at cadence 250)
+
+Steady state, with old deltas and anchors deleted outside the window:
+
+| window | deltas retained | anchors retained | fixed total | fits 266 GB? |
+|---|---|---|---|---|
+| 1 day | 29.6 GB | 21.5 GB | **51.1 GB** | yes, comfortably |
+| 2 days | 59.2 GB | 43.0 GB | **102.2 GB** | yes |
+| 3 days | 88.7 GB | 64.5 GB | **153.3 GB** | yes |
+| 7 days | 207.1 GB | 150.5 GB | **357.6 GB** | **no** |
+
+Plus ledger accumulating 2.7 GB/day forever, and checkpoints which must be
+thinned beyond the window or they remain unbounded at 21.5 GB/day.
+
+### A delete primitive is what makes anchors worth enabling
+
+This is the key interaction. Without deletion, anchors at cadence 250 cost
+**+21.5 GB/day accumulating forever** — which is why §15's implementation ships
+with `process-delta-anchor-slots = 0`. With a retention window they cost a
+**fixed 21.5 GB per day-of-window**, because old anchors are deleted as new ones
+are written. A growth-rate problem becomes a constant-size problem.
+
+So the build order is: **delete primitive + collector first, then enable
+anchors.** Anchors are already implemented and tested on
+`perf/delta-state-anchors`, waiting on exactly this.
+
+### Cost of the cold path (reads outside the window)
+
+Beyond the retention window, deltas are gone and a historical read must
+re-execute from the nearest retained checkpoint. Upper bound from CPU
+accounting: container used 4.585 cores at 11.9 slots/s = **<=385 ms per slot
+execution**, against ~128 ms per delta apply **[M]** — so re-execution is at
+most ~3x delta replay, not the order of magnitude feared. A 1000-slot gap costs
+~6 minutes worst case. Acceptable for cold archival reads.
+
+**Measurement note:** an earlier attempt at this figure multiplied request count
+by request *latency* to get CPU, which is wrong — a request queued for 450 ms
+burns no CPU. That produced "56 cores" on a 4.6-core container. The bound above
+uses cgroup CPU accounting divided by slot rate instead.
