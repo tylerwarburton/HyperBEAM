@@ -108,6 +108,63 @@ should be loosened accordingly. **Do not ship a default that was not measured.**
 
 ---
 
+### MEASURED OUTCOME — Item 2 is NOT nearly free, and ships disabled
+
+Implemented on `perf/delta-state-anchors` (stacked on `feat/lua-5.3b-delta-state`,
+base `08c1268da`). **The cost estimate above was wrong by ~4x** and the
+"suggest 250" default was withdrawn as a result.
+
+Measured with one fresh LMDB store per scenario, byte-identical content across
+scenarios, `hb_store:stop/1` to force the async flush, then allocated blocks.
+Calibration control: synthetic checkpoint **25,436,160 B** vs the real one's
+**24,146,646 B**, so the model is sound. **[M]**
+
+| public state | per anchor | checkpoint | ratio |
+|---|---|---|---|
+| 1.0 MB | **3,951,616 B** | 25,436,160 B | **0.16** |
+| 4.3 MB | **6,223,872 B** | 28,676,096 B | **0.22** |
+
+An anchor is **16-22% of a checkpoint, not the ~4% assumed**. Per 1000 slots at
+1.0 MB state: cadence 250 adds 15.8 MB on top of the window's 25.4 MB
+checkpoint = **+62%** store growth for 115 s -> ~32 s; cadence 500 adds 7.9 MB =
+**+31%** for ~64 s. At 4.3 MB state, cadence 250 = **+98%**.
+
+**Default shipped: `process-delta-anchor-slots` = 0 — mechanism present, off.**
++62% to +98% store growth is not a safe default on a node with ~3.5 days of disk
+runway and no delete primitive at any layer. Enable deliberately once Item 5
+bounds the store.
+
+**Root cause of the bad estimate:** `STORE-GROWTH.md` claimed the public state is
+"under 1 MB" by summing only the seven largest fields and ignoring ~1,622 others
+worth 3.81 MB. Corrected in that file.
+
+### Spec errors found during implementation
+- **`materialize/3` needs no change.** It follows one backward link at a time via
+  `read/3`, so the first non-delta entry already terminates the walk and is by
+  construction the nearest anchor-or-checkpoint. Only a clause returning the
+  anchor's state was needed.
+- The function is `dev_process:ensure_loaded/3`, not `ensure_loaded_state/3`.
+- `dfd199702` (`perf/lua-process-hot-path`) does **not** overlap: it gates whether
+  reaching a target slot forces a VM snapshot, in `dev_process.erl`. Disjoint
+  files, disjoint options; they compose.
+
+### Pre-existing bug found: the shared-store test suite is silently EMPTY
+`dev_process_cache:process_cache_suite_test_/0` generates **zero** tests.
+`hb_store:test_stores/0` returns a list of **maps** (built with `#{...}`
+map-update syntax), but line 499 destructures them with a `{Name, Opts}` tuple
+pattern, so the comprehension matches nothing. **The entire shared-store suite,
+including the existing "delta roundtrip and checkpoint" case, has never run.**
+Verified by source inspection. Fix separately — fixing it inside a feature PR
+would surface unrelated pre-existing failures.
+
+### Revised build order
+**Item 1 first, not Item 2.** Item 1 uses cores that are 75% idle and costs zero
+store bytes; Item 2 buys a 1.8x-3.6x replay improvement for +31% to +98% bytes
+against a 3.5-day disk clock. Anchors are ready to enable once the collector
+(Item 5) bounds the store.
+
+---
+
 ## Item 3 — Raise the replay cache bounds
 
 **Problem.** ETS cycled **644 -> 312 -> 628 -> 269 -> 628 MB** through the

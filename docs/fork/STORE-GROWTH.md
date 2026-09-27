@@ -537,8 +537,26 @@ a 24.1 MB checkpoint, by top-level field:
 `snapshot` is `#{<<"body">> => Binary}` -- a single opaque Lua VM image. It is
 **not compressible** (gzip returns 99% of input) and shares **nothing** between
 consecutive checkpoints (zero identical values between slots 63000 and 64000).
-The actual game state -- players, economy, leaderboard, factions -- is under
-1 MB. The 1,629 fields are what explode into LMDB rows.
+**CORRECTED 2026-09-27.** An earlier version of this line claimed the actual
+game state is "under 1 MB". **That was wrong** and it propagated into
+`SPEED-UPGRADES.md` Item 2, where it produced a 4x-optimistic cost estimate and
+a wrong default. The error: the field table above lists only the seven largest
+fields, and I summed those while ignoring ~1,622 unlisted ones.
+
+Correct arithmetic for this checkpoint:
+
+```
+listed fields sum        20,151,944 B
+checkpoint total         24,146,646 B
+UNLISTED remainder        3,994,702 B  (3.81 MB) across ~1,622 fields
+non-snapshot total        5,269,693 B  (5.03 MB)
+  minus process+module    4,266,238 B  (4.07 MB)  <- what a state-only anchor carries
+```
+
+So the non-snapshot public state is **~4-5 MB, not under 1 MB**. Independently
+confirmed by direct measurement of a synthetic anchor at **3.95-6.2 MB**
+(`perf/delta-state-anchors`), against a calibration control whose synthetic
+checkpoint measured 25,436,160 B vs this real one's 24,146,646 B.
 
 ### Corpus totals
 
