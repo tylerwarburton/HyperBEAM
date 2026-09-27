@@ -697,3 +697,41 @@ most ~3x delta replay, not the order of magnitude feared. A 1000-slot gap costs
 by request *latency* to get CPU, which is wrong — a request queued for 450 ms
 burns no CPU. That produced "56 cores" on a 4.6-core container. The bound above
 uses cgroup CPU accounting divided by slot rate instead.
+
+## 17. DECIDED (2026-09-28): 1-day retention, collector is next
+
+Operator decisions:
+
+- **Retention window: 1 day.** Deltas and anchors retained for 24 h (~51 GB
+  fixed at current rates), older reads fall back to re-execution from the
+  nearest retained checkpoint (bounded <=385 ms/slot, ~6 min for a 1000-slot
+  gap). Chosen over 2-3 days deliberately for maximum headroom against write
+  rates climbing above today's ~1.03M slots/day.
+- **Build next: the delete primitive + collector.** It is the keystone: bounds
+  growth ~31x, removes the ~3.5-day disk clock, and unlocks the anchors already
+  built on `perf/delta-state-anchors`.
+
+### Retention policy to implement
+
+| class | retention | why |
+|---|---|---|
+| process definitions | forever | without these nothing computes — the wipe proved it |
+| assignments + messages | forever | the signed chain; only 2,648 B/slot, 2.7 GB/day |
+| checkpoints (VM snapshot bearing) | forever initially, thin later | the only resume points for re-execution |
+| deltas | **24 h** | 55% of per-slot cost; rebuildable |
+| anchors (once enabled) | **24 h** | read accelerator only, never a resume base |
+| computed states outside window | drop | rebuildable by re-execution |
+
+### Why it must be copy-based
+
+There is **no delete primitive at any layer**: not in the pinned `elmdb` Rust
+NIF, not in the `hb_store` behaviour, and `hb_store_lmdb:reset/3` is `rm -Rf` of
+the whole store. So a collection pass must copy the retained set into a fresh
+store and swap, keeping the old one until the new one is validated.
+
+### The corpus is the test bed
+
+`/opt/runerealm-hb/store/lmdb.CORPUS-20260926T134420Z` (149 GB, 648,289,032
+entries, 370 processes, 1,985,957 assignment slots) exists precisely for this.
+The collector must be built and validated against it, **never against the live
+store**, until it has demonstrated a correct round trip.
