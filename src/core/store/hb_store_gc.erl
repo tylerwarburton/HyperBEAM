@@ -1057,9 +1057,21 @@ unescape(<<"data/", _/binary>>, Value) -> Value;
 unescape(_Key, <<"raw:", Value/binary>>) -> Value;
 unescape(_Key, Value) -> Value.
 
-%% Entry points only, not every copied row: the visited set bounds re-reads of
-%% shared content-addressed blobs without growing to the size of the output.
-seen(Ctx, Key) -> not ets:insert_new(maps:get(seen, Ctx), {Key}).
+%% @doc Has this key been walked already? Entry points only, not every copied row.
+%%
+%% The set holds a 128-bit digest, not the key. Keys here run 45-80 bytes -- above
+%% the 64-byte heap-binary threshold, so each one became a refcounted binary with
+%% its own allocation -- and measured on the corpus the table cost **~430 bytes per
+%% entry**, which is what OOM-killed a 12-worker run at 340 of 370 processes on a
+%% 62 GB box. A 16-byte digest is a heap binary and costs ~6x less.
+%%
+%% A digest collision would skip copying one key, so the arithmetic matters: at
+%% 128 bits, the birthday probability over the ~52M keys a whole-store pass walks
+%% is ~4e-24. That is orders of magnitude below the probability of an undetected
+%% memory or disk error over the same run, and unlike those it is bounded rather
+%% than assumed.
+seen(Ctx, Key) ->
+    not ets:insert_new(maps:get(seen, Ctx), {crypto:hash(md5, Key)}).
 
 rows_bytes(Rows) ->
     lists:sum([ byte_size(K) + byte_size(V) || {K, V} <- Rows ]).
@@ -1728,3 +1740,18 @@ collect_fails_the_run_if_a_worker_dies_test_() ->
         after 5000 -> ?assert(false)
         end
     end}.
+
+seen_is_keyed_by_digest_not_key_test() ->
+    %% The set must answer for the key it was given and cost a digest, not the
+    %% key: a 45-80 byte key above the heap-binary threshold is what made the
+    %% table 430 bytes an entry.
+    Tab = ets:new(t, [set, private]),
+    Ctx = #{ seen => Tab },
+    Key = <<"~scheduler@1.0/assignments/", (binary:copy(<<"a">>, 43))/binary,
+            "/12345">>,
+    ?assertNot(seen(Ctx, Key)),
+    ?assert(seen(Ctx, Key)),
+    ?assertNot(seen(Ctx, <<Key/binary, "x">>)),
+    [{Stored}] = ets:lookup(Tab, crypto:hash(md5, Key)),
+    ?assertEqual(16, byte_size(Stored)),
+    ets:delete(Tab).
