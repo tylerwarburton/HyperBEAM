@@ -386,11 +386,13 @@ collect(RawPolicy, SrcOpts, DstOpts, Which) ->
     %% would materialise every assignment row in the store into one term.
     {Markers, MarkerKeys} =
         with_seen(Ctx, fun(C) ->
-            lists:foldl(
-                fun(Marker, A) -> copy_row(C, Marker, A) end,
-                new_acc(),
-                [?SCHED_ROOT, ?SCHED_PREFIX, ?COMPUTED_ROOT]
-            )
+            reset_seen(C, fun(C2) ->
+                lists:foldl(
+                    fun(Marker, A) -> copy_row(C2, Marker, A) end,
+                    new_acc(),
+                    [?SCHED_ROOT, ?SCHED_PREFIX, ?COMPUTED_ROOT]
+                )
+            end)
         end),
     Acc1 = bump(distinct_keys, MarkerKeys, Markers),
     {AccN, Plans} = collect_all(Ctx, Procs, Acc1),
@@ -422,10 +424,23 @@ collect(RawPolicy, SrcOpts, DstOpts, Which) ->
 with_seen(Ctx, Fun) ->
     Tab = ets:new(hb_store_gc_seen, [set, private]),
     try
-        {Fun(Ctx#{ seen => Tab }), ets:info(Tab, size)}
+        Fun(Ctx#{ seen => Tab })
     after
         ets:delete(Tab)
     end.
+
+%% @doc Clear the visited set, run `Fun', and report how many keys it walked.
+%%
+%% The table is cleared, not recreated. A `ets:new'/`ets:delete' pair per process
+%% leaves the freed carriers behind: `erlang:memory(ets)' came back down but
+%% RssAnon did not, and a 10-worker run reached **36 GB resident at 236 of 370
+%% processes** on that pattern and was killed. Reusing one table per worker keeps
+%% the high-water mark at the largest single process instead.
+reset_seen(Ctx, Fun) ->
+    Tab = maps:get(seen, Ctx),
+    true = ets:delete_all_objects(Tab),
+    Result = Fun(Ctx),
+    {Result, ets:info(Tab, size)}.
 
 %% @doc Collect every process, serially or across `workers' of them.
 collect_all(Ctx, Procs, Acc0) ->
@@ -435,7 +450,8 @@ collect_all(Ctx, Procs, Acc0) ->
     end.
 
 collect_serial(Ctx, Procs, Acc0) ->
-    {Acc, Plans} = fold_procs(Ctx, Procs, length(Procs), Acc0),
+    {Acc, Plans} =
+        with_seen(Ctx, fun(C) -> fold_procs(C, Procs, length(Procs), Acc0) end),
     {Acc, lists:reverse(Plans)}.
 
 fold_procs(Ctx, Procs, Total, Acc0) ->
@@ -443,7 +459,7 @@ fold_procs(Ctx, Procs, Total, Acc0) ->
         fun(ProcID, {A0, Ps}) ->
             ok = check_free_space(Ctx),
             {{A1, Plan}, Keys} =
-                with_seen(Ctx, fun(C) -> collect_process(C, ProcID, A0) end),
+                reset_seen(Ctx, fun(C) -> collect_process(C, ProcID, A0) end),
             A2 = bump(distinct_keys, Keys, bump(procs_done, 1, A1)),
             report_progress(Ctx, Total, A2, Plan),
             {A2, [Plan | Ps]}
@@ -472,17 +488,20 @@ collect_parallel(Ctx, Procs, Acc0, N) ->
 
 worker(Parent, Ctx, Chunk) ->
     {Acc, Plans} =
-        lists:foldl(
-            fun(ProcID, {A0, Ps}) ->
-                ok = check_free_space(Ctx),
-                {{A1, Plan}, Keys} =
-                    with_seen(Ctx, fun(C) -> collect_process(C, ProcID, A0) end),
-                Parent ! {gc_proc_done, Plan},
-                {bump(distinct_keys, Keys, A1), [Plan | Ps]}
-            end,
-            {new_acc(), []},
-            Chunk
-        ),
+        with_seen(Ctx, fun(WCtx) ->
+            lists:foldl(
+                fun(ProcID, {A0, Ps}) ->
+                    ok = check_free_space(WCtx),
+                    {{A1, Plan}, Keys} =
+                        reset_seen(WCtx,
+                            fun(C) -> collect_process(C, ProcID, A0) end),
+                    Parent ! {gc_proc_done, Plan},
+                    {bump(distinct_keys, Keys, A1), [Plan | Ps]}
+                end,
+                {new_acc(), []},
+                Chunk
+            )
+        end),
     Parent ! {gc_worker_done, self(), Acc, lists:reverse(Plans)}.
 
 gather(_Ctx, _Total, 0, Acc, Plans, _Live) -> {Acc, Plans};
