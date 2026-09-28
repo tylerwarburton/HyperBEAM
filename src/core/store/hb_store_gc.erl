@@ -1,17 +1,26 @@
 %%% @doc Retention planning for the process cache.
 %%%
 %%% The store keeps one computed state per slot forever. Measured on a 149 GiB
-%%% production corpus (370 processes, 1,985,934 slots):
+%%% production corpus (370 processes, 1,985,938 computed slots, 1,985,957
+%%% assignment slots):
 %%%
 %%% <ul>
 %%%   <li>a delta slot is ~9-24 KB logically, but explodes into ~325 LMDB rows
 %%%       of ~160 bytes, costing ~48 KB of leaf pages</li>
-%%%   <li>a checkpoint slot (every `process-delta-checkpoint-slots', default
-%%%       1000) is ~24 MB, of which ~18.9 MB is a single incompressible
-%%%       `snapshot/body' binary -- the Lua VM image. Actual game state is
-%%%       under 1 MB</li>
+%%%   <li>a checkpoint slot carries a Lua VM image in one incompressible
+%%%       `snapshot' binary. The largest processes' checkpoints run 14-24 MB,
+%%%       but the corpus-wide mean over all 4,094 of them is ~4.1 MB. The
+%%%       non-snapshot public state is ~4-5 MB on a large process, <em>not</em>
+%%%       "under 1 MB" as an earlier version of this comment said -- that error
+%%%       came from summing only the seven largest fields and ignoring ~1,622
+%%%       others</li>
 %%%   <li>so the store is ~23% VM snapshots (the overflow pages) and ~73%
 %%%       delta field-explosion (the leaf pages)</li>
+%%%   <li>checkpoints do <em>not</em> land on one cadence. Of 370 processes, 162
+%%%       checkpoint every 1000 slots, 161 carry a single one at slot 0, and the
+%%%       rest land at irregular gaps of 50 or less: only a delta-bearing result
+%%%       reaches `process-delta-checkpoint-slots', and everything else uses
+%%%       `process-snapshot-slots' (50) or `process-snapshot-time' (900 s)</li>
 %%% </ul>
 %%%
 %%% Assignments and their messages are the signed ordering commitments -- the
@@ -59,6 +68,7 @@
 -export([plan/1, plan/2, plan_process/3]).
 -export([collect/3, collect/4]).
 -export([classify_root/2, classify_slot/3, retention/4, window_start/4]).
+-export([assignment_timestamp_probe/3]).
 -include_lib("eunit/include/eunit.hrl").
 
 %% Retain every computed slot at or above (head - KeepRecent). The delta chain
@@ -302,6 +312,15 @@ policy(Policy) ->
 %% Guard against a `read_prefix' on an accidentally short prefix -- the hazard
 %% that once materialised 26.5M rows (~21 GiB) into a single term.
 -define(MAX_SUBTREE_ROWS, 250000).
+%% Processes collected concurrently. Copying is bound by random-read latency at
+%% queue depth one, not by bandwidth or CPU: measured on the corpus, a serial pass
+%% held the array at ~8.7k IOPS / 68 MB/s at 73% utilisation with 29% of one core
+%% -- an NVMe mirror that will do an order of magnitude more with requests in
+%% flight. The unit of concurrency is one whole process, so no two workers share a
+%% retention decision; they share only the source (read-only) and the destination's
+%% batching writer, which the live node already writes to from hundreds of Erlang
+%% processes at once. 1 is the serial path.
+-define(DEFAULT_WORKERS, 1).
 %% Free space on the destination's filesystem below which collection stops.
 %% LMDB never shrinks a store, so running the disk out mid-copy leaves a file
 %% that cannot be reclaimed except by deleting it.
@@ -346,7 +365,6 @@ collect(RawPolicy, SrcOpts, DstOpts, Which) ->
             dst_store => DstStore,
             dst_opts => DstOpts,
             policy => Policy,
-            seen => ets:new(hb_store_gc_seen, [set, private]),
             dry_run => maps:get(dry_run, Policy)
         },
     Procs =
@@ -362,24 +380,16 @@ collect(RawPolicy, SrcOpts, DstOpts, Which) ->
     %% The structural group markers the namespaces hang from. Copied as single
     %% rows, never as subtrees: `read_prefix' on `~scheduler@1.0/assignments'
     %% would materialise every assignment row in the store into one term.
-    Acc1 =
-        lists:foldl(
-            fun(Marker, A) -> copy_row(Ctx, Marker, A) end,
-            new_acc(),
-            [?SCHED_ROOT, ?SCHED_PREFIX, ?COMPUTED_ROOT]
-        ),
-    {AccN, Plans} =
-        lists:foldl(
-            fun(ProcID, {A, Ps}) ->
-                ok = check_free_space(Ctx),
-                {A1, P} = collect_process(Ctx, ProcID, A),
-                {bump(procs_done, 1, A1), [P | Ps]}
-            end,
-            {Acc1, []},
-            Procs
-        ),
-    SeenSize = ets:info(maps:get(seen, Ctx), size),
-    ets:delete(maps:get(seen, Ctx)),
+    {Markers, MarkerKeys} =
+        with_seen(Ctx, fun(C) ->
+            lists:foldl(
+                fun(Marker, A) -> copy_row(C, Marker, A) end,
+                new_acc(),
+                [?SCHED_ROOT, ?SCHED_PREFIX, ?COMPUTED_ROOT]
+            )
+        end),
+    Acc1 = bump(distinct_keys, MarkerKeys, Markers),
+    {AccN, Plans} = collect_all(Ctx, Procs, Acc1),
     %% `hb_store_lmdb' batches writes through an async Rust flush worker and
     %% returns `ok' whether or not anything reached disk. Stopping the store
     %% forces the flush; without it every measurement below reads an empty file.
@@ -387,7 +397,124 @@ collect(RawPolicy, SrcOpts, DstOpts, Which) ->
         true -> ok;
         false -> ok = hb_store:stop([DstStore], #{}, DstOpts)
     end,
-    report(AccN, Plans, SeenSize, maps:get(policy, Ctx), SrcStore, DstStore).
+    report(AccN, Plans, maps:get(policy, Ctx), SrcStore, DstStore).
+
+%% @doc Give `Fun' a context with its own visited set and report how big that set
+%% grew. The set holds entry points, not every copied row, so it bounds re-reads of
+%% shared content-addressed blobs without growing to the size of the output -- and
+%% one set per worker costs no more in total than one shared set would.
+with_seen(Ctx, Fun) ->
+    Tab = ets:new(hb_store_gc_seen, [set, private]),
+    try
+        {Fun(Ctx#{ seen => Tab }), ets:info(Tab, size)}
+    after
+        ets:delete(Tab)
+    end.
+
+%% @doc Collect every process, serially or across `workers' of them.
+collect_all(Ctx, Procs, Acc0) ->
+    case maps:get(workers, maps:get(policy, Ctx)) of
+        1 -> collect_serial(Ctx, Procs, Acc0);
+        N -> collect_parallel(Ctx, Procs, Acc0, N)
+    end.
+
+collect_serial(Ctx, Procs, Acc0) ->
+    {{Acc, Plans}, Keys} =
+        with_seen(Ctx, fun(C) -> fold_procs(C, Procs, length(Procs), Acc0) end),
+    {bump(distinct_keys, Keys, Acc), lists:reverse(Plans)}.
+
+fold_procs(Ctx, Procs, Total, Acc0) ->
+    lists:foldl(
+        fun(ProcID, {A0, Ps}) ->
+            ok = check_free_space(Ctx),
+            {A1, Plan} = collect_process(Ctx, ProcID, A0),
+            A2 = bump(procs_done, 1, A1),
+            report_progress(Ctx, Total, A2, Plan),
+            {A2, [Plan | Ps]}
+        end,
+        {Acc0, []},
+        Procs
+    ).
+
+%% @doc Round-robin the processes across `N' workers so the few very large ones do
+%% not all land on one, then merge the per-worker accumulators.
+%%
+%% The unit of concurrency is one whole process, so no two workers share a
+%% retention decision: they share only the source, which is open read-only, and the
+%% destination's batching writer, which the live node already writes to from
+%% hundreds of Erlang processes at once. A worker that dies fails the whole run
+%% rather than leaving a partial copy behind a plausible-looking total.
+collect_parallel(Ctx, Procs, Acc0, N) ->
+    Parent = self(),
+    Total = length(Procs),
+    Chunks = [ C || C <- round_robin(Procs, N), C =/= [] ],
+    Pids =
+        [ element(1,
+            spawn_monitor(fun() -> worker(Parent, Ctx, Chunk) end))
+        || Chunk <- Chunks ],
+    gather(Ctx, Total, length(Pids), Acc0, [], sets:from_list(Pids)).
+
+worker(Parent, Ctx, Chunk) ->
+    {{Acc, Plans}, Keys} =
+        with_seen(Ctx, fun(C) ->
+            lists:foldl(
+                fun(ProcID, {A0, Ps}) ->
+                    ok = check_free_space(C),
+                    {A1, Plan} = collect_process(C, ProcID, A0),
+                    Parent ! {gc_proc_done, Plan},
+                    {A1, [Plan | Ps]}
+                end,
+                {new_acc(), []},
+                Chunk
+            )
+        end),
+    Parent ! {gc_worker_done, self(),
+              bump(distinct_keys, Keys, Acc), lists:reverse(Plans)}.
+
+gather(_Ctx, _Total, 0, Acc, Plans, _Live) -> {Acc, Plans};
+gather(Ctx, Total, Left, Acc, Plans, Live) ->
+    receive
+        {gc_proc_done, Plan} ->
+            Acc1 = bump(procs_done, 1, Acc),
+            report_progress(Ctx, Total, Acc1, Plan),
+            gather(Ctx, Total, Left, Acc1, Plans, Live);
+        {gc_worker_done, Pid, WAcc, WPlans} ->
+            gather(Ctx, Total, Left - 1,
+                   merge_acc(maps:remove(procs_done, WAcc), Acc),
+                   Plans ++ WPlans, sets:del_element(Pid, Live));
+        {'DOWN', _Ref, process, Pid, Reason} ->
+            case {sets:is_element(Pid, Live), Reason} of
+                {false, _} ->
+                    %% Already accounted for by its `gc_worker_done'.
+                    gather(Ctx, Total, Left, Acc, Plans, Live);
+                {true, _} ->
+                    erlang:error({collect_worker_died, Reason})
+            end
+    end.
+
+merge_acc(From, Into) ->
+    maps:fold(
+        fun(max_subtree, V, A) ->
+                maps:update_with(max_subtree, fun(O) -> max(O, V) end, V, A);
+           (K, V, A) when is_integer(V) ->
+                maps:update_with(K, fun(O) -> O + V end, V, A);
+           (_K, _V, A) -> A
+        end,
+        Into,
+        From
+    ).
+
+round_robin(Items, N) ->
+    Filled =
+        lists:foldl(
+            fun({I, Item}, T) ->
+                Slot = (I rem N) + 1,
+                setelement(Slot, T, [Item | element(Slot, T)])
+            end,
+            erlang:make_tuple(N, []),
+            lists:zip(lists:seq(0, length(Items) - 1), Items)
+        ),
+    [ lists:reverse(element(I, Filled)) || I <- lists:seq(1, N) ].
 
 collect_policy(Policy) ->
     (policy(Policy))#{
@@ -396,7 +523,9 @@ collect_policy(Policy) ->
         now => maps:get(now, Policy, undefined),
         dry_run => maps:get(dry_run, Policy, false),
         base_search => maps:get(base_search, Policy, ?DEFAULT_BASE_SEARCH),
-        min_free_bytes => maps:get(min_free_bytes, Policy, ?DEFAULT_MIN_FREE)
+        min_free_bytes => maps:get(min_free_bytes, Policy, ?DEFAULT_MIN_FREE),
+        progress => maps:get(progress, Policy, undefined),
+        workers => max(1, maps:get(workers, Policy, ?DEFAULT_WORKERS))
     }.
 
 %% @doc Refuse to run unless the source is shut out of the write path and is a
@@ -441,6 +570,7 @@ new_acc() ->
     #{
         rows => 0, bytes => 0, closures => 0, misses => 0, max_subtree => 0,
         unfollowed_link_keys => 0, ledger_bytes => 0, computed_bytes => 0,
+        distinct_keys => 0,
         procs_done => 0, assignment_slots => 0,
         retain_slots => 0, drop_slots => 0,
         retain_in_window => 0, retain_checkpoint => 0,
@@ -685,6 +815,11 @@ index_of(Sorted, Slot, Lo, Hi) ->
         V when V < Slot -> index_of(Sorted, Slot, Mid + 1, Hi);
         _ -> index_of(Sorted, Slot, Lo, Mid - 1)
     end.
+
+%% @doc The `timestamp' an assignment carries, in milliseconds. Exported so an
+%% operator can check what reference time a policy would pick before running one.
+assignment_timestamp_probe(Ctx, ID, Slot) ->
+    assignment_timestamp(Ctx, ID, Slot).
 
 %% @doc The `timestamp' an assignment carries, in milliseconds.
 assignment_timestamp(Ctx, ID, Slot) ->
@@ -948,6 +1083,17 @@ batches([R = {K, V} | Rest], Cur, N, B, Out) ->
 
 %%% Reporting.
 
+%% @doc Call the caller's `progress' fun, if any, after each process. A whole-store
+%% pass over the 149 GiB corpus takes hours, so a run with no way to watch it is a
+%% run an operator will kill on suspicion.
+report_progress(Ctx, Total, Acc, Plan) ->
+    case maps:get(progress, maps:get(policy, Ctx)) of
+        undefined -> ok;
+        Fun when is_function(Fun, 1) ->
+            catch Fun(Acc#{ processes_total => Total, last_process => Plan }),
+            ok
+    end.
+
 %% @doc Stop before the destination's filesystem fills. A dry run needs no space
 %% and skips the check.
 %%
@@ -1015,7 +1161,7 @@ reference_now(Ctx, Procs, Policy) ->
         Given -> Given
     end.
 
-report(Acc, Plans, SeenSize, Policy, SrcStore, DstStore) ->
+report(Acc, Plans, Policy, SrcStore, DstStore) ->
     Acc#{
         source => maps:get(<<"name">>, SrcStore, undefined),
         destination => maps:get(<<"name">>, DstStore, undefined),
@@ -1023,8 +1169,9 @@ report(Acc, Plans, SeenSize, Policy, SrcStore, DstStore) ->
         keep_seconds => maps:get(keep_seconds, Policy),
         keep_floor => maps:get(keep_floor, Policy),
         reference_now => maps:get(now, Policy),
+        workers => maps:get(workers, Policy),
         min_free_bytes => maps:get(min_free_bytes, Policy),
-        distinct_keys_visited => SeenSize,
+        distinct_keys_visited => maps:get(distinct_keys, Acc, 0),
         processes => length(Plans),
         plans => lists:reverse(Plans),
         note =>
@@ -1147,9 +1294,11 @@ gc_id(Prefix, N) ->
 %% snapshot-bearing checkpoints and deltas. The `+link' indirection is the point:
 %% a collector that follows only `link:' markers copies every envelope and loses
 %% every message, silently.
-gc_fixture(Slots, CheckpointEvery) ->
-    ProcID = gc_id(<<"proc">>, 0),
-    Def = gc_id(<<"pdef">>, 0),
+gc_fixture(Slots, CheckpointEvery) -> gc_fixture(0, Slots, CheckpointEvery).
+gc_fixture(N, Slots, CheckpointEvery) ->
+    ProcID = gc_id(<<"proc">>, N),
+    Def = gc_id(<<"pdef">>, N),
+    Tag = integer_to_binary(N),
     Base =
         [
             {<<"~scheduler@1.0">>, <<"group">>},
@@ -1165,12 +1314,12 @@ gc_fixture(Slots, CheckpointEvery) ->
     Rows =
         lists:foldl(
             fun(Slot, Acc) ->
-                Asg = gc_id(<<"asg">>, Slot),
-                Msg = gc_id(<<"msg">>, Slot),
-                MsgRef = gc_id(<<"mref">>, Slot),
-                State = gc_id(<<"st">>, Slot),
-                Snap = gc_id(<<"snap">>, Slot),
-                SnapRef = gc_id(<<"sref">>, Slot),
+                Asg = gc_id(<<"asg", Tag/binary>>, Slot),
+                Msg = gc_id(<<"msg", Tag/binary>>, Slot),
+                MsgRef = gc_id(<<"mref", Tag/binary>>, Slot),
+                State = gc_id(<<"st", Tag/binary>>, Slot),
+                Snap = gc_id(<<"snap", Tag/binary>>, Slot),
+                SnapRef = gc_id(<<"sref", Tag/binary>>, Slot),
                 S = integer_to_binary(Slot),
                 Assignment =
                     [
@@ -1188,8 +1337,8 @@ gc_fixture(Slots, CheckpointEvery) ->
                         {Msg, <<"group">>},
                         {<<Msg/binary, "/action">>, <<"Play">>},
                         {<<Msg/binary, "/payload">>,
-                            <<"link:data/", (gc_id(<<"pay">>, Slot))/binary>>},
-                        {<<"data/", (gc_id(<<"pay">>, Slot))/binary>>,
+                            <<"link:data/", (gc_id(<<"pay", Tag/binary>>, Slot))/binary>>},
+                        {<<"data/", (gc_id(<<"pay", Tag/binary>>, Slot))/binary>>,
                             binary:copy(<<"payload-bytes.">>, 8)}
                     ],
                 Computed =
@@ -1227,13 +1376,21 @@ gc_fixture(Slots, CheckpointEvery) ->
     {ProcID, Rows}.
 
 gc_collect_fixture(Suffix, Slots, CheckpointEvery, Policy) ->
-    {Writable, Src} = gc_test_stores(Suffix),
-    {ProcID, Rows} = gc_fixture(Slots, CheckpointEvery),
-    ok = gc_put(Writable, Rows),
-    Dst = gc_test_writable(gc_test_dir(<<Suffix/binary, "-out">>)),
-    Report =
-        collect(Policy, gc_opts(Src), gc_opts(Dst), [ProcID]),
+    {[ProcID], Src, Dst, Report} =
+        gc_collect_fixtures(Suffix, 1, Slots, CheckpointEvery, Policy),
     {ProcID, Src, Dst, Report}.
+
+%% `NProcs' independent processes in one store, so a parallel run has more than
+%% one worker's worth of work to spread.
+gc_collect_fixtures(Suffix, NProcs, Slots, CheckpointEvery, Policy) ->
+    {Writable, Src} = gc_test_stores(Suffix),
+    Built = [ gc_fixture(N, Slots, CheckpointEvery)
+            || N <- lists:seq(0, NProcs - 1) ],
+    ok = gc_put(Writable, lists:append([ R || {_, R} <- Built ])),
+    ProcIDs = [ P || {P, _} <- Built ],
+    Dst = gc_test_writable(gc_test_dir(<<Suffix/binary, "-out">>)),
+    Report = collect(Policy, gc_opts(Src), gc_opts(Dst), ProcIDs),
+    {ProcIDs, Src, Dst, Report}.
 
 %%% The copy must be exact.
 
@@ -1468,4 +1625,90 @@ collect_accounts_for_every_byte_it_copies_test_() ->
                 + byte_size(<<"~scheduler@1.0/assignments">>) + byte_size(<<"group">>)
                 + byte_size(<<"computed">>) + byte_size(<<"group">>),
         ?assertEqual(Total, Ledger + Computed + Markers)
+    end}.
+
+collect_reports_progress_per_process_test_() ->
+    {timeout, 60, fun() ->
+        Self = self(),
+        {_ProcID, _Src, _Dst, _Report} =
+            gc_collect_fixture(<<"progress">>, 10, 10,
+                #{ keep_seconds => 0, keep_floor => 2, dry_run => true,
+                   progress => fun(P) -> Self ! {progress, P} end }),
+        receive
+            {progress, P} ->
+                ?assertEqual(1, maps:get(procs_done, P)),
+                ?assertEqual(1, maps:get(processes_total, P)),
+                ?assertMatch(#{ process := _ }, maps:get(last_process, P))
+        after 1000 -> ?assert(false)
+        end
+    end}.
+
+round_robin_spreads_the_big_ones_test() ->
+    %% Processes arrive in key order, which puts similarly sized ones together,
+    %% so consecutive items must land on different workers.
+    ?assertEqual([[1, 4, 7], [2, 5], [3, 6]], round_robin([1,2,3,4,5,6,7], 3)),
+    ?assertEqual([[1], [], []], round_robin([1], 3)),
+    ?assertEqual([[]], round_robin([], 1)).
+
+merge_acc_sums_counts_and_maxes_the_max_test() ->
+    A = #{ rows => 3, bytes => 10, max_subtree => 50, note => <<"x">> },
+    B = #{ rows => 4, bytes => 1, max_subtree => 20 },
+    M = merge_acc(A, B),
+    ?assertEqual(7, maps:get(rows, M)),
+    ?assertEqual(11, maps:get(bytes, M)),
+    ?assertEqual(50, maps:get(max_subtree, M)),
+    %% Non-integers are not merged: there is no sensible sum for them.
+    ?assertEqual(false, maps:is_key(note, M)).
+
+collect_is_identical_serial_and_parallel_test_() ->
+    {timeout, 300, fun() ->
+        %% Five processes, same policy, four workers against one. Every counted
+        %% figure must match and both copies must answer the same reads -- which is
+        %% the whole point of making the unit of concurrency a whole process.
+        Policy = #{ keep_seconds => 0, keep_floor => 5 },
+        {Ps1, _S1, D1, R1} = gc_collect_fixtures(<<"ser">>, 5, 30, 10, Policy),
+        {Ps2, _S2, D2, R2} =
+            gc_collect_fixtures(<<"par">>, 5, 30, 10, Policy#{ workers => 4 }),
+        ?assertEqual(Ps1, Ps2),
+        ?assertEqual(5, maps:get(procs_done, R1)),
+        ?assertEqual(5, maps:get(procs_done, R2)),
+        [ ?assertEqual({K, maps:get(K, R1)}, {K, maps:get(K, R2)})
+        || K <- [rows, bytes, closures, misses, max_subtree, assignment_slots,
+                 retain_slots, drop_slots, retain_in_window, retain_checkpoint,
+                 drop_delta, drop_state, drop_unknown, unfollowed_link_keys,
+                 ledger_bytes, computed_bytes, procs_done, processes] ],
+        [ ?assertEqual(
+            lists:sort(hb_cache:list_numbered(
+                <<"computed/", P/binary, "/slot">>, gc_opts(D1))),
+            lists:sort(hb_cache:list_numbered(
+                <<"computed/", P/binary, "/slot">>, gc_opts(D2))))
+        || P <- Ps1 ],
+        %% And the plans, which is what an operator reads afterwards.
+        ?assertEqual(
+            lists:sort([ maps:get(process, X) || X <- maps:get(plans, R1) ]),
+            lists:sort([ maps:get(process, X) || X <- maps:get(plans, R2) ]))
+    end}.
+
+collect_fails_the_run_if_a_worker_dies_test_() ->
+    {timeout, 60, fun() ->
+        %% A worker that dies has left a partial copy; the run must not report a
+        %% total that silently omits a process.
+        Parent = self(),
+        Ctx = #{ policy => #{ workers => 2, progress => undefined },
+                 dry_run => true },
+        Pid = spawn(fun() -> receive never -> ok end end),
+        spawn(fun() ->
+            %% `collect_parallel/4' monitors its workers with `spawn_monitor';
+            %% the monitor has to exist here too or no DOWN ever arrives.
+            erlang:monitor(process, Pid),
+            Res = (catch gather(Ctx, 1, 1, new_acc(), [],
+                                sets:from_list([Pid]))),
+            Parent ! {res, Res}
+        end),
+        timer:sleep(50),
+        exit(Pid, kill),
+        receive
+            {res, R} -> ?assertMatch({'EXIT', {{collect_worker_died, _}, _}}, R)
+        after 5000 -> ?assert(false)
+        end
     end}.
