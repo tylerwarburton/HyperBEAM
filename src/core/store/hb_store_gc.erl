@@ -347,6 +347,10 @@ policy(Policy) ->
 %%       real pass would copy.</li>
 %%   <li>`base_search' -- how far below the window start to look for the full
 %%       state the window must reach. Default 20000.</li>
+%%   <li>`workers' -- processes collected concurrently. Default 1. Copying is
+%%       bound by random-read latency at queue depth one, so this is worth
+%%       raising: 12 workers took the corpus from 8.7k to 69k read IOPS.</li>
+%%   <li>`progress' -- `fun((Report) -> any())', called after each process.</li>
 %% </ul>
 collect(Policy, SrcOpts, DstOpts) ->
     collect(Policy, SrcOpts, DstOpts, all).
@@ -400,9 +404,21 @@ collect(RawPolicy, SrcOpts, DstOpts, Which) ->
     report(AccN, Plans, maps:get(policy, Ctx), SrcStore, DstStore).
 
 %% @doc Give `Fun' a context with its own visited set and report how big that set
-%% grew. The set holds entry points, not every copied row, so it bounds re-reads of
-%% shared content-addressed blobs without growing to the size of the output -- and
-%% one set per worker costs no more in total than one shared set would.
+%% grew.
+%%
+%% The set is scoped to <em>one process</em>, and that is a memory decision made
+%% the hard way. Held across a whole run it reached **20.7 GB resident plus 4.6 GB
+%% swapped at 167 of 370 processes** on the corpus **[M]** -- it accumulates ~26
+%% entries per assignment and there are 1.99M assignments, so a whole-store pass
+%% does not fit in 62 GB. Per process it is bounded by the largest process
+%% (~1.7M entries) instead.
+%%
+%% The cost of the narrower scope is that content shared <em>between</em> processes
+%% is read and written more than once. Both are harmless -- a `put' of the same
+%% key and value is idempotent -- but it means `rows' and `bytes' in the report are
+%% <em>rows written</em>, an upper bound on the distinct bytes copied. The
+%% authoritative output size is the store on disk, and the slot and assignment
+%% counts are unaffected because they are counted per process.
 with_seen(Ctx, Fun) ->
     Tab = ets:new(hb_store_gc_seen, [set, private]),
     try
@@ -419,16 +435,16 @@ collect_all(Ctx, Procs, Acc0) ->
     end.
 
 collect_serial(Ctx, Procs, Acc0) ->
-    {{Acc, Plans}, Keys} =
-        with_seen(Ctx, fun(C) -> fold_procs(C, Procs, length(Procs), Acc0) end),
-    {bump(distinct_keys, Keys, Acc), lists:reverse(Plans)}.
+    {Acc, Plans} = fold_procs(Ctx, Procs, length(Procs), Acc0),
+    {Acc, lists:reverse(Plans)}.
 
 fold_procs(Ctx, Procs, Total, Acc0) ->
     lists:foldl(
         fun(ProcID, {A0, Ps}) ->
             ok = check_free_space(Ctx),
-            {A1, Plan} = collect_process(Ctx, ProcID, A0),
-            A2 = bump(procs_done, 1, A1),
+            {{A1, Plan}, Keys} =
+                with_seen(Ctx, fun(C) -> collect_process(C, ProcID, A0) end),
+            A2 = bump(distinct_keys, Keys, bump(procs_done, 1, A1)),
             report_progress(Ctx, Total, A2, Plan),
             {A2, [Plan | Ps]}
         end,
@@ -455,21 +471,19 @@ collect_parallel(Ctx, Procs, Acc0, N) ->
     gather(Ctx, Total, length(Pids), Acc0, [], sets:from_list(Pids)).
 
 worker(Parent, Ctx, Chunk) ->
-    {{Acc, Plans}, Keys} =
-        with_seen(Ctx, fun(C) ->
-            lists:foldl(
-                fun(ProcID, {A0, Ps}) ->
-                    ok = check_free_space(C),
-                    {A1, Plan} = collect_process(C, ProcID, A0),
-                    Parent ! {gc_proc_done, Plan},
-                    {A1, [Plan | Ps]}
-                end,
-                {new_acc(), []},
-                Chunk
-            )
-        end),
-    Parent ! {gc_worker_done, self(),
-              bump(distinct_keys, Keys, Acc), lists:reverse(Plans)}.
+    {Acc, Plans} =
+        lists:foldl(
+            fun(ProcID, {A0, Ps}) ->
+                ok = check_free_space(Ctx),
+                {{A1, Plan}, Keys} =
+                    with_seen(Ctx, fun(C) -> collect_process(C, ProcID, A0) end),
+                Parent ! {gc_proc_done, Plan},
+                {bump(distinct_keys, Keys, A1), [Plan | Ps]}
+            end,
+            {new_acc(), []},
+            Chunk
+        ),
+    Parent ! {gc_worker_done, self(), Acc, lists:reverse(Plans)}.
 
 gather(_Ctx, _Total, 0, Acc, Plans, _Live) -> {Acc, Plans};
 gather(Ctx, Total, Left, Acc, Plans, Live) ->
@@ -1171,6 +1185,8 @@ report(Acc, Plans, Policy, SrcStore, DstStore) ->
         reference_now => maps:get(now, Policy),
         workers => maps:get(workers, Policy),
         min_free_bytes => maps:get(min_free_bytes, Policy),
+        %% Summed over the per-process visited sets, so a key reachable from two
+        %% processes counts twice -- it is a work measure, not a key count.
         distinct_keys_visited => maps:get(distinct_keys, Acc, 0),
         processes => length(Plans),
         plans => lists:reverse(Plans),

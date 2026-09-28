@@ -29,8 +29,10 @@ The gap matters in two specific ways:
   pin. Prod is still on `faa7623`. Any elmdb change (see the audit's §3.2
   `read_prefix_rows` → DirtyIo) must decide which pin it targets first.
 
-The 7 in-flight PR branches are rebased onto **current** `origin/edge`
+The 7 upstream-bound PR branches are rebased onto **current** `origin/edge`
 (0 commits behind), so they are *not* directly mergeable into prod's older base.
+`feat/store-collector` is the exception: `hb_store_gc` is fork-only and has no
+upstream counterpart, so it branches from the prod tip `9d7a958e1` instead.
 
 ---
 
@@ -133,6 +135,7 @@ rollback candidates.
 | `fix/process-worker-slot-normalization` | `bb2e50eb5` | `process-worker-slot-normalization` |
 | `fix/gateway-location-fallback` | `67329b16d` | `push-legacy` |
 | `fix/push-outbox-metadata` | `7150219d1` | `push-outbox-metadata` |
+| `feat/store-collector` | `0dbc1e018` | `store-collector` |
 
 `fix/process-worker-slot-normalization` additionally carries hardening upstream
 does not have yet: atomic leader election (`e25063267`), waiter-enrollment
@@ -165,7 +168,7 @@ Two specs live beside this file. Both are designed and measured; neither is buil
 
 | doc | what | urgency |
 |---|---|---|
-| `STORE-GROWTH.md` | Bound the LMDB store. It grows ~38 GiB/day with no deletion path at any layer. A sorted reload alone recovers ~27 GiB at zero policy risk; a full compactor gets 97 -> ~40 GiB. **Neither bounds it** -- the signed assignment chain is a permanent root and this node is its sole custodian, so an assignment-archival decision is upstream of the compactor. | weeks of runway |
+| `STORE-GROWTH.md` | Bound the LMDB store. **§18: the collector is now built** (`feat/store-collector`, `hb_store_gc:collect/3`) and validated on the 149 GiB corpus -- copy-based, because no layer of this stack has a delete primitive. Not deployed, and the swap is still a manual operator step. The archival fear §14 recorded is resolved: the signed chain is 5% of a slot (§16), so collection bounds the store without touching it. | built, not deployed |
 | `OUTBOX-DURABILITY.md` | Make outbox delivery durable. The dominant loss source is closed (delivery no longer dies with the client connection), but there is no delivery record and no retry, so a node that stops mid-delivery still loses in-flight hops. Path is record -> resume -> cranker. | user-visible |
 
 ## 5. Rollback

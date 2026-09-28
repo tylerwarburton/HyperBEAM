@@ -220,6 +220,60 @@ Also the disk clock: store 76 GB growing ~80 GiB/day with 285 GB free **[M]**
 
 ---
 
+### MEASURED OUTCOME — Item 5 works, and it re-ran the ledger through re-execution
+
+Implemented as `hb_store_gc:collect/3` on `feat/store-collector` (base
+`9d7a958e1`), built and validated only against
+`/opt/runerealm-hb/store/lmdb.CORPUS-20260926T134420Z`. The live store was never
+opened by it. Full numbers and the corrected corpus figures are in
+`STORE-GROWTH.md` §18; what belongs here is what it costs to read a slot the
+collector dropped.
+
+**`dev_process:rewind/4` fired for the first time, and it works.** Verified by
+`dbg:tpl` on the packaged device module (the devices load under
+`_hb_device_process_1_0_<hash>` names, so tracing `dev_process` matches
+nothing — that is why an earlier attempt saw no trace), against an isolated node
+booted on the collected store with a local-only store list:
+
+| read | slots re-executed | wall | rewind fired |
+|---|---|---|---|
+| in-window slot, retained | 0 | **5.7 s** | no (pure delta materialize) |
+| dropped slot, cold worker | 500 | **73.4 s** | no — `ensure_loaded` already lands at or below the target |
+| dropped slot, worker above it | 500 | **55.9 s** | **yes, 1 call** |
+| next dropped slot, worker above it | 500 | **65.9 s** | **yes, 1 call** |
+
+All four returned **HTTP 200**. **[M]**
+
+`rewind/4` is only reachable when a live worker holds a state *above* the target:
+from a cold base, `ensure_loaded_state/3` is handed the target slot and returns
+the newest snapshot at or below it, so `compute_to_slot/6` never enters the
+`CurrentSlot > TargetSlot` branch. Both paths end in the same re-execution.
+
+**Re-execution is exact.** The states rebuilt through `rewind/4` are
+byte-identical to the originals in the corpus: `dev_process_cache:read/3` on both
+stores, `ensure_all_loaded`, `term_to_binary` — equal for every slot checked,
+including the two that were rebuilt after a rewind. **[M]**
+
+**Cost: ~112-147 ms per re-executed slot** (500 slots in 56-73 s). §16's upper
+bound of <=385 ms/slot from cgroup accounting is conservative by ~2.6x, so its
+"~6 minutes for a 1000-slot gap" is really **~2 minutes**. **[M]**
+
+**Operational consequence worth knowing before the swap:** re-execution writes
+its results back through `dev_process_cache`, so every cold historical read
+re-inflates the store with the slots it replayed. Six such reads on one process
+added ~1 GB to the collected store. The collector bounds *growth from
+scheduling*; it does not bound growth from archival reads.
+
+**Anchors (Item 2) are still the right thing to enable next.** §16's argument
+holds: with a window, anchors cost a fixed 21.5 GB per day-of-window instead of
++21.5 GB/day forever. Nothing in the collector needs changing for them —
+`classify_root/2` already recognises `process-anchor@1.0` and treats it as
+window-only, and `lower_to_full_state/4` already treats an anchor as a valid
+terminator for the backward delta walk, which is correct: an anchor is a full
+public state, it just cannot serve as a VM resume base.
+
+---
+
 ## Build order and base branches
 
 **Order: 2, then 1, then 3, then 4.** Item 2 attacks the 115 s at its root;
