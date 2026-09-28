@@ -414,12 +414,13 @@ collect(RawPolicy, SrcOpts, DstOpts, Which) ->
 %% @doc Give `Fun' a context with its own visited set and report how big that set
 %% grew.
 %%
-%% The set is scoped to <em>one process</em>, and that is a memory decision made
-%% the hard way. Held across a whole run it reached **20.7 GB resident plus 4.6 GB
-%% swapped at 167 of 370 processes** on the corpus **[M]** -- it accumulates ~26
-%% entries per assignment and there are 1.99M assignments, so a whole-store pass
-%% does not fit in 62 GB. Per process it is bounded by the largest process
-%% (~1.7M entries) instead.
+%% The table belongs to one worker and `reset_seen/2' clears it between the
+%% processes that worker handles, so its contents are scoped to <em>one
+%% process</em>. That is a memory decision made the hard way: kept across a whole
+%% run the set reached **20.7 GB resident plus 4.6 GB swapped at 167 of 370
+%% processes** on the corpus **[M]** -- it accumulates ~26 entries per assignment
+%% and there are 1.99M assignments, so a whole-store pass does not fit in 62 GB.
+%% Bounded to one process it is the size of the largest one (~1.7M entries).
 %%
 %% The cost of the narrower scope is that content shared <em>between</em> processes
 %% is read and written more than once. Both are harmless -- a `put' of the same

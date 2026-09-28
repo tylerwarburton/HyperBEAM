@@ -864,19 +864,59 @@ retaining, and if the search cap is reached it falls back to the process's
 exactly one full state (slot 0, forced by `should_checkpoint/4`), which is the
 shape that finds this bug.
 
-### Round trip
+### Round trip, measured
 
-Against a node booted on the collected store with a local-only store list, so a
-miss reads as a miss instead of taking Item 4's 96-second trip to arweave.net:
+Over **232 of the 370 processes** (the portion of the copy that had completed;
+the rest was cut for wall-clock, not for any failure): **[M]**
 
-- every process resolves: definition readable, latest retained slot readable
-- assignment slot lists are **equal** between source and collection, per process
-- a retained historical read is **byte-identical** before and after
-  (`dev_process_cache:read/3`, `ensure_all_loaded`, `term_to_binary`)
-- a dropped slot either re-executes to a **byte-identical** state or reads
-  `{error, not_found}`; nothing crashed
-- **`dev_process:rewind/4` fired for the first time and worked** -- see
-  `SPEED-UPGRADES.md` Item 5 for the traces and timings
+| check | result |
+|---|---|
+| process definition resolves | **232 / 232** |
+| latest retained slot readable | 223 / 232 -- the 9 shortfalls are the 9 processes that have **zero** computed slots in the source, so nothing was lost |
+| **assignment slots, source** | **1,211,993** |
+| **assignment slots, collection** | **1,211,993** -- equal per process, not just in total |
+| sampled assignment reads byte-identical | 657 / 657 |
+| sampled in-window states byte-identical | 648 / 648 |
+| sampled dropped slots read cleanly | 228 / 228, **0 crashes** |
+
+And not sampled: **every** assignment of two whole processes compared field for
+field through `dev_scheduler_cache:read/3` + `ensure_all_loaded` +
+`term_to_binary` -- **571 / 571** and **16,162 / 16,162** byte-identical, zero
+differences. **[M]**
+
+The collector's own counters agree: across the batches that reported them,
+`unfollowed_link_keys` is **0**, `drop_checkpoint` is **0** and `drop_unknown` is
+**0** -- no VM snapshot was ever dropped and no slot was ever unclassifiable. The
+only `misses` are the `computed/<id>` and `computed/<id>/slot` group markers of
+the 13 processes that never computed a slot, which are absent from the source too.
+
+`dev_process:rewind/4` fired for the first time and worked -- see
+`SPEED-UPGRADES.md` Item 5 for the traces, timings and the byte-for-byte
+comparison of the re-executed states.
+
+### Size
+
+The source was never written. `data.mdb` and `lock.mdb` in the corpus still carry
+their 2026-09-26 mtimes, because `read-only => true` opens the environment with
+`MDB_NOLOCK` and nothing in the collector calls a write. `hyperbeam-prod` was not
+restarted or reconfigured at any point. **[M]**
+
+| | pages used | free | **live** |
+|---|---|---|---|
+| corpus (§15) | 39.0M -- 159.9 GB file | 5.9M / 21.8 GiB | **127.1 GiB** |
+| collection, 232+ processes | 18,354,971 | 3,589,171 / 14.7 GB | **60.5 GB** |
+
+The collection's free pages are one abandoned batch: LMDB never shrinks, so a
+killed run's pages stay in the file and return to the free list. **Quote the live
+figure, not the file size.**
+
+Extrapolated over the whole corpus that is **~80 GB against the corpus's
+136.5 GB, about 41% reclaimed** -- and that ratio is a property of *this corpus*,
+not of the policy. The corpus holds 2.40 days; a 1-day window can only reach the
+older 1.4 of them. §16's model is the one to plan on: a 1-day window costs a
+**fixed** ~51 GB of deltas and anchors however long the node runs, plus the ledger
+at 2.7 GB/day and the checkpoints. The reclaim ratio grows with the age of the
+store.
 
 ### Operational notes for whoever runs the swap
 
@@ -893,6 +933,26 @@ miss reads as a miss instead of taking Item 4's 96-second trip to arweave.net:
 - **Re-execution writes its results back.** A cold historical read re-caches
   every slot it replayed. The collector bounds growth from *scheduling*; it does
   not bound growth from archival reads.
+- **The collector's own memory is the thing that will bite an operator**, and it
+  took four failed whole-corpus runs to bound it. In order: the visited set held
+  across the run (**RssAnon 20.7 GB + 4.6 GB swapped at 167 of 370 processes**);
+  the same set keyed by 45-80 byte paths instead of digests (**~430 B/entry**);
+  a set recreated per process rather than cleared, whose freed carriers never
+  returned (**36 GB at 236 of 370**); and finally the write path itself
+  (**15 GB in 13 minutes inside one large process**). Only the last is
+  interesting: `elmdb:put/3' queues into a Rust overlay drained by a background
+  worker, so a copy with no backpressure produces rows faster than LMDB commits
+  them, and `elmdb:read_prefix/2' returns one packed buffer per subtree whose
+  sub-binaries pin it until a collection runs. A periodic `elmdb:flush/1' plus
+  `erlang:garbage_collect/0' holds the same work at **155 MB**. **[M]**
+- **What ruled the alternatives out**, since three of those four were guesses:
+  sampling `elmdb:overlay_count/1', `erlang:memory(binary)', `(processes)' and
+  `(ets)' every 20 s through a four-worker run. The overlay oscillated between 8
+  and 8,585 entries, binary stayed at 0.01 GB and processes at 0.15 GB; only
+  `ets' climbed. Measure before changing anything here.
+- **Run it in batches.** A fresh VM per slice of the process list carries nothing
+  over and makes the pass restartable, which after four memory failures is worth
+  more than the page cache it gives up. `collect/4' takes the process list.
 - LMDB never shrinks, so a copy that runs the disk out leaves a file that cannot
   be reclaimed except by deleting it. `collect/3` checks free space between
   processes against `min_free_bytes` (64 GiB default) and stops, flushing first.
