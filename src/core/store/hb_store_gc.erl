@@ -440,7 +440,18 @@ reset_seen(Ctx, Fun) ->
     Tab = maps:get(seen, Ctx),
     true = ets:delete_all_objects(Tab),
     Result = Fun(Ctx),
-    {Result, ets:info(Tab, size)}.
+    Keys = ets:info(Tab, size),
+    %% Then collect, because most of what a worker allocates is refcounted
+    %% binaries and nothing here makes the runtime reclaim them promptly.
+    %% `elmdb:read_prefix/2' returns one packed buffer per subtree with the rows
+    %% as sub-binaries of it, so a single checkpoint pins ~24 MB until the last
+    %% sub-binary dies *and* a garbage collection runs. The binary virtual heap
+    %% that would normally trigger that grows with the worker, so it does not run
+    %% often enough: a batch of 46 processes reached **RssAnon 31.5 GB** with the
+    %% visited sets cleared and `elmdb:overlay_count/1' flat. One collection per
+    %% process is cheap and is the only thing that bounds it.
+    erlang:garbage_collect(),
+    {Result, Keys}.
 
 %% @doc Collect every process, serially or across `workers' of them.
 collect_all(Ctx, Procs, Acc0) ->
@@ -1135,7 +1146,8 @@ report_progress(Ctx, Total, Acc, Plan) ->
     case maps:get(progress, maps:get(policy, Ctx)) of
         undefined -> ok;
         Fun when is_function(Fun, 1) ->
-            catch Fun(Acc#{ processes_total => Total, last_process => Plan }),
+            catch Fun(Acc#{ processes_total => Total, last_process => Plan,
+                            memory_total => erlang:memory(total) }),
             ok
     end.
 
