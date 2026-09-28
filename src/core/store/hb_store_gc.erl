@@ -309,6 +309,11 @@ policy(Policy) ->
 %% Bytes accumulated before a batch is flushed regardless of row count: a single
 %% `snapshot/body' row is ~19 MB and must not be packed with 255 others.
 -define(BATCH_BYTES, 8 * 1024 * 1024).
+%% Bytes copied between synchronous flushes of the destination. `elmdb:put/3' is
+%% fire-and-forget into a Rust overlay that a background worker drains, so without
+%% this a copy produces rows faster than LMDB commits them and the difference is
+%% resident memory. The flush is also the only backpressure available.
+-define(DEFAULT_FLUSH_EVERY, 256 * 1024 * 1024).
 %% Guard against a `read_prefix' on an accidentally short prefix -- the hazard
 %% that once materialised 26.5M rows (~21 GiB) into a single term.
 -define(MAX_SUBTREE_ROWS, 250000).
@@ -368,6 +373,7 @@ collect(RawPolicy, SrcOpts, DstOpts, Which) ->
             src_db => store_db(SrcStore),
             dst_store => DstStore,
             dst_opts => DstOpts,
+            dst_db => store_db(DstStore),
             policy => Policy,
             dry_run => maps:get(dry_run, Policy)
         },
@@ -569,6 +575,8 @@ collect_policy(Policy) ->
         base_search => maps:get(base_search, Policy, ?DEFAULT_BASE_SEARCH),
         min_free_bytes => maps:get(min_free_bytes, Policy, ?DEFAULT_MIN_FREE),
         progress => maps:get(progress, Policy, undefined),
+        flush_every_bytes =>
+            maps:get(flush_every_bytes, Policy, ?DEFAULT_FLUSH_EVERY),
         workers => max(1, maps:get(workers, Policy, ?DEFAULT_WORKERS))
     }.
 
@@ -614,7 +622,7 @@ new_acc() ->
     #{
         rows => 0, bytes => 0, closures => 0, misses => 0, max_subtree => 0,
         unfollowed_link_keys => 0, ledger_bytes => 0, computed_bytes => 0,
-        distinct_keys => 0,
+        distinct_keys => 0, unflushed => 0, flushes => 0,
         procs_done => 0, assignment_slots => 0,
         retain_slots => 0, drop_slots => 0,
         retain_in_window => 0, retain_checkpoint => 0,
@@ -1107,7 +1115,8 @@ rows_bytes(Rows) ->
     lists:sum([ byte_size(K) + byte_size(V) || {K, V} <- Rows ]).
 
 put_rows(Ctx, Rows, Acc) ->
-    Acc1 = bump(rows, length(Rows), bump(bytes, rows_bytes(Rows), Acc)),
+    Bytes = rows_bytes(Rows),
+    Acc1 = bump(rows, length(Rows), bump(bytes, Bytes, Acc)),
     case maps:get(dry_run, Ctx) of
         true -> Acc1;
         false ->
@@ -1121,7 +1130,27 @@ put_rows(Ctx, Rows, Acc) ->
                 end,
                 batches(Rows)
             ),
-            Acc1
+            maybe_flush(Ctx, bump(unflushed, Bytes, Acc1))
+    end.
+
+%% @doc Force the destination's pending writes out every `flush_every_bytes', then
+%% collect.
+%%
+%% Both halves are needed and both were learned from a failure. `elmdb:put/3'
+%% queues into a Rust overlay drained by a background worker, so a copy that never
+%% flushes produces rows faster than LMDB commits them; the synchronous flush is
+%% the only backpressure this interface offers. And the rows themselves are
+%% sub-binaries of the packed buffer `elmdb:read_prefix/2' returns, so each one
+%% pins its whole buffer until a collection runs. With neither, a single large
+%% process climbed past **15 GB resident in 13 minutes**.
+maybe_flush(Ctx, Acc) ->
+    Limit = maps:get(flush_every_bytes, maps:get(policy, Ctx)),
+    case maps:get(unflushed, Acc, 0) >= Limit of
+        false -> Acc;
+        true ->
+            catch elmdb:flush(maps:get(dst_db, Ctx)),
+            erlang:garbage_collect(),
+            maps:put(unflushed, 0, bump(flushes, 1, Acc))
     end.
 
 batches(Rows) -> batches(Rows, [], 0, 0, []).
@@ -1227,6 +1256,7 @@ report(Acc, Plans, Policy, SrcStore, DstStore) ->
         keep_floor => maps:get(keep_floor, Policy),
         reference_now => maps:get(now, Policy),
         workers => maps:get(workers, Policy),
+        flush_every_bytes => maps:get(flush_every_bytes, Policy),
         min_free_bytes => maps:get(min_free_bytes, Policy),
         %% Summed over the per-process visited sets, so a key reachable from two
         %% processes counts twice -- it is a work measure, not a key count.
@@ -1786,3 +1816,21 @@ seen_is_keyed_by_digest_not_key_test() ->
     [{Stored}] = ets:lookup(Tab, crypto:hash(md5, Key)),
     ?assertEqual(16, byte_size(Stored)),
     ets:delete(Tab).
+
+collect_flushes_the_destination_periodically_test_() ->
+    {timeout, 120, fun() ->
+        %% A tiny flush threshold must produce flushes; the default must not fire
+        %% on a fixture this small. The count is what tells an operator whether
+        %% backpressure is engaging at all.
+        Policy = #{ keep_seconds => 0, keep_floor => 5 },
+        {_P1, _S1, _D1, Loose} =
+            gc_collect_fixture(<<"noflush">>, 20, 10, Policy),
+        {_P2, _S2, _D2, Tight} =
+            gc_collect_fixture(<<"flush">>, 20, 10,
+                Policy#{ flush_every_bytes => 1024 }),
+        ?assertEqual(0, maps:get(flushes, Loose)),
+        ?assert(maps:get(flushes, Tight) > 0),
+        %% Flushing changes nothing about what was copied.
+        ?assertEqual(maps:get(rows, Loose), maps:get(rows, Tight)),
+        ?assertEqual(maps:get(bytes, Loose), maps:get(bytes, Tight))
+    end}.
