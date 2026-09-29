@@ -218,22 +218,57 @@ compute(Base, Req, Opts) ->
                         }
                     ),
                     {ok, mark_cached_state(without_snapshot(Result, Opts), Opts)};
-                {error, not_found} ->
-                    {ok, Loaded} = ensure_loaded(ProcBase, Req, Opts),
-                    ?event(compute,
-                        {computing, {process_id, ProcID},
-                        {to_slot, Slot}},
-                        Opts
-                    ),
-                    compute_to_slot(
-                        ProcID,
-                        Loaded,
-                        Req,
-                        Slot,
-                        Opts
-                    )
+                  Res ->
+                      % A plain missing slot already arrives as
+                      % `{error, not_found}' and was handled, so this is not the
+                      % common path. It exists for the shapes that were NOT
+                      % handled and reached `case_clause': notably
+                      % `{error, {invalid_process_delta_chain, _, _}}', which
+                      % `dev_process_cache:materialize/3' returns when a delta's
+                      % recorded base slot is not its predecessor. Collection
+                      % makes that reachable.
+                      %
+                      % Such a miss is recoverable: the assignments and the
+                      % process definition are the signed ledger and are never
+                      % collected, so the slot can be rebuilt by replaying
+                      % forward from the nearest retained snapshot, which is
+                      % what `compute_to_slot/5' does.
+                      %
+                      % Anything that is not a recognised miss -- a store
+                      % failure, say -- is returned untouched rather than
+                      % answered with an expensive replay that would mask it.
+                      case recoverable_miss(Res) of
+                          false -> Res;
+                          true ->
+                              {ok, Loaded} =
+                                  ensure_loaded(ProcBase, Req, Opts),
+                              ?event(compute,
+                                  {recomputing_uncached_slot,
+                                      {process_id, ProcID},
+                                      {to_slot, Slot},
+                                      {cache_said, Res}},
+                                  Opts
+                              ),
+                              compute_to_slot(
+                                  ProcID,
+                                  Loaded,
+                                  Req,
+                                  Slot,
+                                  Opts
+                              )
+                      end
             end
     end.
+
+%% @doc Whether a `dev_process_cache:read/3' result means "not in the cache",
+%% in which case the slot can be rebuilt from the ledger, as opposed to a real
+%% failure that must not be hidden behind a replay.
+recoverable_miss(not_found) -> true;
+recoverable_miss({error, not_found}) -> true;
+%% The delta chain is backward-linked, so if a base slot has been collected --
+%% or was never written -- materialization reports the break, not the slot.
+recoverable_miss({error, {invalid_process_delta_chain, _, _}}) -> true;
+recoverable_miss(_) -> false.
 
 %% @doc Return the slot requested by a `compute' request, or `not_found'.
 %%
@@ -341,26 +376,86 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts, Stored) ->
                     end
             end;
         CurrentSlot when CurrentSlot > TargetSlot ->
-            % The cache should already have the result, so we should never end up
-            % here. Depending on the type of process, 'rewinding' may require
-            % re-computing from a significantly earlier checkpoint, so for now
-            % we throw an error.
+            % We are being asked for a slot behind the state we hold. The
+            % original code threw here, on the assumption that "the cache should
+            % already have the result" -- true only while every computed slot is
+            % kept forever. Collecting old states breaks exactly that invariant:
+            % a worker live at the head, asked for a collected historical slot,
+            % would land here and fail.
+            %
+            % Rewinding is what makes that a latency cost instead of lost
+            % history. Every assignment and the process definition are the
+            % signed ledger and are never collected, so the slot can always be
+            % rebuilt: restart from the newest snapshot at or below the target
+            % and replay forward.
             ?event(
                 compute,
-                {error_already_calculated_slot,
+                {rewinding_to_earlier_slot,
                     {target, TargetSlot},
                     {current, CurrentSlot}
                 },
                 Opts
             ),
-            throw(
-                {error,
-                    {already_calculated_slot,
-                        {target, TargetSlot},
-                        {current, CurrentSlot}
-                    }
-                }
-            )
+            case rewind(Base, Req, TargetSlot, Opts) of
+                {ok, Rewound} ->
+                    compute_to_slot(
+                        ProcID, Rewound, Req, TargetSlot, Opts, Stored
+                    );
+                not_found ->
+                    % No snapshot at or below the target, so there is nothing to
+                    % replay forward from. Preserve the original error rather
+                    % than inventing a state.
+                    ?event(
+                        compute,
+                        {error_already_calculated_slot,
+                            {target, TargetSlot},
+                            {current, CurrentSlot}
+                        },
+                        Opts
+                    ),
+                    throw(
+                        {error,
+                            {already_calculated_slot,
+                                {target, TargetSlot},
+                                {current, CurrentSlot}
+                            }
+                        }
+                    )
+            end
+    end.
+
+%% @doc Restart computation from the newest snapshot at or below `TargetSlot'.
+%%
+%% `ensure_loaded_state/3' already finds that snapshot -- it asks
+%% `dev_process_cache:latest/4' for the latest state carrying `snapshot+link'
+%% up to a limit -- but it short-circuits on an already-initialized state and
+%% would hand back the very state we need to rewind from. So it is given the
+%% process definition, which is never initialized, forcing the load.
+rewind(Base, Req, TargetSlot, Opts) ->
+    Definition = hb_maps:get(<<"process">>, Base, Base, Opts),
+    RewindReq = hb_maps:put(<<"slot">>, TargetSlot, Req, Opts),
+    case catch ensure_loaded_state(Definition, RewindReq, Opts) of
+        {ok, Loaded} ->
+            % Only accept a state at or below the target. A state still ahead of
+            % it would re-enter this same clause and recurse forever, so treat
+            % that as no usable snapshot.
+            case hb_ao:get(
+                    <<"at-slot">>, Loaded, Opts#{ <<"hashpath">> => ignore }) of
+                Slot when is_integer(Slot), Slot =< TargetSlot ->
+                    {ok, Loaded};
+                Other ->
+                    ?event(
+                        compute,
+                        {rewind_landed_above_target,
+                            {target, TargetSlot},
+                            {landed, Other}
+                        },
+                        Opts
+                    ),
+                    not_found
+            end;
+        _ ->
+            not_found
     end.
 
 %% @doc Compute a single slot for a process, given an initialized state.
@@ -940,3 +1035,34 @@ delta_snapshot_cadence_test() ->
     ?assertNot(should_snapshot(50, DeltaState, Opts)),
     ?assertNot(should_snapshot(999, DeltaState, Opts)),
     ?assert(should_snapshot(1000, DeltaState, Opts)).
+
+%% @doc A cache miss must route to re-execution, and a real failure must not.
+%% `dev_process_cache:read/3' returns a bare `not_found' (it passes
+%% `hb_cache:read/2''s result through untouched), and a delta whose base slot is
+%% gone returns `{error, {invalid_process_delta_chain, _, _}}'. Before this,
+%% `compute/3' matched only `{error, not_found}', so both crashed the request
+%% with `case_clause' instead of rebuilding the slot from the ledger.
+recoverable_miss_accepts_every_cache_miss_shape_test() ->
+    ?assert(recoverable_miss(not_found)),
+    ?assert(recoverable_miss({error, not_found})),
+    ?assert(recoverable_miss({error, {invalid_process_delta_chain, 41, 43}})).
+
+%% @doc A store failure answered with a full replay would hide the fault and
+%% cost a replay per request, so anything unrecognised is passed back.
+recoverable_miss_rejects_real_failures_test() ->
+    ?assertNot(recoverable_miss({error, no_viable_store})),
+    ?assertNot(recoverable_miss({error, timeout})),
+    ?assertNot(recoverable_miss({ok, #{}})),
+    ?assertNot(recoverable_miss({error, {some_other_reason, 1}})).
+
+%% @doc When there is no snapshot at or below the target, `rewind/4' must report
+%% `not_found' so the caller preserves the original `already_calculated_slot'
+%% error. It must not crash, and it must not fabricate a state: returning one
+%% above the target would re-enter the same clause and recurse forever.
+rewind_without_snapshot_reports_not_found_test() ->
+    Opts = #{ <<"store">> => [] },
+    ?assertEqual(not_found, rewind(#{}, #{}, 100, Opts)),
+    ?assertEqual(
+        not_found,
+        rewind(#{ <<"process">> => #{} }, #{ <<"slot">> => 100 }, 100, Opts)
+    ).
