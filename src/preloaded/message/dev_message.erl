@@ -623,13 +623,8 @@ set(Base, NewValuesMsg, Opts) ->
 			end,
 			NewValuesKeys
 		),
-	% Find keys in the message that are already set (case-insensitive), and 
-	% note them for removal.
-	_ConflictingKeys =
-		lists:filter(
-			fun(Key) -> lists:member(Key, KeysToSet) end,
-			hb_maps:keys(Base, Opts)
-		),
+    % Only requested keys can be unset. Walking the public base here makes
+    % every scalar update pay for all accounts the process has published.
     UnsetKeys =
         lists:filter(
             fun(Key) ->
@@ -638,13 +633,12 @@ set(Base, NewValuesMsg, Opts) ->
                     _ -> false
                 end
             end,
-            hb_maps:keys(Base, Opts)
+            hb_maps:keys(NewValuesMsg, Opts)
         ),
     % Base message with keys-to-unset removed
     BaseValues = hb_maps:without(UnsetKeys, Base, Opts),
     ?event_debug(debug_message_set,
         {performing_set,
-            {conflicting_keys, _ConflictingKeys},
             {keys_to_unset, UnsetKeys},
             {new_values, NewValuesMsg},
             {original_message, Base}
@@ -967,6 +961,27 @@ set_conflicting_keys_test() ->
 	Req = #{ <<"path">> => <<"set">>, <<"dangerous">> => <<"Value2">> },
 	?assertMatch({ok, #{ <<"dangerous">> := <<"Value2">> }},
 		hb_ao:resolve(Base, Req, #{})).
+
+%% @doc Sparse updates preserve unrelated values and private state, including
+%% when the deletion names an absent key.
+sparse_set_preserves_untouched_state_test() ->
+    Priv = #{<<"state">> => {retained, make_ref()}},
+    Base = #{
+        <<"keep">> => #{<<"nested">> => <<"value">>},
+        <<"remove-me">> => 7,
+        <<"priv">> => Priv
+    },
+    {ok, Result} = hb_ao:resolve(
+        Base,
+        #{<<"path">> => <<"set">>, <<"remove-me">> => unset,
+          <<"absent">> => unset, <<"added">> => 8},
+        #{<<"hashpath">> => ignore}
+    ),
+    ?assertEqual(#{<<"nested">> => <<"value">>}, maps:get(<<"keep">>, Result)),
+    ?assertEqual(8, maps:get(<<"added">>, Result)),
+    ?assertNot(maps:is_key(<<"remove-me">>, Result)),
+    ?assertNot(maps:is_key(<<"absent">>, Result)),
+    ?assertEqual(Priv, hb_private:from_message(Result)).
 
 unset_with_set_test() ->
 	Base = #{ <<"dangerous">> => <<"Value1">> },

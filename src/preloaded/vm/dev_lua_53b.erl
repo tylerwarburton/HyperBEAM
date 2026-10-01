@@ -432,6 +432,40 @@ snapshot_restore_continuity_test() ->
     ?assertEqual(<<"6">>, hb_ao:get(<<"count">>, State6, Opts)),
     ?assertEqual(<<"6">>, hb_ao:get(<<"results/output/data">>, State6, Opts)).
 
+%% @doc Snapshots discard garbage while keeping closures, aliases and cycles.
+snapshot_collects_unreachable_tables_test() ->
+    hb:init(),
+    Opts = #{ <<"hashpath">> => ignore },
+    Script = <<
+        "local kept = { count = 0 }; kept.self = kept\n"
+        "Alias = kept\n"
+        "function compute(req)\n"
+        "  assert(kept == Alias and kept.self == kept)\n"
+        "  kept.count = kept.count + 1\n"
+        "  local garbage = {}\n"
+        "  for i = 1, 1000 do\n"
+        "    garbage[i] = { value = string.rep('discard', 100) .. i }\n"
+        "  end\n"
+        "  garbage = nil\n"
+        "  collectgarbage('step', 1)\n"
+        "  return { patches = {{ path = '/count', value = tostring(kept.count) }} }\n"
+        "end"
+    >>,
+    {ok, Live} = hb_ao:resolve(base(<<"lua@5.3b">>, Script), request(1), Opts),
+    Heap = hb_private:get(<<"state">>, Live, Opts),
+    Before = erlang:external_size(luerl:externalize(Heap)),
+    {ok, Snapshot} = hb_ao:resolve(Live, <<"snapshot">>, Opts),
+    Body = hb_ao:get(<<"body">>, Snapshot, Opts),
+    After = erlang:external_size(binary_to_term(Body)),
+    ?assert(After * 2 < Before),
+    Cold = hb_ao:set(hb_private:reset(Live), <<"snapshot">>, Snapshot, Opts),
+    {ok, Restored} = hb_ao:resolve(Cold, <<"normalize">>, Opts),
+    {ok, Next} = hb_ao:resolve(Restored, request(2), Opts),
+    ?assertEqual(<<"2">>, hb_ao:get(<<"count">>, Next, Opts)),
+    % Taking a snapshot must not replace or mutate the live VM's heap.
+    {ok, LiveNext} = hb_ao:resolve(Live, request(2), Opts),
+    ?assertEqual(<<"2">>, hb_ao:get(<<"count">>, LiveNext, Opts)).
+
 %% @doc Deletes work, while runtime-owned paths are refused.
 patch_validation_test() ->
     hb:init(),

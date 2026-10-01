@@ -385,13 +385,13 @@ snapshot(Base, _Req, Opts) ->
         not_found ->
             {error, <<"Cannot snapshot Lua state: state not initialized.">>};
         State ->
-            % The externalized interpreter heap is large and highly
-            % repetitive, so `term_to_binary/2' with `compressed' shrinks the
-            % stored snapshot by roughly an order of magnitude. `normalize/3'
-            % reads it back through `binary_to_term/1', which decompresses
-            % transparently, so the restore path is unchanged.
+            % Snapshot only reachable Lua objects. Incremental collection can
+            % leave dead tables in the resident heap between cycles; persisting
+            % them adds storage, compression work and cold-restore allocations.
+            % Collection operates on a copy, leaving the resident VM intact.
+            Collected = luerl:gc(State),
             {ok, #{ <<"body">> =>
-                term_to_binary(luerl:externalize(State), [compressed]) }}
+                term_to_binary(luerl:externalize(Collected), [compressed]) }}
     end.
 
 %% @doc Restore the Lua state from a snapshot, if it exists.
