@@ -131,8 +131,12 @@ ets_lookup(Name) ->
         [{Name, Pid}] -> 
             case is_process_alive(Pid) of
                 true -> Pid;
-                false -> 
-                    ets:delete(?NAME_TABLE, Name),
+                false ->
+                    % Delete only the dead registration we read. Between the
+                    % lookup and here another caller may already have removed
+                    % it and registered a live owner, which a by-key delete
+                    % would remove, leaving two leaders for one name.
+                    ets:delete_object(?NAME_TABLE, {Name, Pid}),
                     undefined
             end;
         [] -> undefined
@@ -267,6 +271,57 @@ wait_for_cleanup(Name, Retries) ->
                     wait_for_cleanup(Name, Retries - 1)
             end;
         false -> undefined
+    end.
+
+%% @doc Regression: the dead-owner cleanup in `lookup/1' must never remove a
+%% registration made after it read the dead owner. Readers spin on `lookup/1'
+%% while the name cycles between a dead owner and a fresh live one; a reader
+%% that read the dead owner and deletes by key afterwards drops the live
+%% registration, which the next registrant then duplicates.
+dead_cleanup_keeps_fresh_registration_test_() ->
+    {timeout, 60, fun() ->
+        Name = {dead_cleanup, os:timestamp()},
+        Readers =
+            [ spawn(fun() -> spin_lookup(Name) end) || _ <- lists:seq(1, 4) ],
+        Deadline = erlang:monotonic_time(millisecond) + 1500,
+        Lost = dead_cleanup_rounds(Name, Deadline, 0),
+        [ exit(R, kill) || R <- Readers ],
+        ?MODULE:unregister(Name),
+        ?assertEqual(0, Lost)
+    end}.
+
+spin_lookup(Name) ->
+    lookup(Name),
+    spin_lookup(Name).
+
+dead_cleanup_rounds(Name, Deadline, Lost) ->
+    case erlang:monotonic_time(millisecond) > Deadline of
+        true -> Lost;
+        false ->
+            {Dead, Ref} = spawn_monitor(fun() -> ok end),
+            receive {'DOWN', Ref, process, Dead, _} -> ok end,
+            ets:insert(?NAME_TABLE, {Name, Dead}),
+            Live = spawn(fun() -> receive stop -> ok end end),
+            ok = register_when_free(Name, Live),
+            % Give the readers a moment to act on what they read.
+            erlang:yield(),
+            timer:sleep(1),
+            NewLost =
+                case ets:lookup(?NAME_TABLE, Name) of
+                    [{Name, Live}] -> Lost;
+                    _ -> Lost + 1
+                end,
+            Live ! stop,
+            ets:delete(?NAME_TABLE, Name),
+            dead_cleanup_rounds(Name, Deadline, NewLost)
+    end.
+
+register_when_free(Name, Pid) ->
+    case ?MODULE:register(Name, Pid) of
+        ok -> ok;
+        error ->
+            lookup(Name),
+            register_when_free(Name, Pid)
     end.
 
 all_test() ->
