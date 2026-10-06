@@ -45,7 +45,6 @@
 -export([test_unsigned/1, test_signed/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
--define(MATCH_PREFIX, <<"~match@1.0">>).
 -define(DIRECT_VALUE_LENGTH, 60).
 
 %% @doc Ensure that a value is loaded from the cache if it is an ID or a link.
@@ -271,8 +270,10 @@ write(RawMsg, Opts) when is_map(RawMsg) ->
     TABM = hb_message:convert(Msg, tabm, <<"structured@1.0">>, Opts),
     ?event_debug(debug_cache, {writing_full_message, {msg, TABM}}),
     try
+        % The message's private keys are not written, but the `cache-write'
+        % hook receives them.
         do_write_message(
-            TABM,
+            hb_private:set_priv(TABM, hb_private:from_message(RawMsg)),
             hb_opts:get(store, no_viable_store, Opts),
             Opts
         )
@@ -323,13 +324,14 @@ write_message_ops(Msg, Opts) when is_map(Msg) ->
     ?event_debug(debug_cache, {writing_message, Msg}),
     UncommittedID =
         hb_message:id(Msg, none, Opts#{ <<"linkify-mode">> => discard }),
-    AllIDs = calculate_all_ids(Msg, UncommittedID, Opts),
-    AltIDs = AllIDs -- [UncommittedID],
+    {SignedIDs, UnsignedIDs, AllID} = calculate_all_ids(Msg, UncommittedID, Opts),
     MsgHashpathAlg = hb_path:hashpath_alg(Msg, Opts),
     ?event_debug(debug_cache,
         {writing_message,
             {id, UncommittedID},
-            {alt_ids, AltIDs},
+            {signed_ids, SignedIDs},
+            {unsigned_ids, UnsignedIDs},
+            {all_id, AllID},
             {original, Msg}
         }
     ),
@@ -341,11 +343,9 @@ write_message_ops(Msg, Opts) when is_map(Msg) ->
             [{group, UncommittedID}],
             maps:without([<<"priv">>], Msg)
         ),
-    MatchOps =
-        case match_store(Opts) of
-            [] -> KeyOps;
-            _ -> [{match, AllIDs, Msg} | KeyOps]
-        end,
+    % Create an operation to link from the root ID the keys are replicated under
+    % to each of the known alternative IDs for the message (the combined 'all'
+    % ID, signed IDs, and _other_ non-root IDs).
     Ops =
         lists:foldl(
             fun(AltID, Acc) ->
@@ -357,8 +357,8 @@ write_message_ops(Msg, Opts) when is_map(Msg) ->
                 ),
                 [{link, AltID, UncommittedID} | Acc]
             end,
-            MatchOps,
-            AltIDs
+            [{index_hook, AllID, SignedIDs, UnsignedIDs, Msg} | KeyOps],
+            lists:uniq((SignedIDs ++ UnsignedIDs ++ [AllID])) -- [UncommittedID]
         ),
     {ok, UncommittedID, lists:reverse(Ops)}.
 
@@ -462,9 +462,25 @@ run_write_ops(Store, Ops, Opts) ->
     run_write_ops(Store, Ops, Opts, []).
 run_write_ops(Store, [], Opts, Pending) ->
     flush_write_ops(Store, Pending, Opts);
-run_write_ops(Store, [{match, IDs, Msg} | Rest], Opts, Pending) ->
+run_write_ops(
+        Store,
+        [{index_hook, AllID, SignedIDs, UnsignedIDs, Msg} | Rest],
+        Opts,
+        Pending
+) ->
     flush_write_ops(Store, Pending, Opts),
-    write_match_index(IDs, Msg, Opts),
+    {ok, _} =
+        hb_hook:on(
+            <<"cache-write">>,
+            #{
+                <<"body">> => Msg,
+                <<"all-id">> => AllID,
+                <<"signed-ids">> => SignedIDs,
+                <<"unsigned-ids">> => UnsignedIDs,
+                <<"priv">> => #{ <<"hook-caller">> => <<"kernel">> }
+            },
+            Opts
+        ),
     run_write_ops(Store, Rest, Opts, []);
 run_write_ops(Store, [Op | Rest], Opts, Pending) ->
     run_write_ops(Store, Rest, Opts, [Op | Pending]).
@@ -506,107 +522,6 @@ apply_write_ops(Store, Ops, Opts) ->
     end,
     ok.
 
-%% @doc Write all message keys to the optional match index.
-write_match_index(IDs, Base, Opts) ->
-    case match_store(Opts) of
-        [] -> {skip, <<"No store configured for match index.">>};
-        Store ->
-            IndexBase = hb_message:uncommitted(hb_private:reset(Base)),
-            Ops =
-                hb_maps:fold(
-                fun(RawKey, Value, Acc) ->
-                    Key = hb_ao:normalize_key(RawKey),
-                    ValuePath = match_value_path(Value, Opts),
-                    MatchAddress = match_address(Key, ValuePath),
-                    lists:foldl(
-                        fun(ID, InnerAcc) ->
-                            Address = match_address_id(MatchAddress, ID),
-                            [{write, Address, <<"">>} | InnerAcc]
-                        end,
-                        [{group, MatchAddress} | Acc],
-                        IDs
-                    )
-                end,
-                [],
-                IndexBase
-            ),
-            apply_write_ops(Store, lists:reverse(Ops), Opts)
-    end.
-
-%% @doc Select the store that should receive reverse match-index writes.
-%% A local `match-index' option wins when present. Otherwise, a local
-%% `store' means "write this message and its match index to the same
-%% caller-provided store". If neither is present, use the global node
-%% `match-index' setting. The selected value is interpreted as:
-%% `false' disables index writes, `true' uses the normal configured
-%% store, and a store definition/list writes the index there.
-match_store(Opts) ->
-    LocalMatchIndex = maps:get(<<"match-index">>, Opts, undefined),
-    LocalStore = maps:get(<<"store">>, Opts, undefined),
-    GlobalMatchIndex = hb_opts:get(match_index, false, #{ <<"only">> => global }),
-    MatchIndexStore =
-        case {LocalMatchIndex, LocalStore} of
-            {false, _} ->
-                false;
-            {[], _} ->
-                [];
-            {undefined, undefined} ->
-                GlobalMatchIndex;
-            {undefined, _} ->
-                LocalStore;
-            {Local, Store}
-                    when Store =/= undefined andalso
-                        Local =:= GlobalMatchIndex ->
-                Store;
-            {Local, _} ->
-                Local
-        end,
-    case MatchIndexStore of
-        false -> [];
-        true -> hb_opts:get(store, [], Opts);
-        ResolvedStore when is_list(ResolvedStore) -> ResolvedStore;
-        ResolvedStore -> [ResolvedStore]
-    end.
-
-%% @doc Calculate the address of a key-value pair in the match index.
-match_address(Key, Value) ->
-    KeyBin = match_bin(Key),
-    ValueBin = match_bin(Value),
-    iolist_to_binary([?MATCH_PREFIX, "&", KeyBin, "=", ValueBin]).
-match_address_id(Address, ID) ->
-    IDBin = match_bin(ID),
-    <<Address/binary, "/", IDBin/binary>>.
-
-%% @doc Normalize a match-index path part.
-match_bin(Bin) when is_binary(Bin) -> Bin;
-match_bin(Atom) when is_atom(Atom) -> atom_to_binary(Atom);
-match_bin(Int) when is_integer(Int) -> integer_to_binary(Int);
-match_bin(Float) when is_float(Float) -> float_to_binary(Float, [compact]);
-match_bin(List) when is_list(List) ->
-    try iolist_to_binary(List)
-    catch _:_ -> term_to_binary(List)
-    end;
-match_bin(Other) ->
-    term_to_binary(Other).
-
-%% @doc Return the path representation used by cache key-value links.
-match_value_path(Bin, Opts) when is_binary(Bin) ->
-    generate_binary_path(Bin, Opts);
-match_value_path(Map, Opts) when is_map(Map) ->
-    hb_message:id(Map, none, Opts#{ <<"linkify-mode">> => discard });
-match_value_path(List, Opts) when is_list(List) ->
-    case io_lib:printable_unicode_list(List) of
-        true ->
-            match_value_path(iolist_to_binary(List), Opts);
-        false ->
-            match_value_path(
-                hb_message:convert(List, tabm, <<"structured@1.0">>, Opts),
-                Opts
-            )
-    end;
-match_value_path(Other, Opts) ->
-    match_value_path(hb_path:to_binary(Other), Opts).
-
 %% @doc The `structured@1.0` encoder does not typically encode `commitments`,
 %% subsequently, when we encounter a commitments message we prepare its contents
 %% separately, then write each to the store.
@@ -628,21 +543,31 @@ calculate_all_ids(Bin, _UncommittedID, _Opts) when is_binary(Bin) -> [];
 calculate_all_ids(Msg, UncommittedID, Opts) ->
     CommIDs = 
         hb_maps:keys(
-            hb_maps:get(<<"commitments">>, Msg, #{}, Opts),
+            Comms = hb_maps:get(<<"commitments">>, Msg, #{}, Opts),
             Opts
+        ),
+    {SignedIDs, UnsignedIDs} =
+        lists:partition(
+            fun(ID) ->
+                Comm = hb_maps:get(ID, Comms, #{}, Opts),
+                is_map_key(<<"committer">>, Comm)
+            end,
+            CommIDs
         ),
     ?event_debug({calculating_ids, {msg, Msg}, {comm_ids, CommIDs}}),
     case length(CommIDs) of
         0 ->
             % With no commitments the `all' id is the uncommitted id we already
             % computed; skip re-serializing the message to recompute it.
-            [UncommittedID];
+            {[], [UncommittedID], UncommittedID};
         _ ->
-            All = hb_message:id(Msg, all, Opts#{ <<"linkify-mode">> => discard }),
-            case lists:member(All, CommIDs) of
-                true -> CommIDs;
-                false -> [All | CommIDs]
-            end
+            AllID =
+                hb_message:id(
+                    Msg,
+                    all,
+                    Opts#{ <<"linkify-mode">> => discard }
+                ),
+            {SignedIDs, UnsignedIDs, AllID}
     end.
 
 %% @doc Write a hashpath and its message to the store and link it.
@@ -1317,7 +1242,7 @@ test_match_message(Store) when map_get(<<"store-module">>, Store) =/= hb_store_l
     skip;
 test_match_message(Store) ->
     hb_store:reset(Store),
-    Opts = #{ <<"store">> => Store },
+    Opts = #{ <<"store">> => Store, <<"match-index">> => false },
     % Write two messages that match the template, and a third that does not.
     {ok, ID1} = hb_cache:write(#{ <<"x">> => <<"1">> }, Opts),
     {ok, ID2} = hb_cache:write(#{ <<"y">> => <<"2">>, <<"z">> => <<"3">> }, Opts),
@@ -1344,7 +1269,7 @@ test_match_linked_message(Store) when map_get(<<"store-module">>, Store) =/= hb_
     skip;
 test_match_linked_message(Store) ->
     hb_store:reset(Store),
-    Opts = #{ <<"store">> => Store },
+    Opts = #{ <<"store">> => Store, <<"match-index">> => false },
     Msg = #{ <<"a">> => Inner = #{ <<"b">> => <<"c">>, <<"d">> => <<"e">> } },
     {ok, _ID} = write(Msg, Opts),
     {ok, [MatchedID]} = match(#{ <<"b">> => <<"c">> }, Opts),
@@ -1364,7 +1289,7 @@ test_match_typed_message(Store) when map_get(<<"store-module">>, Store) =/= hb_s
     skip;
 test_match_typed_message(Store) ->
     hb_store:reset(Store),
-    Opts = #{ <<"store">> => Store },
+    Opts = #{ <<"store">> => Store, <<"match-index">> => false },
     % Add some messages that should not match the template, as well as the main
     % message that should match the template.
     write(#{ <<"atom-value">> => atom, <<"wrong">> => <<"wrong">> }, Opts),
@@ -1416,7 +1341,7 @@ test_raw_match_read(Store) ->
 
 test_immediate_marker_values(Store) ->
     hb_store:reset(Store),
-    Opts = #{ <<"store">> => Store },
+    Opts = #{ <<"store">> => Store, <<"match-index">> => false },
     Msg = #{
         <<"groupish">> => <<"group">>,
         <<"linkish">> => <<"link:literal">>,
@@ -1434,11 +1359,37 @@ test_immediate_marker_values(Store) ->
             ok
     end.
 
-match_store_control_test() ->
-    Store = hb_test_utils:test_store(hb_store_volatile, <<"match-control">>),
-    ?assertEqual([Store], match_store(#{ <<"store">> => Store })),
-    ?assertEqual([], match_store(#{ <<"store">> => Store, <<"match-index">> => false })),
-    ?assertEqual([], match_store(#{ <<"store">> => Store, <<"match-index">> => [] })).
+%% @doc The `cache-write' hook receives each message the cache writes with its
+%% private keys, which are not written, under the IDs it is written at.
+test_cache_write_hook(Store) ->
+    hb_store:reset(Store),
+    Self = self(),
+    Opts = #{
+        <<"store">> => Store,
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"on">> => #{
+            <<"cache-write">> => [
+                #{
+                    <<"device">> => #{
+                        cache_write =>
+                            fun(_, Req, _) -> Self ! Req, {ok, Req} end
+                    }
+                },
+                #{ <<"device">> => <<"match@1.0">>, <<"path">> => <<"index">> }
+            ]
+        }
+    },
+    Committed = hb_message:commit(#{ <<"a">> => <<"b">> }, Opts),
+    Msg = hb_private:set(Committed, <<"offset">>, 1, Opts),
+    {ok, ID} = write(Msg, Opts),
+    Req = receive R = #{ <<"body">> := #{ <<"a">> := _ } } -> R end,
+    #{ <<"body">> := Body, <<"signed-ids">> := IDs } = Req,
+    ?assertEqual(<<"kernel">>, hb_private:get(<<"hook-caller">>, Req, Opts)),
+    ?assertEqual(1, hb_private:get(<<"offset">>, Body, Opts)),
+    ?assertEqual([hb_message:id(Msg, signed, Opts)], IDs),
+    ?assertEqual({ok, IDs}, match(#{ <<"a">> => <<"b">> }, Opts)),
+    {ok, Keys} = hb_store:list(Store, ID, Opts),
+    ?assertNot(lists:member(<<"priv">>, Keys)).
 
 cache_suite_test_() ->
     hb_store:generate_test_suite([
@@ -1455,7 +1406,8 @@ cache_suite_test_() ->
         {"match linked message", fun test_match_linked_message/1},
         {"match typed message", fun test_match_typed_message/1},
         {"raw match read", fun test_raw_match_read/1},
-        {"immediate marker values", fun test_immediate_marker_values/1}
+        {"immediate marker values", fun test_immediate_marker_values/1},
+        {"cache-write hook", fun test_cache_write_hook/1}
     ]).
 
 %% @doc Test that message whose device is `#{}' cannot be written. If it were to

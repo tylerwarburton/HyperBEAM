@@ -33,7 +33,6 @@
 -define(DEFAULT_SIZE, 2 * 1024 * 1024 * 1024 * 1024). % 2TiB default database size
 -define(DEFAULT_BATCH_SIZE, 5_000).             % Flush keys on every read or 
                                                 % every 5,000 write operations.
--define(MAX_REDIRECTS, 1000).                   % Only resolve 1000 links to data
 
 %% @doc Start the LMDB storage system for a given database configuration.
 %%
@@ -154,7 +153,7 @@ write(Opts, Req, _NodeOpts) when is_map(Req) ->
 write(#{ <<"read-only">> := true }, _PathParts, _Value) ->
     {error, not_found};
 write(Opts, PathParts, Value) when is_list(PathParts) ->
-    write(Opts, to_path(PathParts), Value);
+    write(Opts, hb_store_utils:to_path(PathParts), Value);
 write(Opts, Path, Value) ->
     #{ <<"db">> := DBInstance } = find_env(Opts),
     ?event_debug({elmdb_write, {db, DBInstance}, {path, Path}, {value, Value}}),
@@ -318,15 +317,16 @@ read_result(Opts, Path) ->
 %% the resolved target. Content-addressed `data' keys never carry links, so they
 %% short-circuit straight to `not_found' without a resolver walk.
 read_prefix_miss(Opts, Path) ->
-    case is_data_path(Path) of
+    case hb_store_utils:is_data_path(Path) of
         true ->
             {error, not_found};
         false ->
             try
                 PathParts = binary:split(Path, <<"/">>, [global, trim_all]),
-                case resolve_path_links(Opts, PathParts) of
+                Read = fun(Key) -> read_direct(Opts, Key) end,
+                case hb_store_utils:resolve_path_links(Read, PathParts) of
                     {ok, ResolvedPathParts} ->
-                        case to_path(ResolvedPathParts) of
+                        case hb_store_utils:to_path(ResolvedPathParts) of
                             Path -> {error, not_found};
                             ResolvedPath -> read_result(Opts, ResolvedPath)
                         end;
@@ -378,9 +378,14 @@ do_read_resolved(Opts, Path) ->
                 _ ->
                     try
                         PathParts = binary:split(Path, <<"/">>, [global, trim_all]),
-                        case resolve_path_links(Opts, PathParts) of
+                        Read = fun(Key) -> read_direct(Opts, Key) end,
+                        Resolved =
+                            hb_store_utils:resolve_path_links(Read, PathParts),
+                        case Resolved of
                             {ok, ResolvedPathParts} ->
-                                read_with_links(Opts, to_path(ResolvedPathParts));
+                                Target =
+                                    hb_store_utils:to_path(ResolvedPathParts),
+                                read_with_links(Opts, Target);
                             {error, _} ->
                                 not_found
                         end
@@ -399,16 +404,6 @@ do_read_resolved(Opts, Path) ->
                     end
             end
     end.
-
-%% @doc Helper function to check if a value is a link and extract the target.
-is_link(<<"link:", Link/binary>>) when byte_size(Link) > 0 ->
-    {true, Link};
-is_link(_) ->
-    false.
-
-%% @doc Helper function to convert to a path
-to_path(PathParts) ->
-    hb_util:bin(lists:join(<<"/">>, PathParts)).
 
 %% @doc Unified read function that handles LMDB reads with fallback to the
 %% in-process pending writes, if necessary.
@@ -448,7 +443,7 @@ read_direct(DBInstance, Name, Path) ->
 read_with_links(Opts, Path) ->
     case read_direct(Opts, Path) of
         {ok, Value} ->
-            case is_link(Value) of
+            case hb_store_utils:is_link(Value) of
                 {true, Link} -> 
                     do_read_resolved(Opts, Link);
                 false ->
@@ -456,55 +451,6 @@ read_with_links(Opts, Path) ->
             end;
         not_found ->
             not_found
-    end.
-
-is_data_path(<<"data">>) -> true;
-is_data_path(<<"data/", _/binary>>) -> true;
-is_data_path(_) -> false.
-
-%% @doc Resolve links in a path, checking each segment except the last.
-%% Returns the resolved path where any intermediate links have been followed.
-resolve_path_links(Opts, Path) ->
-    resolve_path_links(Opts, Path, 0).
-
-%% Internal helper with depth limit to prevent infinite loops
-resolve_path_links(_Opts, _Path, Depth) when Depth > ?MAX_REDIRECTS ->
-    % Prevent infinite loops with depth limit
-    {error, too_many_redirects};
-resolve_path_links(_Opts, [LastSegment], _Depth) ->
-    % Base case: only one segment left, no link resolution needed
-    {ok, [LastSegment]};
-resolve_path_links(Opts, Path, Depth) ->
-    resolve_path_links_acc(Opts, Path, [], Depth).
-
-%% Internal helper that accumulates the resolved path
-resolve_path_links_acc(_Opts, [], AccPath, _Depth) ->
-    % No more segments to process
-    {ok, lists:reverse(AccPath)};
-resolve_path_links_acc(_, FullPath = [<<"data">>|_], [], _Depth) ->
-    {ok, FullPath};
-resolve_path_links_acc(Opts, [Head | Tail], AccPath, Depth) ->
-    % Build the accumulated path so far
-    CurrentPath = lists:reverse([Head | AccPath]),
-    CurrentPathBin = to_path(CurrentPath),
-    % Check if the accumulated path (not just the segment) is a link
-    case read_direct(Opts, CurrentPathBin) of
-        {ok, Value} ->
-            case is_link(Value) of
-                {true, Link} ->
-                    % The accumulated path is a link! Resolve it
-                    LinkSegments = binary:split(Link, <<"/">>, [global]),
-                    % Replace the accumulated path with the link target and
-                    % continue with remaining segments
-                    NewPath = LinkSegments ++ Tail,
-                    resolve_path_links(Opts, NewPath, Depth + 1);
-                false ->
-                    % Not a link, continue accumulating
-                    resolve_path_links_acc(Opts, Tail, [Head | AccPath], Depth)
-            end;
-        not_found ->
-            % Path doesn't exist as a complete link, continue accumulating
-            resolve_path_links_acc(Opts, Tail, [Head | AccPath], Depth)
     end.
 
 %% @doc Return the scope of this storage backend.
@@ -546,7 +492,7 @@ scope(_) -> scope().
 %% @param StoreOpts Database configuration map
 %% @param Path Binary prefix to search for
 %% @returns {ok, [Key]} list of matching keys, {error, Reason} on failure
-list(Opts, #{ <<"list">> := Path }, _NodeOpts) ->
+list(Opts, Req = #{ <<"list">> := Path }, _NodeOpts) ->
     EnvOpts = ensure_env(Opts),
     PathBin =
         case is_binary(Path) of
@@ -555,21 +501,32 @@ list(Opts, #{ <<"list">> := Path }, _NodeOpts) ->
         end,
     case read_resolved(EnvOpts, PathBin) of
         {ok, ResolvedPath, <<"group">>} ->
-            list_children(EnvOpts, ResolvedPath);
+            list_children(EnvOpts, ResolvedPath, Req);
         {ok, _ResolvedPath, _Value} ->
             {error, not_found};
         not_found ->
             {error, not_found}
     end.
 
-list_children(Opts, ResolvedPath) ->
-    SearchPath = child_prefix(ResolvedPath),
-    % Use native elmdb:list function
+%% @doc The children of a group through the NIF's cursor: every one, or
+%% those the request names from its `from' in its direction, no more than
+%% its limit -- a batch being every child: LMDB reads a page at a time only
+%% from a key's fixed-size duplicate values, and the database holds none.
+list_children(Opts, ResolvedPath, Req) ->
+    #{
+        <<"from">> := From,
+        <<"limit">> := Limit,
+        <<"direction">> := Direction
+    } = hb_store_utils:list_request_bounds(Req),
     #{ <<"db">> := DBInstance } = find_env(Opts),
-    case elmdb:list(DBInstance, SearchPath) of
+    Options =
+        [ {from, From} || From =/= none ] ++
+        [ {limit, Limit} || Limit =/= all ] ++
+        [ {direction, case Direction of asc -> forward; desc -> backward end} ],
+    Prefix = hb_store_utils:child_prefix(ResolvedPath),
+    case elmdb:list(DBInstance, Prefix, Options) of
         {ok, Children} -> {ok, Children};
-        {error, not_found} -> {ok, []};
-        not_found -> {ok, []}
+        {error, Type, Description} -> {error, {Type, Description}}
     end.
 
 read_prefix_rows(Opts, Path) ->
@@ -592,42 +549,16 @@ prefix_read_result(Opts, Path, [{Path, <<"link:", Link/binary>>} | _])
         when byte_size(Link) > 0 ->
     read_result(Opts, Link);
 prefix_read_result(_Opts, Path, [{Path, <<"group">>} | Rows]) ->
-    {composite, immediate_children(child_prefix(Path), Rows)};
+    Prefix = hb_store_utils:child_prefix(Path),
+    {composite, hb_store_utils:immediate_children(Prefix, Rows)};
 prefix_read_result(_Opts, Path, [{Path, Value} | _]) ->
     {ok, Value};
 prefix_read_result(_Opts, Path, Rows) ->
-    case {is_data_path(Path), immediate_children(child_prefix(Path), Rows)} of
+    Prefix = hb_store_utils:child_prefix(Path),
+    Children = hb_store_utils:immediate_children(Prefix, Rows),
+    case {hb_store_utils:is_data_path(Path), Children} of
         {false, [_ | _] = Children} -> {composite, Children};
         _ -> {error, not_found}
-    end.
-
-%% `elmdb:read_prefix' returns every descendant row (full key) under the prefix.
-%% Reduce that to the immediate children: strip the prefix and drop any relative
-%% key that still contains a `/' (a grandchild reached only through a subgroup,
-%% whose own `group' marker is returned as an immediate child in its own right).
-immediate_children(Prefix, Rows) ->
-    PrefixSize = byte_size(Prefix),
-    lists:filtermap(
-        fun({Key, Value}) ->
-            case Key of
-                <<Prefix:PrefixSize/binary, Child/binary>> when Child =/= <<>> ->
-                    case binary:match(Child, <<"/">>) of
-                        nomatch -> {true, {Child, Value}};
-                        _ -> false
-                    end;
-                _ ->
-                    false
-            end
-        end,
-        Rows
-    ).
-
-child_prefix(<<>>) -> <<>>;
-child_prefix(<<"/">>) -> <<>>;
-child_prefix(Path) ->
-    case binary:last(Path) of
-        $/ -> Path;
-        _ -> <<Path/binary, "/">>
     end.
 
 %% @doc Match a series of keys and values against the database. Returns 
@@ -724,7 +655,8 @@ prefix_group_paths([], _Current, Acc) ->
     Acc;
 prefix_group_paths([Next | Rest], Current, Acc) ->
     NewCurrent = Current ++ [Next],
-    prefix_group_paths(Rest, NewCurrent, [to_path(NewCurrent) | Acc]).
+    Path = hb_store_utils:to_path(NewCurrent),
+    prefix_group_paths(Rest, NewCurrent, [Path | Acc]).
 
 %% @doc Create a symbolic link from a new key to an existing key.
 %%
@@ -766,7 +698,7 @@ link(Opts, Req, _NodeOpts) when is_map(Req) ->
 link(#{ <<"read-only">> := true }, _Existing, _New) ->
     {error, not_found};
 link(Opts, Existing, New) when is_list(Existing) ->
-    link(Opts, to_path(Existing), New);
+    link(Opts, hb_store_utils:to_path(Existing), New);
 link(Opts, Existing, New) ->
    ExistingBin = hb_util:bin(Existing),
    ensure_parent_groups(Opts, hb_path:to_binary(New)),
@@ -783,9 +715,12 @@ link(Opts, Existing, New) ->
 %% @returns The resolved path as a binary
 resolve(Opts, #{ <<"resolve">> := Path }, _NodeOpts) ->
     PathBin = hb_path:to_binary(Path),
-    case resolve_path_links(Opts, binary:split(PathBin, <<"/">>, [global])) of
+    case hb_store_utils:resolve_path_links(
+        fun(Key) -> read_direct(Opts, Key) end,
+        binary:split(PathBin, <<"/">>, [global])
+    ) of
         {ok, ResolvedParts} ->
-            {ok, to_path(ResolvedParts)};
+            {ok, hb_store_utils:to_path(ResolvedParts)};
         {error, _} ->
             {ok, PathBin}
     end.
@@ -896,14 +831,14 @@ test_list(StoreOpts, Path) ->
     ResolvedPath =
         case read_direct(StoreOpts, PathBin) of
             {ok, Value} ->
-                case is_link(Value) of
+                case hb_store_utils:is_link(Value) of
                     {true, Link} -> Link;
                     false -> PathBin
                 end;
             not_found ->
                 PathBin
         end,
-    list_children(StoreOpts, ResolvedPath).
+    list_children(StoreOpts, ResolvedPath, #{}).
 
 test_write(StoreOpts, Path, Value) ->
     ok = write(StoreOpts, Path, Value),
