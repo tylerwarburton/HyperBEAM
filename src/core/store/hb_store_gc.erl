@@ -1535,7 +1535,12 @@ retain(Opts) ->
                 {Acc1, new_chunk()},
                 Procs
             ),
-        Acc3 = sweep_chunk(Ctx, Pending, Acc2),
+        Acc3a = sweep_chunk(Ctx, Pending, Acc2),
+        Acc3 =
+            case hb_util:atom(hb_opts:get(<<"store-retention-orphans">>, false, Opts)) of
+                true -> orphan_sweep(Ctx, Acc3a);
+                _ -> Acc3a
+            end,
         Report = Acc3#{
             started_at => os:system_time(second),
             duration_ms => erlang:monotonic_time(millisecond) - Start,
@@ -1556,12 +1561,14 @@ retain(Opts) ->
         ?event(store_retention, {retention_run, Report}),
         Report
     after
+        catch elmdb:track_watch(DB, clear),
         catch elmdb:track(DB, false),
         ets:delete(Seen)
     end.
 
 ret_acc() ->
-    #{ dropped_slots => 0, kept_slots => 0, candidate_keys => 0,
+    #{ orphan_units => 0, orphan_deleted_units => 0, orphan_scans => 0,
+       dropped_slots => 0, kept_slots => 0, candidate_keys => 0,
        protected_keys => 0, protected_by_scan => 0, protected_by_writes => 0,
        deleted_keys => 0, deleted_bytes => 0, alias_keys => 0, conflicts => 0,
        scans => 0, scanned_rows => 0, recovered_journal => false,
@@ -1707,9 +1714,17 @@ sweep_chunk(Ctx, Chunk = #{ slots := Slots, keep := Keep }, Acc) ->
     Roots = lists:usort([ R || {_P, _S, R} <- Slots, R =/= not_found ]),
     %% Candidates: the closure of the dropped roots, never entering a pin, a
     %% kept root, or a named namespace.
+    %% A generation per chunk: record every write from here (no watch), make
+    %% every earlier one visible to the scan, then narrow the record -- and the
+    %% scan -- to the candidates once they are known. Neither then grows with
+    %% the node's write rate.
+    DB = maps:get(src_db, Ctx),
+    ok = elmdb:track_watch(DB, clear),
+    ok = elmdb:flush(DB),
     Cand = new_cand(),
     Stop = sets:union(maps:get(pins, Ctx), Keep),
     lists:foreach(fun(R) -> closure(Ctx, Cand, R, Stop) end, Roots),
+    ok = elmdb:track_watch(DB, ets:select(maps:get(tab, Cand), [{{'$1', '_', '_', '_'}, [], ['$1']}])),
     Acc1 = bump(candidate_keys, cand_size(Cand), Acc),
     case maps:get(dry_run, Policy) of
         true ->
@@ -1930,7 +1945,7 @@ protection_scan(Ctx, Cand, Acc) ->
     Pause = maps:get(scan_pause, Policy),
     Loop =
         fun L(From, Seeds, Aliases, Rows) ->
-            case elmdb:scan_refs(DB, From, Step) of
+            case elmdb:scan_watched(DB, From, Step) of
                 {ok, Refs, N, Next} ->
                     {Seeds1, Aliases1} =
                         lists:foldl(
@@ -2114,6 +2129,7 @@ recover_journal(Ctx, Acc) ->
             ?event(store_retention, {recovering_journal, length(Aliases), length(Keys)}),
             Cand = new_cand(),
             [ ets:insert(maps:get(tab, Cand), {K, O, B, false}) || {K, O, B} <- Keys ],
+            ok = elmdb:track_watch(maps:get(src_db, Ctx), [ K || {K, _, _} <- Keys ]),
             counters:add(maps:get(counter, Cand), 1, length(Keys)),
             {Acc1, Revived} = delete_aliases(Ctx, Aliases, Acc),
             Acc2 = protect_and_sweep(Ctx, Cand, Revived,
@@ -2122,6 +2138,170 @@ recover_journal(Ctx, Acc) ->
             ok = clear_journal(Ctx),
             Acc2;
         {error, enoent} -> Acc
+    end.
+
+%%% Orphans: content units nothing references.
+%%%
+%%% Opt-in (`store-retention-orphans'). The computed sweep only deletes what a
+%%% dropped slot reaches. A node also writes content no computed slot reaches:
+%%% every message conversion offloads its nested messages to the store
+%%% (`hb_link:normalize/3', `offload'), so each scheduled message, its
+%%% commitments and the request structures around it are written to the main
+%%% store whichever store the scheduler writes the assignment to. With an
+%%% essentials store those main-store copies are referenced by nothing, and
+%%% they are most of what still grows.
+%%%
+%%% A content unit -- `data/<hash>', or a top-level 43-byte ID with its rows
+%%% -- is an orphan when no row outside it references it: no named namespace
+%%% (`computed', `~scheduler@1.0', anything unknown), no pin, no other unit
+%%% that is not itself an orphan, and no write since the pass began. Units are
+%%% taken a chunk at a time in key order; one scan of the reference rows that
+%%% name them (Rust-side filtered) yields the references from outside the chunk
+%%% and the edges inside it, and protection is the fixpoint over those edges. A
+%%% unit is deleted only when it was an orphan on the previous run too, so
+%%% nothing an in-flight request still holds a lazy link to goes: the interval
+%%% is the grace. Chains of orphans spread over chunks go over successive runs.
+%%%
+%%% This deletes content that is reachable only by ID -- a message a client
+%%% cached with `~cache@1.0', say, and nothing else references. That is the
+%%% point for the offloaded copies, and the reason it is opt-in: it is meant
+%%% for a node whose essentials live in their own store.
+
+-define(ORPHAN_MARKS, "retention-orphans.bin").
+-define(ORPHAN_CHUNK, 100000).
+
+orphan_sweep(Ctx, Acc) ->
+    DB = maps:get(src_db, Ctx),
+    Opts = maps:get(node_opts, Ctx),
+    MarksFile = filename:join(filename:dirname(maps:get(journal, Ctx)), ?ORPHAN_MARKS),
+    Prev =
+        case file:read_file(MarksFile) of
+            {ok, Bin} -> sets:from_list(binary_to_term(Bin), [{version, 2}]);
+            _ -> sets:new([{version, 2}])
+        end,
+    Chunk = ret_opt(<<"store-retention-orphan-chunk">>, ?ORPHAN_CHUNK, Opts),
+    Loop =
+        fun L(From, Marks, A) ->
+            case elmdb:scan_units(DB, From, Chunk) of
+                {ok, [], _} -> {Marks, A};
+                {ok, Units, Next} ->
+                    {Marks1, A1} = orphan_chunk(Ctx, Units, Prev, Marks, A),
+                    case Next of
+                        done -> {Marks1, A1};
+                        _ -> L(Next, Marks1, A1)
+                    end;
+                {error, T, D} -> erlang:error({store_retention_scan_failed, T, D})
+            end
+        end,
+    {Marks, Acc1} = Loop(<<>>, [], Acc),
+    ok = file:write_file(MarksFile ++ ".tmp", term_to_binary(Marks, [compressed]), [raw, sync]),
+    ok = file:rename(MarksFile ++ ".tmp", MarksFile),
+    Acc1.
+
+orphan_chunk(Ctx, Units, Prev, Marks, Acc) ->
+    DB = maps:get(src_db, Ctx),
+    Policy = maps:get(policy, Ctx),
+    UnitKeys = [ U || {U, _, _} <- Units ],
+    Bytes = maps:from_list([ {U, B} || {U, _, B} <- Units ]),
+    In = sets:from_list(UnitKeys, [{version, 2}]),
+    %% Generation for this chunk: earlier writes visible to the scan, later
+    %% ones recorded.
+    ok = elmdb:track_watch(DB, clear),
+    ok = elmdb:flush(DB),
+    ok = elmdb:track_watch(DB, UnitKeys),
+    Step = maps:get(scan_rows, Policy),
+    Scan =
+        fun S(From, Seeds, Edges) ->
+            case elmdb:scan_unit_refs(DB, From, Step) of
+                {ok, Refs, _N, Next} ->
+                    {Seeds1, Edges1} =
+                        lists:foldl(
+                            fun({K, V}, {Sd, Ed}) ->
+                                Targets = [ unit_of(T) || T <- ref_targets(V) ],
+                                Hits = [ T || T <- Targets, T =/= none, sets:is_element(T, In) ],
+                                Own = unit_of(K),
+                                case Own =/= none andalso sets:is_element(Own, In) of
+                                    true -> {Sd, [ {Own, T} || T <- Hits, T =/= Own ] ++ Ed};
+                                    false -> {Hits ++ Sd, Ed}
+                                end
+                            end,
+                            {Seeds, Edges},
+                            Refs
+                        ),
+                    case Next of
+                        done -> {Seeds1, Edges1};
+                        _ -> S(Next, Seeds1, Edges1)
+                    end;
+                {error, T, D} -> erlang:error({store_retention_scan_failed, T, D})
+            end
+        end,
+    {ScanSeeds, Edges} = Scan(<<>>, [], []),
+    Pins = [ U || U <- UnitKeys, sets:is_element(U, maps:get(pins, Ctx)) ],
+    {ok, Tracked} = elmdb:track_take(DB),
+    Written = [ U || T <- Tracked, U <- [unit_of(T)], U =/= none, sets:is_element(U, In) ],
+    Graph = lists:foldl(fun({A, B}, G) -> maps:update_with(A, fun(L) -> [B | L] end, [B], G) end,
+                        #{}, Edges),
+    Protected = reach(ScanSeeds ++ Pins ++ Written, Graph, sets:new([{version, 2}])),
+    Orphans = [ U || U <- UnitKeys, not sets:is_element(U, Protected) ],
+    {Confirmed, Fresh} =
+        lists:partition(fun(U) -> sets:is_element(crypto:hash(md5, U), Prev) end, Orphans),
+    Acc1 = bump(orphan_scans, 1, bump(orphan_units, length(Orphans), Acc)),
+    case maps:get(dry_run, Policy) of
+        true ->
+            {[ crypto:hash(md5, U) || U <- Orphans ] ++ Marks, Acc1};
+        false ->
+            {Deleted, Vetoed} = delete_units(Ctx, Confirmed),
+            Acc2 = Acc1#{
+                orphan_deleted_units => maps:get(orphan_deleted_units, Acc1) + length(Deleted),
+                deleted_keys => maps:get(deleted_keys, Acc1) +
+                    lists:sum([ N || {_, N} <- Deleted ]),
+                deleted_bytes => maps:get(deleted_bytes, Acc1) +
+                    lists:sum([ maps:get(U, Bytes, 0) || {U, _} <- Deleted ]),
+                conflicts => maps:get(conflicts, Acc1) + length(Vetoed)
+            },
+            %% What is an orphan now and was not deleted is confirmed next run.
+            {[ crypto:hash(md5, U) || U <- Fresh ] ++ Marks, Acc2}
+    end.
+
+reach([], _Graph, Seen) -> Seen;
+reach([U | Rest], Graph, Seen) ->
+    case sets:is_element(U, Seen) of
+        true -> reach(Rest, Graph, Seen);
+        false -> reach(maps:get(U, Graph, []) ++ Rest, Graph, sets:add_element(U, Seen))
+    end.
+
+%% Delete whole units, guarded: the unit key is in each batch, and every write
+%% of a key in the unit (or naming it) since the chunk began records the unit.
+delete_units(Ctx, Units) ->
+    lists:foldl(
+        fun(U, {D, V}) ->
+            Keys =
+                case raw_subtree(Ctx, U) of
+                    {ok, Rows} -> lists:usort([U | [ K || {K, _} <- Rows ]]);
+                    _ -> [U]
+                end,
+            %% One transaction per unit: a unit is deleted whole or not at all.
+            case hb_store:delete(maps:get(src_store, Ctx),
+                    #{ <<"delete">> => Keys, <<"guarded">> => true },
+                    maps:get(src_opts, Ctx)) of
+                {ok, N} -> pace(Ctx, length(Keys)), {[{U, N} | D], V};
+                {error, {conflict, _}} -> {D, [U | V]};
+                {error, Reason} -> erlang:error({store_retention_delete_failed, Reason})
+            end
+        end,
+        {[], []},
+        Units
+    ).
+
+%% @doc The content unit of a key, as `elmdb' computes it: `data/<hash>', the
+%% top-level 43-byte ID, or `none' for a named namespace.
+unit_of(<<"data/", Rest/binary>>) ->
+    <<"data/", (hd(binary:split(Rest, <<"/">>)))/binary>>;
+unit_of(Key) ->
+    Top = hd(binary:split(Key, <<"/">>)),
+    case byte_size(Top) == 43 of
+        true -> Top;
+        false -> none
     end.
 
 %%% Essentials migration helper.

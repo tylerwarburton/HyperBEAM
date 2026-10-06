@@ -406,6 +406,47 @@ essentials_store_suffices_to_rebuild_test_() ->
         ?assertEqual(Digests, Rebuilt)
     end}.
 
+%% @doc With an essentials store and `store-retention-orphans', the main-store
+%% copies nothing references (offloaded messages, their commitments) go after
+%% two runs, while everything the node reads survives: every assignment
+%% byte-identical through the node's own store list, `now', and computing on.
+%% Content a named key references is kept.
+orphan_retention_keeps_what_is_used_test_() ->
+    {timeout, 300, fun() ->
+        Ess = hb_test_utils:test_store(hb_store_lmdb, <<"ess-orphans">>),
+        Opts0 = node_opts(#{ <<"store-retention-orphans">> => true }),
+        Opts = Opts0#{
+            <<"essentials-store">> => Ess,
+            <<"store">> => hb_store_essentials:node_store(Opts0#{ <<"essentials-store">> => Ess })
+        },
+        ok = hb_store:start([Ess], #{}, Opts),
+        Process = lua_process(Opts),
+        Next = run_slots(Process, 0, 22, Opts),
+        Before = assignments(Process, Opts),
+        DB = main_db(Opts),
+        % A message only a named key references, and one nothing references.
+        Named = hb_message:commit(#{ <<"kept">> => <<"yes">> }, Opts),
+        {ok, NamedID} = hb_cache:write(Named, Opts0),
+        ok = elmdb:put(DB, <<"~other@1.0/named">>, <<"link:", NamedID/binary>>),
+        Loose = hb_message:commit(#{ <<"kept">> => <<"no">> }, Opts),
+        {ok, LooseID} = hb_cache:write(Loose, Opts0),
+        Rows0 = store_rows(DB),
+        R1 = hb_store_gc:retain(Opts),
+        ?assert(maps:get(orphan_units, R1) > 0),
+        ?assertEqual(0, maps:get(orphan_deleted_units, R1)),
+        R2 = hb_store_gc:retain(Opts),
+        ?assert(maps:get(orphan_deleted_units, R2) > 0),
+        Rows2 = store_rows(DB),
+        ?assert(Rows2 < Rows0),
+        ?assertEqual(not_found, elmdb:get(DB, LooseID)),
+        ?assertMatch({ok, _}, elmdb:get(DB, NamedID)),
+        clear_process_caches(),
+        ?assertEqual(Before, assignments(Process, Opts)),
+        {ok, Now} = hb_ao:resolve(Process, <<"now">>, Opts),
+        ?assertEqual(integer_to_binary(Next), hb_ao:get(<<"count">>, Now, Opts)),
+        _ = run_slots(Process, Next, 6, Opts)
+    end}.
+
 %% @doc With an essentials store, the essentials of a node that kept everything
 %% in one store are copied over by `migrate/3' and verified byte-for-byte.
 essentials_migration_verifies_test_() ->
@@ -434,10 +475,12 @@ retention_steady_state_report_test_() ->
             NStr ->
                 N = list_to_integer(NStr),
                 Curve =
-                    fun(Retain) ->
+                    fun(Mode) ->
+                        Retain = Mode =/= off,
                         Ess = hb_test_utils:test_store(hb_store_lmdb, <<"ess-steady">>),
                         Base = node_opts(#{ <<"process-delta-checkpoint-slots">> => 50,
-                                            <<"store-retention-recent-slots">> => 32 }),
+                                            <<"store-retention-recent-slots">> => 32,
+                                            <<"store-retention-orphans">> => Mode == orphans }),
                         Opts = Base#{
                             <<"essentials-store">> => Ess,
                             <<"store">> => hb_store_essentials:node_store(
@@ -460,11 +503,13 @@ retention_steady_state_report_test_() ->
                             lists:seq(0, 9)
                         )
                     end,
-                On = Curve(true),
-                Off = Curve(false),
-                io:format(user, "~nRETENTION_STEADY slots main_rows_on main_rows_off ess_rows~n", []),
-                [ io:format(user, "RETENTION_STEADY ~p ~p ~p ~p~n", [S, MOn, MOff, E])
-                || {{S, MOn, E}, {S, MOff, _}} <- lists:zip(On, Off) ]
+                Orph = Curve(orphans),
+                On = Curve(computed),
+                Off = Curve(off),
+                io:format(user, "~nRETENTION_STEADY slots main_rows_off main_rows_computed "
+                                "main_rows_computed+orphans ess_rows~n", []),
+                [ io:format(user, "RETENTION_STEADY ~p ~p ~p ~p ~p~n", [S, MOff, MOn, MOr, E])
+                || {{S, MOr, E}, {S, MOn, _}, {S, MOff, _}} <- lists:zip3(Orph, On, Off) ]
         end
     end}.
 
@@ -606,3 +651,114 @@ ess_client(Node, [Req | Reqs], Opts, Deadline, Acc) ->
         true -> Acc;
         false -> ess_client(Node, Reqs, Opts, Deadline, [Lat | Acc])
     end.
+
+%% @doc Diagnostic: what the main store holds after retention, by the field
+%% signature of each top-level unit. Set `HB_RETENTION_DIAG=<slots>'.
+retention_diagnostic_test_() ->
+    {timeout, 3600, fun() ->
+        case os:getenv("HB_RETENTION_DIAG") of
+            false -> ok;
+            NStr ->
+                N = list_to_integer(NStr),
+                Ess = hb_test_utils:test_store(hb_store_lmdb, <<"ess-diag">>),
+                Base = node_opts(#{ <<"process-delta-checkpoint-slots">> => 50,
+                                    <<"store-retention-recent-slots">> => 32 }),
+                Opts = Base#{
+                    <<"essentials-store">> => Ess,
+                    <<"store">> => hb_store_essentials:node_store(
+                        Base#{ <<"essentials-store">> => Ess })
+                },
+                ok = hb_store:start([Ess], #{}, Opts),
+                Process = lua_process(Opts),
+                _ = run_slots(Process, 0, 5, Opts),
+                % Who writes: the caller of every hb_cache:write/2, by stack.
+                Self = self(),
+                Tracer = spawn(fun() -> diag_tracer(Self, #{}) end),
+                erlang:trace(all, true, [call, {tracer, Tracer}]),
+                erlang:trace_pattern({hb_cache, write, 2},
+                    [{'_', [], [{message, {process_dump}}]}], [local]),
+                _ = run_slots(Process, 5, N, Opts),
+                erlang:trace(all, false, [call]),
+                Tracer ! {done, Self},
+                receive {callers, Callers} ->
+                    [ io:format(user, "DIAG writer ~6b ~s~n", [C, K])
+                    || {K, C} <- lists:sublist(lists:reverse(lists:keysort(2, maps:to_list(Callers))), 25) ]
+                end,
+                R = hb_store_gc:retain(Opts),
+                io:format(user, "~nDIAG report ~p~n", [maps:without([policy], R)]),
+                DB = main_db(Opts),
+                ok = elmdb:flush(DB),
+                Rows = all_rows(DB),
+                Units =
+                    lists:foldl(
+                        fun({K, V}, Acc) ->
+                            case binary:split(K, <<"/">>) of
+                                [Top, Rest] ->
+                                    Field = hd(binary:split(Rest, <<"/">>)),
+                                    maps:update_with(Top, fun(S) -> sets:add_element(Field, S) end,
+                                        sets:from_list([Field]), Acc);
+                                [Top] ->
+                                    case V of
+                                        <<"group">> -> maps:update_with(Top, fun(S) -> S end, sets:new(), Acc);
+                                        <<"link:", _/binary>> -> maps:update_with(Top, fun(S) -> sets:add_element(<<"=alias">>, S) end, sets:from_list([<<"=alias">>]), Acc);
+                                        _ -> maps:update_with(Top, fun(S) -> sets:add_element(<<"=value">>, S) end, sets:from_list([<<"=value">>]), Acc)
+                                    end
+                            end
+                        end,
+                        #{},
+                        Rows
+                    ),
+                Sigs =
+                    maps:fold(
+                        fun(Top, Fields, Acc) ->
+                            Sig =
+                                case Top of
+                                    <<"data">> -> [<<"data/*">>];
+                                    <<"computed">> -> [<<"computed/*">>];
+                                    _ when byte_size(Top) == 43 ->
+                                        lists:sort(sets:to_list(Fields));
+                                    _ -> [Top]
+                                end,
+                            maps:update_with(Sig, fun(C) -> C + 1 end, 1, Acc)
+                        end,
+                        #{},
+                        Units
+                    ),
+                io:format(user, "DIAG rows=~p units=~p~n", [length(Rows), maps:size(Units)]),
+                [ io:format(user, "DIAG ~6b ~p~n", [C, S])
+                || {S, C} <- lists:reverse(lists:keysort(2, maps:to_list(Sigs))) ]
+        end
+    end}.
+
+%% Summarise each traced call by the chain of hb/dev functions on its stack.
+diag_tracer(Parent, Acc) ->
+    receive
+        {trace, _Pid, call, {hb_cache, write, _}, Dump} when is_binary(Dump) ->
+            Lines = binary:split(Dump, <<"\n">>, [global]),
+            Frames =
+                [ hd(binary:split(L, <<" + ">>))
+                || L <- Lines,
+                   binary:match(L, <<"Return addr">>) =/= nomatch
+                     orelse binary:match(L, <<"CP:">>) =/= nomatch ],
+            Mods =
+                [ F || F <- [ case re:run(L, <<"\\(([a-z_0-9]+:[a-z_0-9]+/[0-9]+)">>,
+                                          [{capture, all_but_first, binary}]) of
+                                  {match, [M]} -> M; _ -> <<>> end
+                              || L <- Frames ],
+                       F =/= <<>>,
+                       binary:match(F, [<<"hb_cache:">>, <<"lists:">>, <<"maps:">>]) == nomatch ],
+            Key = iolist_to_binary(lists:join(<<" < ">>, lists:sublist(Mods, 6))),
+            diag_tracer(Parent, maps:update_with(Key, fun(C) -> C + 1 end, 1, Acc));
+        {trace, _, _, _, _} -> diag_tracer(Parent, Acc);
+        {done, From} -> From ! {callers, Acc}
+    end.
+
+all_rows(DB) ->
+    Loop =
+        fun L(From, Acc) ->
+            case elmdb:scan_rows(DB, From, 50000) of
+                {ok, Rows, _, done} -> Acc ++ Rows;
+                {ok, Rows, _, Next} -> L(Next, Acc ++ Rows)
+            end
+        end,
+    Loop(<<>>, []).

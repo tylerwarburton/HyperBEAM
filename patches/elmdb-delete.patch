@@ -1,7 +1,7 @@
 diff -ruN a/src/elmdb.erl b/src/elmdb.erl
---- a/src/elmdb.erl	2026-10-07 00:40:18.610601416 +0200
-+++ b/src/elmdb.erl	2026-10-07 00:40:18.616601401 +0200
-@@ -17,6 +17,12 @@
+--- a/src/elmdb.erl	2026-10-07 01:46:58.786062716 +0200
++++ b/src/elmdb.erl	2026-10-07 01:46:58.790062705 +0200
+@@ -17,6 +17,13 @@
  %% Key-value operations
  -export([put/3, put_batch/2, get/2, flush/1]).
  
@@ -9,12 +9,13 @@ diff -ruN a/src/elmdb.erl b/src/elmdb.erl
 +-export([delete/2, delete_batch/2, delete_batch_guarded/2]).
 +
 +%% Collector support: write tracking and a reference scan
-+-export([track/2, track_take/1, scan_refs/3, scan_rows/3]).
++-export([track/2, track_take/1, track_watch/2, scan_refs/3, scan_watched/3,
++         scan_unit_refs/3, scan_units/3, scan_rows/3]).
 +
  %% Diagnostics
  -export([overlay_count/1]).
  
-@@ -334,6 +340,60 @@
+@@ -334,6 +341,95 @@
  flush(_DBInstance) ->
      erlang:nif_error(nif_not_loaded).
  
@@ -65,6 +66,41 @@ diff -ruN a/src/elmdb.erl b/src/elmdb.erl
 +scan_refs(_DBInstance, _From, _MaxRows) ->
 +    erlang:nif_error(nif_not_loaded).
 +
++%% @doc Restrict write tracking, and `scan_watched/3', to `Keys' (or `clear'
++%% to record everything again). Tracked entries outside `Keys' are dropped.
++%% Lets a collector track and scan for exactly its candidate set, so neither
++%% grows with the node's write rate nor returns the whole store to Erlang.
++-spec track_watch(DBInstance :: term(), Keys :: [binary()] | clear) -> ok.
++track_watch(_DBInstance, _Keys) ->
++    erlang:nif_error(nif_not_loaded).
++
++%% @doc As `scan_refs/3', returning only rows outside the watch set whose value
++%% references a key in it (a `link:' target or a path prefix of it, or a bare
++%% ID). Without a watch set, as `scan_refs/3'.
++-spec scan_watched(DBInstance :: term(), From :: binary(), MaxRows :: pos_integer()) ->
++    {ok, [{binary(), binary()}], non_neg_integer(), binary() | done} |
++    {error, term(), term()}.
++scan_watched(_DBInstance, _From, _MaxRows) ->
++    erlang:nif_error(nif_not_loaded).
++
++%% @doc Every reference row, whatever its own key, naming a watched key or a
++%% path below one. With a watch set of content units this is, in one pass,
++%% both the references into them from outside and their internal edges.
++-spec scan_unit_refs(DBInstance :: term(), From :: binary(), MaxRows :: pos_integer()) ->
++    {ok, [{binary(), binary()}], non_neg_integer(), binary() | done} |
++    {error, term(), term()}.
++scan_unit_refs(_DBInstance, _From, _MaxRows) ->
++    erlang:nif_error(nif_not_loaded).
++
++%% @doc Up to `MaxUnits' whole content units from `From' in key order -- a blob
++%% (`data/<hash>') or a top-level 43-byte ID with its rows -- as
++%% `{Unit, RowCount, Bytes}', skipping keys of named namespaces.
++-spec scan_units(DBInstance :: term(), From :: binary(), MaxUnits :: pos_integer()) ->
++    {ok, [{binary(), non_neg_integer(), non_neg_integer()}], binary() | done} |
++    {error, term(), term()}.
++scan_units(_DBInstance, _From, _MaxUnits) ->
++    erlang:nif_error(nif_not_loaded).
++
 +%% @doc As `scan_refs/3', returning every row walked.
 +-spec scan_rows(DBInstance :: term(), From :: binary(), MaxRows :: pos_integer()) ->
 +    {ok, [{binary(), binary()}], non_neg_integer(), binary() | done} |
@@ -76,8 +112,8 @@ diff -ruN a/src/elmdb.erl b/src/elmdb.erl
  -spec overlay_count(DBInstance :: term()) -> non_neg_integer().
  overlay_count(_DBInstance) ->
 diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
---- a/native/elmdb_nif/src/lib.rs	2026-10-07 00:40:18.614601406 +0200
-+++ b/native/elmdb_nif/src/lib.rs	2026-10-07 00:40:18.620601392 +0200
+--- a/native/elmdb_nif/src/lib.rs	2026-10-07 01:46:58.788062711 +0200
++++ b/native/elmdb_nif/src/lib.rs	2026-10-07 01:46:58.792062700 +0200
 @@ -155,6 +155,8 @@
          bad_val_size,
          bad_dbi,
@@ -113,7 +149,7 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
      Shutdown,
  }
  
-@@ -231,6 +248,12 @@
+@@ -231,6 +248,15 @@
      worker_tx: Mutex<Option<Sender<WorkerCommand>>>,
      /// Handle to the worker thread for joining
      worker_handle: Mutex<Option<JoinHandle<()>>>,
@@ -123,15 +159,47 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +    /// Written keys and referenced targets since tracking began or since the
 +    /// last `track_take`.
 +    tracked: ArcSwap<TrackSet>,
++    /// When set, tracking records only entries in this set, and
++    /// `scan_watched` returns only rows referencing it.
++    watch: ArcSwap<Option<Arc<TrackSet>>>,
  }
  
  #[derive(Debug)]
-@@ -263,6 +286,55 @@
+@@ -263,6 +289,94 @@
      SccHashMap::with_hasher(ahash::RandomState::default())
  }
  
 +fn new_track_set() -> TrackSet {
 +    scc::HashSet::with_hasher(ahash::RandomState::default())
++}
++
++/// The content unit a key belongs to: `data/<hash>' for a blob, the top-level
++/// 43-byte ID for a message (its rows, aliases and commitment groups), or
++/// `None' for a key in a named namespace.
++fn unit_of(key: &[u8]) -> Option<&[u8]> {
++    if key.len() > 5 && &key[..5] == b"data/" {
++        let end = key[5..].iter().position(|c| *c == b'/').map(|i| i + 5).unwrap_or(key.len());
++        return Some(&key[..end]);
++    }
++    let end = key.iter().position(|c| *c == b'/').unwrap_or(key.len());
++    if is_id43(&key[..end]) { Some(&key[..end]) } else { None }
++}
++
++fn references_watched(value: &[u8], watch: &TrackSet) -> bool {
++    if value.len() > 5 && &value[..5] == b"link:" {
++        let target = &value[5..];
++        if watch.contains_sync(target) {
++            return true;
++        }
++        for (i, c) in target.iter().enumerate() {
++            if *c == b'/' && watch.contains_sync(&target[..i]) {
++                return true;
++            }
++        }
++        false
++    } else {
++        watch.contains_sync(value)
++    }
 +}
 +
 +fn is_id43(value: &[u8]) -> bool {
@@ -146,6 +214,11 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +/// being taken after it was read would be lost, so retry until the set the
 +/// entry went into is still the current one.
 +fn track_insert(db: &LmdbDatabase, entry: &[u8]) {
++    if let Some(ref watch) = **db.watch.load() {
++        if !watch.contains_sync(entry) {
++            return;
++        }
++    }
 +    loop {
 +        let set = db.tracked.load();
 +        let _ = set.insert_sync(entry.to_vec());
@@ -166,6 +239,11 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +        return;
 +    }
 +    track_insert(db, key);
++    if let Some(unit) = unit_of(key) {
++        if unit.len() < key.len() {
++            track_insert(db, unit);
++        }
++    }
 +    if value.len() > 5 && &value[..5] == b"link:" {
 +        let target = &value[5..];
 +        for (i, c) in target.iter().enumerate() {
@@ -182,7 +260,7 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
  fn build_environment(path: &str, options: &EnvOptions) -> Result<Environment, lmdb::Error> {
      let mut env_builder = Environment::new();
  
-@@ -394,15 +466,28 @@
+@@ -394,15 +508,28 @@
  }
  
  fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
@@ -213,7 +291,7 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
      }
  
      let (live_env, live_db) = match db.fast_get_handles() {
-@@ -436,10 +521,43 @@
+@@ -436,10 +563,43 @@
          return Err(e);
      }
  
@@ -258,7 +336,7 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
          }
          Err(e) => {
              restore_failed_flush(db, old_map);
-@@ -462,17 +580,58 @@
+@@ -462,15 +622,56 @@
  
  fn drain_remaining_sync_waiters(rx: &Receiver<WorkerCommand>, fatal_error: Option<String>) {
      while let Ok(cmd) = rx.try_recv() {
@@ -285,10 +363,10 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +                cvar.notify_all();
 +            }
 +            _ => {}
-         }
-     }
- }
- 
++        }
++    }
++}
++
 +fn delete_sync(
 +    db_handle: &LmdbDatabase,
 +    keys: Vec<Vec<u8>>,
@@ -306,8 +384,8 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +                .map_err(|_| "Worker thread is gone".to_string())?;
 +        } else {
 +            return Err("Worker thread is not running".to_string());
-+        }
-+    }
+         }
+     }
 +    let (lock, cvar) = &*signal;
 +    let mut result = lock
 +        .lock()
@@ -318,12 +396,10 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +            .map_err(|_| "Condvar wait failed".to_string())?;
 +    }
 +    result.take().unwrap()
-+}
-+
+ }
+ 
  fn worker_loop(rx: Receiver<WorkerCommand>, db: ResourceArc<LmdbDatabase>) {
-     let mut exit_error: Option<String> = None;
-     loop {
-@@ -512,6 +671,31 @@
+@@ -512,6 +713,31 @@
                      break;
                  }
              }
@@ -355,16 +431,17 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
              Ok(WorkerCommand::Shutdown) => {
                  let result = do_flush(&db);
                  if let Err(e) = result {
-@@ -900,6 +1084,8 @@
+@@ -900,6 +1126,9 @@
          hot_handles: ArcSwap::from_pointee(None),
          worker_tx: Mutex::new(None),
          worker_handle: Mutex::new(None),
 +        tracking: AtomicBool::new(false),
 +        tracked: ArcSwap::from_pointee(new_track_set()),
++        watch: ArcSwap::from_pointee(None),
      };
      let resource = ResourceArc::new(lmdb_db);
  
-@@ -1132,6 +1318,7 @@
+@@ -1132,6 +1361,7 @@
          }
      }
  
@@ -372,7 +449,7 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
      loop {
          let map = db_handle.active.load();
          let _ = map.upsert_sync(key_vec.clone(), value_vec.clone());
-@@ -1284,6 +1471,11 @@
+@@ -1284,6 +1514,11 @@
          }
      }
  
@@ -384,7 +461,7 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
      loop {
          let m = db_handle.active.load();
          let _reserved = m.reserve(key_value_pairs.len());
-@@ -2238,6 +2430,184 @@
+@@ -2238,6 +2473,316 @@
  }
  
  ///===================================================================
@@ -460,6 +537,32 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +    Ok(atoms::ok().encode(env))
 +}
 +
++/// Restrict tracking (and `scan_watched') to `keys', dropping tracked
++/// entries outside them; `clear' records everything again. Entries tracked
++/// before the watch was set and inside it are kept.
++#[rustler::nif(schedule = "DirtyCpu")]
++fn track_watch<'a>(env: Env<'a>, db_handle: ResourceArc<LmdbDatabase>, keys: Term<'a>) -> NifResult<Term<'a>> {
++    if let Ok(list) = keys.decode::<Vec<Binary>>() {
++        let set = new_track_set();
++        for k in list.iter() {
++            let _ = set.insert_sync(k.as_slice().to_vec());
++        }
++        let set = Arc::new(set);
++        db_handle.watch.store(Arc::new(Some(set.clone())));
++        // Keep what was tracked before the watch and is inside it.
++        let old = db_handle.tracked.swap(Arc::new(new_track_set()));
++        old.iter_sync(|k| {
++            if set.contains_sync(k.as_slice()) {
++                track_insert(&db_handle, k);
++            }
++            true
++        });
++    } else {
++        db_handle.watch.store(Arc::new(None));
++    }
++    Ok(atoms::ok().encode(env))
++}
++
 +/// Return the tracked entries and start a fresh set.
 +#[rustler::nif(schedule = "DirtyCpu")]
 +fn track_take<'a>(env: Env<'a>, db_handle: ResourceArc<LmdbDatabase>) -> NifResult<Term<'a>> {
@@ -488,7 +591,105 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +    from: Binary,
 +    max_rows: usize,
 +) -> NifResult<Term<'a>> {
-+    scan_impl(env, db_handle, from, max_rows, true)
++    scan_impl(env, db_handle, from, max_rows, 1)
++}
++
++/// As `scan_refs', returning only rows whose key is outside the watch set and
++/// whose value references a key in it (a `link:' target or any path prefix of
++/// it, or a bare ID). Without a watch set, as `scan_refs'.
++#[rustler::nif(schedule = "DirtyIo")]
++fn scan_watched<'a>(
++    env: Env<'a>,
++    db_handle: ResourceArc<LmdbDatabase>,
++    from: Binary,
++    max_rows: usize,
++) -> NifResult<Term<'a>> {
++    scan_impl(env, db_handle, from, max_rows, 2)
++}
++
++/// Every reference row (whatever its own key) naming a watched key or a path
++/// below one: with a watch set of content units, the external references and
++/// the internal edges of those units in one pass.
++#[rustler::nif(schedule = "DirtyIo")]
++fn scan_unit_refs<'a>(
++    env: Env<'a>,
++    db_handle: ResourceArc<LmdbDatabase>,
++    from: Binary,
++    max_rows: usize,
++) -> NifResult<Term<'a>> {
++    scan_impl(env, db_handle, from, max_rows, 3)
++}
++
++/// List up to `max_units' whole content units (see `unit_of') from `from',
++/// in key order, each as `{Unit, Rows, Bytes}', skipping named keys, in one
++/// short read transaction. Returns `{ok, Units, Next | done}'.
++#[rustler::nif(schedule = "DirtyIo")]
++fn scan_units<'a>(
++    env: Env<'a>,
++    db_handle: ResourceArc<LmdbDatabase>,
++    from: Binary,
++    max_units: usize,
++) -> NifResult<Term<'a>> {
++    if let Err(error_msg) = db_handle.validate_database() {
++        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
++    }
++    let (live_env, live_db) = match db_handle.fast_get_handles() {
++        Ok(handles) => handles,
++        Err(error_msg) => {
++            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
++        }
++    };
++    let txn = match RawReadTxn::begin(&live_env) {
++        Ok(txn) => txn,
++        Err(error_msg) => {
++            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
++        }
++    };
++    let cursor = match RawCursor::open(&txn, live_db) {
++        Ok(cursor) => cursor,
++        Err(error_msg) => {
++            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
++        }
++    };
++    let from_bytes = from.as_slice();
++    let mut key = ffi::MDB_val { mv_size: from_bytes.len(), mv_data: from_bytes.as_ptr() as *mut _ };
++    let mut value = ffi::MDB_val { mv_size: 0, mv_data: std::ptr::null_mut() };
++    let mut rc = if from_bytes.is_empty() {
++        unsafe { ffi::mdb_cursor_get(cursor.cursor, &mut key, &mut value, ffi::MDB_FIRST) }
++    } else {
++        unsafe { ffi::mdb_cursor_get(cursor.cursor, &mut key, &mut value, ffi::MDB_SET_RANGE) }
++    };
++    let mut units: Vec<(Vec<u8>, usize, usize)> = Vec::new();
++    let mut next: Option<Vec<u8>> = None;
++    while rc == ffi::MDB_SUCCESS {
++        let k = unsafe { slice::from_raw_parts(key.mv_data as *const u8, key.mv_size) };
++        if let Some(unit) = unit_of(k) {
++            let same = units.last().map(|(u, _, _)| u.as_slice() == unit).unwrap_or(false);
++            if same {
++                let last = units.last_mut().unwrap();
++                last.1 += 1;
++                last.2 += key.mv_size + value.mv_size;
++            } else if units.len() >= max_units {
++                next = Some(k.to_vec());
++                break;
++            } else {
++                units.push((unit.to_vec(), 1, key.mv_size + value.mv_size));
++            }
++        }
++        rc = unsafe { ffi::mdb_cursor_get(cursor.cursor, &mut key, &mut value, ffi::MDB_NEXT) };
++    }
++    if rc != ffi::MDB_SUCCESS && rc != ffi::MDB_NOTFOUND {
++        return Ok((atoms::error(), atoms::database_error(), "Failed to advance unit cursor".to_string()).encode(env));
++    }
++    let mut terms = Vec::with_capacity(units.len());
++    for (u, n, b) in units.iter() {
++        terms.push((encode_binary(env, u)?, *n, *b));
++    }
++    let next_term = match next {
++        Some(k) => encode_binary(env, &k)?,
++        None => atoms::done().encode(env),
++    };
++    Ok((atoms::ok(), terms, next_term).encode(env))
 +}
 +
 +/// As `scan_refs', returning every row walked.
@@ -499,7 +700,7 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +    from: Binary,
 +    max_rows: usize,
 +) -> NifResult<Term<'a>> {
-+    scan_impl(env, db_handle, from, max_rows, false)
++    scan_impl(env, db_handle, from, max_rows, 0)
 +}
 +
 +fn scan_impl<'a>(
@@ -507,8 +708,9 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +    db_handle: ResourceArc<LmdbDatabase>,
 +    from: Binary,
 +    max_rows: usize,
-+    refs_only: bool,
++    mode: u8,
 +) -> NifResult<Term<'a>> {
++    let watch = db_handle.watch.load_full();
 +    if let Err(error_msg) = db_handle.validate_database() {
 +        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
 +    }
@@ -543,7 +745,14 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +    while rc == ffi::MDB_SUCCESS && seen < max_rows {
 +        let k = unsafe { slice::from_raw_parts(key.mv_data as *const u8, key.mv_size) };
 +        let v = unsafe { slice::from_raw_parts(value.mv_data as *const u8, value.mv_size) };
-+        if !refs_only || (v.len() > 5 && &v[..5] == b"link:") || is_id43(v) {
++        let is_ref = (v.len() > 5 && &v[..5] == b"link:") || is_id43(v);
++        let keep = match (mode, &*watch) {
++            (0, _) => true,
++            (1, _) | (_, None) => is_ref,
++            (3, Some(w)) => is_ref && references_watched(v, w),
++            (_, Some(w)) => is_ref && !w.contains_sync(k) && references_watched(v, w),
++        };
++        if keep {
 +            rows.push((k.to_vec(), v.to_vec()));
 +        }
 +        seen += 1;
