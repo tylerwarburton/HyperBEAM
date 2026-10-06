@@ -901,3 +901,183 @@ notify_compute_honours_compute_key_test() ->
     receive {resolved, _, Group, {slot, 5}, _} -> ok
     after 0 -> ?assertEqual(notified, none)
     end.
+
+%%% Regression tests: historical reads must not regress the live state.
+
+%% @doc A Lua counter process with `Count' scheduled messages, checkpointed
+%% every 10 slots. Slot N leaves `count' at N + 1.
+counter_process(Count, ExtraOpts) ->
+    test_init(),
+    Wallet = ar_wallet:new(),
+    Opts =
+        ExtraOpts#{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => Wallet,
+            <<"process-snapshot-slots">> => 10,
+            <<"process-delta-checkpoint-slots">> => 10
+        },
+    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Process =
+        hb_message:commit(
+            #{
+                <<"device">> => <<"process@1.0">>,
+                <<"type">> => <<"Process">>,
+                <<"scheduler-device">> => <<"scheduler@1.0">>,
+                <<"execution-device">> => <<"lua@5.3b">>,
+                <<"module">> =>
+                    #{
+                        <<"content-type">> => <<"application/lua">>,
+                        <<"body">> => counter_script()
+                    },
+                <<"authority">> => [Address],
+                <<"scheduler-location">> => Address,
+                <<"test-random-seed">> => rand:uniform(1000000)
+            },
+            Opts
+        ),
+    {ok, _} = hb_cache:write(Process, Opts),
+    schedule_counter(Process, lists:seq(1, Count), Opts),
+    {Process, Opts}.
+
+schedule_counter(Process, Ns, Opts) ->
+    ProcID = hb_message:id(Process, all, Opts),
+    lists:foreach(
+        fun(N) ->
+            {ok, _} =
+                hb_ao:resolve(
+                    Process,
+                    hb_message:commit(
+                        #{
+                            <<"path">> => <<"schedule">>,
+                            <<"method">> => <<"POST">>,
+                            <<"body">> =>
+                                hb_message:commit(
+                                    #{
+                                        <<"target">> => ProcID,
+                                        <<"type">> => <<"Message">>,
+                                        <<"number">> => N
+                                    },
+                                    Opts
+                                )
+                        },
+                        Opts
+                    ),
+                    Opts
+                )
+        end,
+        Ns
+    ).
+
+%% @doc Run `Fun' and return its result with the number of slots it executed.
+count_executed_slots(Fun) ->
+    MFA = {dev_process, compute_slot, 6},
+    erlang:trace_pattern(MFA, true, [call_count]),
+    try
+        Res = Fun(),
+        {call_count, N} = erlang:trace_info(MFA, call_count),
+        {Res, N}
+    after
+        erlang:trace_pattern(MFA, false, [call_count])
+    end.
+
+%% @doc Regression: a historical read must not replace the worker's live state.
+%% `compute&slot=-1' rewound the worker to the initialized state and the worker
+%% kept it, so the next head request replayed every slot from 0 (6,601 slots,
+%% 215s, on stage). The worker is live at slot 50 here; after reads of -1 and 3
+%% the next slot must cost exactly one executed slot.
+historical_read_keeps_live_state_test_() ->
+    {timeout, 300, fun() ->
+        {Process, Opts} =
+            counter_process(
+                51,
+                #{
+                    <<"spawn-worker">> => true,
+                    <<"process-workers">> => true,
+                    <<"await-inprogress">> => named
+                }
+            ),
+        {ok, S50} =
+            hb_ao:resolve(
+                Process,
+                #{ <<"path">> => <<"compute">>, <<"slot">> => 50 },
+                Opts
+            ),
+        ?assertEqual(<<"51">>, hb_ao:get(<<"count">>, S50, Opts)),
+        Group = hb_util:human_id(hb_message:id(Process, all, Opts)),
+        Worker = await_worker(Group, 50),
+        ?assert(is_pid(Worker)),
+        {ok, Init} =
+            bounded_resolve(
+                Process,
+                #{ <<"path">> => <<"compute">>, <<"slot">> => <<"-1">> },
+                Opts
+            ),
+        ?assertEqual(-1, hb_ao:get(<<"at-slot">>, Init, Opts)),
+        ?assertEqual(not_found, hb_ao:get(<<"count">>, Init, Opts)),
+        {ok, S3} =
+            bounded_resolve(
+                Process,
+                #{ <<"path">> => <<"compute">>, <<"slot">> => 3 },
+                Opts
+            ),
+        ?assertEqual(3, hb_ao:get(<<"at-slot">>, S3, Opts)),
+        ?assertEqual(<<"4">>, hb_ao:get(<<"count">>, S3, Opts)),
+        schedule_counter(Process, [52], Opts),
+        {{ok, S51}, Executed} =
+            count_executed_slots(
+                fun() ->
+                    bounded_resolve(
+                        Process,
+                        #{ <<"path">> => <<"compute">>, <<"slot">> => 51 },
+                        Opts
+                    )
+                end
+            ),
+        ?assertEqual(<<"52">>, hb_ao:get(<<"count">>, S51, Opts)),
+        ?assertEqual(1, Executed),
+        ?assertEqual(Worker, hb_name:lookup(Group))
+    end}.
+
+%% @doc Without a worker: a historical read from a live state is an answer
+%% only, and a head computation from a live state far behind the newest
+%% checkpoint resumes from that checkpoint instead of replaying the gap.
+historical_read_without_worker_test_() ->
+    {timeout, 300, fun() ->
+        {Process, Opts} = counter_process(61, #{}),
+        {ok, S5} =
+            hb_ao:resolve(
+                Process,
+                #{ <<"path">> => <<"compute">>, <<"slot">> => 5 },
+                Opts
+            ),
+        ?assertNot(dev_process:is_cached_state(S5)),
+        {ok, S59} =
+            hb_ao:resolve(
+                Process,
+                #{ <<"path">> => <<"compute">>, <<"slot">> => 59 },
+                Opts
+            ),
+        ?assertEqual(<<"60">>, hb_ao:get(<<"count">>, S59, Opts)),
+        % A historical read from the live state is marked as an answer.
+        {ok, Init} =
+            hb_ao:resolve(
+                S59,
+                #{ <<"path">> => <<"compute">>, <<"slot">> => -1 },
+                Opts
+            ),
+        ?assertEqual(-1, hb_ao:get(<<"at-slot">>, Init, Opts)),
+        ?assert(dev_process:is_cached_state(Init)),
+        % Slot 60 from the state at slot 5 resumes from the checkpoint at 50.
+        {{ok, S60}, Executed} =
+            count_executed_slots(
+                fun() ->
+                    hb_ao:resolve(
+                        S5,
+                        #{ <<"path">> => <<"compute">>, <<"slot">> => 60 },
+                        Opts
+                    )
+                end
+            ),
+        ?assertEqual(<<"61">>, hb_ao:get(<<"count">>, S60, Opts)),
+        ?assert(Executed =< 10)
+    end}.

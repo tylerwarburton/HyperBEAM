@@ -39,6 +39,15 @@
 %%%                      before the full (restorable) state should be cached.
 %%%     Cache-Keys:      A list of the keys that should be cached for all 
 %%%                      assignments, in addition to `/Results'.
+%%%     process-historical-replay-limit:
+%%%                      The most slots a read of a slot behind the state it
+%%%                      is computed from may replay from the newest
+%%%                      checkpoint at or below it (default 1000; `infinity'
+%%%                      for no bound). Beyond it the read is a 503.
+%%%     process-checkpoint-resume-gap:
+%%%                      The gap, in slots, from the loaded state to the target
+%%%                      at which computation resumes from a newer checkpoint
+%%%                      when there is one (default 32).
 -module(dev_process).
 -device_libraries([lib_process]).
 %%% Public API
@@ -57,6 +66,15 @@
 -define(DEFAULT_SNAPSHOT_SLOTS, undefined).
 -define(DEFAULT_SNAPSHOT_TIME, 60).
 -endif.
+
+%% The most slots a historical read (a slot behind the state being computed
+%% from) may replay from its checkpoint before it is refused. Overridden with
+%% the `process-historical-replay-limit' option; `infinity' removes the bound.
+-define(DEFAULT_HISTORICAL_REPLAY_LIMIT, 1000).
+%% The smallest gap between the loaded state and the target slot at which the
+%% newest checkpoint is looked up to resume from instead. Overridden with the
+%% `process-checkpoint-resume-gap' option.
+-define(DEFAULT_CHECKPOINT_RESUME_GAP, 32).
 
 %% @doc When the info key is called, we should return the process exports.
 info(_Base) ->
@@ -251,16 +269,157 @@ compute(Base, Req, Opts) ->
                                       {cache_said, Res}},
                                   Opts
                               ),
-                              compute_to_slot(
-                                  ProcID,
-                                  Loaded,
-                                  Req,
-                                  Slot,
-                                  Opts
-                              )
+                              compute_from(ProcID, Loaded, Req, Slot, Opts)
                       end
             end
     end.
+
+%% @doc Compute `Slot' from the loaded state, choosing where to start.
+%%
+%% A target behind the loaded state is a historical read. It is computed off to
+%% the side by `compute_historical/5' and never becomes the caller's state:
+%% previously it went to `compute_to_slot/5' with the live state, whose rewind
+%% returned the old state as the result, and the process worker kept it as its
+%% live base. A single `compute&slot=-1' (~40ms) thus put a worker live at slot
+%% N back at the initialized state, and the next head request replayed every
+%% slot from 0, ignoring all checkpoints (6,601 slots, 215s, on stage).
+%%
+%% A target well ahead of the loaded state resumes from the newest checkpoint
+%% at or below it when that is newer than the loaded state. A loaded state that
+%% is already initialized short-circuits `ensure_loaded_state/3', so it was
+%% replayed forward however far behind the checkpoints it was. The check costs
+%% a listing of the process's slots, so it is made only when the gap is at
+%% least `process-checkpoint-resume-gap' slots: the steady head path (a gap of
+%% a few slots) does no extra work, and a smaller gap replays no more than that.
+compute_from(ProcID, Loaded, Req, Slot, Opts) ->
+    case loaded_slot(Loaded, Opts) of
+        Current when is_integer(Current), Current > Slot ->
+            compute_historical(ProcID, Loaded, Req, Slot, Opts);
+        Current when is_integer(Current) ->
+            Gap = hb_util:int(
+                hb_opts:get(
+                    <<"process-checkpoint-resume-gap">>,
+                    ?DEFAULT_CHECKPOINT_RESUME_GAP,
+                    Opts
+                )
+            ),
+            Start =
+                case Slot - Current >= Gap of
+                    true -> newer_checkpoint(ProcID, Loaded, Current, Req, Slot, Opts);
+                    false -> Loaded
+                end,
+            compute_to_slot(ProcID, Start, Req, Slot, Opts);
+        _ ->
+            compute_to_slot(ProcID, Loaded, Req, Slot, Opts)
+    end.
+
+%% @doc The slot a loaded state is at, or `undefined'.
+loaded_slot(State, Opts) ->
+    hb_ao:get(<<"at-slot">>, State, undefined, Opts#{ <<"hashpath">> => ignore }).
+
+%% @doc The newest checkpoint at or below `Slot', loaded, if it is ahead of the
+%% `Current' slot of `Loaded'; otherwise `Loaded' itself.
+newer_checkpoint(ProcID, Loaded, Current, Req, Slot, Opts) ->
+    case checkpoint_slot(ProcID, Slot, Opts) of
+        Checkpoint when Checkpoint > Current ->
+            case rewind(Loaded, Req, Slot, Opts) of
+                {ok, Restored} ->
+                    case loaded_slot(Restored, Opts) of
+                        Restart when is_integer(Restart), Restart > Current ->
+                            ?event(compute,
+                                {resuming_from_newer_checkpoint,
+                                    {proc_id, ProcID},
+                                    {loaded, Current},
+                                    {checkpoint, Restart},
+                                    {target, Slot}
+                                },
+                                Opts
+                            ),
+                            Restored;
+                        _ -> Loaded
+                    end;
+                not_found -> Loaded
+            end;
+        _ -> Loaded
+    end.
+
+%% @doc The newest slot at or below `Slot' that holds a full checkpoint, or -1
+%% (the initialized state) when there is none.
+checkpoint_slot(ProcID, Slot, Opts) ->
+    case catch dev_process_cache:latest(ProcID, [<<"snapshot+link">>], Slot, Opts) of
+        {ok, Found, _} -> hb_util:int(hb_cache:ensure_all_loaded(Found, Opts));
+        _ -> -1
+    end.
+
+%% @doc Compute a slot behind the loaded state, without touching that state.
+%%
+%% The slot is rebuilt by a throwaway executor started from the newest
+%% checkpoint at or below it (or from `init' when there is none, as for -1),
+%% and the result is marked as a cached state: it is an answer, never a base
+%% to compute onward from, so the process worker keeps its live state
+%% (`dev_process_worker:next_base/2'). Push is never triggered for a rebuilt
+%% slot; it already ran when the slot was first computed.
+%%
+%% The rebuild is bounded by `process-historical-replay-limit' (default
+%% ?DEFAULT_HISTORICAL_REPLAY_LIMIT slots, `infinity' for none): a read that
+%% would replay more slots than that from its checkpoint is answered with a 503
+%% before any work is done, since a historical read is cheap to request and
+%% the replay runs in the worker every request for the process queues behind.
+compute_historical(ProcID, Loaded, Req, Slot, Opts) ->
+    From = checkpoint_slot(ProcID, Slot, Opts),
+    Limit =
+        hb_opts:get(
+            <<"process-historical-replay-limit">>,
+            ?DEFAULT_HISTORICAL_REPLAY_LIMIT,
+            Opts
+        ),
+    ?event(compute,
+        {computing_historical_slot,
+            {proc_id, ProcID},
+            {target, Slot},
+            {loaded, loaded_slot(Loaded, Opts)},
+            {checkpoint, From},
+            {limit, Limit}
+        },
+        Opts
+    ),
+    case within_replay_limit(Slot - From, Limit) of
+        false ->
+            {error,
+                #{
+                    <<"status">> => 503,
+                    <<"body">> =>
+                        <<"Historical slot is too far from a checkpoint to "
+                            "recompute.">>,
+                    <<"slot">> => Slot,
+                    <<"checkpoint">> => From,
+                    <<"replay-limit">> => hb_util:bin(Limit)
+                }
+            };
+        true ->
+            HistReq = hb_maps:without([<<"push">>], Req, Opts),
+            case rewind(Loaded, HistReq, Slot, Opts) of
+                {ok, Start} ->
+                    case compute_to_slot(ProcID, Start, HistReq, Slot, Opts) of
+                        {ok, State} -> {ok, mark_cached_state(State, Opts)};
+                        Error -> Error
+                    end;
+                not_found ->
+                    {error,
+                        #{
+                            <<"status">> => 404,
+                            <<"body">> => <<"No state to recompute slot from.">>,
+                            <<"slot">> => Slot
+                        }
+                    }
+            end
+    end.
+
+within_replay_limit(_Distance, Limit)
+        when Limit == infinity; Limit == <<"infinity">>; Limit == false ->
+    true;
+within_replay_limit(Distance, Limit) ->
+    Distance =< hb_util:int(Limit).
 
 %% @doc Whether a `dev_process_cache:read/3' result means "not in the cache",
 %% in which case the slot can be rebuilt from the ledger, as opposed to a real
@@ -1132,3 +1291,16 @@ rewind_without_snapshot_reports_not_found_test() ->
         not_found,
         rewind(#{ <<"process">> => #{} }, #{ <<"slot">> => 100 }, 100, Opts)
     ).
+
+%% @doc A historical read further from its checkpoint than the replay limit is
+%% refused before any work is done: with no store there is no checkpoint, so
+%% slot 7 is 8 slots from the initialized state.
+historical_read_is_bounded_test() ->
+    Opts = #{ <<"store">> => [], <<"process-historical-replay-limit">> => 2 },
+    ?assertMatch(
+        {error, #{ <<"status">> := 503, <<"checkpoint">> := -1 }},
+        compute_historical(<<"pid">>, #{ <<"at-slot">> => 11 }, #{}, 7, Opts)
+    ),
+    ?assert(within_replay_limit(8, infinity)),
+    ?assert(within_replay_limit(8, <<"8">>)),
+    ?assertNot(within_replay_limit(9, 8)).
