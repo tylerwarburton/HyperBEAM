@@ -116,3 +116,227 @@ directory until that passes.
 
 Note that (1) changes the slope and not the outcome: while nothing deletes, any
 write reduction only postpones the wall. (2) is what actually bounds the store.
+
+## 18. The collector, built and measured against the corpus (2026-09-28)
+
+`hb_store_gc:collect/3` on `feat/store-collector` (base `9d7a958e1`). It copies
+the retained set into a fresh store and leaves both in place; nothing is
+deleted and the source is opened through a store marked
+`read-only => true, access => [<<"read">>]`, so `write`, `link`, `group` and
+`reset` are inadmissible before they reach `hb_store_lmdb`.
+
+### The delete primitive really is absent — checked, not assumed
+
+The pinned `elmdb` (`faa762323be6bad2db26abfa1d4243863a877f0f`) exports exactly
+`env_open`, `env_sync`, `env_close`, `env_close_by_name`, `env_status`,
+`db_open`, `db_close`, `put`, `put_batch`, `get`, `flush`, `overlay_count`,
+`iterator`, `iterator_next`, `foreach`, `fold`, `map`, `list`, `read_prefix`,
+`match`. **[M]** Grepping the Rust NIF for `del`/`delete`/`remove`/`drop` finds
+two hits, both unrelated: `remove_file` of a `.lmdb_test` probe, and
+`HashMap::remove` of an environment handle. The `hb_store` behaviour's callbacks
+are `start/3`, `stop/3`, `reset/3`, `group/3`, `link/3`, `type/3`, `read/3`,
+`write/3`, `list/3`, `match/3`, `resolve/3`. `hb_store_lmdb:reset/3` is
+`os:cmd("rm -Rf " ++ DataDir)`. §17's premise stands.
+
+### The bug that would have destroyed the chain silently
+
+**There are two kinds of reference in this store and only one of them looks like
+one.** The store's own is `"link:<key>"`, written by `hb_store_lmdb:link/3`. The
+message layer's is `hb_link:normalize/3`'s `<key>+link => <ID>`, which
+`hb_cache:ensure_loaded/3` follows by reading the message at `<ID>`. Because
+`hb_cache:is_immediate_value/2` excludes `+link` keys from inline storage, that
+ID is itself held behind a `link:data/<hash>` row — so a collector that copies
+`link:` targets reaches the row that *names* the submessage and stops there.
+
+Measured on the corpus: assignment `hBTUgAD6...` has
+`body+link => link:data/tdsn3UtJ...`, and `data/tdsn3UtJ...` holds the 43-byte
+ID `pDXEJvHbxSSBA_e_6nVlZKK1dVjmoBle-2p8gIKyTOo`. That root is the signed game
+message — 5,241 bytes with its own commitments and RSA signature. **[M]** The
+first version of the collector copied every assignment envelope, reported
+**zero misses**, and left every message body behind. A checkpoint's ~16 MB VM
+image hides the same way, one level deeper:
+`snapshot+link -> link:data/4bQwJcS3... -> lCsalH5u...`.
+
+The symptom is not a silent wrong answer — `hb_cache:ensure_all_loaded/3` throws
+`{necessary_message_not_found, ...}` on the missing target, so an incompletely
+copied store **crashes reads rather than serving partial ones**. That is the
+only reason this was recoverable. Removing the `+link` rule from
+`follow_row/3` fails two tests.
+
+### Retention classes are read, not inferred
+
+§15's `plan/2` prices slots by the writer's cadence. **That is fine for a
+projection and wrong for enactment.** Classifying all 1,985,938 computed slots
+by reading them: **[M]**
+
+| class | slots | what it is | fate |
+|---|---|---|---|
+| `delta` | 1,898,775 | `cache-format: process-delta@1.0` | window only |
+| `state` | 83,069 | full public state, **no** VM image | window only |
+| `checkpoint` | **4,094** | carries `snapshot+link` | **forever** |
+| `anchor` | 0 | `process-anchor@1.0`; not enabled yet | window only |
+
+`checkpoint` is defined by `snapshot+link`, which is exactly the key
+`dev_process_cache:latest/4` searches for when `dev_process:rewind/4` needs a
+resume base. Nothing else can restart execution.
+
+**Cadence is not uniform, so arithmetic would have dropped real snapshots.**
+Of the 370 processes: 162 checkpoint at exactly every 1000 slots, 161 carry a
+single checkpoint (slot 0, which `should_checkpoint/4` forces), and the rest land
+irregularly at gaps of 50 or less. **[M]** That split is the two execution
+devices: `dev_process:should_snapshot/3` routes a delta-bearing result
+(`lua@5.3b`) to `should_snapshot_delta_slots/2` and the 1000 cadence, and
+everything else to `process-snapshot-slots` (50) or `process-snapshot-time`
+(900 s). Every process with >20,000 slots is on the clean 1000 cadence.
+
+### This resolves §15's 2x overflow gap
+
+§15 recorded an unexplained discrepancy: 27.6 GiB of overflow pages against a
+sampled checkpoint mean implying only ~13.8 GiB of snapshots. The cause is the
+checkpoint count. §15 assumed the 1000-slot cadence and arrived at ~2,235
+checkpoints; there are **4,094**. 4,094 / 2,235 = **1.83x**, which is the gap.
+The sampled mean was not the main error — the denominator was.
+
+### Corrections to earlier figures in this file
+
+- §14: "It did confirm **zero `match@` keys**, consistent with
+  `match-index: false`". **Wrong.** `elmdb:list(DB, <<"~">>)` — safe to
+  enumerate, since base64url never contains `~` — returns thousands of
+  `match@1.0&<hash>=data` keys alongside `scheduler@1.0`. **[M]** They are a
+  derived reverse index, and the collector drops them.
+- §15: "1,985,934 computed slots". Measured **1,985,938**. Assignment slots
+  confirmed at 1,985,957 exactly.
+- §15's 2.6x on-disk amplification does not hold for the retained set. On one
+  real collection (below) it is **1.363x**, closer to §16's 1.3x.
+- `~scheduler@1.0` has exactly one child, `assignments` **[M]**, so the root set
+  covers the whole ledger namespace.
+
+### What the 1-day policy actually retains on this corpus
+
+Counted, not projected — every computed slot classified, every process's window
+start derived from assignment timestamps: **[M]**
+
+| quantity | value |
+|---|---|
+| computed slots | 1,985,938 |
+| assignment slots | 1,985,957 |
+| retained: inside the window | 855,469 |
+| retained: checkpoints below the window | 1,965 |
+| **dropped** | **1,128,504 (56.8%)** |
+| corpus timestamp span | **2.40 days** |
+
+**56.8% is not the steady-state figure and must not be quoted as one.** The
+corpus holds 2.40 days of history, so a 1-day window can only reach 57% of it by
+arithmetic, and `keep_floor = 1000` holds a floor under every process regardless
+of age. Several processes were still live when the corpus was cut and retain
+their entire history. On a store that has run for weeks the same policy drops
+proportionally more; §16's steady-state estimate of ~51 GB fixed for a 1-day
+window is the number to plan capacity on, not this one.
+
+### The retention window has a second job, and it is the one that can break reads
+
+A time window alone is not safe. `dev_process_cache:materialize/3` walks a delta
+chain backwards one `base-slot` at a time and stops at the first non-delta entry,
+and `dev_process_cache` hard-matches, so a window whose *bottom* slot is a delta
+whose base was dropped fails to read rather than degrading. `collect/3` therefore
+lowers the window start to the nearest slot holding a full state before
+retaining, and if the search cap is reached it falls back to the process's
+**lowest** slot -- never the lowest slot searched. 161 of 370 processes carry
+exactly one full state (slot 0, forced by `should_checkpoint/4`), which is the
+shape that finds this bug.
+
+### Round trip, measured
+
+Over **232 of the 370 processes** (the portion of the copy that had completed;
+the rest was cut for wall-clock, not for any failure): **[M]**
+
+| check | result |
+|---|---|
+| process definition resolves | **232 / 232** |
+| latest retained slot readable | 223 / 232 -- the 9 shortfalls are the 9 processes that have **zero** computed slots in the source, so nothing was lost |
+| **assignment slots, source** | **1,211,993** |
+| **assignment slots, collection** | **1,211,993** -- equal per process, not just in total |
+| sampled assignment reads byte-identical | 657 / 657 |
+| sampled in-window states byte-identical | 648 / 648 |
+| sampled dropped slots read cleanly | 228 / 228, **0 crashes** |
+
+And not sampled: **every** assignment of two whole processes compared field for
+field through `dev_scheduler_cache:read/3` + `ensure_all_loaded` +
+`term_to_binary` -- **571 / 571** and **16,162 / 16,162** byte-identical, zero
+differences. **[M]**
+
+The collector's own counters agree: across the batches that reported them,
+`unfollowed_link_keys` is **0**, `drop_checkpoint` is **0** and `drop_unknown` is
+**0** -- no VM snapshot was ever dropped and no slot was ever unclassifiable. The
+only `misses` are the `computed/<id>` and `computed/<id>/slot` group markers of
+the 13 processes that never computed a slot, which are absent from the source too.
+
+`dev_process:rewind/4` fired for the first time and worked -- see
+`SPEED-UPGRADES.md` Item 5 for the traces, timings and the byte-for-byte
+comparison of the re-executed states.
+
+### Size
+
+The source was never written. `data.mdb` and `lock.mdb` in the corpus still carry
+their 2026-09-26 mtimes, because `read-only => true` opens the environment with
+`MDB_NOLOCK` and nothing in the collector calls a write. `hyperbeam-prod` was not
+restarted or reconfigured at any point. **[M]**
+
+| | pages used | free | **live** |
+|---|---|---|---|
+| corpus (§15) | 39.0M -- 159.9 GB file | 5.9M / 21.8 GiB | **127.1 GiB** |
+| collection, 232+ processes | 18,354,971 | 3,589,171 / 14.7 GB | **60.5 GB** |
+
+The collection's free pages are one abandoned batch: LMDB never shrinks, so a
+killed run's pages stay in the file and return to the free list. **Quote the live
+figure, not the file size.**
+
+Extrapolated over the whole corpus that is **~80 GB against the corpus's
+136.5 GB, about 41% reclaimed** -- and that ratio is a property of *this corpus*,
+not of the policy. The corpus holds 2.40 days; a 1-day window can only reach the
+older 1.4 of them. §16's model is the one to plan on: a 1-day window costs a
+**fixed** ~51 GB of deltas and anchors however long the node runs, plus the ledger
+at 2.7 GB/day and the checkpoints. The reclaim ratio grows with the age of the
+store.
+
+### Operational notes for whoever runs the swap
+
+- **Copying is bound by random-read latency at queue depth one, not by bandwidth
+  or CPU.** A serial pass held the NVMe mirror at **8.7k IOPS / 68 MB/s at 73%
+  utilisation with 29% of one core** **[M]** -- every assignment costs ~10 random
+  reads issued one at a time. `workers => 12` gets **69k IOPS / 355 MB/s,
+  `aqu-sz` 6.0, 99% utilisation**: an **8x** speedup on the same hardware, which
+  is the difference between most of a day and under an hour. **[M]** The unit of
+  concurrency is one whole process, so no two workers share a retention
+  decision; the default is still 1. `collect/3` also takes a `progress' fun,
+  because a multi-hour pass with no way to watch it is a pass an operator kills
+  on suspicion.
+- **Re-execution writes its results back.** A cold historical read re-caches
+  every slot it replayed. The collector bounds growth from *scheduling*; it does
+  not bound growth from archival reads.
+- **The collector's own memory is the thing that will bite an operator**, and it
+  took four failed whole-corpus runs to bound it. In order: the visited set held
+  across the run (**RssAnon 20.7 GB + 4.6 GB swapped at 167 of 370 processes**);
+  the same set keyed by 45-80 byte paths instead of digests (**~430 B/entry**);
+  a set recreated per process rather than cleared, whose freed carriers never
+  returned (**36 GB at 236 of 370**); and finally the write path itself
+  (**15 GB in 13 minutes inside one large process**). Only the last is
+  interesting: `elmdb:put/3' queues into a Rust overlay drained by a background
+  worker, so a copy with no backpressure produces rows faster than LMDB commits
+  them, and `elmdb:read_prefix/2' returns one packed buffer per subtree whose
+  sub-binaries pin it until a collection runs. A periodic `elmdb:flush/1' plus
+  `erlang:garbage_collect/0' holds the same work at **155 MB**. **[M]**
+- **What ruled the alternatives out**, since three of those four were guesses:
+  sampling `elmdb:overlay_count/1', `erlang:memory(binary)', `(processes)' and
+  `(ets)' every 20 s through a four-worker run. The overlay oscillated between 8
+  and 8,585 entries, binary stayed at 0.01 GB and processes at 0.15 GB; only
+  `ets' climbed. Measure before changing anything here.
+- **Run it in batches.** A fresh VM per slice of the process list carries nothing
+  over and makes the pass restartable, which after four memory failures is worth
+  more than the page cache it gives up. `collect/4' takes the process list.
+- LMDB never shrinks, so a copy that runs the disk out leaves a file that cannot
+  be reclaimed except by deleting it. `collect/3` checks free space between
+  processes against `min_free_bytes` (64 GiB default) and stops, flushing first.
+- The source must carry `read-only => true` and `access => [<<"read">>]` or
+  `collect/3` refuses to start, and it refuses if source and destination name the
+  same store.
