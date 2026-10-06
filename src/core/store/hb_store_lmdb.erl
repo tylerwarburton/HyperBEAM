@@ -23,7 +23,7 @@
 -export([start/3, stop/3, scope/0, scope/1, reset/3]).
 -export([read/3, write/3, list/3, match/3]).
 -export([group/3, link/3, type/3, resolve/3]).
--export([sync/3]).
+-export([sync/3, delete/3]).
 
 %% Test framework and project includes
 -include_lib("eunit/include/eunit.hrl").
@@ -168,6 +168,39 @@ write(Opts, Path, Value) ->
                 }
             ),
             retry
+    end.
+
+%% @doc Delete exact keys: `#{ <<"delete">> => [Key] }'.
+%%
+%% No link is followed and no subtree is implied -- the caller names every row.
+%% The elmdb write worker commits the overlay and deletes in one transaction,
+%% so a write that returned before this call cannot be resurrected by a later
+%% flush, and a read after this call returns `not_found' until the key is
+%% written again. Absent keys are skipped. LMDB returns the freed pages to its
+%% free list for reuse; the file does not shrink.
+%%
+%% With `<<"guarded">> => true' the delete is vetoed as a whole, atomically
+%% with the commit, if any key was written -- or named by a written value --
+%% since elmdb write tracking was switched on or last taken
+%% (`elmdb:track/2', `elmdb:track_take/1'); the result is then
+%% `{error, {conflict, Keys}}' and nothing is deleted.
+%% @returns `{ok, Deleted}', the number of keys that existed.
+delete(#{ <<"read-only">> := true }, _Req, _NodeOpts) ->
+    {error, read_only};
+delete(Opts, Req = #{ <<"delete">> := Keys }, _NodeOpts) when is_list(Keys) ->
+    #{ <<"db">> := DB } = find_env(Opts),
+    Bins = [ hb_util:bin(K) || K <- Keys ],
+    Result =
+        case maps:get(<<"guarded">>, Req, false) of
+            true -> elmdb:delete_batch_guarded(DB, Bins);
+            _ -> elmdb:delete_batch(DB, Bins)
+        end,
+    case Result of
+        {ok, N} -> {ok, N};
+        {error, conflict, Found} -> {error, {conflict, Found}};
+        {error, Type, Description} ->
+            ?event(error, {lmdb_delete_failed, Type, Description}),
+            {error, {Type, Description}}
     end.
 
 %% @doc Make every write that has already returned durable.
@@ -1298,4 +1331,167 @@ sync_commits_overlay_test() ->
     ),
     ?assertEqual(0, elmdb:overlay_count(DB)),
     ?assertEqual({ok, <<"v">>}, test_read(StoreOpts, <<"par-7">>)),
+    test_stop(StoreOpts).
+
+%%% Delete primitive (patches/elmdb-delete.patch).
+
+delete_env() ->
+    StoreOpts = hb_test_utils:test_store(?MODULE),
+    test_reset(StoreOpts),
+    #{ <<"db">> := DB } = ensure_env(StoreOpts),
+    {StoreOpts, DB}.
+
+%% @doc A committed key is gone after a delete, and deleting it again (or a key
+%% that never existed) is not an error.
+delete_committed_key_test() ->
+    {StoreOpts, DB} = delete_env(),
+    test_write(StoreOpts, <<"k1">>, <<"v1">>),
+    test_write(StoreOpts, <<"k2">>, <<"v2">>),
+    ok = elmdb:flush(DB),
+    ?assertEqual({ok, 1}, hb_store:delete(StoreOpts, [<<"k1">>], #{})),
+    ?assertEqual(not_found, elmdb:get(DB, <<"k1">>)),
+    ?assertEqual({ok, <<"v2">>}, elmdb:get(DB, <<"k2">>)),
+    ?assertEqual({ok, 0}, hb_store:delete(StoreOpts, [<<"k1">>, <<"never">>], #{})),
+    ?assertEqual({error, not_found}, read(StoreOpts, #{ <<"read">> => <<"k1">> }, #{})),
+    test_stop(StoreOpts).
+
+%% @doc A put still in the overlay when the delete arrives is committed and
+%% deleted, never resurrected by a later flush; a put after the delete wins.
+delete_beats_pending_overlay_put_test() ->
+    {StoreOpts, DB} = delete_env(),
+    test_write(StoreOpts, <<"pending">>, <<"v">>),
+    ?assert(elmdb:overlay_count(DB) > 0),
+    ?assertEqual({ok, 1}, elmdb:delete(DB, <<"pending">>)),
+    ?assertEqual(not_found, elmdb:get(DB, <<"pending">>)),
+    ok = elmdb:flush(DB),
+    ?assertEqual(not_found, elmdb:get(DB, <<"pending">>)),
+    test_write(StoreOpts, <<"pending">>, <<"again">>),
+    ?assertEqual({ok, <<"again">>}, elmdb:get(DB, <<"pending">>)),
+    ok = elmdb:flush(DB),
+    ?assertEqual({ok, <<"again">>}, elmdb:get(DB, <<"pending">>)),
+    test_stop(StoreOpts).
+
+%% @doc A batch deletes exactly the keys named and nothing else.
+delete_batch_is_exact_test() ->
+    {StoreOpts, DB} = delete_env(),
+    Keys = [ <<"b/", (integer_to_binary(N))/binary>> || N <- lists:seq(1, 2000) ],
+    ok = elmdb:put_batch(DB, [ {K, K} || K <- Keys ]),
+    {Gone, Kept} = lists:split(1000, Keys),
+    ?assertEqual({ok, 1000}, elmdb:delete_batch(DB, Gone)),
+    ?assertEqual([not_found], lists:usort([ elmdb:get(DB, K) || K <- Gone ])),
+    ?assert(lists:all(fun(K) -> elmdb:get(DB, K) =:= {ok, K} end, Kept)),
+    % The parent prefix is still listed with exactly the survivors.
+    {ok, Rows} = elmdb:read_prefix(DB, <<"b/">>),
+    ?assertEqual(1000, length(Rows)),
+    test_stop(StoreOpts).
+
+%% @doc Readers running through a delete never see a deleted key come back,
+%% and never lose a key that was not deleted.
+delete_with_concurrent_readers_test_() ->
+    {timeout, 60, fun() ->
+        {StoreOpts, DB} = delete_env(),
+        Keep = [ <<"keep/", (integer_to_binary(N))/binary>> || N <- lists:seq(1, 500) ],
+        Drop = [ <<"drop/", (integer_to_binary(N))/binary>> || N <- lists:seq(1, 500) ],
+        ok = elmdb:put_batch(DB, [ {K, <<"v">>} || K <- Keep ++ Drop ]),
+        ok = elmdb:flush(DB),
+        Self = self(),
+        Reader =
+            fun Loop(Seen) ->
+                receive stop -> Self ! {reader_done, self(), ok}
+                after 0 ->
+                    lists:foreach(
+                        fun(K) -> {ok, <<"v">>} = elmdb:get(DB, K) end,
+                        lists:sublist(Keep, rand:uniform(450), 50)
+                    ),
+                    Seen2 =
+                        lists:foldl(
+                            fun(K, Acc) ->
+                                case {elmdb:get(DB, K), sets:is_element(K, Acc)} of
+                                    {not_found, _} -> sets:add_element(K, Acc);
+                                    {{ok, _}, true} -> exit({resurrected, K});
+                                    {{ok, _}, false} -> Acc
+                                end
+                            end,
+                            Seen,
+                            lists:sublist(Drop, rand:uniform(450), 50)
+                        ),
+                    Loop(Seen2)
+                end
+            end,
+        Readers =
+            [ spawn_link(fun() -> Reader(sets:new()) end) || _ <- lists:seq(1, 8) ],
+        % Writers keep the overlay busy with unrelated keys meanwhile.
+        WriteLoop =
+            fun W(N) ->
+                receive stop -> ok
+                after 0 ->
+                    ok = elmdb:put(DB, <<"other/", (integer_to_binary(N))/binary>>, <<"x">>),
+                    W(N + 1)
+                end
+            end,
+        Writer = spawn_link(fun() -> WriteLoop(0) end),
+        lists:foreach(
+            fun(Chunk) -> {ok, _} = elmdb:delete_batch(DB, Chunk), timer:sleep(5) end,
+            chunks(Drop, 50)
+        ),
+        Writer ! stop,
+        [ R ! stop || R <- Readers ],
+        [ receive {reader_done, R, ok} -> ok after 10000 -> exit(reader_hung) end
+        || R <- Readers ],
+        ?assertEqual([not_found], lists:usort([ elmdb:get(DB, K) || K <- Drop ])),
+        ?assertEqual([{ok, <<"v">>}], lists:usort([ elmdb:get(DB, K) || K <- Keep ])),
+        test_stop(StoreOpts)
+    end}.
+
+chunks([], _N) -> [];
+chunks(L, N) when length(L) =< N -> [L];
+chunks(L, N) -> {A, B} = lists:split(N, L), [A | chunks(B, N)].
+
+%% @doc With tracking on, a guarded delete is vetoed atomically by a write of
+%% the key, or by a write whose value references it (a `link:' or a bare ID);
+%% an unguarded delete is not.
+delete_guarded_by_tracked_writes_test() ->
+    {StoreOpts, DB} = delete_env(),
+    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ok = elmdb:put_batch(DB, [{<<"t1">>, <<"v">>}, {<<"t2/x">>, <<"v">>}, {ID, <<"v">>}]),
+    ok = elmdb:flush(DB),
+    ok = elmdb:track(DB, true),
+    ?assertEqual({ok, 1}, elmdb:delete_batch_guarded(DB, [<<"t1">>])),
+    ok = elmdb:put(DB, <<"ref">>, <<"link:t2/x">>),
+    ?assertMatch({error, conflict, [<<"t2/x">>]},
+        elmdb:delete_batch_guarded(DB, [<<"t2/x">>])),
+    ?assertEqual({ok, <<"v">>}, elmdb:get(DB, <<"t2/x">>)),
+    % The prefix of a link target is recorded too.
+    {ok, Tracked} = elmdb:track_take(DB),
+    ?assert(lists:member(<<"t2">>, Tracked)),
+    ?assert(lists:member(<<"ref">>, Tracked)),
+    % After a take, only new writes veto.
+    ?assertEqual({ok, 1}, elmdb:delete_batch_guarded(DB, [<<"t2/x">>])),
+    ok = elmdb:put(DB, <<"idref">>, ID),
+    ?assertMatch({error, conflict, [ID]}, elmdb:delete_batch_guarded(DB, [ID])),
+    ?assertEqual({ok, 1}, elmdb:delete_batch(DB, [ID])),
+    ok = elmdb:track(DB, false),
+    ok = elmdb:put(DB, <<"later">>, <<"link:never">>),
+    ?assertEqual({ok, 0}, elmdb:delete_batch_guarded(DB, [<<"never">>])),
+    test_stop(StoreOpts).
+
+%% @doc `scan_refs' walks the committed keyspace in bounded steps and returns
+%% only the rows whose value references a key.
+scan_refs_returns_reference_rows_test() ->
+    {StoreOpts, DB} = delete_env(),
+    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ok = elmdb:put_batch(DB,
+        [{<<"a">>, <<"plain">>}, {<<"b">>, <<"link:a">>}, {<<"c">>, ID},
+         {<<"d">>, <<"group">>}, {<<"e">>, <<"link:d/x">>}]),
+    ok = elmdb:flush(DB),
+    Walk =
+        fun W(From, Acc, Steps) ->
+            case elmdb:scan_refs(DB, From, 2) of
+                {ok, Rows, _N, done} -> {Acc ++ Rows, Steps + 1};
+                {ok, Rows, 2, Next} -> W(Next, Acc ++ Rows, Steps + 1)
+            end
+        end,
+    {Refs, Steps} = Walk(<<>>, [], 0),
+    ?assertEqual([{<<"b">>, <<"link:a">>}, {<<"c">>, ID}, {<<"e">>, <<"link:d/x">>}], Refs),
+    ?assertEqual(3, Steps),
     test_stop(StoreOpts).

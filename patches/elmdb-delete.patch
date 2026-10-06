@@ -1,0 +1,571 @@
+diff -ruN a/src/elmdb.erl b/src/elmdb.erl
+--- a/src/elmdb.erl	2026-10-07 00:40:18.610601416 +0200
++++ b/src/elmdb.erl	2026-10-07 00:40:18.616601401 +0200
+@@ -17,6 +17,12 @@
+ %% Key-value operations
+ -export([put/3, put_batch/2, get/2, flush/1]).
+ 
++%% Deletes
++-export([delete/2, delete_batch/2, delete_batch_guarded/2]).
++
++%% Collector support: write tracking and a reference scan
++-export([track/2, track_take/1, scan_refs/3, scan_rows/3]).
++
+ %% Diagnostics
+ -export([overlay_count/1]).
+ 
+@@ -334,6 +340,60 @@
+ flush(_DBInstance) ->
+     erlang:nif_error(nif_not_loaded).
+ 
++%% @doc Delete one key. Equivalent to `delete_batch(DB, [Key])'.
++-spec delete(DBInstance :: term(), Key :: binary()) ->
++    {ok, non_neg_integer()} | {error, term(), term()}.
++delete(DBInstance, Key) ->
++    delete_batch(DBInstance, [Key]).
++
++%% @doc Delete keys in one transaction. The write worker first commits the
++%% overlay, so a put that returned before this call is committed and then
++%% deleted rather than resurrected by a later flush; a get after this returns
++%% `not_found' until the key is put again. Absent keys are skipped.
++%% @returns `{ok, Deleted}' with the number of keys that existed.
++-spec delete_batch(DBInstance :: term(), Keys :: [binary()]) ->
++    {ok, non_neg_integer()} | {error, term(), term()}.
++delete_batch(_DBInstance, _Keys) ->
++    erlang:nif_error(nif_not_loaded).
++
++%% @doc As `delete_batch/2', but atomically vetoed if any key was written, or
++%% referenced by a written value, since tracking was switched on or last
++%% taken: `{error, conflict, FoundKeys}' and nothing is deleted.
++-spec delete_batch_guarded(DBInstance :: term(), Keys :: [binary()]) ->
++    {ok, non_neg_integer()} | {error, conflict, [binary()]} |
++    {error, term(), term()}.
++delete_batch_guarded(_DBInstance, _Keys) ->
++    erlang:nif_error(nif_not_loaded).
++
++%% @doc Switch write tracking on (`true') or off. While on, every put records
++%% its key, each path prefix of a `link:' target in its value, and a value that
++%% is a bare 43-byte ID. The tracked set is emptied either way.
++-spec track(DBInstance :: term(), On :: boolean()) -> ok.
++track(_DBInstance, _On) ->
++    erlang:nif_error(nif_not_loaded).
++
++%% @doc Return the tracked entries and start a new, empty set.
++-spec track_take(DBInstance :: term()) -> {ok, [binary()]}.
++track_take(_DBInstance) ->
++    erlang:nif_error(nif_not_loaded).
++
++%% @doc Scan up to `MaxRows' committed rows from `From' (inclusive; `<<>>' is
++%% the first key) in one short read transaction. Returns only the rows whose
++%% value references a key -- `link:...' or a bare 43-byte ID -- with the number
++%% of rows walked and the key to resume from, or `done'.
++-spec scan_refs(DBInstance :: term(), From :: binary(), MaxRows :: pos_integer()) ->
++    {ok, [{binary(), binary()}], non_neg_integer(), binary() | done} |
++    {error, term(), term()}.
++scan_refs(_DBInstance, _From, _MaxRows) ->
++    erlang:nif_error(nif_not_loaded).
++
++%% @doc As `scan_refs/3', returning every row walked.
++-spec scan_rows(DBInstance :: term(), From :: binary(), MaxRows :: pos_integer()) ->
++    {ok, [{binary(), binary()}], non_neg_integer(), binary() | done} |
++    {error, term(), term()}.
++scan_rows(_DBInstance, _From, _MaxRows) ->
++    erlang:nif_error(nif_not_loaded).
++
+ %% @doc Return the number of entries in the write overlay (diagnostic)
+ -spec overlay_count(DBInstance :: term()) -> non_neg_integer().
+ overlay_count(_DBInstance) ->
+diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
+--- a/native/elmdb_nif/src/lib.rs	2026-10-07 00:40:18.614601406 +0200
++++ b/native/elmdb_nif/src/lib.rs	2026-10-07 00:40:18.620601392 +0200
+@@ -155,6 +155,8 @@
+         bad_val_size,
+         bad_dbi,
+         validation_error,
++        conflict,
++        done,
+     }
+ }
+ 
+@@ -176,10 +178,25 @@
+ 
+ type OverlayMap = SccHashMap<Vec<u8>, Vec<u8>, ahash::RandomState>;
+ type FlushSyncState = Arc<(Mutex<Option<Result<(), String>>>, Condvar)>;
++/// Keys and reference targets written while tracking is on (see `track_put`).
++type TrackSet = scc::HashSet<Vec<u8>, ahash::RandomState>;
++type DeleteSyncState = Arc<(Mutex<Option<Result<DeleteOutcome, String>>>, Condvar)>;
++
++/// What a delete command did. A guarded delete that finds any of its keys in
++/// the tracked set deletes nothing and names the keys it found.
++enum DeleteOutcome {
++    Deleted(usize),
++    Conflict(Vec<Vec<u8>>),
++}
+ 
+ enum WorkerCommand {
+     Flush,
+     FlushSync(FlushSyncState),
++    /// Commit the overlay and delete `keys` in the same write transaction.
++    /// Serialized with every flush by the worker, so a put that returned
++    /// before the delete was sent is committed first and then deleted, and a
++    /// reader never observes the overlay value after the delete returns.
++    Delete(Vec<Vec<u8>>, bool, DeleteSyncState),
+     Shutdown,
+ }
+ 
+@@ -231,6 +248,12 @@
+     worker_tx: Mutex<Option<Sender<WorkerCommand>>>,
+     /// Handle to the worker thread for joining
+     worker_handle: Mutex<Option<JoinHandle<()>>>,
++    /// True while a collector has tracking switched on: every put records
++    /// its key and the targets its value references into `tracked`.
++    tracking: AtomicBool,
++    /// Written keys and referenced targets since tracking began or since the
++    /// last `track_take`.
++    tracked: ArcSwap<TrackSet>,
+ }
+ 
+ #[derive(Debug)]
+@@ -263,6 +286,55 @@
+     SccHashMap::with_hasher(ahash::RandomState::default())
+ }
+ 
++fn new_track_set() -> TrackSet {
++    scc::HashSet::with_hasher(ahash::RandomState::default())
++}
++
++fn is_id43(value: &[u8]) -> bool {
++    value.len() == 43
++        && value
++            .iter()
++            .all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_')
++}
++
++/// Insert into the tracked set that is current when the insert lands: a
++/// concurrent `track_take` swaps the set, and an entry inserted into the set
++/// being taken after it was read would be lost, so retry until the set the
++/// entry went into is still the current one.
++fn track_insert(db: &LmdbDatabase, entry: &[u8]) {
++    loop {
++        let set = db.tracked.load();
++        let _ = set.insert_sync(entry.to_vec());
++        if Arc::ptr_eq(&set, &db.tracked.load()) {
++            break;
++        }
++    }
++}
++
++/// Record a put for a running collector: the key itself (a key that is
++/// written again is live again), every path prefix of a `link:` target (the
++/// row now references that subtree), and a value that is a bare 43-byte ID
++/// (how a `+link' key names a message, and how an immediate value can name
++/// one). Called before the put reaches the overlay, so a put that a flush
++/// commits has always been recorded first. A no-op unless tracking is on.
++fn track_put(db: &LmdbDatabase, key: &[u8], value: &[u8]) {
++    if !db.tracking.load(Ordering::Acquire) {
++        return;
++    }
++    track_insert(db, key);
++    if value.len() > 5 && &value[..5] == b"link:" {
++        let target = &value[5..];
++        for (i, c) in target.iter().enumerate() {
++            if *c == b'/' {
++                track_insert(db, &target[..i]);
++            }
++        }
++        track_insert(db, target);
++    } else if is_id43(value) {
++        track_insert(db, value);
++    }
++}
++
+ fn build_environment(path: &str, options: &EnvOptions) -> Result<Environment, lmdb::Error> {
+     let mut env_builder = Environment::new();
+ 
+@@ -394,15 +466,28 @@
+ }
+ 
+ fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
++    do_flush_delete(db, &[], false).map(|_| ())
++}
++
++/// Commit the overlay and then, in the same write transaction, delete `keys`.
++/// When `guarded`, a key that is in the tracked set -- written, or referenced
++/// by a write, since the collector last took the set -- vetoes the whole
++/// delete: the overlay is still committed, nothing is deleted, and the keys
++/// found are returned so the caller can keep what they reach.
++fn do_flush_delete(
++    db: &LmdbDatabase,
++    keys: &[Vec<u8>],
++    guarded: bool,
++) -> Result<DeleteOutcome, String> {
+     let new_map = Arc::new(new_overlay_map());
+     let old_map = db.active.load_full();
+     db.draining.store(Arc::new(Some(old_map.clone())));
+     db.active.store(new_map);
+     let _ = db.op_count.swap(0, Ordering::AcqRel);
+ 
+-    if old_map.is_empty() {
++    if old_map.is_empty() && keys.is_empty() {
+         db.draining.store(Arc::new(None));
+-        return Ok(());
++        return Ok(DeleteOutcome::Deleted(0));
+     }
+ 
+     let (live_env, live_db) = match db.fast_get_handles() {
+@@ -436,10 +521,43 @@
+         return Err(e);
+     }
+ 
++    let mut outcome = DeleteOutcome::Deleted(0);
++    if !keys.is_empty() {
++        let conflicts: Vec<Vec<u8>> = if guarded {
++            let tracked = db.tracked.load();
++            keys.iter()
++                .filter(|k| tracked.contains_sync(k.as_slice()))
++                .cloned()
++                .collect()
++        } else {
++            Vec::new()
++        };
++        if conflicts.is_empty() {
++            let mut deleted = 0usize;
++            for key in keys.iter() {
++                if key.is_empty() {
++                    continue;
++                }
++                match txn.del(live_db, key, None) {
++                    Ok(()) => deleted += 1,
++                    Err(lmdb::Error::NotFound) => {}
++                    Err(e) => {
++                        drop(txn);
++                        restore_failed_flush(db, old_map);
++                        return Err(format!("Failed to delete key: {:?}", e));
++                    }
++                }
++            }
++            outcome = DeleteOutcome::Deleted(deleted);
++        } else {
++            outcome = DeleteOutcome::Conflict(conflicts);
++        }
++    }
++
+     match txn.commit() {
+         Ok(()) => {
+             db.draining.store(Arc::new(None));
+-            Ok(())
++            Ok(outcome)
+         }
+         Err(e) => {
+             restore_failed_flush(db, old_map);
+@@ -462,17 +580,58 @@
+ 
+ fn drain_remaining_sync_waiters(rx: &Receiver<WorkerCommand>, fatal_error: Option<String>) {
+     while let Ok(cmd) = rx.try_recv() {
+-        if let WorkerCommand::FlushSync(signal) = cmd {
+-            let err_msg = fatal_error.clone().unwrap_or_else(|| "Worker shut down".to_string());
+-            let (lock, cvar) = &*signal;
+-            if let Ok(mut guard) = lock.lock() {
+-                *guard = Some(Err(err_msg));
++        let err_msg = fatal_error.clone().unwrap_or_else(|| "Worker shut down".to_string());
++        match cmd {
++            WorkerCommand::FlushSync(signal) => {
++                let (lock, cvar) = &*signal;
++                if let Ok(mut guard) = lock.lock() {
++                    *guard = Some(Err(err_msg));
++                }
++                cvar.notify_all();
+             }
+-            cvar.notify_all();
++            WorkerCommand::Delete(_, _, signal) => {
++                let (lock, cvar) = &*signal;
++                if let Ok(mut guard) = lock.lock() {
++                    *guard = Some(Err(err_msg));
++                }
++                cvar.notify_all();
++            }
++            _ => {}
+         }
+     }
+ }
+ 
++fn delete_sync(
++    db_handle: &LmdbDatabase,
++    keys: Vec<Vec<u8>>,
++    guarded: bool,
++) -> Result<DeleteOutcome, String> {
++    let signal: DeleteSyncState = Arc::new((Mutex::new(None), Condvar::new()));
++    {
++        let tx = db_handle
++            .worker_tx
++            .lock()
++            .map_err(|_| "Failed to lock worker channel".to_string())?;
++        if let Some(ref sender) = *tx {
++            sender
++                .send(WorkerCommand::Delete(keys, guarded, signal.clone()))
++                .map_err(|_| "Worker thread is gone".to_string())?;
++        } else {
++            return Err("Worker thread is not running".to_string());
++        }
++    }
++    let (lock, cvar) = &*signal;
++    let mut result = lock
++        .lock()
++        .map_err(|_| "Failed to lock signal".to_string())?;
++    while result.is_none() {
++        result = cvar
++            .wait(result)
++            .map_err(|_| "Condvar wait failed".to_string())?;
++    }
++    result.take().unwrap()
++}
++
+ fn worker_loop(rx: Receiver<WorkerCommand>, db: ResourceArc<LmdbDatabase>) {
+     let mut exit_error: Option<String> = None;
+     loop {
+@@ -512,6 +671,31 @@
+                     break;
+                 }
+             }
++            Ok(WorkerCommand::Delete(keys, guarded, signal)) => {
++                db.flush_pending.store(false, Ordering::Release);
++                let result = do_flush_delete(&db, &keys, guarded);
++                let fatal = match result {
++                    Err(ref e) => Some(e.clone()),
++                    Ok(_) => None,
++                };
++                if let Some(ref e) = fatal {
++                    if let Ok(mut guard) = db.fatal_error.lock() {
++                        *guard = Some(e.clone());
++                    }
++                    db.has_fatal_error.store(true, Ordering::Release);
++                    exit_error = Some(e.clone());
++                }
++                {
++                    let (lock, cvar) = &*signal;
++                    if let Ok(mut guard) = lock.lock() {
++                        *guard = Some(result);
++                    }
++                    cvar.notify_all();
++                }
++                if fatal.is_some() {
++                    break;
++                }
++            }
+             Ok(WorkerCommand::Shutdown) => {
+                 let result = do_flush(&db);
+                 if let Err(e) = result {
+@@ -900,6 +1084,8 @@
+         hot_handles: ArcSwap::from_pointee(None),
+         worker_tx: Mutex::new(None),
+         worker_handle: Mutex::new(None),
++        tracking: AtomicBool::new(false),
++        tracked: ArcSwap::from_pointee(new_track_set()),
+     };
+     let resource = ResourceArc::new(lmdb_db);
+ 
+@@ -1132,6 +1318,7 @@
+         }
+     }
+ 
++    track_put(&db_handle, &key_vec, &value_vec);
+     loop {
+         let map = db_handle.active.load();
+         let _ = map.upsert_sync(key_vec.clone(), value_vec.clone());
+@@ -1284,6 +1471,11 @@
+         }
+     }
+ 
++    if db_handle.tracking.load(Ordering::Acquire) {
++        for (key, value) in key_value_pairs.iter() {
++            track_put(&db_handle, key.as_slice(), value.as_slice());
++        }
++    }
+     loop {
+         let m = db_handle.active.load();
+         let _reserved = m.reserve(key_value_pairs.len());
+@@ -2238,6 +2430,184 @@
+ }
+ 
+ ///===================================================================
++/// Delete and collector support
++///===================================================================
++
++fn delete_impl<'a>(
++    env: Env<'a>,
++    db_handle: ResourceArc<LmdbDatabase>,
++    keys: Vec<Binary>,
++    guarded: bool,
++) -> NifResult<Term<'a>> {
++    if let Err(error_msg) = db_handle.validate_database() {
++        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
++    }
++    ensure_worker(&db_handle);
++    if db_handle.has_fatal_error.load(Ordering::Acquire) {
++        if let Ok(guard) = db_handle.fatal_error.lock() {
++            if let Some(ref err) = *guard {
++                return Ok((atoms::error(), atoms::transaction_error(), err.clone()).encode(env));
++            }
++        }
++    }
++    let mut key_vecs = Vec::with_capacity(keys.len());
++    for key in keys.iter() {
++        let klen = key.as_slice().len();
++        if klen == 0 || klen > LMDB_DEFAULT_MAX_KEY_SIZE {
++            return Ok((atoms::error(), atoms::validation_error(), format!("Invalid key size {klen}")).encode(env));
++        }
++        key_vecs.push(key.as_slice().to_vec());
++    }
++    match delete_sync(&db_handle, key_vecs, guarded) {
++        Ok(DeleteOutcome::Deleted(n)) => Ok((atoms::ok(), n).encode(env)),
++        Ok(DeleteOutcome::Conflict(found)) => {
++            let mut terms = Vec::with_capacity(found.len());
++            for k in found.iter() {
++                terms.push(encode_binary(env, k)?);
++            }
++            Ok((atoms::error(), atoms::conflict(), terms).encode(env))
++        }
++        Err(error_msg) => Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env)),
++    }
++}
++
++/// Delete keys. Any put to them that returned before this call is committed
++/// and then deleted in one transaction; a get after this returns `not_found'
++/// until the key is put again. Deleting an absent key is not an error.
++#[rustler::nif(schedule = "DirtyIo")]
++fn delete_batch<'a>(
++    env: Env<'a>,
++    db_handle: ResourceArc<LmdbDatabase>,
++    keys: Vec<Binary>,
++) -> NifResult<Term<'a>> {
++    delete_impl(env, db_handle, keys, false)
++}
++
++/// As `delete_batch', but deletes nothing if any key was written, or named by
++/// a written value, since tracking began or was last taken.
++#[rustler::nif(schedule = "DirtyIo")]
++fn delete_batch_guarded<'a>(
++    env: Env<'a>,
++    db_handle: ResourceArc<LmdbDatabase>,
++    keys: Vec<Binary>,
++) -> NifResult<Term<'a>> {
++    delete_impl(env, db_handle, keys, true)
++}
++
++/// Switch write tracking on or off. Either way the tracked set starts empty.
++#[rustler::nif]
++fn track<'a>(env: Env<'a>, db_handle: ResourceArc<LmdbDatabase>, on: bool) -> NifResult<Term<'a>> {
++    db_handle.tracking.store(on, Ordering::Release);
++    db_handle.tracked.store(Arc::new(new_track_set()));
++    Ok(atoms::ok().encode(env))
++}
++
++/// Return the tracked entries and start a fresh set.
++#[rustler::nif(schedule = "DirtyCpu")]
++fn track_take<'a>(env: Env<'a>, db_handle: ResourceArc<LmdbDatabase>) -> NifResult<Term<'a>> {
++    let old = db_handle.tracked.swap(Arc::new(new_track_set()));
++    let mut out: Vec<Vec<u8>> = Vec::with_capacity(old.len());
++    old.iter_sync(|k| {
++        out.push(k.clone());
++        true
++    });
++    let mut terms = Vec::with_capacity(out.len());
++    for k in out.iter() {
++        terms.push(encode_binary(env, k)?);
++    }
++    Ok((atoms::ok(), terms).encode(env))
++}
++
++/// Scan up to `max_rows' committed rows in key order starting at `from'
++/// (inclusive), in one short read transaction, and return those whose value
++/// references another key: a `link:' value, or a bare 43-byte ID. Returns
++/// `{ok, Rows, Next}' with `Next' the key to resume from, or `done'. The
++/// overlay is not consulted: a collector tracks writes instead.
++#[rustler::nif(schedule = "DirtyIo")]
++fn scan_refs<'a>(
++    env: Env<'a>,
++    db_handle: ResourceArc<LmdbDatabase>,
++    from: Binary,
++    max_rows: usize,
++) -> NifResult<Term<'a>> {
++    scan_impl(env, db_handle, from, max_rows, true)
++}
++
++/// As `scan_refs', returning every row walked.
++#[rustler::nif(schedule = "DirtyIo")]
++fn scan_rows<'a>(
++    env: Env<'a>,
++    db_handle: ResourceArc<LmdbDatabase>,
++    from: Binary,
++    max_rows: usize,
++) -> NifResult<Term<'a>> {
++    scan_impl(env, db_handle, from, max_rows, false)
++}
++
++fn scan_impl<'a>(
++    env: Env<'a>,
++    db_handle: ResourceArc<LmdbDatabase>,
++    from: Binary,
++    max_rows: usize,
++    refs_only: bool,
++) -> NifResult<Term<'a>> {
++    if let Err(error_msg) = db_handle.validate_database() {
++        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
++    }
++    let (live_env, live_db) = match db_handle.fast_get_handles() {
++        Ok(handles) => handles,
++        Err(error_msg) => {
++            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
++        }
++    };
++    let txn = match RawReadTxn::begin(&live_env) {
++        Ok(txn) => txn,
++        Err(error_msg) => {
++            return Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env));
++        }
++    };
++    let cursor = match RawCursor::open(&txn, live_db) {
++        Ok(cursor) => cursor,
++        Err(error_msg) => {
++            return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
++        }
++    };
++    let from_bytes = from.as_slice();
++    let mut key = ffi::MDB_val { mv_size: from_bytes.len(), mv_data: from_bytes.as_ptr() as *mut _ };
++    let mut value = ffi::MDB_val { mv_size: 0, mv_data: std::ptr::null_mut() };
++    let mut rc = if from_bytes.is_empty() {
++        unsafe { ffi::mdb_cursor_get(cursor.cursor, &mut key, &mut value, ffi::MDB_FIRST) }
++    } else {
++        unsafe { ffi::mdb_cursor_get(cursor.cursor, &mut key, &mut value, ffi::MDB_SET_RANGE) }
++    };
++    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
++    let mut seen = 0usize;
++    while rc == ffi::MDB_SUCCESS && seen < max_rows {
++        let k = unsafe { slice::from_raw_parts(key.mv_data as *const u8, key.mv_size) };
++        let v = unsafe { slice::from_raw_parts(value.mv_data as *const u8, value.mv_size) };
++        if !refs_only || (v.len() > 5 && &v[..5] == b"link:") || is_id43(v) {
++            rows.push((k.to_vec(), v.to_vec()));
++        }
++        seen += 1;
++        rc = unsafe { ffi::mdb_cursor_get(cursor.cursor, &mut key, &mut value, ffi::MDB_NEXT) };
++    }
++    if rc != ffi::MDB_SUCCESS && rc != ffi::MDB_NOTFOUND {
++        return Ok((atoms::error(), atoms::database_error(), "Failed to advance scan cursor".to_string()).encode(env));
++    }
++    let next = if rc == ffi::MDB_SUCCESS {
++        let k = unsafe { slice::from_raw_parts(key.mv_data as *const u8, key.mv_size) };
++        encode_binary(env, k)?
++    } else {
++        atoms::done().encode(env)
++    };
++    let mut terms = Vec::with_capacity(rows.len());
++    for (k, v) in rows.iter() {
++        terms.push((encode_binary(env, k)?, encode_binary(env, v)?));
++    }
++    Ok((atoms::ok(), terms, seen, next).encode(env))
++}
++
++///===================================================================
+ /// Debug/Status Operations
+ ///===================================================================
+ 

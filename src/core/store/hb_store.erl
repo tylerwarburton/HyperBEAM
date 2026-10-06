@@ -40,6 +40,11 @@
 %%%                   Composite read results may also return children as
 %%%                   `{Key, Value}' pairs when the store can provide a child
 %%%                   value without an additional read.
+%%%     delete/3:     Optional. Remove the rows named by a request of the form
+%%%                   `#{ <<"delete">> => [Key] }', exactly as given: no link
+%%%                   is followed and no subtree is implied. Only `delete/2,3'
+%%%                   of this module calls it, and only on a store that
+%%%                   exports it.
 %%% '''
 %%% Each function takes a `store' message first, containing an arbitrary set
 %%% of its necessary configuration keys, as well as the `store-module' key which
@@ -109,6 +114,7 @@
     resolve/2, resolve/3
 ]).
 -export([sync/2, sync/3]).
+-export([delete/2, delete/3, supports_delete/1]).
 -export([find/1]).
 -export([generate_test_suite/1, generate_test_suite/2, test_stores/0]).
 -include("include/hb.hrl").
@@ -451,6 +457,54 @@ sync([Store = #{ <<"store-module">> := Mod } | Rest], Req, Opts) ->
     end;
 sync([_ | Rest], Req, Opts) ->
     sync(Rest, Req, Opts).
+
+%% @doc Delete exact keys from the given store(s). `Req' is either a list of
+%% keys or `#{ <<"delete">> => Keys }', optionally with `<<"guarded">> => true'
+%% (see `hb_store_lmdb:delete/3'). Unlike reads and writes, this never falls
+%% through a list and never retries: deleting is applied to every writable
+%% store in the list that implements the optional `delete/3' callback, and
+%% returns `{error, not_supported}' if none does. The callback is guarded with
+%% `function_exported': routing a missing callback through `call_function/3'
+%% would reach `retry/6', which stops and restarts the store.
+delete(Stores, KeysOrReq) ->
+    delete(Stores, KeysOrReq, #{}).
+delete(Stores, Keys, Opts) when is_list(Keys) ->
+    delete(Stores, #{ <<"delete">> => Keys }, Opts);
+delete(Store, Req, Opts) when not is_list(Store) ->
+    delete([Store], Req, Opts);
+delete(Stores, Req, Opts) ->
+    case [ S || S <- Stores, supports_delete(S) ] of
+        [] -> {error, not_supported};
+        Supported ->
+            lists:foldl(
+                fun(Store = #{ <<"store-module">> := Mod }, ok) ->
+                        normalize_result(
+                            Mod:delete(maps:remove(<<"access">>, Store), Req, Opts)
+                        );
+                   (Store = #{ <<"store-module">> := Mod }, {ok, N}) ->
+                        case normalize_result(
+                                Mod:delete(maps:remove(<<"access">>, Store), Req, Opts)) of
+                            {ok, M} when is_integer(M) -> {ok, N + M};
+                            Other -> Other
+                        end;
+                   (_Store, Error) ->
+                        Error
+                end,
+                ok,
+                Supported
+            )
+    end.
+
+%% @doc Whether a store message names a writable store whose module implements
+%% the optional `delete/3' callback.
+supports_delete(Store = #{ <<"store-module">> := Mod }) ->
+    is_admissible(Store, write) andalso
+        begin
+            _ = code:ensure_loaded(Mod),
+            erlang:function_exported(Mod, delete, 3)
+        end;
+supports_delete(_) ->
+    false.
 
 %% @doc Call a function on the first store module that succeeds. Returns its
 %% result, or `not_found` if none of the stores succeed. If `TIME_CALLS` is set,
