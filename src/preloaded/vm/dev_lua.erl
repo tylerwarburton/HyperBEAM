@@ -385,13 +385,12 @@ snapshot(Base, _Req, Opts) ->
         not_found ->
             {error, <<"Cannot snapshot Lua state: state not initialized.">>};
         State ->
-            % Snapshot only reachable Lua objects. Incremental collection can
-            % leave dead tables in the resident heap between cycles; persisting
-            % them adds storage, compression work and cold-restore allocations.
-            % Collection operates on a copy, leaving the resident VM intact.
-            Collected = luerl:gc(State),
+            % Serialize the VM exactly as it is resident. Collecting a copy here
+            % would give a restored VM other free lists, and so other table
+            % identities, than the live VM it must keep matching. A pending
+            % incremental cycle is carried over by `luerl:externalize/1'.
             {ok, #{ <<"body">> =>
-                term_to_binary(luerl:externalize(Collected), [compressed]) }}
+                term_to_binary(luerl:externalize(State), [compressed]) }}
     end.
 
 %% @doc Restore the Lua state from a snapshot, if it exists.
@@ -577,6 +576,54 @@ nested_collect_keeps_outer_values_test() ->
             ?assertEqual({Name, <<"alice">>}, {Name, Result})
         end,
         Programs
+    ).
+
+%% @doc A VM restored from a snapshot behaves exactly as the live VM it was
+%% taken from: same table identities, table-keyed iteration order, collector
+%% progress and `count', including snapshots taken mid incremental cycle.
+snapshot_restore_matches_live_vm_test() ->
+    Opts = #{},
+    Script = <<"""
+        Kept = {}; Keys = {}
+        function req(n)
+            local garbage = {}
+            for i = 1, 30 do garbage[i] = { i, { i } } end
+            Kept[n % 37] = { n = n, t = {} }
+            local k = {}; Keys[k] = n
+            if n % 3 == 0 then Keys[next(Keys)] = nil end
+            local done = collectgarbage('step', 40)
+            local order = {}
+            for _, v in pairs(Keys) do order[#order + 1] = v end
+            return table.concat({ tostring({}), tostring(done),
+                tostring(collectgarbage('count')), table.concat(order, ',') }, ' ')
+        end
+        """>>,
+    {ok, [], State0} = luerl:do_dec(Script, luerl:init()),
+    Run =
+        fun(State, From, To) ->
+            lists:foldl(
+                fun(N, {Acc, StateIn}) ->
+                    {ok, [Out], StateOut} =
+                        luerl:call_function_dec([<<"req">>], [N], StateIn),
+                    {[Out | Acc], StateOut}
+                end,
+                {[], State},
+                lists:seq(From, To)
+            )
+        end,
+    lists:foreach(
+        fun(Checkpoint) ->
+            {_, Live} = Run(State0, 1, Checkpoint),
+            {ok, #{ <<"body">> := Body }} =
+                snapshot(hb_private:set(#{}, <<"state">>, Live, Opts), #{}, Opts),
+            {ok, RestoredMsg} =
+                normalize(#{ <<"snapshot">> => #{ <<"body">> => Body } }, #{}, Opts),
+            Restored = hb_private:get(<<"state">>, RestoredMsg, Opts),
+            {LiveOut, _} = Run(Live, Checkpoint + 1, 120),
+            {RestoredOut, _} = Run(Restored, Checkpoint + 1, 120),
+            ?assertEqual({Checkpoint, LiveOut}, {Checkpoint, RestoredOut})
+        end,
+        [5, 17, 33, 60]
     ).
 
 simple_invocation_test() ->

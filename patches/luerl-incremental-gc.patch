@@ -1,16 +1,20 @@
 diff --git a/src/luerl.erl b/src/luerl.erl
-index 5f92f10..a7f00d2 100644
+index 5f92f10..13db0cd 100644
 --- a/src/luerl.erl
 +++ b/src/luerl.erl
-@@ -505,7 +505,7 @@ decode_erlmfa(#erl_mfa{m=Mod,f=Func,a=Arg}=_Mfa, _St, _In) ->
+@@ -505,10 +505,10 @@ decode_erlmfa(#erl_mfa{m=Mod,f=Func,a=Arg}=_Mfa, _St, _In) ->
  %% Currently very simple: only random state needs special treatment.
  
  externalize(S) ->
 -    luerl_lib_math:externalize(S).
-+    luerl_lib_math:externalize(luerl_heap:gc_cancel(S)).
++    luerl_lib_math:externalize(luerl_heap:gc_externalize(S)).
  
  internalize(S) ->
-     luerl_lib_math:internalize(S).
+-    luerl_lib_math:internalize(S).
++    luerl_heap:gc_internalize(luerl_lib_math:internalize(S)).
+ 
+ %% put_private(Key, Value, State) ->
+ %%   State.
 diff --git a/src/luerl.hrl b/src/luerl.hrl
 index 824dcac..72672de 100644
 --- a/src/luerl.hrl
@@ -57,7 +61,7 @@ index 6e26f6b..38df4e7 100644
  methodcall(Obj, Meth, Args, St0) ->
      %% Get the function to call from object and method.
 diff --git a/src/luerl_heap.erl b/src/luerl_heap.erl
-index 93449c5..d24a269 100644
+index 93449c5..825a73c 100644
 --- a/src/luerl_heap.erl
 +++ b/src/luerl_heap.erl
 @@ -24,11 +24,13 @@
@@ -70,26 +74,33 @@ index 93449c5..d24a269 100644
  
  %% External interface.
 --export([gc/1,
-+-export([gc/1,gc_step/2,gc_count/1,gc_cancel/1,
-+         gc_nested/1,gc_defer/2,gc_deferred/2,
++-export([gc/1,gc_step/2,gc_count/1,gc_nested/1,gc_defer/2,gc_deferred/2,
++         gc_externalize/1,gc_internalize/1,
           alloc_table/1,alloc_table/2,free_table/2,
           get_table/2,set_table/3,upd_table/3,chk_table/2,
           get_global_key/2,set_global_key/3,
-@@ -45,6 +47,10 @@
+@@ -45,6 +47,9 @@
  
  -import(luerl_lib, [lua_error/2,badarg_error/3]).
  
-+-define(GC_STEP_BASELINE, luerl_gc_step_baseline).
 +-define(GC_STEP_CYCLE, luerl_gc_step_cycle).
 +-define(GC_DEFERRED, luerl_gc_deferred).
 +
  %% init() -> State
  %%
  %% Initialise the heap section of the state and return the state.
-@@ -589,20 +595,159 @@ set_env_var(#eref{i=N}, Index, Val, #luerl{envs=Est0}=St) ->
+@@ -589,20 +594,210 @@ set_env_var(#eref{i=N}, Index, Val, #luerl{envs=Est0}=St) ->
  
  -record(gct, {t,s}).                            %Gc table info table, seen
  
++%% An incremental cycle. Work is either the live marking state or, after
++%% externalize/internalize, the heaps the cycle started from; the latter is
++%% re-marked from Roots with the Spent budget on the next step, which
++%% reproduces exactly the state the cycle had when it was externalized.
++-record(gc_cycle, {roots,                       %Root values at cycle start
++                   spent=0,                     %Mark budget used so far
++                   work}).                      %Marking state or heaps
++
 +%% gc_step(Budget, State) -> {CycleCompleted, State}.
 +%% Incremental snapshot-at-the-beginning mark/sweep. The cycle keeps the
 +%% immutable heap maps and roots that existed when it began. Objects allocated
@@ -106,8 +117,8 @@ index 93449c5..d24a269 100644
 +        end,
 +    Cycle =
 +        case maps:get(?GC_STEP_CYCLE, St0#luerl.private, undefined) of
-+            undefined -> new_gc_cycle(St0);
-+            Existing -> Existing
++            #gc_cycle{}=Existing -> Existing;
++            _ -> new_gc_cycle(St0)
 +        end,
 +    advance_gc_cycle(Cycle, Budget, St0).
 +
@@ -150,26 +161,69 @@ index 93449c5..d24a269 100644
 +            St2#luerl{stk=Stk}
 +    end.
 +
-+gc_cancel(St) ->
-+    St#luerl{
-+        private=maps:remove(?GC_STEP_CYCLE, St#luerl.private)
-+    }.
++%% gc_count(State) -> Count.
++%% collectgarbage("count"): the number of heap objects, a deterministic
++%% function of the heap rather than of its Erlang encoding.
++gc_count(#luerl{tabs=#tstruct{data=Tt},envs=#tstruct{data=Et},
++                usds=#tstruct{data=Ut},fncs=#tstruct{data=Ft}}) ->
++    float(map_size(Tt) + map_size(Et) + map_size(Ut) + map_size(Ft)).
 +
-+%% Approximate the memory reported by Lua's collectgarbage("count") in KiB.
-+gc_count(St) ->
-+    erlang:external_size(St) / 1024.
++%% gc_externalize(State) -> State.
++%% gc_internalize(State) -> State.
++%% A pending cycle is stored as its roots, budget spent and the difference
++%% between the heaps it started from and the current heaps, so that a
++%% restored VM continues the cycle exactly as the live VM does.
++gc_externalize(#luerl{private=Private}=St) ->
++    case maps:get(?GC_STEP_CYCLE, Private, undefined) of
++        #gc_cycle{work=Work}=Cycle ->
++            {Tt,Et,Ut,Ft} = cycle_heaps(Work),
++            Delta = {heap_delta(Tt, St#luerl.tabs),
++                     heap_delta(Et, St#luerl.envs),
++                     heap_delta(Ut, St#luerl.usds),
++                     heap_delta(Ft, St#luerl.fncs)},
++            Ext = Cycle#gc_cycle{work={delta,Delta}},
++            St#luerl{private=Private#{?GC_STEP_CYCLE => Ext}};
++        _ -> St
++    end.
 +
-+object_count(#luerl{
-+        tabs=#tstruct{data=Tabs},
-+        envs=#tstruct{data=Envs},
-+        usds=#tstruct{data=Usds},
-+        fncs=#tstruct{data=Fncs}
-+    }) ->
-+    table_count(Tabs) + table_count(Envs) +
-+        table_count(Usds) + table_count(Fncs).
++gc_internalize(#luerl{private=Private}=St) ->
++    case maps:get(?GC_STEP_CYCLE, Private, undefined) of
++        #gc_cycle{work={delta,{Dt,De,Du,Df}}}=Cycle ->
++            Work = {replay,
++                    heap_undelta(Dt, St#luerl.tabs),
++                    heap_undelta(De, St#luerl.envs),
++                    heap_undelta(Du, St#luerl.usds),
++                    heap_undelta(Df, St#luerl.fncs)},
++            St#luerl{private=Private#{?GC_STEP_CYCLE =>
++                                          Cycle#gc_cycle{work=Work}}};
++        _ -> St
++    end.
 +
-+table_count(Data) ->
-+    ?FOLD_TABLES(fun(_, _, Count) -> Count + 1 end, 0, Data).
++cycle_heaps({replay,Tt,Et,Ut,Ft}) -> {Tt,Et,Ut,Ft};
++cycle_heaps({_,_,#gct{t=Tt},#gct{t=Et},#gct{t=Ut},#gct{t=Ft}}) ->
++    {Tt,Et,Ut,Ft}.
++
++%% Entries changed or removed since the cycle began, and keys added since.
++%% Unchanged entries share the current term, so the comparison is cheap.
++heap_delta(Old, #tstruct{data=Cur}) ->
++    Changed = ?FOLD_TABLES(fun (K, V, Acc) ->
++                                   case ?CHK_TABLE(K, Cur) andalso
++                                       ?GET_TABLE(K, Cur) =:= V of
++                                       true -> Acc;
++                                       false -> [{K,V}|Acc]
++                                   end
++                           end, [], Old),
++    Added = ?FOLD_TABLES(fun (K, _, Acc) ->
++                                 case ?CHK_TABLE(K, Old) of
++                                     true -> Acc;
++                                     false -> [K|Acc]
++                                 end
++                         end, [], Cur),
++    {Changed,Added}.
++
++heap_undelta({Changed,Added}, #tstruct{data=Cur}) ->
++    Old0 = lists:foldl(fun (K, D) -> ?DEL_TABLE(K, D) end, Cur, Added),
++    lists:foldl(fun ({K,V}, D) -> ?SET_TABLE(K, V, D) end, Old0, Changed).
 +
 +new_gc_cycle(#luerl{
 +        tabs=#tstruct{data=Tt0},
@@ -177,27 +231,27 @@ index 93449c5..d24a269 100644
 +        usds=#tstruct{data=Ut0},
 +        fncs=#tstruct{data=Ft0}
 +    }=St) ->
-+    {
-+        root_set(St),
-+        [],
-+        #gct{t=Tt0,s=#{}},
-+        #gct{t=Et0,s=#{}},
-+        #gct{t=Ut0,s=#{}},
-+        #gct{t=Ft0,s=#{}}
-+    }.
++    Roots = root_set(St),
++    #gc_cycle{roots=Roots,spent=0,work={replay,Tt0,Et0,Ut0,Ft0}}.
 +
-+advance_gc_cycle({Todo,More,GcT,GcE,GcU,GcF}, Budget, St) ->
++advance_gc_cycle(#gc_cycle{roots=Roots,spent=Spent,
++                           work={replay,Tt,Et,Ut,Ft}}=Cycle, Budget, St) ->
++    %% Marking is deterministic, so one pass with the whole budget spent so
++    %% far plus this step's lands where the original steps did.
++    Work = {Roots,[],#gct{t=Tt,s=#{}},#gct{t=Et,s=#{}},
++            #gct{t=Ut,s=#{}},#gct{t=Ft,s=#{}}},
++    advance_gc_cycle(Cycle#gc_cycle{spent=0,work=Work}, Spent + Budget, St);
++advance_gc_cycle(#gc_cycle{spent=Spent,work={Todo,More,GcT,GcE,GcU,GcF}}=Cycle,
++                 Budget, St) ->
 +    case mark_step(Todo, More, GcT, GcE, GcU, GcF, Budget) of
 +        {pending,NextTodo,NextMore,NextT,NextE,NextU,NextF} ->
-+            NextCycle =
-+                {NextTodo,NextMore,NextT,NextE,NextU,NextF},
-+            Private1 = maps:put(?GC_STEP_CYCLE, NextCycle, St#luerl.private),
++            Work = {NextTodo,NextMore,NextT,NextE,NextU,NextF},
++            Next = Cycle#gc_cycle{spent=Spent + Budget,work=Work},
++            Private1 = maps:put(?GC_STEP_CYCLE, Next, St#luerl.private),
 +            {false,St#luerl{private=Private1}};
 +        {done,DoneT,DoneE,DoneU,DoneF} ->
 +            Collected = sweep_cycle(DoneT, DoneE, DoneU, DoneF, St),
-+            Private0 = maps:remove(?GC_STEP_CYCLE, Collected#luerl.private),
-+            Baseline = object_count(Collected),
-+            Private1 = maps:put(?GC_STEP_BASELINE, Baseline, Private0),
++            Private1 = maps:remove(?GC_STEP_CYCLE, Collected#luerl.private),
 +            {true,Collected#luerl{private=Private1}}
 +    end.
 +
@@ -256,17 +310,13 @@ index 93449c5..d24a269 100644
      %% io:format("gc: ~p\n", [{SeenT,SeenF,SeenU}]),
      %% Free unseen tables and add freed to free list.
      {Tf1,Tt1} = filter_tables(SeenT, Tf0, Tt0),
-@@ -614,7 +759,19 @@ gc(#luerl{tabs=#tstruct{data=Tt0,free=Tf0}=Tab0,
+@@ -614,7 +809,15 @@ gc(#luerl{tabs=#tstruct{data=Tt0,free=Tf0}=Tab0,
      Env1 = Env0#tstruct{data=Et1,free=Ef1},
      Usd1 = Usd0#tstruct{data=Ut1,free=Uf1},
      Fnc1 = Fnc0#tstruct{data=Ft1,free=Ff1},
 -    St#luerl{tabs=Tab1,envs=Env1,usds=Usd1,fncs=Fnc1}.
-+    LiveCount =
-+        maps:size(SeenT) + maps:size(SeenE) +
-+            maps:size(SeenU) + maps:size(SeenF),
 +    %% A full collection completes any pending cycle and deferred request.
-+    Private0 = maps:without([?GC_STEP_CYCLE,?GC_DEFERRED], St#luerl.private),
-+    Private1 = maps:put(?GC_STEP_BASELINE, LiveCount, Private0),
++    Private1 = maps:without([?GC_STEP_CYCLE,?GC_DEFERRED], St#luerl.private),
 +    St#luerl{
 +        tabs=Tab1,
 +        envs=Env1,
@@ -277,7 +327,7 @@ index 93449c5..d24a269 100644
  
  %% mark(ToDo, MoreTodo, GcTabs, GcEnv, GcUserdata, GcFuncdefs) ->
  %%     {SeenTabs,SeenFrames,SeenUserdata,SeenFuncdefs}.
-@@ -625,11 +782,11 @@ mark([{in_table,_}=_T|Todo], More, GcT, GcE, GcU, GcF) ->
+@@ -625,11 +828,11 @@ mark([{in_table,_}=_T|Todo], More, GcT, GcE, GcU, GcF) ->
      %%io:format("gc: ~p\n", [_T]),
      mark(Todo, More, GcT, GcE, GcU, GcF);
  mark([#tref{i=T}|Todo], More, #gct{t=Tt,s=Ts0}=GcT, GcE, GcU, GcF) ->
@@ -291,7 +341,7 @@ index 93449c5..d24a269 100644
              #table{a=Arr,d=Dict,meta=Meta} = ?GET_TABLE(T, Tt),
              %% Have to be careful when adding Tab and Meta as Tab is
              %% [{Key,Val}], Arr is array and Meta is
-@@ -641,21 +798,21 @@ mark([#tref{i=T}|Todo], More, #gct{t=Tt,s=Ts0}=GcT, GcE, GcU, GcF) ->
+@@ -641,21 +844,21 @@ mark([#tref{i=T}|Todo], More, #gct{t=Tt,s=Ts0}=GcT, GcE, GcU, GcF) ->
      end;
  mark([#eref{i=F}|Todo], More, GcT, #gct{t=Et,s=Es0}=GcE, GcU, GcF) ->
      %% io:format("eref0: ~p\ ~p ~pn", [F,Et,Es0]),
@@ -317,7 +367,7 @@ index 93449c5..d24a269 100644
             mark(Todo, More, GcT, GcE, GcU#gct{s=Us1}, GcF)
      end;
  mark([#funref{i=F,env=Erefs}|ToDo], More, GcT, GcE, GcU,
-@@ -663,12 +820,12 @@ mark([#funref{i=F,env=Erefs}|ToDo], More, GcT, GcE, GcU,
+@@ -663,12 +866,12 @@ mark([#funref{i=F,env=Erefs}|ToDo], More, GcT, GcE, GcU,
      %% io:format("funref0: ~p ~p ~p\n", [F,Fs0,Erefs]),
      %% Each funref has its own environments but we only need to add
      %% the function definition once.
@@ -332,7 +382,7 @@ index 93449c5..d24a269 100644
              Fdef = ?GET_TABLE(F, Ft0),
              %% io:format("funref1: ~p ~p ~p\n", [F,Fs1,Erefs]),
              mark([Fdef|ToDo], [Erefs|More], GcT, GcE, GcU, GcF#gct{s=Fs1})
-@@ -697,6 +854,9 @@ mark([#userdata{meta=Meta}|Todo], More, GcT, GcE, GcU, GcF) ->
+@@ -697,6 +900,9 @@ mark([#userdata{meta=Meta}|Todo], More, GcT, GcE, GcU, GcF) ->
  mark([{K,V}|Todo], More, GcT, GcE, GcU, GcF) -> %Table key-value pair
      %% io:format("mt: ~p\n", [{K,V}]),
      mark([K,V|Todo], More, GcT, GcE, GcU, GcF);
@@ -342,7 +392,7 @@ index 93449c5..d24a269 100644
  mark([_|Todo], More, GcT, GcE, GcU, GcF) ->
      %% Can ignore everything else.
      mark(Todo, More, GcT, GcE, GcU, GcF);
-@@ -705,6 +865,151 @@ mark([], [M|More], GcT, GcE, GcU, GcF) ->
+@@ -705,6 +911,151 @@ mark([], [M|More], GcT, GcE, GcU, GcF) ->
  mark([], [], #gct{s=St}, #gct{s=Se}, #gct{s=Su}, #gct{s=Sf}) ->
      {St,Se,Su,Sf}.
  
@@ -494,7 +544,7 @@ index 93449c5..d24a269 100644
  %% filter_tables(Seen, Free, Tables) -> {Free,Tables}.
  %% filter_environment(Seen, Free, Frames) -> {Free,Frames}.
  %% filter_userdata(Seen, Free, Frames) -> {Free,Frames}.
-@@ -715,46 +1020,46 @@ mark([], [], #gct{s=St}, #gct{s=Se}, #gct{s=Su}, #gct{s=Sf}) ->
+@@ -715,46 +1066,46 @@ mark([], [], #gct{s=St}, #gct{s=Se}, #gct{s=Su}, #gct{s=Sf}) ->
  filter_tables(Seen, Tf0, Tt0) ->
      %% Update the free list.
      Tf1 = ?FOLD_TABLES(fun (K, _, Free) ->
