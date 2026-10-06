@@ -2,6 +2,7 @@
 -module(dev_scheduler_cache).
 -export([write/2, write_spawn/2, read/3]).
 -export([list/2, latest/2]).
+-export([sync/2, read_upload_mark/2, write_upload_mark/3, processes/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -56,6 +57,51 @@ write(RawAssignment, RawOpts) ->
             ?event(error, {failed_to_write_assignment, {reason, Reason}}),
             {error, Reason}
     end.
+
+%% @doc Make every assignment written so far durable at the given level
+%% (`commit' or `fsync'; see `hb_store:sync/3').
+sync(Level, RawOpts) ->
+    Opts = opts(RawOpts),
+    hb_store:sync(
+        hb_opts:get(store, no_viable_store, Opts),
+        #{ <<"level">> => Level },
+        Opts
+    ).
+
+%% @doc Read the highest slot of a process below which every assignment has been
+%% published remotely. Only local stores are consulted.
+read_upload_mark(ProcID, RawOpts) ->
+    Opts = opts(RawOpts),
+    Store = hb_store:scope(hb_opts:get(store, no_viable_store, Opts), local),
+    case hb_store:read(Store, upload_mark_path(ProcID), Opts) of
+        {ok, Bin} when is_binary(Bin) -> {ok, binary_to_integer(Bin)};
+        _ -> not_found
+    end.
+
+%% @doc Record that every assignment of a process up to `Slot' is published.
+write_upload_mark(ProcID, Slot, RawOpts) when is_integer(Slot) ->
+    Opts = opts(RawOpts),
+    Store = hb_store:scope(hb_opts:get(store, no_viable_store, Opts), local),
+    hb_store:write(
+        Store,
+        #{ upload_mark_path(ProcID) => integer_to_binary(Slot) },
+        Opts
+    ).
+
+upload_mark_path(ProcID) ->
+    hb_path:to_binary([
+        ?SCHEDULER_CACHE_PREFIX,
+        <<"uploaded">>,
+        hb_util:human_id(ProcID)
+    ]).
+
+%% @doc List the IDs of every process with assignments in the cache.
+processes(RawOpts) ->
+    Opts = opts(RawOpts),
+    hb_cache:list(
+        hb_path:to_binary([?SCHEDULER_CACHE_PREFIX, <<"assignments">>]),
+        Opts
+    ).
 
 %% @doc Assignments are addressed by process and slot, and read back through
 %% those paths. The reverse match index is a derived structure that no reader of
