@@ -164,12 +164,6 @@ print_logger_config() ->
 logger_handler_config(Domain, FilterId, FormatterConfig, HandlerConfig) ->
     #{
         level => all,
-        sync_mode_qlen => 200,
-        drop_mode_qlen => 200,
-        flush_qlen => 1000,
-        burst_limit_enable => true,
-        burst_limit_max_count => 500,
-        burst_limit_window_time => 1000,
         filter_default => stop,
         filters =>
             [
@@ -179,7 +173,14 @@ logger_handler_config(Domain, FilterId, FormatterConfig, HandlerConfig) ->
                 }
             ],
         formatter => {logger_formatter, FormatterConfig},
-        config => HandlerConfig
+        config => HandlerConfig#{
+            sync_mode_qlen => 200,
+            drop_mode_qlen => 200,
+            flush_qlen => 1000,
+            burst_limit_enable => true,
+            burst_limit_max_count => 500,
+            burst_limit_window_time => 1000
+        }
     }.
 
 ensure_default_handler_filter(FilterId, Domain) ->
@@ -684,3 +685,39 @@ wait_drain_loop(Pid, Deadline) ->
             error(event_server_dead)
     end.
 -endif.
+
+%% @doc Verify the effective OTP handler settings, not just the input map.
+logger_queue_settings_test() ->
+    Id = hb_queue_settings_test,
+    Config = logger_handler_config(
+        [hb_queue_test], hb_queue_test_domain,
+        #{template => [msg, "\n"]}, #{type => standard_error}
+    ),
+    ok = logger:add_handler(Id, logger_std_h, Config),
+    try
+        {ok, #{config := Effective}} = logger:get_handler_config(Id),
+        ?assertEqual(200, maps:get(sync_mode_qlen, Effective)),
+        ?assertEqual(200, maps:get(drop_mode_qlen, Effective)),
+        ?assertEqual(1000, maps:get(flush_qlen, Effective)),
+        ?assertEqual(500, maps:get(burst_limit_max_count, Effective)),
+        % A stalled sink must not block a short burst at OTP's default queue
+        % threshold of ten. Test the real handler with its consumer suspended.
+        Handler = whereis(logger_std_h_hb_queue_settings_test),
+        ok = sys:suspend(Handler),
+        try
+            {Writer, Ref} = spawn_monitor(fun() ->
+                lists:foreach(fun(_) ->
+                    logger:log(notice, "queue regression", #{domain => [hb_queue_test]})
+                end, lists:seq(1, 30))
+            end),
+            receive
+                {'DOWN', Ref, process, Writer, normal} -> ok;
+                {'DOWN', Ref, process, Writer, Reason} -> error(Reason)
+            after 2000 -> error(logger_blocked_short_burst)
+            end
+        after
+            sys:resume(Handler)
+        end
+    after
+        logger:remove_handler(Id)
+    end.

@@ -13,6 +13,12 @@
 -define(RECENT_CACHE, dev_process_delta_recent_cache).
 -define(REPLAY_CACHE, dev_process_delta_replay_cache).
 -define(DEFAULT_DELTA_CHECKPOINT_SLOTS, 1000).
+-define(DEFAULT_HOT_CACHE_SLOTS, 32).
+%% Byte ceiling for the recent-slot window. Never reached at the default
+%% 32-slot window (measured: 915 entries, 124 MB, ~139 KB/entry on a live node),
+%% so this changes nothing until an operator raises the window. That is the
+%% point: it makes raising it safe.
+-define(DEFAULT_HOT_CACHE_MB, 1024).
 -define(DEFAULT_REPLAY_CACHE_SLOTS, 128).
 -define(DEFAULT_REPLAY_CACHE_MB, 1536).
 
@@ -242,17 +248,97 @@ hot_put(ProcID, Slot, Msg, Opts) ->
 %% per read). With the window, it is a lookup, or a replay of a few deltas
 %% from the nearest kept slot.
 recent_put(Key, Slot, Newest, Msg, Opts) ->
-    Window = hb_util:int(hb_opts:get(<<"process-hot-cache-slots">>, 32, Opts)),
+    Window =
+        hb_util:int(
+            hb_opts:get(<<"process-hot-cache-slots">>,
+                ?DEFAULT_HOT_CACHE_SLOTS, Opts)
+        ),
     Oldest = Newest - Window + 1,
     case Window > 0 andalso Slot >= Oldest of
         false -> replay_put(Key, Slot, Msg, Opts);
         true ->
             ets:insert(?RECENT_CACHE, {{Key, Slot}, Msg}),
-            ets:select_delete(
-                ?RECENT_CACHE,
-                [{{{Key, '$1'}, '_'}, [{'<', '$1', Oldest}], [true]}]
-            ),
+            expire_recent(Key, Oldest),
+            enforce_recent_bytes(Key, Opts),
             ok
+    end.
+
+%% @doc Expire only slots below the window, without scanning retained history.
+expire_recent(Key, Oldest) ->
+    case ets:prev(?RECENT_CACHE, {Key, Oldest}) of
+        {Key, Slot} ->
+            ets:delete(?RECENT_CACHE, {Key, Slot}),
+            expire_recent(Key, Oldest);
+        _ -> ok
+    end.
+
+%% @doc Bound the recent window by bytes as well as by slot count.
+%%
+%% The window is a slot count, but an entry is a materialized process state, and
+%% state size varies by orders of magnitude between processes -- `replay_put'
+%% documents the same hazard: "a count bounds memory only by accident". At the
+%% default 32 that does not matter. It matters a great deal once the window is
+%% raised to cover a busy process, which is the whole reason to raise it: a
+%% shard serving a thousand concurrent clients advances hundreds of slots
+%% between a client's write and that client's read of its own reply, so the
+%% window has to span that gap or every such read falls back to a delta replay.
+%%
+%% When over budget, trim only the OVER-BUDGET process's own window, oldest
+%% first, rather than flushing the table the way `replay_put' does. A global
+%% flush is safe there because losing a replay window costs a replay. Here it
+%% would cost the opposite of what the cache is for: every in-flight client
+%% settling its own write would miss at once and fall into the replay storm the
+%% window exists to prevent. Trimming per process also self-limits exactly the
+%% process that is large, and leaves small processes their full window.
+%%
+%% The newest half is kept because the reads this serves cluster just behind the
+%% head.
+enforce_recent_bytes(Key, Opts) ->
+    LimitMB =
+        hb_util:int(
+            hb_opts:get(<<"process-hot-cache-mb">>,
+                ?DEFAULT_HOT_CACHE_MB, Opts)
+        ),
+    case LimitMB > 0 andalso recent_bytes() >= LimitMB * 1048576 of
+        false -> ok;
+        true ->
+            Slots =
+                lists:sort(
+                    ets:select(
+                        ?RECENT_CACHE,
+                        [{{{Key, '$1'}, '_'}, [], ['$1']}]
+                    )
+                ),
+            case length(Slots) of
+                N when N > 1 ->
+                    lists:foreach(
+                        fun(S) -> ets:delete(?RECENT_CACHE, {Key, S}) end,
+                        lists:sublist(Slots, N div 2)
+                    );
+                _ ->
+                    % A single entry already over budget cannot be trimmed
+                    % further without evicting the state just written, which
+                    % would make the put pointless.
+                    ok
+            end,
+            ok
+    end.
+
+%% @doc Held bytes, as ETS accounts them.
+%%
+%% `ets:info/2' `memory' counts the table's own words and NOT the payload of
+%% refc binaries, which live off-heap and are only pointed at from the table.
+%% That is accurate for what this cache actually holds -- a process state is a
+%% map of many small fields, which is why a live node reports ~138 KB/entry
+%% across 916 entries -- but a state carrying a large binary would be
+%% under-counted and could slip past the bound. The VM snapshot, the one big
+%% binary in play, is stripped by `without_snapshot/2' before anything reaches
+%% this cache, so that case does not arise today. `replay_put' bounds itself the
+%% same way and inherits the same caveat.
+recent_bytes() ->
+    case ets:info(?RECENT_CACHE, memory) of
+        Words when is_integer(Words) -> Words * erlang:system_info(wordsize);
+        _ -> 0
     end.
 
 %% @doc Keep the states a replay rebuilds on its way to a historical slot.
@@ -1123,3 +1209,133 @@ with_delta(State, Patches, Results, Opts) ->
         #{ <<"patches">> => Patches, <<"results">> => Results },
         Opts
     ).
+
+%% @doc The byte bound must not fire at the default window. If it did, every
+%% node would silently lose its recent window on upgrade.
+hot_cache_byte_bound_inert_at_default_test() ->
+    ensure_hot_cache(),
+    Key = {<<"inert-", (integer_to_binary(erlang:unique_integer([positive])))/binary>>, local},
+    Opts = #{},
+    lists:foreach(
+        fun(S) -> recent_put(Key, S, 31, #{ <<"n">> => S }, Opts) end,
+        lists:seq(0, 31)
+    ),
+    Held = ets:select_count(?RECENT_CACHE, [{{{Key, '$1'}, '_'}, [], [true]}]),
+    ?assertEqual(32, Held),
+    ets:match_delete(?RECENT_CACHE, {{Key, '_'}, '_'}).
+
+%% @doc Over budget, the over-sized process trims its OWN window and keeps the
+%% newest half. A global flush here would drop every other process's window and
+%% send their clients into the replay storm the cache exists to prevent.
+hot_cache_byte_bound_trims_newest_half_test() ->
+    ensure_hot_cache(),
+    Key = {<<"trim-", (integer_to_binary(erlang:unique_integer([positive])))/binary>>, local},
+    %% Bulk must come from heap terms, not one big binary: a >64-byte binary is
+    %% refc and stored off-heap, so `ets:info/2' `memory' would not see it and
+    %% the bound would never fire. Real process states are maps of many small
+    %% fields, so this is also the shape the bound is tuned for.
+    Opts = #{ <<"process-hot-cache-slots">> => 64, <<"process-hot-cache-mb">> => 1 },
+    Fat = maps:from_list([ {integer_to_binary(I), I} || I <- lists:seq(1, 3000) ]),
+    lists:foreach(
+        fun(S) -> recent_put(Key, S, 63, Fat#{ <<"n">> => S }, Opts) end,
+        lists:seq(0, 63)
+    ),
+    Slots = lists:sort(ets:select(?RECENT_CACHE, [{{{Key, '$1'}, '_'}, [], ['$1']}])),
+    ?assert(length(Slots) < 64),
+    ?assert(length(Slots) > 0),
+    %% What survives is the newest run: the reads this serves sit just behind
+    %% the head, so trimming from the old end is the useful direction.
+    ?assertEqual(63, lists:max(Slots)),
+    ets:match_delete(?RECENT_CACHE, {{Key, '_'}, '_'}).
+
+%% @doc One process going over budget must not evict another's window.
+hot_cache_byte_bound_is_per_process_test() ->
+    ensure_hot_cache(),
+    U = integer_to_binary(erlang:unique_integer([positive])),
+    Big = {<<"big-", U/binary>>, local},
+    Small = {<<"small-", U/binary>>, local},
+    SmallOpts = #{ <<"process-hot-cache-slots">> => 8 },
+    lists:foreach(
+        fun(S) -> recent_put(Small, S, 7, #{ <<"n">> => S }, SmallOpts) end,
+        lists:seq(0, 7)
+    ),
+    Before = ets:select_count(?RECENT_CACHE, [{{{Small, '$1'}, '_'}, [], [true]}]),
+    BigOpts = #{ <<"process-hot-cache-slots">> => 64, <<"process-hot-cache-mb">> => 1 },
+    Fat = maps:from_list([ {integer_to_binary(I), I} || I <- lists:seq(1, 3000) ]),
+    lists:foreach(
+        fun(S) -> recent_put(Big, S, 63, Fat#{ <<"n">> => S }, BigOpts) end,
+        lists:seq(0, 63)
+    ),
+    After = ets:select_count(?RECENT_CACHE, [{{{Small, '$1'}, '_'}, [], [true]}]),
+    ?assertEqual(Before, After),
+    ?assertEqual(8, After),
+    ets:match_delete(?RECENT_CACHE, {{Big, '_'}, '_'}),
+    ets:match_delete(?RECENT_CACHE, {{Small, '_'}, '_'}).
+
+%% @doc A zero byte limit disables the bound rather than trimming everything.
+hot_cache_byte_bound_zero_disables_test() ->
+    ensure_hot_cache(),
+    Key = {<<"zero-", (integer_to_binary(erlang:unique_integer([positive])))/binary>>, local},
+    Opts = #{ <<"process-hot-cache-slots">> => 16, <<"process-hot-cache-mb">> => 0 },
+    Fat = maps:from_list([ {integer_to_binary(I), I} || I <- lists:seq(1, 3000) ]),
+    lists:foreach(
+        fun(S) -> recent_put(Key, S, 15, Fat#{ <<"n">> => S }, Opts) end,
+        lists:seq(0, 15)
+    ),
+    ?assertEqual(16, ets:select_count(?RECENT_CACHE, [{{{Key, '$1'}, '_'}, [], [true]}])),
+    ets:match_delete(?RECENT_CACHE, {{Key, '_'}, '_'}).
+
+%% @doc Budget eviction preserves latest reads and durable historical results.
+recent_cache_budget_test_() ->
+    {timeout, 60, fun() ->
+        application:ensure_all_started(hb),
+        ets:delete_all_objects(?RECENT_CACHE),
+        Store = hb_test_utils:test_store(hb_store_lmdb),
+        Opts = #{
+            <<"store">> => [Store],
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"process-hot-cache-slots">> => 2048,
+            <<"process-hot-cache-mb">> => 1,
+            <<"process-delta-checkpoint-slots">> => 8
+        },
+        ProcID = hb_util:encode(crypto:strong_rand_bytes(32)),
+        Results = #{ <<"output">> => #{ <<"data">> => <<"ok">> } },
+        State0 = #{
+            <<"at-slot">> => 0, <<"count">> => 0,
+            <<"payload">> => lists:seq(1, 12000), <<"results">> => Results
+        },
+        {ok, _} = write(ProcID, 0, with_delta(State0, [], Results, Opts), Opts),
+        lists:foldl(fun(Slot, Prev) ->
+            Patches = [#{ <<"path">> => <<"/count">>, <<"value">> => Slot }],
+            {ok, Next} = hb_process_delta:apply(Prev, Patches, Results, Slot, Opts),
+            {ok, _} = write(ProcID, Slot, with_delta(Next, Patches, Results, Opts), Opts),
+            ?assert(ets:info(?RECENT_CACHE, memory) * erlang:system_info(wordsize)
+                =< 1048576),
+            Next
+        end, State0, lists:seq(1, 12)),
+        ?assertEqual([], ets:lookup(?RECENT_CACHE, {hot_key(ProcID, Opts), 0})),
+        ?assertMatch({ok, 12, _}, hot_newest(ProcID, Opts)),
+        {ok, Historical} = read(ProcID, 3, Opts),
+        ?assertEqual(3, hb_ao:get(<<"count">>, Historical, Opts)),
+        ?assertMatch({ok, 12, _}, hot_newest(ProcID, Opts)),
+        ok
+    end}.
+
+%% @doc Expiry removes gaps and negative initialization slots, without touching
+%% neighbouring processes or copying retained public state out of ETS.
+recent_expiry_boundaries_test() ->
+    ensure_hot_cache(),
+    U = integer_to_binary(erlang:unique_integer([positive])),
+    Key = {<<"expiry-", U/binary>>, local},
+    Other = {<<"expiry-other-", U/binary>>, local},
+    lists:foreach(fun(Slot) ->
+        ets:insert(?RECENT_CACHE, {{Key, Slot}, #{ <<"slot">> => Slot }})
+    end, [-1, 0, 3, 9, 10, 11]),
+    ets:insert(?RECENT_CACHE, {{Other, 0}, #{}}),
+    expire_recent(Key, 10),
+    ?assertEqual([10, 11], ets:select(?RECENT_CACHE,
+        [{{{Key, '$1'}, '_'}, [], ['$1']}])),
+    ?assertMatch([_], ets:lookup(?RECENT_CACHE, {Other, 0})),
+    expire_recent(Key, 10),
+    ets:match_delete(?RECENT_CACHE, {{Key, '_'}, '_'}),
+    ets:delete(?RECENT_CACHE, {Other, 0}).
