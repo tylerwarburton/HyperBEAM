@@ -100,7 +100,7 @@ info(_Base) ->
 init(Base, Req, Opts) ->
     case hb_private:get(<<"state">>, Base, Opts) of
         not_found ->
-            Strict = Opts#{ <<"lua-minimum-sandbox">> => sandbox(Opts) },
+            Strict = Opts#{ <<"lua-device-sandbox">> => sandbox() },
             case hb_ao:raw(<<"lua@5.3b">>, <<"init">>, Base, Req, Strict) of
                 {ok, Initialized} ->
                     State = hb_private:get(<<"state">>, Initialized, Opts),
@@ -116,12 +116,10 @@ init(Base, Req, Opts) ->
     end.
 
 %% @doc Restrict both global names and package aliases before module loading.
-sandbox(Opts) ->
-    Extra = case hb_opts:get(<<"lua-minimum-sandbox">>, [], Opts) of
-        false -> [];
-        Spec -> Spec
-    end,
-    Extra ++ [
+%% `lua@5.3a' applies these after the node's minimum sandbox, which keeps its
+%% default when the node does not configure one.
+sandbox() ->
+    [
         {[loadfile], <<"sandboxed">>},
         {[dofile], <<"sandboxed">>},
         {[print], <<"sandboxed">>},

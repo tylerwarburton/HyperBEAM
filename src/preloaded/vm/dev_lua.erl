@@ -185,13 +185,21 @@ initialize(Base, Modules, Opts) ->
     % Apply the node's minimum sandbox and install the disk-free `require'
     % before loading any modules, such that code run while a module loads
     % cannot escape them. The message may add further restrictions via
-    % `sandbox', but cannot lift these.
+    % `sandbox', but cannot lift these. A device built on this one adds its
+    % own mandatory entries through `lua-device-sandbox', on top of the node's
+    % minimum rather than in place of it.
+    MinSpec = hb_opts:get(<<"lua-minimum-sandbox">>, ?DEFAULT_MIN_SANDBOX, Opts),
+    DeviceSpec = hb_opts:get(<<"lua-device-sandbox">>, [], Opts),
     State0 =
-        case hb_opts:get(<<"lua-minimum-sandbox">>, ?DEFAULT_MIN_SANDBOX, Opts) of
-            false -> luerl:init();
-            MinSpec ->
+        case {MinSpec, DeviceSpec} of
+            {false, []} -> luerl:init();
+            _ ->
                 dev_lua_require:install(
-                    sandbox(luerl:init(), MinSpec, Opts),
+                    sandbox(
+                        luerl:init(),
+                        sandbox_list(MinSpec) ++ DeviceSpec,
+                        Opts
+                    ),
                     Opts
                 )
         end,
@@ -258,6 +266,11 @@ functions(Base, _Req, Opts) ->
                 ),
             {ok, hb_util:message_to_ordered_list(decode(Res, Opts))}
     end.
+
+%% @doc A sandbox spec as a list; `false' disables the node minimum.
+sandbox_list(false) -> [];
+sandbox_list(Map) when is_map(Map) -> maps:to_list(Map);
+sandbox_list(List) when is_list(List) -> List.
 
 %% @doc Sandbox (render inoperable) a set of Lua functions. Each function is
 %% referred to as if it is a path in AO-Core, with its value being what to 
