@@ -12,6 +12,11 @@
 -define(HOT_CACHE, dev_process_delta_hot_cache).
 -define(RECENT_CACHE, dev_process_delta_recent_cache).
 -define(REPLAY_CACHE, dev_process_delta_replay_cache).
+%% Recent-window eviction order: process -> last write sequence, and the
+%% sequence-ordered set of processes. See `touch_recent/1'.
+-define(RECENT_SEQ, dev_process_delta_recent_seq).
+-define(RECENT_LRU, dev_process_delta_recent_lru).
+-define(HOT_CACHE_OWNER, dev_process_delta_cache_owner).
 -define(DEFAULT_DELTA_CHECKPOINT_SLOTS, 1000).
 -define(DEFAULT_HOT_CACHE_SLOTS, 32).
 %% Byte ceiling for the recent-slot window. Never reached at the default
@@ -19,6 +24,8 @@
 %% so this changes nothing until an operator raises the window. That is the
 %% point: it makes raising it safe.
 -define(DEFAULT_HOT_CACHE_MB, 1024).
+%% Entries the process being written keeps when the byte bound trims it.
+-define(RECENT_FLOOR_SLOTS, 4).
 -define(DEFAULT_REPLAY_CACHE_SLOTS, 128).
 -define(DEFAULT_REPLAY_CACHE_MB, 1536).
 
@@ -29,21 +36,26 @@ read(ProcID, SlotRef, Opts) ->
     ?event({reading_computed_result, ProcID, SlotRef}),
     case hot_read(ProcID, SlotRef, Opts) of
         {ok, Msg} -> {ok, Msg};
-        not_found ->
-            Path = path(ProcID, SlotRef, Opts),
-            case hb_cache:read(Path, Opts) of
-                {ok, Stored} ->
-                    case materialize(ProcID, Stored, Opts) of
-                        {ok, Msg} when is_integer(SlotRef) ->
-                            % Keep the rebuilt state, so the next read of the
-                            % latest slot does not replay the delta chain
-                            % again. `hot_put' never replaces a newer slot.
-                            hot_put(ProcID, SlotRef, Msg, Opts),
-                            {ok, Msg};
-                        Res -> Res
-                    end;
-                Other -> Other
-            end
+        not_found -> read_stored(ProcID, SlotRef, Opts)
+    end.
+
+%% @doc Read a slot from the store, bypassing the in-memory caches. Those hold
+%% states without their VM `snapshot' (see `cacheable/1'), so a caller that
+%% needs the snapshot must come here.
+read_stored(ProcID, SlotRef, Opts) ->
+    Path = path(ProcID, SlotRef, Opts),
+    case hb_cache:read(Path, Opts) of
+        {ok, Stored} ->
+            case materialize(ProcID, Stored, Opts) of
+                {ok, Msg} when is_integer(SlotRef) ->
+                    % Keep the rebuilt state, so the next read of the
+                    % latest slot does not replay the delta chain
+                    % again. `hot_put' never replaces a newer slot.
+                    hot_put(ProcID, SlotRef, Msg, Opts),
+                    {ok, Msg};
+                Res -> Res
+            end;
+        Other -> Other
     end.
 
 %% @doc Write a process computation result to the cache.
@@ -183,8 +195,10 @@ materialize(ProcID, #{ <<"cache-format">> := ?DELTA_FORMAT } = Delta, Opts) ->
                         maps:get(<<"results">>, Delta),
                         Opts
                     ),
+                    % A delta slot has no VM snapshot of its own: one carried
+                    % over from a checkpoint base would be a stale VM state.
                     hb_process_delta:apply(
-                        Base,
+                        cacheable(Base),
                         patch_list(StoredPatches, Opts),
                         StoredResults,
                         Slot,
@@ -206,18 +220,23 @@ patch_list(Patches, _Opts) -> Patches.
 hot_read(ProcID, SlotRef, Opts) when is_integer(SlotRef) ->
     ensure_hot_cache(),
     Key = hot_key(ProcID, Opts),
-    try ets:lookup(?HOT_CACHE, Key) of
-        [{Key, SlotRef, Msg}] -> {ok, Msg};
-        _ ->
-            case ets:lookup(?RECENT_CACHE, {Key, SlotRef}) of
-                [{_, Msg}] -> {ok, Msg};
-                [] ->
-                    case ets:lookup(?REPLAY_CACHE, {Key, SlotRef}) of
-                        [{_, Msg}] -> {ok, Msg};
-                        [] -> not_found
-                    end
-            end
-    catch error:badarg -> not_found
+    % Every lookup sits inside the `try': the cache is an accelerator, so a
+    % table that vanished with its owner is a miss, never a failed read. The
+    % `select' copies the head state out only when it is the slot asked for.
+    try
+        case ets:select(?HOT_CACHE, [{{Key, SlotRef, '$1'}, [], ['$1']}]) of
+            [Msg] -> {ok, Msg};
+            [] ->
+                case ets:lookup(?RECENT_CACHE, {Key, SlotRef}) of
+                    [{_, Msg}] -> {ok, Msg};
+                    [] ->
+                        case ets:lookup(?REPLAY_CACHE, {Key, SlotRef}) of
+                            [{_, Msg}] -> {ok, Msg};
+                            [] -> not_found
+                        end
+                end
+        end
+    catch _:_ -> not_found
     end;
 hot_read(_ProcID, _SlotRef, _Opts) -> not_found.
 
@@ -225,20 +244,65 @@ hot_read(_ProcID, _SlotRef, _Opts) -> not_found.
 %% a newer one: a replay after a restart writes old slots while readers want
 %% the latest, and letting the replay evict it sends every read back down the
 %% delta chain.
+%%
+%% Best effort: every caller has already made the state durable (or read it
+%% from the store), so a cache failure -- a table gone with its owner, a bad
+%% window option -- is logged and dropped, never raised into the write or read
+%% it accelerates.
 hot_put(ProcID, Slot, Msg, Opts) ->
     ensure_hot_cache(),
     Key = hot_key(ProcID, Opts),
-    try ets:lookup(?HOT_CACHE, Key) of
-        [{Key, Newer, _}] when Newer > Slot ->
-            recent_put(Key, Slot, Newer, Msg, Opts);
-        _ ->
-            ets:insert(?HOT_CACHE, {Key, Slot, Msg}),
-            recent_put(Key, Slot, Slot, Msg, Opts)
-    catch error:badarg ->
-        % Losing this acceleration never loses state: the durable delta or
-        % checkpoint was already written.
+    try
+        Cached = cacheable(Msg),
+        Newest = hot_advance(Key, Slot, Cached),
+        recent_put(Key, Slot, Newest, Cached, Opts)
+    catch Class:Reason ->
+        ?event(compute_cache,
+            {hot_cache_put_failed,
+                {proc_id, ProcID},
+                {slot, Slot},
+                {class, Class},
+                {reason, Reason}
+            }
+        ),
         ok
     end.
+
+%% @doc Offer `Slot' as the newest state of `Key' and return the newest slot
+%% held afterwards. The move is a conditional replace, so it is atomic against
+%% a concurrent put: a reader rebuilding slot S and the writer of S+1 used to
+%% both see the old entry, and whichever inserted last won -- leaving S as
+%% `latest' for as long as the process stayed idle. Retries only when another
+%% put changed the entry between the two steps.
+hot_advance(Key, Slot, Msg) ->
+    case ets:lookup_element(?HOT_CACHE, Key, 2, absent) of
+        absent ->
+            case ets:insert_new(?HOT_CACHE, {Key, Slot, Msg}) of
+                true -> Slot;
+                false -> hot_advance(Key, Slot, Msg)
+            end;
+        Newer when Newer > Slot -> Newer;
+        _ ->
+            Replace =
+                [{
+                    {Key, '$1', '_'},
+                    [{'=<', '$1', Slot}],
+                    [{{{const, Key}, Slot, {const, Msg}}}]
+                }],
+            case ets:select_replace(?HOT_CACHE, Replace) of
+                1 -> Slot;
+                0 -> hot_advance(Key, Slot, Msg)
+            end
+    end.
+
+%% @doc The form of a state the in-memory caches hold: without its VM
+%% `snapshot'. A checkpoint's snapshot is a full VM image (~19 MB on a live Lua
+%% process) that no cache reader uses: `compute' and `now' strip it from what
+%% they return, `compute_cached' only tests for presence, and a delta replay
+%% patches public state. The one reader that needs it -- a cold restore asking
+%% `latest/4' for `snapshot+link' -- reads the store (`read_stored/3').
+cacheable(Msg) when is_map(Msg) -> maps:remove(<<"snapshot">>, Msg);
+cacheable(Msg) -> Msg.
 
 %% @doc Also keep the last `process-hot-cache-slots' (default 32) states of a
 %% process. A `compute&slot=N' read for a recent slot that is no longer the
@@ -258,6 +322,7 @@ recent_put(Key, Slot, Newest, Msg, Opts) ->
         false -> replay_put(Key, Slot, Msg, Opts);
         true ->
             ets:insert(?RECENT_CACHE, {{Key, Slot}, Msg}),
+            touch_recent(Key),
             expire_recent(Key, Oldest),
             enforce_recent_bytes(Key, Opts),
             ok
@@ -272,6 +337,42 @@ expire_recent(Key, Oldest) ->
         _ -> ok
     end.
 
+%% @doc Mark `Key' as the most recently written process in the recent window.
+%% `?RECENT_SEQ' maps a process to its last write sequence and `?RECENT_LRU'
+%% orders processes by it, so the least recently written one is `ets:first/1'.
+%% Both hold one row per process with a window, a few words each. Two puts to
+%% one process racing here can leave a superseded `?RECENT_LRU' row behind;
+%% eviction drops such a row when it reaches it, and `sweep_recent_lru/0'
+%% bounds how many can collect before that.
+touch_recent(Key) ->
+    Seq = erlang:unique_integer([monotonic]),
+    case ets:lookup_element(?RECENT_SEQ, Key, 2, absent) of
+        absent -> ok;
+        Old -> ets:delete(?RECENT_LRU, {Old, Key})
+    end,
+    ets:insert(?RECENT_SEQ, {Key, Seq}),
+    ets:insert(?RECENT_LRU, {{Seq, Key}}),
+    case ets:info(?RECENT_LRU, size) > 2 * ets:info(?RECENT_SEQ, size) + 64 of
+        true -> sweep_recent_lru();
+        false -> ok
+    end.
+
+%% @doc Drop every superseded `?RECENT_LRU' row. A full pass, but it runs only
+%% once superseded rows outnumber live ones, so it is amortized over at least
+%% as many racing puts as it visits rows.
+sweep_recent_lru() ->
+    ets:foldl(
+        fun({{Seq, Key}} = Row, ok) ->
+            case ets:lookup_element(?RECENT_SEQ, Key, 2, absent) of
+                Seq -> ok;
+                _ -> ets:delete_object(?RECENT_LRU, Row)
+            end,
+            ok
+        end,
+        ok,
+        ?RECENT_LRU
+    ).
+
 %% @doc Bound the recent window by bytes as well as by slot count.
 %%
 %% The window is a slot count, but an entry is a materialized process state, and
@@ -283,57 +384,92 @@ expire_recent(Key, Oldest) ->
 %% between a client's write and that client's read of its own reply, so the
 %% window has to span that gap or every such read falls back to a delta replay.
 %%
-%% When over budget, trim only the OVER-BUDGET process's own window, oldest
-%% first, rather than flushing the table the way `replay_put' does. A global
-%% flush is safe there because losing a replay window costs a replay. Here it
-%% would cost the opposite of what the cache is for: every in-flight client
-%% settling its own write would miss at once and fall into the replay storm the
-%% window exists to prevent. Trimming per process also self-limits exactly the
-%% process that is large, and leaves small processes their full window.
-%%
-%% The newest half is kept because the reads this serves cluster just behind the
-%% head.
+%% When over budget, evict from the LEAST RECENTLY WRITTEN process first, its
+%% oldest slot first, one entry at a time until the table is back under budget,
+%% rather than flushing the table the way `replay_put' does. A global flush is
+%% safe there because losing a replay window costs a replay. Here it would cost
+%% the opposite of what the cache is for: every in-flight client settling its
+%% own write would miss at once and fall into the replay storm the window
+%% exists to prevent. An idle process's window is the one no client is
+%% settling against (its newest state stays in `?HOT_CACHE'), so it goes
+%% first; the process being written is trimmed last, oldest first, and keeps
+%% at least `?RECENT_FLOOR_SLOTS' entries -- the reads this serves cluster just
+%% behind the head. Each put evicts about what it inserted, so the cost is
+%% amortized: a few ordered lookups and deletes per put, never a scan.
 enforce_recent_bytes(Key, Opts) ->
     LimitMB =
         hb_util:int(
             hb_opts:get(<<"process-hot-cache-mb">>,
                 ?DEFAULT_HOT_CACHE_MB, Opts)
         ),
-    case LimitMB > 0 andalso recent_bytes() >= LimitMB * 1048576 of
+    case LimitMB > 0 of
+        false -> ok;
+        true -> evict_recent(Key, LimitMB * 1048576)
+    end.
+
+evict_recent(Active, Limit) ->
+    case recent_bytes() >= Limit of
         false -> ok;
         true ->
-            Slots =
-                lists:sort(
-                    ets:select(
-                        ?RECENT_CACHE,
-                        [{{{Key, '$1'}, '_'}, [], ['$1']}]
-                    )
-                ),
-            case length(Slots) of
-                N when N > 1 ->
-                    lists:foreach(
-                        fun(S) -> ets:delete(?RECENT_CACHE, {Key, S}) end,
-                        lists:sublist(Slots, N div 2)
-                    );
+            case ets:first(?RECENT_LRU) of
+                '$end_of_table' -> ok;
+                {Seq, Key} = Row ->
+                    Live =
+                        ets:lookup_element(?RECENT_SEQ, Key, 2, absent) =:= Seq,
+                    case Live of
+                        false ->
+                            ets:delete(?RECENT_LRU, Row),
+                            evict_recent(Active, Limit);
+                        true when Key =:= Active ->
+                            trim_active(Active, Limit);
+                        true ->
+                            case recent_slots(Key, 1) of
+                                [Slot] ->
+                                    ets:delete(?RECENT_CACHE, {Key, Slot});
+                                [] ->
+                                    ets:delete(?RECENT_LRU, Row),
+                                    ets:delete_object(?RECENT_SEQ, {Key, Seq})
+                            end,
+                            evict_recent(Active, Limit)
+                    end
+            end
+    end.
+
+%% @doc Every other process's window is gone and the table is still over
+%% budget: trim the process being written, oldest first, down to the floor.
+trim_active(Active, Limit) ->
+    case recent_bytes() >= Limit of
+        false -> ok;
+        true ->
+            case recent_slots(Active, ?RECENT_FLOOR_SLOTS + 1) of
+                [Oldest | Rest] when length(Rest) >= ?RECENT_FLOOR_SLOTS ->
+                    ets:delete(?RECENT_CACHE, {Active, Oldest}),
+                    trim_active(Active, Limit);
                 _ ->
-                    % A single entry already over budget cannot be trimmed
-                    % further without evicting the state just written, which
-                    % would make the put pointless.
+                    % At the floor. Trimming further would evict the states
+                    % just written, which would make the put pointless.
                     ok
-            end,
-            ok
+            end
+    end.
+
+%% @doc The oldest `N' slots `Key' holds in the recent window. The key prefix
+%% is bound, so this is an ordered range read, not a table scan.
+recent_slots(Key, N) ->
+    case ets:select(?RECENT_CACHE, [{{{Key, '$1'}, '_'}, [], ['$1']}], N) of
+        {Slots, _} -> Slots;
+        '$end_of_table' -> []
     end.
 
 %% @doc Held bytes, as ETS accounts them.
 %%
 %% `ets:info/2' `memory' counts the table's own words and NOT the payload of
-%% refc binaries, which live off-heap and are only pointed at from the table.
-%% That is accurate for what this cache actually holds -- a process state is a
-%% map of many small fields, which is why a live node reports ~138 KB/entry
-%% across 916 entries -- but a state carrying a large binary would be
-%% under-counted and could slip past the bound. The VM snapshot, the one big
-%% binary in play, is stripped by `without_snapshot/2' before anything reaches
-%% this cache, so that case does not arise today. `replay_put' bounds itself the
+%% refc binaries (over 64 bytes), which live off-heap and are only pointed at
+%% from the table. That is accurate for what this cache holds -- a process
+%% state is a map of many small fields, which is why a live node reports
+%% ~138 KB/entry across 916 entries. The one large binary in play, the VM
+%% `snapshot' a checkpoint carries, is removed by `cacheable/1' in `hot_put'
+%% before a state reaches any of these tables. A state carrying some other
+%% large binary would still be under-counted. `replay_put' bounds itself the
 %% same way and inherits the same caveat.
 recent_bytes() ->
     case ets:info(?RECENT_CACHE, memory) of
@@ -391,13 +527,19 @@ replay_put(Key, Slot, Msg, Opts) ->
             ok
     end.
 
+%% @doc The cache key of a process: its ID and the `process-cache-scope'. The
+%% store is deliberately not part of it. A node runs one store stack per scope,
+%% and the store descriptor is not a stable identity: `latest_from_store/4'
+%% re-scopes it before reading, so keying on it would split one process's
+%% entries across descriptors and miss on every such read. Two nodes sharing a
+%% VM (tests) with different stores must use distinct process IDs or scopes.
 hot_key(ProcID, Opts) ->
     {
         ProcID,
         hb_opts:get(<<"process-cache-scope">>, local, Opts)
     }.
 
-%% @doc Make sure the hot cache table exists. It is owned by a dedicated
+%% @doc Make sure the hot cache tables exist. They are owned by a dedicated
 %% process that never exits: an ETS table dies with its owner, and the first
 %% caller is often a short-lived HTTP request, which used to take the whole
 %% hot cache with it when it finished -- leaving every `now' read to rebuild
@@ -408,26 +550,7 @@ ensure_hot_cache() ->
             Parent = self(),
             Ref = make_ref(),
             {Owner, Mon} =
-                spawn_monitor(
-                    fun() ->
-                        try ets:new(?HOT_CACHE, [named_table, public, set]) of
-                            _ ->
-                                ets:new(
-                                    ?RECENT_CACHE,
-                                    [named_table, public, ordered_set]
-                                ),
-                                ets:new(
-                                    ?REPLAY_CACHE,
-                                    [named_table, public, ordered_set]
-                                ),
-                                Parent ! {Ref, created},
-                                receive after infinity -> ok end
-                        catch error:badarg ->
-                            % Another caller created it first.
-                            Parent ! {Ref, exists}
-                        end
-                    end
-                ),
+                spawn_monitor(fun() -> hot_cache_owner(Parent, Ref) end),
             receive
                 {Ref, _} -> ok;
                 {'DOWN', Mon, process, Owner, _} -> ok
@@ -436,6 +559,41 @@ ensure_hot_cache() ->
             erlang:demonitor(Mon, [flush]),
             ok;
         _ -> ok
+    end.
+
+%% @doc Become the one owner of the cache tables, or report that one exists.
+%% Ownership is claimed by registering a name, which is atomic, rather than by
+%% creating the first table: when an owner dies its tables are deleted one at a
+%% time, so a successor could create the first table while an older one still
+%% held a later name, and crash on it.
+hot_cache_owner(Parent, Ref) ->
+    case catch register(?HOT_CACHE_OWNER, self()) of
+        true ->
+            lists:foreach(
+                fun new_cache_table/1,
+                [
+                    {?RECENT_CACHE, ordered_set},
+                    {?REPLAY_CACHE, ordered_set},
+                    {?RECENT_SEQ, set},
+                    {?RECENT_LRU, ordered_set},
+                    % Last: callers test for this one to skip creation.
+                    {?HOT_CACHE, set}
+                ]
+            ),
+            Parent ! {Ref, created},
+            receive after infinity -> ok end;
+        _ ->
+            Parent ! {Ref, exists}
+    end.
+
+%% @doc Create a named table, waiting out a dead predecessor's table of the
+%% same name while the runtime deletes it.
+new_cache_table(Spec) -> new_cache_table(Spec, 1000).
+new_cache_table({Name, Type} = Spec, Tries) ->
+    try ets:new(Name, [named_table, public, Type])
+    catch error:badarg when Tries > 0 ->
+        timer:sleep(1),
+        new_cache_table(Spec, Tries - 1)
     end.
 
 %% @doc Calculate the path of a result, given a process ID and a slot.
@@ -540,8 +698,14 @@ latest_from_store(ProcID, RawRequiredPath, Limit, RawOpts) ->
             % No slot found with the necessary path was found.
             {error, not_found};
         SlotNum ->
-            % Found. Return the slot number and the message at that slot.
-            {ok, Msg} = read(ProcID, SlotNum, Opts),
+            % Found. Return the slot number and the message at that slot. A
+            % required path (in practice `snapshot+link', for a cold restore)
+            % may name a key the in-memory caches strip, so read the store.
+            {ok, Msg} =
+                case RequiredPath of
+                    [] -> read(ProcID, SlotNum, Opts);
+                    _ -> read_stored(ProcID, SlotNum, Opts)
+                end,
             {ok, SlotNum, Msg}
     end.
 
@@ -1224,9 +1388,8 @@ hot_cache_byte_bound_inert_at_default_test() ->
     ?assertEqual(32, Held),
     ets:match_delete(?RECENT_CACHE, {{Key, '_'}, '_'}).
 
-%% @doc Over budget, the over-sized process trims its OWN window and keeps the
-%% newest half. A global flush here would drop every other process's window and
-%% send their clients into the replay storm the cache exists to prevent.
+%% @doc Over budget with no other process to evict, the process being written
+%% trims its own window from the oldest end and keeps the newest run.
 hot_cache_byte_bound_trims_newest_half_test() ->
     ensure_hot_cache(),
     Key = {<<"trim-", (integer_to_binary(erlang:unique_integer([positive])))/binary>>, local},
@@ -1248,29 +1411,48 @@ hot_cache_byte_bound_trims_newest_half_test() ->
     ?assertEqual(63, lists:max(Slots)),
     ets:match_delete(?RECENT_CACHE, {{Key, '_'}, '_'}).
 
-%% @doc One process going over budget must not evict another's window.
-hot_cache_byte_bound_is_per_process_test() ->
+%% @doc Over budget, the least recently written process loses its window
+%% first, oldest slot first, and the process being written keeps its window.
+%% Trimming the writer instead -- the old policy -- collapsed a busy process to
+%% one entry while idle processes kept theirs and memory stayed at the bound.
+hot_cache_byte_bound_evicts_idle_processes_first_test() ->
     ensure_hot_cache(),
+    ets:delete_all_objects(?RECENT_CACHE),
     U = integer_to_binary(erlang:unique_integer([positive])),
-    Big = {<<"big-", U/binary>>, local},
-    Small = {<<"small-", U/binary>>, local},
-    SmallOpts = #{ <<"process-hot-cache-slots">> => 8 },
+    [IdleA, IdleB, IdleC] =
+        [{<<N/binary, "-", U/binary>>, local} || N <- [<<"a">>, <<"b">>, <<"c">>]],
+    Active = {<<"active-", U/binary>>, local},
+    Opts = #{ <<"process-hot-cache-slots">> => 64, <<"process-hot-cache-mb">> => 1 },
+    Fat = maps:from_list([ {integer_to_binary(I), I} || I <- lists:seq(1, 1000) ]),
+    Count = fun(K) -> ets:select_count(?RECENT_CACHE, [{{{K, '$1'}, '_'}, [], [true]}]) end,
+    % Three idle processes, each holding four entries, written a, b, c.
     lists:foreach(
-        fun(S) -> recent_put(Small, S, 7, #{ <<"n">> => S }, SmallOpts) end,
-        lists:seq(0, 7)
+        fun(K) ->
+            [ recent_put(K, S, 3, Fat#{ <<"n">> => S }, Opts) || S <- lists:seq(0, 3) ]
+        end,
+        [IdleA, IdleB, IdleC]
     ),
-    Before = ets:select_count(?RECENT_CACHE, [{{{Small, '$1'}, '_'}, [], [true]}]),
-    BigOpts = #{ <<"process-hot-cache-slots">> => 64, <<"process-hot-cache-mb">> => 1 },
-    Fat = maps:from_list([ {integer_to_binary(I), I} || I <- lists:seq(1, 3000) ]),
-    lists:foreach(
-        fun(S) -> recent_put(Big, S, 63, Fat#{ <<"n">> => S }, BigOpts) end,
-        lists:seq(0, 63)
-    ),
-    After = ets:select_count(?RECENT_CACHE, [{{{Small, '$1'}, '_'}, [], [true]}]),
-    ?assertEqual(Before, After),
-    ?assertEqual(8, After),
-    ets:match_delete(?RECENT_CACHE, {{Big, '_'}, '_'}),
-    ets:match_delete(?RECENT_CACHE, {{Small, '_'}, '_'}).
+    ?assertEqual([4, 4, 4], [Count(K) || K <- [IdleA, IdleB, IdleC]]),
+    Trace =
+        [
+            begin
+                recent_put(Active, S, S, Fat#{ <<"n">> => S }, Opts),
+                {S, Count(IdleA), Count(IdleC), Count(Active)}
+            end
+        ||
+            S <- lists:seq(0, 39)
+        ],
+    % The first eviction falls on `a', the least recently written, while `c'
+    % is still whole.
+    ?assertMatch([_ | _], [T || {_, A, 4, _} = T <- Trace, A < 4]),
+    % At the end the idle windows are gone and the writer keeps a real window,
+    % its newest slots, under the byte bound.
+    ?assertEqual([0, 0, 0], [Count(K) || K <- [IdleA, IdleB, IdleC]]),
+    ActiveSlots = ets:select(?RECENT_CACHE, [{{{Active, '$1'}, '_'}, [], ['$1']}]),
+    ?assert(length(ActiveSlots) >= 8),
+    ?assertEqual(39, lists:max(ActiveSlots)),
+    ?assert(recent_bytes() < 1048576),
+    ets:match_delete(?RECENT_CACHE, {{Active, '_'}, '_'}).
 
 %% @doc A zero byte limit disables the bound rather than trimming everything.
 hot_cache_byte_bound_zero_disables_test() ->
@@ -1339,3 +1521,153 @@ recent_expiry_boundaries_test() ->
     expire_recent(Key, 10),
     ets:match_delete(?RECENT_CACHE, {{Key, '_'}, '_'}),
     ets:delete(?RECENT_CACHE, {Other, 0}).
+
+%% @doc A reader putting a rebuilt slot S races the writer of S+1. The head must
+%% end at S+1 every time: a lost race used to leave S as `latest' for as long
+%% as the process stayed idle. The stale head is a large state so that copying
+%% it out -- what the old lookup-then-insert did between its two steps -- holds
+%% the race window open long enough to lose it reliably.
+hot_put_race_keeps_newest_test_() ->
+    {timeout, 60, fun() ->
+        ensure_hot_cache(),
+        ProcID = <<"race-", (integer_to_binary(erlang:unique_integer([positive])))/binary>>,
+        Opts = #{ <<"process-hot-cache-slots">> => 4 },
+        Key = hot_key(ProcID, Opts),
+        Stale = maps:from_list([ {integer_to_binary(I), I} || I <- lists:seq(1, 3000) ]),
+        Schedulers = erlang:system_info(schedulers_online),
+        Round =
+            fun() ->
+                ets:insert(?HOT_CACHE, {Key, 0, Stale}),
+                Self = self(),
+                Go = make_ref(),
+                Put =
+                    fun(Slot, Scheduler) ->
+                        spawn_opt(
+                            fun() ->
+                                receive Go -> ok end,
+                                hot_put(ProcID, Slot, #{ <<"n">> => Slot }, Opts),
+                                Self ! {Go, Slot}
+                            end,
+                            [{scheduler, Scheduler}]
+                        )
+                    end,
+                % On separate schedulers, so the two puts really overlap.
+                Pids = [Put(10, 1), Put(11, min(2, Schedulers))],
+                [ P ! Go || P <- Pids ],
+                [ receive {Go, S} -> ok end || S <- [10, 11] ],
+                latest(ProcID, Opts)
+            end,
+        Lost = [ R || R <- [ Round() || _ <- lists:seq(1, 200) ], element(2, R) =/= 11 ],
+        ets:delete(?HOT_CACHE, Key),
+        ets:match_delete(?RECENT_CACHE, {{Key, '_'}, '_'}),
+        ?assertEqual(0, length(Lost))
+    end}.
+
+%% @doc A checkpoint's VM snapshot never reaches the in-memory caches, where
+%% the byte bound cannot see it, and does not leak into the delta slots built
+%% on that checkpoint. A cold restore asking for `snapshot+link' still gets it,
+%% from the store.
+snapshot_is_not_cached_in_memory_test_() ->
+    {timeout, 60, fun() ->
+        application:ensure_all_started(hb),
+        Opts = #{
+            <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)],
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"process-delta-checkpoint-slots">> => 1000
+        },
+        ProcID = hb_util:encode(crypto:strong_rand_bytes(32)),
+        Image = crypto:strong_rand_bytes(1024 * 1024),
+        Results = #{ <<"output">> => #{ <<"data">> => <<"0">> } },
+        State0 = #{
+            <<"at-slot">> => 0,
+            <<"count">> => <<"0">>,
+            <<"results">> => Results,
+            <<"snapshot">> => #{ <<"data">> => Image }
+        },
+        {ok, _} = write(ProcID, 0, with_delta(State0, [], Results, Opts), Opts),
+        Patches = [#{ <<"path">> => <<"/count">>, <<"value">> => <<"1">> }],
+        {ok, State1} =
+            hb_process_delta:apply(
+                maps:remove(<<"snapshot">>, State0), Patches, Results, 1, Opts),
+        {ok, _} = write(ProcID, 1, with_delta(State1, Patches, Results, Opts), Opts),
+        Key = hot_key(ProcID, Opts),
+        [{_, Cached0}] = ets:lookup(?RECENT_CACHE, {Key, 0}),
+        ?assertNot(maps:is_key(<<"snapshot">>, Cached0)),
+        % Rebuild slot 1 from the store: the checkpoint base is read with its
+        % snapshot, and the delta state must not inherit it.
+        ets:delete(?HOT_CACHE, Key),
+        ets:match_delete(?RECENT_CACHE, {{Key, '_'}, '_'}),
+        {ok, Rebuilt} = read(ProcID, 1, Opts),
+        ?assertEqual(<<"1">>, hb_ao:get(<<"count">>, Rebuilt, Opts)),
+        ?assertNot(maps:is_key(<<"snapshot">>, Rebuilt)),
+        {ok, 1, Head} = hot_newest(ProcID, Opts),
+        ?assertNot(maps:is_key(<<"snapshot">>, Head)),
+        % The cold-restore lookup finds the checkpoint and its snapshot.
+        {ok, 0, Restore} = latest(ProcID, [<<"snapshot+link">>], undefined, Opts),
+        Snapshot = hb_cache:ensure_all_loaded(maps:get(<<"snapshot">>, Restore), Opts),
+        ?assertEqual(Image, hb_ao:get(<<"data">>, Snapshot, Opts)),
+        ets:delete(?HOT_CACHE, Key),
+        ets:match_delete(?RECENT_CACHE, {{Key, '_'}, '_'})
+    end}.
+
+%% @doc The caches are best effort: once a slot is durable, nothing the cache
+%% layer raises may fail the write that made it so.
+cache_failure_never_fails_a_durable_write_test_() ->
+    {timeout, 60, fun() ->
+        application:ensure_all_started(hb),
+        Opts = #{
+            <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)],
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"process-hot-cache-slots">> => <<"not-a-number">>
+        },
+        ProcID = hb_util:encode(crypto:strong_rand_bytes(32)),
+        State = #{ <<"at-slot">> => 0, <<"count">> => <<"0">> },
+        ?assertMatch({ok, _}, write(ProcID, 0, State, Opts)),
+        {ok, Read} = read(ProcID, 0, Opts#{ <<"process-hot-cache-slots">> => 4 }),
+        ?assertEqual(<<"0">>, hb_ao:get(<<"count">>, Read, Opts))
+    end}.
+
+%% @doc Killing the table owner under concurrent puts and reads raises nothing
+%% to the callers, and the next caller restores every table under one owner.
+cache_owner_death_is_not_raised_test_() ->
+    {timeout, 120, fun() ->
+        ensure_hot_cache(),
+        Opts = #{ <<"process-hot-cache-slots">> => 4 },
+        Self = self(),
+        Raised =
+            lists:sum([
+                begin
+                    Owner = ets:info(?HOT_CACHE, owner),
+                    Workers =
+                        [
+                            spawn(fun() ->
+                                Res =
+                                    [
+                                        catch begin
+                                            hot_put(<<"od">>, I * 1000 + J, #{}, Opts),
+                                            hot_read(<<"od">>, I * 1000 + J, Opts),
+                                            hot_newest(<<"od">>, Opts)
+                                        end
+                                    ||
+                                        J <- lists:seq(1, 200)
+                                    ],
+                                Self ! {od, length([ x || {'EXIT', _} <- Res ])}
+                            end)
+                        ||
+                            I <- lists:seq(1, 8)
+                        ],
+                    is_pid(Owner) andalso exit(Owner, kill),
+                    lists:sum([ receive {od, N} -> N end || _ <- Workers ])
+                end
+            ||
+                _ <- lists:seq(1, 30)
+            ]),
+        ?assertEqual(0, Raised),
+        ensure_hot_cache(),
+        Owner = ets:info(?HOT_CACHE, owner),
+        ?assert(is_process_alive(Owner)),
+        ?assertEqual(Owner, ets:info(?RECENT_CACHE, owner)),
+        ?assertEqual(Owner, ets:info(?REPLAY_CACHE, owner)),
+        ets:delete(?HOT_CACHE, {<<"od">>, local}),
+        ets:match_delete(?RECENT_CACHE, {{{<<"od">>, local}, '_'}, '_'})
+    end}.
