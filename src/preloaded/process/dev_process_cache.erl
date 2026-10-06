@@ -46,7 +46,7 @@ read_stored(ProcID, SlotRef, Opts) ->
     Path = path(ProcID, SlotRef, Opts),
     case hb_cache:read(Path, Opts) of
         {ok, Stored} ->
-            case materialize(ProcID, Stored, Opts) of
+            case retention_loaded(materialize(ProcID, Stored, Opts), Opts) of
                 {ok, Msg} when is_integer(SlotRef) ->
                     % Keep the rebuilt state, so the next read of the
                     % latest slot does not replay the delta chain
@@ -57,6 +57,28 @@ read_stored(ProcID, SlotRef, Opts) ->
             end;
         Other -> Other
     end.
+
+%% @doc With store retention on, a state read from the store is loaded whole
+%% (all but its VM `snapshot', which a cold restore loads at once) before it
+%% reaches the in-memory caches or a process worker. A lazily loaded state
+%% holds links into the stored rows of the checkpoint it came from, and
+%% retention deletes old checkpoints' rows once newer ones exist: a worker that
+%% kept computing on such a state for hours would otherwise find a field gone
+%% the first time it touched it. Without retention, nothing changes.
+retention_loaded({ok, Msg}, Opts) when is_map(Msg) ->
+    case hb_util:atom(hb_opts:get(<<"store-retention">>, false, Opts)) of
+        true ->
+            {ok,
+                maps:map(
+                    fun(<<"snapshot">>, V) -> V;
+                       (_K, V) -> hb_cache:ensure_all_loaded(V, Opts)
+                    end,
+                    Msg
+                )
+            };
+        _ -> {ok, Msg}
+    end;
+retention_loaded(Other, _Opts) -> Other.
 
 %% @doc Write a process computation result to the cache.
 write(ProcID, Slot, Msg, Opts) ->
@@ -527,7 +549,10 @@ replay_put(Key, Slot, Msg, Opts) ->
             ok
     end.
 
-%% @doc The cache key of a process: its ID and the `process-cache-scope'. The
+%% @doc The cache key of a process: its ID and the `process-cache-scope'.
+%% `hb_store_gc:forget_process_cache/3' builds the same key and drops entries
+%% from these tables by name (core code cannot call a preloaded device module):
+%% a change to the key or the table layout must be made there too. The
 %% store is deliberately not part of it. A node runs one store stack per scope,
 %% and the store descriptor is not a stable identity: `latest_from_store/4'
 %% re-scopes it before reading, so keying on it would split one process's

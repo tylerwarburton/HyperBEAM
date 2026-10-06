@@ -211,7 +211,10 @@ new_server(RawNodeMsg) ->
     HookMsg = #{ <<"body">> => RawNodeMsgWithDefaults },
     NodeMsg =
         case hb_hook:on(<<"start">>, HookMsg, RawNodeMsgWithDefaults) of
-            {ok, #{ <<"body">> := NodeMsgAfterHook }} -> NodeMsgAfterHook;
+            {ok, #{ <<"body">> := NodeMsgAfterHook }} ->
+                % With an `essentials-store', start it and add it (read-only)
+                % to the node's store list. Unchanged otherwise.
+                hb_store_essentials:node_message(NodeMsgAfterHook);
             Unexpected ->
                 ?event(http,
                     {failed_to_start_server,
@@ -295,6 +298,9 @@ new_server(RawNodeMsg) ->
     % that the OS assigned a different port. This happens, for example, when we
     % use port 0.
     set_opts(NodeMsg#{ <<"port">> => Port }),
+    % Background retention of the main store; a no-op unless
+    % `store-retention' is true.
+    ok = hb_store_gc:maybe_start_retention(NodeMsg),
     ?event(http,
         {http_server_started,
             {listener, Listener},

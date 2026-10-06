@@ -69,6 +69,10 @@
 -export([collect/3, collect/4]).
 -export([classify_root/2, classify_slot/3, retention/4, window_start/4]).
 -export([assignment_timestamp_probe/3]).
+-export([retain/1, maybe_start_retention/1, start_retention/1, stop_retention/0,
+         run_retention/1, retention_status/0, retain_plan/3,
+         copy_essential_namespaces/3, forget_process_cache/3]).
+-include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %% Retain every computed slot at or above (head - KeepRecent). The delta chain
@@ -363,7 +367,7 @@ collect(RawPolicy, SrcOpts, DstOpts, Which) ->
     Policy = collect_policy(RawPolicy),
     SrcStore = sole_store(SrcOpts),
     DstStore = sole_store(DstOpts),
-    ok = refuse_unsafe(SrcStore, DstStore),
+    ok = refuse_unsafe(SrcStore, DstStore, Policy),
     ok = hb_store:start([SrcStore], #{}, SrcOpts),
     ok = hb_store:start([DstStore], #{}, DstOpts),
     Ctx0 =
@@ -573,6 +577,8 @@ collect_policy(Policy) ->
         keep_floor => maps:get(keep_floor, Policy, ?DEFAULT_KEEP_FLOOR),
         now => maps:get(now, Policy, undefined),
         dry_run => maps:get(dry_run, Policy, false),
+        retain_computed => maps:get(retain_computed, Policy, true),
+        live_source => maps:get(live_source, Policy, false),
         base_search => maps:get(base_search, Policy, ?DEFAULT_BASE_SEARCH),
         min_free_bytes => maps:get(min_free_bytes, Policy, ?DEFAULT_MIN_FREE),
         progress => maps:get(progress, Policy, undefined),
@@ -585,7 +591,22 @@ collect_policy(Policy) ->
 %% different store from the destination. The source holds a signed chain that no
 %% layer of this stack can restore; a typo that aimed the destination at it would
 %% rewrite the thing being protected.
-refuse_unsafe(Src, Dst) ->
+refuse_unsafe(Src, Dst, #{ live_source := true }) ->
+    %% A live node's own store cannot be reopened `read-only' from inside the
+    %% node (elmdb shares one environment per path, and reopening it with other
+    %% flags would change the live one), so for an online copy the access list
+    %% alone shuts the source out of the write path.
+    case maps:get(<<"access">>, Src, undefined) of
+        [<<"read">>] -> refuse_unsafe(Src, Dst, same_store_only);
+        Found -> erlang:error({collect_source_not_read_only,
+                    {required, [{<<"access">>, [<<"read">>]}]}, {found, Found}})
+    end;
+refuse_unsafe(Src, Dst, same_store_only) ->
+    case maps:get(<<"name">>, Src, undefined) =:= maps:get(<<"name">>, Dst, undefined) of
+        true -> erlang:error({collect_source_is_destination, maps:get(<<"name">>, Src)});
+        false -> ok
+    end;
+refuse_unsafe(Src, Dst, _Policy) ->
     SrcName = maps:get(<<"name">>, Src, undefined),
     DstName = maps:get(<<"name">>, Dst, undefined),
     case SrcName of
@@ -654,11 +675,31 @@ collect_process(Ctx, RawID, Acc0) ->
             Acc2,
             AssignSlots
         ),
+    %% The essentials migration (`hb_store_essentials:migrate/3') copies the
+    %% ledger alone: no computed slot is retained, and the scheduler's upload
+    %% watermark, an essential the collector does not otherwise carry, is.
     {Retain, Drop, Meta} =
-        retention(Ctx, ID, #{ slots => ComputedSlots,
-                              assignment_slots => AssignSlots }, Policy),
-    Acc4 = copy_row(Ctx, <<"computed/", ID/binary>>, Acc3),
-    Acc5 = copy_row(Ctx, <<"computed/", ID/binary, "/slot">>, Acc4),
+        case maps:get(retain_computed, Policy, true) of
+            true ->
+                retention(Ctx, ID, #{ slots => ComputedSlots,
+                                      assignment_slots => AssignSlots }, Policy);
+            false ->
+                {[], [], #{ head => undefined, window_start => undefined }}
+        end,
+    {_Acc4, Acc5} =
+        case maps:get(retain_computed, Policy, true) of
+            true ->
+                A4 = copy_row(Ctx, <<"computed/", ID/binary>>, Acc3),
+                {A4, copy_row(Ctx, <<"computed/", ID/binary, "/slot">>, A4)};
+            false ->
+                Mark = <<?SCHED_ROOT/binary, "/uploaded/", ID/binary>>,
+                A4 =
+                    case raw_get(Ctx, Mark) of
+                        not_found -> Acc3;
+                        _ -> copy_row(Ctx, Mark, Acc3)
+                    end,
+                {A4, A4}
+        end,
     Acc6 =
         lists:foldl(
             fun({Slot, Class}, A) ->
@@ -1268,6 +1309,852 @@ report(Acc, Plans, Policy, SrcStore, DstStore) ->
             <<"copy-only: the source store is untouched and both stores remain "
               "on disk. Validate the copy, then swap.">>
     }.
+
+%%% ------------------------------------------------------------------
+%%% Online retention: mark and sweep in place.
+%%% ------------------------------------------------------------------
+%%%
+%%% `collect/3' copies the retained set into a fresh store because no delete
+%%% primitive existed. `patches/elmdb-delete.patch' adds one (`elmdb:delete_batch/2'
+%%% and a guarded variant, ordered with the write worker), so this half deletes
+%%% in place, online, on a schedule, and the main store reaches a steady size
+%%% instead of being swapped.
+%%%
+%%% What may be deleted -- and the order in which it is decided:
+%%%
+%%% <ol>
+%%%   <li><b>Plan</b> (`retain_plan/3'), per process. Keep the newest
+%%%       `store-retention-checkpoints' (K) slots carrying `snapshot+link' (the
+%%%       only resume points, `classify_root/2'), the newest
+%%%       `store-retention-recent-slots', optionally everything inside
+%%%       `store-retention-keep-seconds' of assignment time
+%%%       (`window_start/4'), and the contiguous chain from the lowest of those
+%%%       up to the head, lowered to a full state (`lower_to_full_state/4')
+%%%       so the backward delta walk always terminates inside the kept set.
+%%%       Optionally one checkpoint per `store-retention-sparse-slots' bucket
+%%%       below the window. A process with fewer than K checkpoints keeps from
+%%%       its lowest one; with none at all it keeps everything. Every other slot
+%%%       is dropped: its two alias rows go, and its state is a candidate.</li>
+%%%   <li><b>Candidates</b> (`closure/3'): every row reachable from the dropped
+%%%       roots through `link:' rows, `+link' keys (the `link:data/<h>' row
+%%%       holding a 43-byte ID -- the reference that hid every message body
+%%%       from the first collector) and group subtrees -- but only rows of
+%%%       content-addressed units: a top-level 43-byte ID or `data/'. A named
+%%%       namespace (`~scheduler@1.0', `~location@1.0', anything unknown) is
+%%%       never a candidate, whatever links into it. Pins (process IDs,
+%%%       trusted devices, `store-retention-pins') are never entered.</li>
+%%%   <li><b>Aliases</b> of the dropped slots are deleted first, guarded, so a
+%%%       new reader can no longer reach the candidates; in-memory process
+%%%       caches drop those slots (`forget_process_cache/3') before
+%%%       and after a grace period (`store-retention-grace-ms') that lets
+%%%       readers that resolved an alias just before finish.</li>
+%%%   <li><b>Protection</b>, the step that makes in-place deletion safe under
+%%%       content addressing: a candidate is kept if <em>any</em> row outside
+%%%       the candidate set references it -- found by one full, bounded-step
+%%%       scan of the store's reference rows (`elmdb:scan_refs/3', Rust-side
+%%%       filtered) -- or if it was written, or referenced by a write, since the
+%%%       run began (`elmdb:track/2'). Everything a protected candidate reaches
+%%%       is protected too. So a blob shared with a retained state, an
+%%%       assignment body that is also an outbox message, or any row of any
+%%%       namespace this module has never heard of, keeps what it uses.</li>
+%%%   <li><b>Sweep</b>: the rest is deleted top-down in guarded batches
+%%%       (`elmdb:delete_batch_guarded/2'): a batch containing a key written or
+%%%       referenced since the last check deletes nothing, and what that key
+%%%       reaches is protected before retrying. Rate-limited by
+%%%       `store-retention-max-deletes-per-sec'.</li>
+%%% </ol>
+%%%
+%%% Crash safety: before the first alias is deleted, the candidate set is
+%%% journalled to `retention-pending.bin' in the store directory. A run that
+%%% finds the journal finishes it (protection scan included) before planning
+%%% anything new. Every step is idempotent, and no step leaves a process
+%%% unloadable: aliases go before content, and the kept window is a closed,
+%%% contiguous chain from a full state.
+%%%
+%%% Cost: one scan of the store's reference rows per batch of
+%%% `store-retention-batch-keys' candidates, in short read transactions. With
+%%% the essentials in their own store (`hb_store_essentials') the main store
+%%% is bounded, and so is the scan.
+
+-define(RET_DEFAULT_INTERVAL, 600000).
+-define(RET_DEFAULT_CHECKPOINTS, 2).
+-define(RET_DEFAULT_BATCH_SLOTS, 1000).
+-define(RET_DEFAULT_DELETE_BATCH, 1000).
+-define(RET_DEFAULT_RATE, 20000).
+-define(RET_DEFAULT_SCAN_ROWS, 20000).
+-define(RET_DEFAULT_GRACE, 30000).
+-define(RET_JOURNAL, "retention-pending.bin").
+-define(RET_SERVER, hb_store_gc_retention).
+-define(RET_STATUS, {?MODULE, retention_status}).
+
+%% @doc Start the background retention loop when `store-retention' is true.
+maybe_start_retention(Opts) ->
+    case hb_util:atom(hb_opts:get(<<"store-retention">>, false, Opts)) of
+        true -> start_retention(Opts);
+        _ -> ok
+    end.
+
+start_retention(Opts) ->
+    case whereis(?RET_SERVER) of
+        undefined ->
+            Pid = spawn(fun() -> retention_server_init(Opts) end),
+            try register(?RET_SERVER, Pid), ok
+            catch error:badarg -> exit(Pid, kill), ok
+            end;
+        _ -> ok
+    end.
+
+stop_retention() ->
+    case whereis(?RET_SERVER) of
+        undefined -> ok;
+        Pid -> exit(Pid, kill), ok
+    end.
+
+retention_server_init(Opts) ->
+    erlang:send_after(ret_opt(<<"store-retention-first-ms">>, 60000, Opts), self(), run),
+    retention_server(Opts).
+
+retention_server(Opts) ->
+    receive
+        run ->
+            _ = retain_safely(Opts),
+            erlang:send_after(
+                ret_opt(<<"store-retention-interval-ms">>, ?RET_DEFAULT_INTERVAL, Opts),
+                self(), run),
+            retention_server(Opts);
+        {run_now, From, Ref} ->
+            From ! {Ref, retain_safely(Opts)},
+            retention_server(Opts)
+    end.
+
+%% @doc Run once now in the background server (or inline when none runs).
+run_retention(Opts) ->
+    case whereis(?RET_SERVER) of
+        undefined -> retain(Opts);
+        Pid ->
+            Ref = make_ref(),
+            Pid ! {run_now, self(), Ref},
+            receive {Ref, R} -> R after infinity -> timeout end
+    end.
+
+retain_safely(Opts) ->
+    try retain(Opts)
+    catch C:R:St ->
+        ?event(error, {store_retention_failed, C, R, {trace, St}}),
+        Status = retention_status(),
+        persistent_term:put(?RET_STATUS,
+            Status#{ last_error => {C, R}, last_error_at => os:system_time(second),
+                     failures => maps:get(failures, Status, 0) + 1 }),
+        {error, {C, R}}
+    end.
+
+%% @doc The last run's report and running totals.
+retention_status() ->
+    persistent_term:get(?RET_STATUS, #{}).
+
+ret_opt(Key, Default, Opts) ->
+    case hb_opts:get(Key, Default, Opts) of
+        V when is_binary(V), is_integer(Default) -> binary_to_integer(V);
+        V -> V
+    end.
+
+retention_policy(Opts) ->
+    Hot = hb_util:int(hb_opts:get(<<"process-hot-cache-slots">>, 32, Opts)),
+    #{
+        checkpoints => ret_opt(<<"store-retention-checkpoints">>, ?RET_DEFAULT_CHECKPOINTS, Opts),
+        recent => max(Hot, ret_opt(<<"store-retention-recent-slots">>, Hot, Opts)),
+        keep_seconds => ret_opt(<<"store-retention-keep-seconds">>, 0, Opts),
+        sparse => ret_opt(<<"store-retention-sparse-slots">>, 0, Opts),
+        batch_slots => ret_opt(<<"store-retention-batch-slots">>, ?RET_DEFAULT_BATCH_SLOTS, Opts),
+        delete_batch => ret_opt(<<"store-retention-delete-batch">>, ?RET_DEFAULT_DELETE_BATCH, Opts),
+        rate => ret_opt(<<"store-retention-max-deletes-per-sec">>, ?RET_DEFAULT_RATE, Opts),
+        scan_rows => ret_opt(<<"store-retention-scan-rows">>, ?RET_DEFAULT_SCAN_ROWS, Opts),
+        scan_pause => ret_opt(<<"store-retention-scan-pause-ms">>, 0, Opts),
+        grace => ret_opt(<<"store-retention-grace-ms">>, ?RET_DEFAULT_GRACE, Opts),
+        dry_run => hb_util:atom(hb_opts:get(<<"store-retention-dry-run">>, false, Opts)) == true,
+        %% Fields `window_start/4' and `lower_to_full_state/4' read.
+        base_search => ?DEFAULT_BASE_SEARCH,
+        now => undefined,
+        %% Test hook: called with a phase atom between the steps of a sweep.
+        hook => hb_opts:get(<<"store-retention-test-hook">>, undefined, Opts)
+    }.
+
+%% @doc The store retention acts on: the first writable `hb_store_lmdb' of the
+%% node's store list. Never an essentials store, never one restricted by
+%% `access'.
+main_store(Opts) ->
+    Stores =
+        case hb_opts:get(<<"store">>, [], Opts) of
+            L when is_list(L) -> L;
+            M when is_map(M) -> [M]
+        end,
+    Ess = case hb_store_essentials:store(Opts) of undefined -> []; E -> E end,
+    EssNames = [ maps:get(<<"name">>, S, undefined) || S <- Ess ] ++
+        [ maps:get(<<"name">>, maps:get(<<"inner">>, S), undefined)
+        || S = #{ <<"inner">> := _ } <- Ess ],
+    case [ S || S = #{ <<"store-module">> := hb_store_lmdb } <- Stores,
+                not maps:is_key(<<"access">>, S),
+                not maps:get(<<"read-only">>, S, false),
+                not lists:member(maps:get(<<"name">>, S, undefined), EssNames) ] of
+        [Main | _] -> Main;
+        [] -> erlang:error(store_retention_needs_a_writable_lmdb_store)
+    end.
+
+%% @doc One retention run over the main store. Returns a report.
+retain(Opts) ->
+    Start = erlang:monotonic_time(millisecond),
+    Store = main_store(Opts),
+    ok = hb_store:start([Store], #{}, Opts),
+    DB = store_db(Store),
+    Policy = retention_policy(Opts),
+    Seen = ets:new(hb_store_gc_ret_seen, [set, private]),
+    Ctx = #{
+        src_db => DB,
+        src_store => Store,
+        src_opts => Opts#{ <<"store">> => [Store] },
+        node_opts => Opts,
+        policy => Policy,
+        seen => Seen,
+        pins => pins(DB, Opts),
+        journal => filename:join(hb_util:list(maps:get(<<"name">>, Store)), ?RET_JOURNAL)
+    },
+    %% The generation begins: from here every write is tracked, and the flush
+    %% makes every earlier write visible to the scans.
+    ok = elmdb:track(DB, true),
+    ok = elmdb:flush(DB),
+    try
+        Acc0 = ret_acc(),
+        Acc1 = recover_journal(Ctx, Acc0),
+        Procs = computed_processes(Ctx),
+        {Acc2, Pending} =
+            lists:foldl(
+                fun(P, {A, Chunk}) ->
+                    {Plan, A1} = retain_plan(Ctx, P, A),
+                    add_to_chunk(Ctx, P, Plan, Chunk, A1)
+                end,
+                {Acc1, new_chunk()},
+                Procs
+            ),
+        Acc3 = sweep_chunk(Ctx, Pending, Acc2),
+        Report = Acc3#{
+            started_at => os:system_time(second),
+            duration_ms => erlang:monotonic_time(millisecond) - Start,
+            processes => length(Procs),
+            store => maps:get(<<"name">>, Store),
+            policy => maps:without([hook], Policy)
+        },
+        Prev = retention_status(),
+        persistent_term:put(?RET_STATUS,
+            (maps:without([last_error, last_error_at], Prev))#{
+                last_run => Report,
+                runs => maps:get(runs, Prev, 0) + 1,
+                total_deleted_keys =>
+                    maps:get(total_deleted_keys, Prev, 0) + maps:get(deleted_keys, Report),
+                total_deleted_bytes =>
+                    maps:get(total_deleted_bytes, Prev, 0) + maps:get(deleted_bytes, Report)
+            }),
+        ?event(store_retention, {retention_run, Report}),
+        Report
+    after
+        catch elmdb:track(DB, false),
+        ets:delete(Seen)
+    end.
+
+ret_acc() ->
+    #{ dropped_slots => 0, kept_slots => 0, candidate_keys => 0,
+       protected_keys => 0, protected_by_scan => 0, protected_by_writes => 0,
+       deleted_keys => 0, deleted_bytes => 0, alias_keys => 0, conflicts => 0,
+       scans => 0, scanned_rows => 0, recovered_journal => false,
+       skipped_processes => 0 }.
+
+%% @doc Explicit roots: every process ID (the definitions, R1b), every trusted
+%% device, and any configured pin. Never entered as candidates.
+pins(DB, Opts) ->
+    Procs =
+        [ P || P <- list_children(DB, <<"computed">>) ++
+                    list_children(DB, ?SCHED_PREFIX) ],
+    Devices =
+        case hb_opts:get(<<"trusted-devices">>, #{}, Opts) of
+            M when is_map(M) -> maps:values(M);
+            _ -> []
+        end,
+    Extra =
+        case hb_opts:get(<<"store-retention-pins">>, [], Opts) of
+            L when is_list(L) -> L;
+            _ -> []
+        end,
+    sets:from_list([ hb_util:bin(X) || X <- Procs ++ Devices ++ Extra ], [{version, 2}]).
+
+list_children(DB, Prefix) ->
+    case elmdb:list(DB, <<Prefix/binary, "/">>) of
+        {ok, L} -> [ C || C <- L, is_binary(C) ];
+        _ -> []
+    end.
+
+computed_processes(#{ src_db := DB }) ->
+    [ P || P <- list_children(DB, <<"computed">>), byte_size(P) == 43 ].
+
+%%% Planning, per process.
+
+%% @doc Split a process's computed slots into kept and dropped. Returns the
+%% dropped slots with their roots and the roots of the kept slots.
+retain_plan(Ctx, P, Acc) ->
+    Policy = maps:get(policy, Ctx),
+    Slots = lists:sort(computed_slots(P, maps:get(src_opts, Ctx))),
+    case Slots of
+        [] -> {#{ drop => [], keep_roots => [] }, Acc};
+        _ ->
+            Head = lists:last(Slots),
+            Classify = fun(S) -> classify_slot(Ctx, P, S) end,
+            Desc = lists:reverse(Slots),
+            K = maps:get(checkpoints, Policy),
+            Ckpts = newest_checkpoints(Desc, Classify, K),
+            case Ckpts of
+                [] ->
+                    %% No resume point at all: keep everything.
+                    {#{ drop => [], keep_roots => [] },
+                     bump(skipped_processes, 1, Acc)};
+                _ ->
+                    Recent = Head - maps:get(recent, Policy) + 1,
+                    Timed =
+                        case maps:get(keep_seconds, Policy) of
+                            0 -> Head;
+                            _ ->
+                                window_start(Ctx, P,
+                                    lists:sort(assignment_slots(Ctx, P)),
+                                    Policy#{ keep_seconds => maps:get(keep_seconds, Policy) })
+                        end,
+                    Raw = lists:min([lists:min(Ckpts), Recent, Timed]),
+                    W = lower_to_full_state(Slots, Raw, Policy, Classify),
+                    Below = [ S || S <- Slots, S < W ],
+                    Sparse = sparse_keep(Below, maps:get(sparse, Policy), Classify),
+                    Drop = [ S || S <- Below, not lists:member(S, Sparse) ],
+                    KeepSlots = (Slots -- Drop),
+                    KeepRoots = [ R || S <- KeepSlots, R <- [deref(Ctx, computed_path(P, S))],
+                                       R =/= not_found ],
+                    DropRoots = [ {S, deref(Ctx, computed_path(P, S))} || S <- Drop ],
+                    {#{ drop => DropRoots, keep_roots => KeepRoots, window_start => W },
+                     bump(kept_slots, length(KeepSlots), bump(dropped_slots, length(Drop), Acc))}
+            end
+    end.
+
+newest_checkpoints(Desc, Classify, K) ->
+    newest_checkpoints(Desc, Classify, K, []).
+newest_checkpoints(_, _Classify, 0, Acc) -> Acc;
+newest_checkpoints([], _Classify, _K, Acc) -> Acc;
+newest_checkpoints([S | Rest], Classify, K, Acc) ->
+    case Classify(S) of
+        checkpoint -> newest_checkpoints(Rest, Classify, K - 1, [S | Acc]);
+        _ -> newest_checkpoints(Rest, Classify, K, Acc)
+    end.
+
+%% One checkpoint per `M'-slot bucket below the window: the lowest one found.
+sparse_keep(_Below, M, _Classify) when not is_integer(M); M =< 0 -> [];
+sparse_keep(Below, M, Classify) ->
+    Buckets = lists:foldl(
+        fun(S, Acc) -> maps:update_with(S div M, fun(L) -> [S | L] end, [S], Acc) end,
+        #{}, Below),
+    lists:flatmap(
+        fun(Bucket) ->
+            case [ S || S <- lists:sort(Bucket), Classify(S) == checkpoint ] of
+                [First | _] -> [First];
+                [] -> []
+            end
+        end,
+        maps:values(Buckets)).
+
+%%% Candidate chunks: dropped slots accumulate across processes until
+%%% `store-retention-batch-slots' is reached, then one protection scan serves
+%%% them all.
+
+new_chunk() -> #{ slots => [], keep => sets:new([{version, 2}]), procs => #{} }.
+
+add_to_chunk(_Ctx, _P, #{ drop := [] }, Chunk, Acc) ->
+    {Acc, Chunk};
+add_to_chunk(Ctx, P, #{ drop := Drop, keep_roots := KeepRoots }, Chunk0, Acc0) ->
+    Max = maps:get(batch_slots, maps:get(policy, Ctx)),
+    Keep = sets:from_list(KeepRoots, [{version, 2}]),
+    lists:foldl(
+        fun({S, Root}, {A, C}) ->
+            C1 = C#{
+                slots => [{P, S, Root} | maps:get(slots, C)],
+                keep => sets:union(Keep, maps:get(keep, C)),
+                procs => maps:update_with(P, fun(M) -> max(M, S) end, S,
+                                          maps:get(procs, C))
+            },
+            case length(maps:get(slots, C1)) >= Max of
+                true -> {sweep_chunk(Ctx, C1, A), new_chunk()};
+                false -> {A, C1}
+            end
+        end,
+        {Acc0, Chunk0},
+        Drop
+    ).
+
+%% The alias rows of a dropped slot: `computed/<P>/slot/<N>', and
+%% `computed/<P>/<Root>' unless a kept slot shares that root.
+slot_aliases(P, S, Root, Keep) ->
+    [computed_path(P, S)] ++
+        [ <<"computed/", P/binary, "/", Root/binary>>
+        || Root =/= not_found, not sets:is_element(Root, Keep) ].
+
+%%% The sweep of one chunk.
+
+sweep_chunk(_Ctx, #{ slots := [] }, Acc) -> Acc;
+sweep_chunk(Ctx, Chunk = #{ slots := Slots, keep := Keep }, Acc) ->
+    Policy = maps:get(policy, Ctx),
+    Aliases = lists:append([ slot_aliases(P, S, R, Keep) || {P, S, R} <- Slots ]),
+    Roots = lists:usort([ R || {_P, _S, R} <- Slots, R =/= not_found ]),
+    %% Candidates: the closure of the dropped roots, never entering a pin, a
+    %% kept root, or a named namespace.
+    Cand = new_cand(),
+    Stop = sets:union(maps:get(pins, Ctx), Keep),
+    lists:foreach(fun(R) -> closure(Ctx, Cand, R, Stop) end, Roots),
+    Acc1 = bump(candidate_keys, cand_size(Cand), Acc),
+    case maps:get(dry_run, Policy) of
+        true ->
+            Acc2 = protect_and_sweep(Ctx, Cand, [], Acc1#{ dry_run => true }),
+            free_cand(Cand),
+            Acc2;
+        false ->
+            ok = write_journal(Ctx, Aliases, Cand),
+            hook(Ctx, journal_written),
+            %% Aliases first, so no new reader reaches the candidates.
+            {Acc2, Revived} = delete_aliases(Ctx, Aliases, Acc1),
+            forget(Chunk, Slots, Revived),
+            hook(Ctx, aliases_deleted),
+            timer:sleep(maps:get(grace, Policy)),
+            forget(Chunk, Slots, Revived),
+            Acc3 = protect_and_sweep(Ctx, Cand, Revived, Acc2),
+            free_cand(Cand),
+            ok = clear_journal(Ctx),
+            Acc3
+    end.
+
+%% Drop the swept slots from the in-memory process caches, except those whose
+%% alias was rewritten during the run.
+forget(#{ procs := Procs }, _Slots, _Revived) ->
+    maps:foreach(
+        fun(P, MaxSlot) -> forget_process_cache(P, MaxSlot + 1, #{}) end,
+        Procs).
+
+%% @doc Drop every in-memory state `dev_process_cache' holds for a process
+%% below `Slot': their stored rows are deleted, or about to be. The tables are
+%% addressed by name, with the key `dev_process_cache:hot_key/2' builds
+%% (`{ProcID, process-cache-scope}'): core code cannot call a preloaded device
+%% module, whose name is rewritten when it is packaged. The newest state is
+%% dropped only if it is itself below `Slot', which retention never asks for.
+forget_process_cache(ProcID, Slot, Opts) ->
+    Key = {ProcID, hb_opts:get(<<"process-cache-scope">>, local, Opts)},
+    Below = [{'<', '$1', Slot}],
+    [ catch ets:select_delete(T, [{{{Key, '$1'}, '_'}, Below, [true]}])
+    || T <- [dev_process_delta_recent_cache, dev_process_delta_replay_cache] ],
+    catch ets:select_delete(dev_process_delta_hot_cache, [{{Key, '$1', '_'}, Below, [true]}]),
+    ok.
+
+hook(Ctx, Phase) ->
+    case maps:get(hook, maps:get(policy, Ctx)) of
+        F when is_function(F, 1) -> F(Phase);
+        _ -> ok
+    end.
+
+%% @doc Delete the alias rows, guarded. An alias that was rewritten since the
+%% run began (a historical replay recomputing that slot, say) survives, and so
+%% does everything its root reaches: those roots are returned as protection
+%% seeds.
+delete_aliases(Ctx, Aliases, Acc) ->
+    {Deleted, Conflicts} = guarded_delete(Ctx, Aliases),
+    Revived =
+        lists:usort(
+            [ R || A <- Conflicts, R <- [deref(Ctx, A)], R =/= not_found ]),
+    {bump(alias_keys, Deleted, bump(conflicts, length(Conflicts), Acc)), Revived}.
+
+%% Delete keys in guarded batches; a vetoed batch is retried without the
+%% vetoing keys. Returns {Deleted, VetoedKeys}.
+guarded_delete(Ctx, Keys) ->
+    Policy = maps:get(policy, Ctx),
+    Batches = chunks(Keys, maps:get(delete_batch, Policy)),
+    lists:foldl(
+        fun(Batch, {D, V}) ->
+            {D1, V1} = guarded_batch(Ctx, Batch),
+            {D + D1, V1 ++ V}
+        end,
+        {0, []},
+        Batches
+    ).
+
+guarded_batch(_Ctx, []) -> {0, []};
+guarded_batch(Ctx, Batch) ->
+    Store = maps:get(src_store, Ctx),
+    case hb_store:delete(Store, #{ <<"delete">> => Batch, <<"guarded">> => true },
+                         maps:get(src_opts, Ctx)) of
+        {ok, N} ->
+            pace(Ctx, length(Batch)),
+            {N, []};
+        {error, {conflict, Found}} ->
+            {N, More} = guarded_batch(Ctx, Batch -- Found),
+            {N, Found ++ More};
+        {error, Reason} ->
+            erlang:error({store_retention_delete_failed, Reason})
+    end.
+
+chunks([], _N) -> [];
+chunks(L, N) when length(L) =< N -> [L];
+chunks(L, N) -> {A, B} = lists:split(N, L), [A | chunks(B, N)].
+
+%% Bound the delete rate: sleep long enough that `Count' deletes take at least
+%% Count / rate seconds.
+pace(Ctx, Count) ->
+    case maps:get(rate, maps:get(policy, Ctx)) of
+        R when is_integer(R), R > 0 -> timer:sleep((Count * 1000) div R);
+        _ -> ok
+    end.
+
+%%% Candidate set: an ETS table of {Key, Order, Bytes, Protected}, plus the
+%%% order keys were found in (top-down: a unit before what it reaches).
+
+new_cand() ->
+    #{ tab => ets:new(hb_store_gc_cand, [set, private]),
+       counter => counters:new(1, []) }.
+free_cand(#{ tab := T }) -> ets:delete(T).
+cand_size(#{ tab := T }) -> ets:info(T, size).
+is_cand(#{ tab := T }, K) -> ets:member(T, K).
+
+add_cand(#{ tab := T, counter := C }, K, Bytes) ->
+    counters:add(C, 1, 1),
+    ets:insert_new(T, {K, counters:get(C, 1), Bytes, false}).
+
+%% @doc Is `Key' in a unit retention may delete: a top-level 43-byte ID
+%% (a message, a message alias, a commitments group) or `data/'.
+content_key(Key) ->
+    case binary:split(Key, <<"/">>) of
+        [<<"data">>, _] -> true;
+        [Top | _] -> byte_size(Top) == 43
+    end.
+
+top(Key) -> hd(binary:split(Key, <<"/">>)).
+
+%% @doc Add `Key' and everything it reaches to the candidate set: its subtree
+%% when it is a group, the targets of `link:' rows, and the message named by a
+%% `+link' key. Only content keys are entered; `Stop' keys never are.
+closure(Ctx, Cand, Key, Stop) ->
+    case content_key(Key) andalso not sets:is_element(Key, Stop)
+            andalso not sets:is_element(top(Key), Stop)
+            andalso not is_cand(Cand, Key) of
+        false -> ok;
+        true ->
+            case raw_get(Ctx, Key) of
+                not_found ->
+                    %% A multi-segment target reached through links: take the
+                    %% unit it lives in, which the scan then guards like any
+                    %% other.
+                    case top(Key) of
+                        Key -> ok;
+                        Top -> closure(Ctx, Cand, Top, Stop)
+                    end;
+                {ok, <<"group">>} ->
+                    case raw_subtree(Ctx, Key) of
+                        {ok, Rows} ->
+                            [ add_cand(Cand, K, byte_size(K) + byte_size(V)) || {K, V} <- Rows ],
+                            [ follow(Ctx, Cand, Row, Stop) || Row <- Rows ],
+                            ok;
+                        _ -> ok
+                    end;
+                {ok, Value} ->
+                    add_cand(Cand, Key, byte_size(Key) + byte_size(Value)),
+                    follow(Ctx, Cand, {Key, Value}, Stop)
+            end
+    end.
+
+follow(Ctx, Cand, {Key, Value}, Stop) ->
+    case Value of
+        <<"link:", Target/binary>> when byte_size(Target) > 0 ->
+            closure(Ctx, Cand, Target, Stop);
+        _ -> ok
+    end,
+    case hb_link:is_link_key(Key) of
+        true ->
+            case read_value(Ctx, Value) of
+                {ok, ID} when byte_size(ID) == 43 -> closure(Ctx, Cand, ID, Stop);
+                _ -> ok
+            end;
+        false -> ok
+    end.
+
+%% @doc The targets a reference row names, for the protection scan: a `link:'
+%% target and each of its path prefixes, or a bare 43-byte ID value.
+ref_targets(<<"link:", Target/binary>>) ->
+    Parts = binary:split(Target, <<"/">>, [global]),
+    [ hb_util:bin(lists:join(<<"/">>, lists:sublist(Parts, N)))
+    || N <- lists:seq(1, length(Parts)) ];
+ref_targets(ID) when byte_size(ID) == 43 -> [ID];
+ref_targets(_) -> [].
+
+%% @doc Find the protected candidates and delete the rest.
+protect_and_sweep(Ctx, Cand, Seeds0, Acc) ->
+    Pins = maps:get(pins, Ctx),
+    PinSeeds = [ K || K <- sets:to_list(Pins), is_cand(Cand, K) ],
+    {ScanSeeds, Aliases, Acc1} = protection_scan(Ctx, Cand, Acc),
+    AliasSeeds =
+        case Aliases of
+            [] -> [];
+            _ -> alias_scan(Ctx, Cand, Aliases)
+        end,
+    {ok, Tracked} = elmdb:track_take(maps:get(src_db, Ctx)),
+    WriteSeeds = [ K || K <- Tracked, is_cand(Cand, K) ],
+    Seeds = Seeds0 ++ PinSeeds ++ ScanSeeds ++ AliasSeeds ++ WriteSeeds,
+    lists:foreach(fun(S) -> protect(Ctx, Cand, S) end, Seeds),
+    %% Alias rows of a deleted unit go with it, unless the unit is protected.
+    lists:foreach(
+        fun({AliasKey, Unit}) ->
+            case ets:lookup(maps:get(tab, Cand), Unit) of
+                [{_, _, _, false}] -> add_cand(Cand, AliasKey, byte_size(AliasKey) + 48);
+                _ -> ok
+            end
+        end,
+        Aliases),
+    Acc2 = Acc1#{
+        protected_by_scan => maps:get(protected_by_scan, Acc1) + length(ScanSeeds ++ AliasSeeds),
+        protected_by_writes => maps:get(protected_by_writes, Acc1) + length(WriteSeeds)
+    },
+    sweep(Ctx, Cand, Acc2).
+
+%% @doc One pass over every reference row in the store. A row that is not a
+%% candidate and names a candidate protects it. A top-level ID row linking to a
+%% candidate unit is an alias of that unit (written by `hb_cache' for its
+%% signed and `all' IDs): it is returned to be deleted with the unit.
+protection_scan(Ctx, Cand, Acc) ->
+    Policy = maps:get(policy, Ctx),
+    DB = maps:get(src_db, Ctx),
+    Step = maps:get(scan_rows, Policy),
+    Pause = maps:get(scan_pause, Policy),
+    Loop =
+        fun L(From, Seeds, Aliases, Rows) ->
+            case elmdb:scan_refs(DB, From, Step) of
+                {ok, Refs, N, Next} ->
+                    {Seeds1, Aliases1} =
+                        lists:foldl(
+                            fun({K, V}, {S, A}) ->
+                                case is_cand(Cand, K) of
+                                    true -> {S, A};
+                                    false -> classify_ref(Ctx, Cand, K, V, S, A)
+                                end
+                            end,
+                            {Seeds, Aliases},
+                            Refs
+                        ),
+                    case Next of
+                        done -> {Seeds1, Aliases1, Rows + N};
+                        _ ->
+                            case Pause of 0 -> ok; _ -> timer:sleep(Pause) end,
+                            L(Next, Seeds1, Aliases1, Rows + N)
+                    end;
+                {error, T, D} -> erlang:error({store_retention_scan_failed, T, D})
+            end
+        end,
+    {Seeds, Aliases, Rows} = Loop(<<>>, [], [], 0),
+    {Seeds, Aliases, bump(scans, 1, bump(scanned_rows, Rows, Acc))}.
+
+classify_ref(Ctx, Cand, K, V = <<"link:", Target/binary>>, S, A) ->
+    %% A pin (a process ID, a trusted device) is a root, never an alias to
+    %% delete: what it names is protected.
+    case binary:match(K, <<"/">>) == nomatch andalso byte_size(K) == 43
+            andalso not sets:is_element(K, maps:get(pins, Ctx))
+            andalso is_cand(Cand, Target) of
+        true -> {S, [{K, Target} | A]};
+        false -> {[ T || T <- ref_targets(V), is_cand(Cand, T) ] ++ S, A}
+    end;
+classify_ref(_Ctx, Cand, _K, V, S, A) ->
+    {[ T || T <- ref_targets(V), is_cand(Cand, T) ] ++ S, A}.
+
+%% @doc A second pass, only when candidate units have alias rows: anything
+%% outside the candidates that names an alias protects the unit behind it.
+alias_scan(Ctx, Cand, Aliases) ->
+    ByAlias = maps:from_list(Aliases),
+    DB = maps:get(src_db, Ctx),
+    Step = maps:get(scan_rows, maps:get(policy, Ctx)),
+    Loop =
+        fun L(From, Seeds) ->
+            {ok, Refs, _N, Next} = elmdb:scan_refs(DB, From, Step),
+            Seeds1 =
+                lists:foldl(
+                    fun({K, V}, S) ->
+                        case is_cand(Cand, K) orelse maps:is_key(K, ByAlias) of
+                            true -> S;
+                            false ->
+                                [ maps:get(T, ByAlias)
+                                || T <- ref_targets(V), maps:is_key(T, ByAlias) ] ++ S
+                        end
+                    end,
+                    Seeds,
+                    Refs),
+            case Next of done -> Seeds1; _ -> L(Next, Seeds1) end
+        end,
+    Loop(<<>>, []).
+
+%% @doc Mark a candidate and everything it reaches inside the candidate set as
+%% protected.
+protect(Ctx, Cand = #{ tab := T }, Key) ->
+    case ets:lookup(T, Key) of
+        [{_, _, _, true}] -> ok;
+        [{K, O, B, false}] ->
+            ets:insert(T, {K, O, B, true}),
+            %% A protected unit keeps its subtree and what its rows reference.
+            case raw_get(Ctx, K) of
+                {ok, <<"group">>} ->
+                    case raw_subtree(Ctx, K) of
+                        {ok, Rows} ->
+                            [ protect_row(Ctx, Cand, Row) || Row <- Rows ];
+                        _ -> ok
+                    end;
+                {ok, V} -> protect_row(Ctx, Cand, {K, V});
+                not_found -> ok
+            end,
+            ok;
+        [] ->
+            %% A path inside a candidate unit: protect the unit.
+            case top(Key) of
+                Key -> ok;
+                Top -> protect(Ctx, Cand, Top)
+            end
+    end.
+
+protect_row(Ctx, Cand = #{ tab := T }, {K, V}) ->
+    case ets:lookup(T, K) of
+        [{_, O, B, false}] -> ets:insert(T, {K, O, B, true});
+        _ -> ok
+    end,
+    [ protect(Ctx, Cand, Tgt) || Tgt <- ref_targets(V), is_cand(Cand, Tgt) ],
+    case hb_link:is_link_key(K) of
+        true ->
+            case read_value(Ctx, V) of
+                {ok, ID} when byte_size(ID) == 43 -> protect(Ctx, Cand, ID);
+                _ -> ok
+            end;
+        false -> ok
+    end.
+
+%% @doc Delete every unprotected candidate, top-down, in guarded batches. A
+%% vetoed key -- written or referenced since the last check -- is protected
+%% with everything it reaches, and the remaining batches are recomputed.
+sweep(Ctx, Cand = #{ tab := T }, Acc) ->
+    Ordered =
+        [ {K, B} || {K, _O, B, false} <-
+              lists:keysort(2, ets:tab2list(T)) ],
+    Protected = ets:select_count(T, [{{'_', '_', '_', true}, [], [true]}]),
+    Acc1 = Acc#{ protected_keys => maps:get(protected_keys, Acc) + Protected },
+    case maps:get(dry_run, Acc1, false) of
+        true ->
+            Acc1#{
+                deleted_keys => maps:get(deleted_keys, Acc1) + length(Ordered),
+                deleted_bytes => maps:get(deleted_bytes, Acc1) +
+                    lists:sum([ B || {_, B} <- Ordered ])
+            };
+        false -> sweep_batches(Ctx, Cand, Ordered, Acc1)
+    end.
+
+sweep_batches(_Ctx, _Cand, [], Acc) -> Acc;
+sweep_batches(Ctx, Cand = #{ tab := T }, Ordered, Acc) ->
+    N = maps:get(delete_batch, maps:get(policy, Ctx)),
+    {Batch, Rest} = lists:split(min(N, length(Ordered)), Ordered),
+    %% Fold in what was written since the last check before deciding.
+    {ok, Tracked} = elmdb:track_take(maps:get(src_db, Ctx)),
+    [ protect(Ctx, Cand, K) || K <- Tracked, is_cand(Cand, K) ],
+    Live = [ {K, B} || {K, B} <- Batch, ets:lookup_element(T, K, 4) == false ],
+    Store = maps:get(src_store, Ctx),
+    case hb_store:delete(Store, #{ <<"delete">> => [ K || {K, _} <- Live ],
+                                   <<"guarded">> => true },
+                         maps:get(src_opts, Ctx)) of
+        {ok, _} ->
+            pace(Ctx, length(Live)),
+            hook(Ctx, {deleted, length(Live)}),
+            Acc1 = Acc#{
+                deleted_keys => maps:get(deleted_keys, Acc) + length(Live),
+                deleted_bytes => maps:get(deleted_bytes, Acc) +
+                    lists:sum([ B || {_, B} <- Live ])
+            },
+            sweep_batches(Ctx, Cand, Rest, Acc1);
+        {error, {conflict, Found}} ->
+            [ protect(Ctx, Cand, K) || K <- Found ],
+            Remaining = [ {K, B} || {K, B} <- Batch ++ Rest,
+                                    ets:lookup_element(T, K, 4) == false ],
+            sweep_batches(Ctx, Cand, Remaining,
+                Acc#{ conflicts => maps:get(conflicts, Acc) + length(Found),
+                      protected_by_writes => maps:get(protected_by_writes, Acc) + length(Found) });
+        {error, Reason} ->
+            erlang:error({store_retention_delete_failed, Reason})
+    end.
+
+%%% The journal: the candidate keys and alias keys of the sweep in progress,
+%%% written before anything is deleted.
+
+write_journal(Ctx, Aliases, #{ tab := T }) ->
+    Keys = [ {K, O, B} || {K, O, B, _} <- ets:tab2list(T) ],
+    Bin = term_to_binary({retention_journal, 1, Aliases, Keys}, [compressed]),
+    File = maps:get(journal, Ctx),
+    Tmp = File ++ ".tmp",
+    ok = file:write_file(Tmp, Bin, [raw, sync]),
+    file:rename(Tmp, File).
+
+clear_journal(Ctx) ->
+    case file:delete(maps:get(journal, Ctx)) of
+        ok -> ok;
+        {error, enoent} -> ok;
+        Err -> Err
+    end.
+
+%% @doc Finish a sweep a crash interrupted: delete its aliases, then protect
+%% and sweep its candidates exactly as if the run had continued. The rows a
+%% partial sweep already deleted are simply absent.
+recover_journal(Ctx, Acc) ->
+    File = maps:get(journal, Ctx),
+    case file:read_file(File) of
+        {ok, Bin} ->
+            {retention_journal, 1, Aliases, Keys} = binary_to_term(Bin),
+            ?event(store_retention, {recovering_journal, length(Aliases), length(Keys)}),
+            Cand = new_cand(),
+            [ ets:insert(maps:get(tab, Cand), {K, O, B, false}) || {K, O, B} <- Keys ],
+            counters:add(maps:get(counter, Cand), 1, length(Keys)),
+            {Acc1, Revived} = delete_aliases(Ctx, Aliases, Acc),
+            Acc2 = protect_and_sweep(Ctx, Cand, Revived,
+                       Acc1#{ recovered_journal => true }),
+            free_cand(Cand),
+            ok = clear_journal(Ctx),
+            Acc2;
+        {error, enoent} -> Acc
+    end.
+
+%%% Essentials migration helper.
+
+%% @doc Copy the small essential namespaces and the trusted-device archives,
+%% which `collect/3' does not walk, from the sole store of `SrcOpts' to that
+%% of `DstOpts'.
+copy_essential_namespaces(SrcOpts, DstOpts, Policy0) ->
+    Policy = collect_policy(Policy0),
+    Src = sole_store(SrcOpts),
+    Dst = sole_store(DstOpts),
+    ok = refuse_unsafe(Src, Dst, Policy),
+    ok = hb_store:start([Src], #{}, SrcOpts),
+    ok = hb_store:start([Dst], #{}, DstOpts),
+    Ctx = #{ src_store => Src, src_opts => SrcOpts, src_db => store_db(Src),
+             dst_store => Dst, dst_opts => DstOpts, dst_db => store_db(Dst),
+             policy => Policy, dry_run => maps:get(dry_run, Policy) },
+    Devices =
+        case hb_opts:get(<<"trusted-devices">>, #{}, SrcOpts) of
+            M when is_map(M) -> maps:values(M);
+            _ -> []
+        end,
+    Roots = [<<"~location@1.0">>, <<"~bundler@1.0">>, <<"~arweave@2.9">>,
+             <<"~meta@1.0">>] ++ [ hb_util:bin(D) || D <- Devices ],
+    {Acc, _Keys} =
+        with_seen(Ctx, fun(C) ->
+            reset_seen(C, fun(C2) ->
+                lists:foldl(fun(R, A) -> copy_closure(C2, R, A) end, new_acc(), Roots)
+            end)
+        end),
+    catch elmdb:flush(maps:get(dst_db, Ctx)),
+    #{ namespace_rows => maps:get(rows, Acc), namespace_misses => maps:get(misses, Acc) }.
+
 
 %%% Tests
 

@@ -1,0 +1,579 @@
+%%% @doc Integration tests for in-place store retention (`hb_store_gc:retain/1')
+%%% and the essentials store (`hb_store_essentials'), on real `lua@5.3b'
+%%% processes with a small checkpoint cadence.
+-module(hb_store_gc_tests).
+-include("include/hb.hrl").
+-include_lib("eunit/include/eunit.hrl").
+
+-define(CADENCE, 5).
+
+%%% Fixtures
+
+node_opts(Extra) ->
+    hb:init(),
+    application:ensure_all_started(hb),
+    Store = hb_test_utils:test_store(hb_store_lmdb),
+    ok = hb_store:start([Store], #{}, #{}),
+    maps:merge(
+        #{
+            <<"store">> => [Store],
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"hashpath">> => ignore,
+            <<"spawn-worker">> => false,
+            <<"process-workers">> => false,
+            <<"process-delta-checkpoint-slots">> => ?CADENCE,
+            <<"process-hot-cache-slots">> => 4,
+            <<"store-retention">> => true,
+            <<"store-retention-recent-slots">> => 4,
+            <<"store-retention-checkpoints">> => 2,
+            <<"store-retention-grace-ms">> => 0,
+            <<"store-retention-max-deletes-per-sec">> => 0,
+            <<"store-retention-scan-rows">> => 5000
+        },
+        Extra
+    ).
+
+main_db(Opts) ->
+    [Store | _] = hb_opts:get(<<"store">>, [], Opts),
+    #{ <<"db">> := DB } = hb_store:find(Store),
+    DB.
+
+new_process(Opts) ->
+    Process = lua_process(Opts),
+    {ok, _} = hb_cache:write(Process, Opts),
+    Process.
+
+lua_process(Opts) ->
+    Wallet = hb_opts:get(<<"priv-wallet">>, hb:wallet(), Opts),
+    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    hb_message:commit(
+        #{
+            <<"device">> => <<"process@1.0">>,
+            <<"type">> => <<"Process">>,
+            <<"scheduler-device">> => <<"scheduler@1.0">>,
+            <<"execution-device">> => <<"lua@5.3b">>,
+            <<"module">> => #{
+                <<"content-type">> => <<"application/lua">>,
+                <<"body">> => script()
+            },
+            <<"authority">> => [Address],
+            <<"scheduler-location">> => Address,
+            <<"test-random-seed">> => rand:uniform(1000000)
+        },
+        Opts
+    ).
+
+%% A counter plus a ledger table the patches grow, so states share most of
+%% their content across slots and deltas carry real sub-messages.
+script() ->
+    <<
+        "Count = Count or 0\n"
+        "function compute(first, second)\n"
+        "  Count = Count + 1\n"
+        "  local value = tostring(Count)\n"
+        "  local req = second or first\n"
+        "  local body = req.body or req\n"
+        "  local action = tostring(body.action or '')\n"
+        "  return {\n"
+        "    patches = {\n"
+        "      { path = '/count', value = value },\n"
+        "      { path = '/last-action', value = action },\n"
+        "      { path = '/ledger/k' .. tostring(Count % 7), value = string.rep(value, 20) }\n"
+        "    },\n"
+        "    results = { output = { data = value } }\n"
+        "  }\n"
+        "end\n"
+    >>.
+
+schedule(Process, N, Opts) ->
+    ProcID = hb_message:id(Process, all, Opts),
+    Req =
+        hb_message:commit(
+            #{
+                <<"path">> => <<"schedule">>,
+                <<"method">> => <<"POST">>,
+                <<"body">> =>
+                    hb_message:commit(
+                        #{
+                            <<"target">> => ProcID,
+                            <<"type">> => <<"Message">>,
+                            <<"action">> => <<"Increment">>,
+                            <<"number">> => N,
+                            <<"data">> => crypto:strong_rand_bytes(96)
+                        },
+                        Opts
+                    )
+            },
+            Opts
+        ),
+    {ok, _} = hb_ao:resolve(Process, Req, Opts),
+    ok.
+
+compute(Process, Slot, Opts) ->
+    hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, Opts).
+
+count_at(Process, Slot, Opts) ->
+    {ok, State} = compute(Process, Slot, Opts),
+    hb_ao:get(<<"count">>, State, Opts).
+
+%% Schedule `N' messages and compute every slot, returning the next slot.
+run_slots(Process, From, N, Opts) ->
+    lists:foreach(
+        fun(Slot) ->
+            ok = schedule(Process, Slot, Opts),
+            ?assertEqual(integer_to_binary(Slot + 1), count_at(Process, Slot, Opts))
+        end,
+        lists:seq(From, From + N - 1)
+    ),
+    From + N.
+
+clear_process_caches() ->
+    [ catch ets:delete_all_objects(T)
+    || T <- [dev_process_delta_hot_cache, dev_process_delta_recent_cache,
+             dev_process_delta_replay_cache] ],
+    ok.
+
+proc_id(Process, Opts) -> hb_util:human_id(hb_message:id(Process, all, Opts)).
+
+computed_slots(Process, Opts) ->
+    lists:sort(hb_cache:list_numbered(
+        <<"computed/", (proc_id(Process, Opts))/binary, "/slot">>, Opts)).
+
+%% Every assignment, fully loaded and serialized, by its stored path.
+assignments(Process, Opts) ->
+    P = proc_id(Process, Opts),
+    Prefix = <<"~scheduler@1.0/assignments/", P/binary>>,
+    [ {S, term_to_binary(
+            hb_cache:ensure_all_loaded(
+                hb_util:ok(hb_cache:read(<<Prefix/binary, "/", (integer_to_binary(S))/binary>>, Opts)),
+                Opts),
+            [deterministic])}
+    || S <- lists:sort(hb_cache:list_numbered(Prefix, Opts)) ].
+
+%% A slot's public state as `compute&slot=N' serves it.
+state_digest(Process, Slot, Opts) ->
+    {ok, Msg} = compute(Process, Slot, Opts),
+    Loaded = hb_cache:ensure_all_loaded(maps:without([<<"snapshot">>], Msg), Opts),
+    {hb_ao:get(<<"count">>, Loaded, Opts), hb_ao:get(<<"ledger">>, Loaded, Opts),
+     hb_ao:get(<<"results">>, Loaded, Opts)}.
+
+store_rows(DB) ->
+    ok = elmdb:flush(DB),
+    Loop =
+        fun L(From, N) ->
+            case elmdb:scan_rows(DB, From, 50000) of
+                {ok, _, C, done} -> N + C;
+                {ok, _, C, Next} -> L(Next, N + C)
+            end
+        end,
+    Loop(<<>>, 0).
+
+%%% Tests
+
+%% @doc After a run, every slot of the window is read back identically from a
+%% cold cache, `now' is unchanged, every assignment is byte-identical, the
+%% definition and the shared module blob survive, the process keeps
+%% computing, and a dropped slot is either re-executed correctly or refused
+%% fast, depending on `process-historical-replay-limit'.
+retention_keeps_processes_correct_test_() ->
+    {timeout, 300, fun() ->
+        Opts = node_opts(#{}),
+        Process = new_process(Opts),
+        Next = run_slots(Process, 0, 32, Opts),
+        Head = Next - 1,
+        Before = assignments(Process, Opts),
+        {ok, NowBefore} = hb_ao:resolve(Process, <<"now">>, Opts),
+        DB = main_db(Opts),
+        RowsBefore = store_rows(DB),
+        Report = hb_store_gc:retain(Opts),
+        ?event(debug_retention, {report, Report}),
+        ?assert(maps:get(dropped_slots, Report) > 0),
+        ?assert(maps:get(deleted_keys, Report) > 0),
+        RowsAfter = store_rows(DB),
+        ?assert(RowsAfter < RowsBefore),
+        Kept = computed_slots(Process, Opts),
+        % The newest two checkpoints and everything above the lower one.
+        Ckpt = ((Head div ?CADENCE) - 1) * ?CADENCE,
+        ?assertEqual(lists:seq(Ckpt, Head), Kept),
+        clear_process_caches(),
+        lists:foreach(
+            fun(S) ->
+                {Count, _, _} = state_digest(Process, S, Opts),
+                ?assertEqual(integer_to_binary(S + 1), Count)
+            end,
+            Kept),
+        {ok, NowAfter} = hb_ao:resolve(Process, <<"now">>, Opts),
+        ?assertEqual(hb_ao:get(<<"count">>, NowBefore, Opts),
+                     hb_ao:get(<<"count">>, NowAfter, Opts)),
+        ?assertEqual(Before, assignments(Process, Opts)),
+        ProcID = hb_message:id(Process, all, Opts),
+        {ok, Def} = hb_cache:read(ProcID, Opts),
+        ?assert(hb_message:verify(hb_cache:ensure_all_loaded(Def, Opts), all, Opts)),
+        % Shared content-addressed blobs: the module body is reachable from
+        % every checkpoint and from the definition.
+        ModuleBlob = <<"data/", (hb_path:hashpath(script(), Opts))/binary>>,
+        ?assertMatch({ok, _}, elmdb:get(DB, ModuleBlob)),
+        % It keeps computing, across a checkpoint boundary.
+        Next2 = run_slots(Process, Next, 8, Opts),
+        ?assertEqual(integer_to_binary(Next2), count_at(Process, Next2 - 1, Opts)),
+        % A dropped slot is rebuilt by re-execution from the assignments.
+        clear_process_caches(),
+        ?assertEqual(<<"4">>, count_at(Process, 3, Opts)),
+        ?assertEqual(<<"10">>, count_at(Process, 9, Opts)),
+        % A second run finds the historical re-execution's writes and removes
+        % them again; the window is unchanged.
+        R2 = hb_store_gc:retain(Opts),
+        ?assertEqual(false, maps:get(recovered_journal, R2)),
+        Kept2 = computed_slots(Process, Opts),
+        ?assertEqual(lists:max(Kept2), Next2 - 1),
+        ?assert(lists:min(Kept2) > 3)
+    end}.
+
+%% @doc With a live process worker at the head, a read of a slot retention
+%% dropped is either rebuilt correctly or, beyond
+%% `process-historical-replay-limit', refused at once with a 503 -- never a
+%% crash, a hang, or a change to the worker's live state.
+retention_historical_reads_with_worker_test_() ->
+    {timeout, 300, fun() ->
+        Opts = node_opts(#{
+            <<"spawn-worker">> => true,
+            <<"process-workers">> => true,
+            <<"await-inprogress">> => named
+        }),
+        Process = new_process(Opts),
+        Next = run_slots(Process, 0, 27, Opts),
+        R = hb_store_gc:retain(Opts),
+        ?assert(maps:get(deleted_keys, R) > 0),
+        ?assertNot(lists:member(12, computed_slots(Process, Opts))),
+        LimitOpts = Opts#{ <<"process-historical-replay-limit">> => 2 },
+        {T, Refused} = timer:tc(fun() -> compute(Process, 12, LimitOpts) end),
+        ?assertMatch({error, #{ <<"status">> := 503 }}, Refused),
+        ?assert(T < 2000000),
+        ?assertEqual(<<"13">>, count_at(Process, 12, Opts)),
+        % The worker's live state is untouched: the head computes on.
+        _ = run_slots(Process, Next, 3, Opts)
+    end}.
+
+%% @doc A cold restart -- fresh in-memory caches, store closed and reopened --
+%% resumes from the retained checkpoint and computes on correctly.
+retention_cold_resume_test_() ->
+    {timeout, 300, fun() ->
+        Opts = node_opts(#{}),
+        Process = new_process(Opts),
+        Next = run_slots(Process, 0, 23, Opts),
+        _ = hb_store_gc:retain(Opts),
+        [Store | _] = hb_opts:get(<<"store">>, [], Opts),
+        ok = hb_store:stop([Store], #{}, Opts),
+        clear_process_caches(),
+        ok = schedule(Process, Next, Opts),
+        ?assertEqual(integer_to_binary(Next + 1), count_at(Process, Next, Opts)),
+        _ = run_slots(Process, Next + 1, 6, Opts)
+    end}.
+
+%% @doc Retention running repeatedly while slots are scheduled and computed
+%% continuously: no compute fails, no read finds a missing link, and every
+%% kept slot reads back afterwards.
+retention_under_concurrent_load_test_() ->
+    {timeout, 600, fun() ->
+        Opts = node_opts(#{ <<"store-retention-delete-batch">> => 50 }),
+        Process = new_process(Opts),
+        Start = run_slots(Process, 0, 12, Opts),
+        Parent = self(),
+        Loader =
+            spawn_link(fun() ->
+                Loop =
+                    fun L(Slot) ->
+                        receive {stop, From} -> From ! {loaded, Slot}
+                        after 0 ->
+                            ok = schedule(Process, Slot, Opts),
+                            ?assertEqual(integer_to_binary(Slot + 1),
+                                         count_at(Process, Slot, Opts)),
+                            % Reads of recent slots race the sweep too.
+                            {ok, _} = compute(Process, max(0, Slot - 2), Opts),
+                            L(Slot + 1)
+                        end
+                    end,
+                Loop(Start)
+            end),
+        Reports = [ begin timer:sleep(200), hb_store_gc:retain(Opts) end
+                  || _ <- lists:seq(1, 6) ],
+        Loader ! {stop, Parent},
+        Last = receive {loaded, S} -> S - 1 after 120000 -> error(loader_hung) end,
+        ?assert(Last > Start + 10),
+        ?assert(lists:sum([ maps:get(deleted_keys, R) || R <- Reports ]) > 0),
+        clear_process_caches(),
+        Kept = computed_slots(Process, Opts),
+        ?assertEqual(Last, lists:max(Kept)),
+        ?assertEqual(lists:seq(lists:min(Kept), Last), Kept),
+        [ ?assertEqual(integer_to_binary(S + 1), element(1, state_digest(Process, S, Opts)))
+        || S <- Kept ]
+    end}.
+
+%% @doc A run killed after its aliases are gone, or in the middle of deleting
+%% candidates, leaves a journal; the next run finishes it, and the process
+%% reads and computes normally throughout.
+retention_crash_mid_sweep_test_() ->
+    {timeout, 300, fun() ->
+        lists:foreach(
+            fun(KillAt) ->
+                Opts = node_opts(#{}),
+                Process = new_process(Opts),
+                Next = run_slots(Process, 0, 27, Opts),
+                Kill =
+                    fun(Phase) ->
+                        case Phase of
+                            KillAt -> exit(simulated_crash);
+                            {deleted, _} when KillAt == deleting -> exit(simulated_crash);
+                            _ -> ok
+                        end
+                    end,
+                ?assertExit(simulated_crash,
+                    hb_store_gc:retain(Opts#{ <<"store-retention-test-hook">> => Kill,
+                                              <<"store-retention-delete-batch">> => 20 })),
+                clear_process_caches(),
+                % Mid-crash, the process is fully usable.
+                ?assertEqual(integer_to_binary(Next), count_at(Process, Next - 1, Opts)),
+                R = hb_store_gc:retain(Opts),
+                ?assert(maps:get(recovered_journal, R)),
+                clear_process_caches(),
+                Kept = computed_slots(Process, Opts),
+                [ ?assertEqual(integer_to_binary(S + 1),
+                               element(1, state_digest(Process, S, Opts)))
+                || S <- Kept ],
+                _ = run_slots(Process, Next, 4, Opts)
+            end,
+            [aliases_deleted, deleting]
+        )
+    end}.
+
+%% @doc A content-addressed blob that a dropped state shares with a row
+%% retention knows nothing about is kept: the protection scan finds the
+%% reference.
+retention_keeps_externally_referenced_content_test_() ->
+    {timeout, 300, fun() ->
+        Opts = node_opts(#{}),
+        Process = new_process(Opts),
+        _ = run_slots(Process, 0, 17, Opts),
+        P = proc_id(Process, Opts),
+        DB = main_db(Opts),
+        % Slot 2 will be dropped. Point an unknown namespace at its state root.
+        {ok, <<"link:", Root/binary>>} =
+            elmdb:get(DB, <<"computed/", P/binary, "/slot/2">>),
+        ok = elmdb:put(DB, <<"~other@1.0/keeps">>, <<"link:", Root/binary>>),
+        ok = elmdb:flush(DB),
+        R = hb_store_gc:retain(Opts),
+        ?assert(maps:get(protected_by_scan, R) > 0),
+        ?assertEqual(not_found, elmdb:get(DB, <<"computed/", P/binary, "/slot/2">>)),
+        {ok, Kept} = hb_cache:read(<<"~other@1.0/keeps">>, Opts),
+        ?assertMatch(#{}, hb_cache:ensure_all_loaded(Kept, Opts))
+    end}.
+
+%% @doc Assignments, their messages and the definition land in the essentials
+%% store, self-contained; with the main store wiped and the essentials store
+%% intact, every slot is rebuilt by replay to the same state.
+essentials_store_suffices_to_rebuild_test_() ->
+    {timeout, 300, fun() ->
+        Ess = hb_test_utils:test_store(hb_store_lmdb, <<"essentials">>),
+        Opts0 = node_opts(#{}),
+        Opts = Opts0#{
+            <<"essentials-store">> => Ess,
+            <<"store">> => hb_store_essentials:node_store(Opts0#{ <<"essentials-store">> => Ess })
+        },
+        ok = hb_store:start([Ess], #{}, Opts),
+        % The definition is written by the scheduler when it first sees the
+        % process -- into the essentials store.
+        Process = lua_process(Opts),
+        Next = run_slots(Process, 0, 12, Opts),
+        Digests = [ state_digest(Process, S, Opts) || S <- lists:seq(0, Next - 1) ],
+        P = proc_id(Process, Opts),
+        #{ <<"db">> := EssDB } = hb_store:find(Ess),
+        MainDB = main_db(Opts),
+        ok = elmdb:flush(EssDB), ok = elmdb:flush(MainDB),
+        AKey = <<"~scheduler@1.0/assignments/", P/binary, "/3">>,
+        ?assertMatch({ok, <<"link:", _/binary>>}, elmdb:get(EssDB, AKey)),
+        ?assertEqual(not_found, elmdb:get(MainDB, AKey)),
+        % Every row an assignment reaches is in the essentials store.
+        ?assertEqual(assignments(Process, Opts),
+                     assignments(Process, Opts#{ <<"store">> => [Ess] })),
+        % Wipe the main store; keep the essentials store.
+        [Main | _] = hb_opts:get(<<"store">>, [], Opts0),
+        ok = hb_store:reset([Main], #{}, Opts),
+        ok = hb_store:start([Main], #{}, Opts),
+        clear_process_caches(),
+        ?assertEqual([], computed_slots(Process, Opts)),
+        Rebuilt = [ begin {ok, _} = compute(Process, S, Opts), state_digest(Process, S, Opts) end
+                  || S <- lists:seq(0, Next - 1) ],
+        ?assertEqual(Digests, Rebuilt)
+    end}.
+
+%% @doc With an essentials store, the essentials of a node that kept everything
+%% in one store are copied over by `migrate/3' and verified byte-for-byte.
+essentials_migration_verifies_test_() ->
+    {timeout, 300, fun() ->
+        Opts = node_opts(#{}),
+        Process = new_process(Opts),
+        _ = run_slots(Process, 0, 9, Opts),
+        [Main | _] = hb_opts:get(<<"store">>, [], Opts),
+        Ess = hb_test_utils:test_store(hb_store_lmdb, <<"migrated">>),
+        Src = Opts#{ <<"store">> => [Main#{ <<"access">> => [<<"read">>] }] },
+        Dst = Opts#{ <<"store">> => [Ess] },
+        Report = hb_store_essentials:migrate(Src, Dst, #{ live_source => true }),
+        ?assertEqual(9, maps:get(assignment_slots, Report)),
+        ?assertMatch({ok, #{ assignments := 9 }},
+            hb_store_essentials:verify(Opts#{ <<"store">> => [Main] }, Dst)),
+        % Nothing computed was copied.
+        ?assertEqual([], computed_slots(Process, Dst))
+    end}.
+
+%% @doc Main-store growth with retention on flattens; without it, it does not.
+%% Prints the curve. Set `HB_RETENTION_STEADY=<slots>' to run it.
+retention_steady_state_report_test_() ->
+    {timeout, 3600, fun() ->
+        case os:getenv("HB_RETENTION_STEADY") of
+            false -> ok;
+            NStr ->
+                N = list_to_integer(NStr),
+                Curve =
+                    fun(Retain) ->
+                        Ess = hb_test_utils:test_store(hb_store_lmdb, <<"ess-steady">>),
+                        Base = node_opts(#{ <<"process-delta-checkpoint-slots">> => 50,
+                                            <<"store-retention-recent-slots">> => 32 }),
+                        Opts = Base#{
+                            <<"essentials-store">> => Ess,
+                            <<"store">> => hb_store_essentials:node_store(
+                                Base#{ <<"essentials-store">> => Ess })
+                        },
+                        ok = hb_store:start([Ess], #{}, Opts),
+                        Process = lua_process(Opts),
+                        #{ <<"db">> := EssDB } = hb_store:find(Ess),
+                        MainDB = main_db(Opts),
+                        Step = max(1, N div 10),
+                        lists:map(
+                            fun(I) ->
+                                _ = run_slots(Process, I * Step, Step, Opts),
+                                case Retain of
+                                    true -> _ = hb_store_gc:retain(Opts);
+                                    false -> ok
+                                end,
+                                {(I + 1) * Step, store_rows(MainDB), store_rows(EssDB)}
+                            end,
+                            lists:seq(0, 9)
+                        )
+                    end,
+                On = Curve(true),
+                Off = Curve(false),
+                io:format(user, "~nRETENTION_STEADY slots main_rows_on main_rows_off ess_rows~n", []),
+                [ io:format(user, "RETENTION_STEADY ~p ~p ~p ~p~n", [S, MOn, MOff, E])
+                || {{S, MOn, E}, {S, MOff, _}} <- lists:zip(On, Off) ]
+        end
+    end}.
+
+%% @doc POST /schedule throughput and latency over HTTP under concurrent load,
+%% for each essentials layout. Run with
+%% `HB_ESS_BENCH=base,lmdb,export,fs HB_ESS_FAST=<local dir>
+%% HB_ESS_REMOTE=<slow dir> HB_ESS_BENCH_MS=<duration>'.
+%% `base': no essentials store. `lmdb': a local LMDB essentials store.
+%% `export': the same plus the asynchronous export to `HB_ESS_REMOTE'.
+%% `fs': an `hb_store_fs' essentials store directly on `HB_ESS_REMOTE'.
+essentials_schedule_benchmark_test_() ->
+    {timeout, 3600, fun() ->
+        case os:getenv("HB_ESS_BENCH") of
+            false -> ok;
+            Spec ->
+                Fast = os:getenv("HB_ESS_FAST", "cache-TEST/bench-fast"),
+                Remote = os:getenv("HB_ESS_REMOTE", "cache-TEST/bench-remote"),
+                Dur = list_to_integer(os:getenv("HB_ESS_BENCH_MS", "20000")),
+                Clients = list_to_integer(os:getenv("HB_ESS_BENCH_CLIENTS", "16")),
+                [ ess_bench(list_to_atom(V), Fast, Remote, Dur, Clients)
+                || V <- string:tokens(Spec, ",") ]
+        end
+    end}.
+
+ess_bench(Variant, Fast, Remote, Dur, Clients) ->
+    application:ensure_all_started(hb),
+    Tag = atom_to_list(Variant) ++ "-" ++ integer_to_list(erlang:unique_integer([positive])),
+    Dir = fun(Root, Name) -> hb_util:bin(filename:join([Root, Tag, Name])) end,
+    Main = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => Dir(Fast, "main") },
+    LocalEss = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => Dir(Fast, "ess") },
+    Extra =
+        case Variant of
+            base -> #{};
+            lmdb -> #{ <<"essentials-store">> => LocalEss };
+            export ->
+                #{ <<"essentials-store">> => LocalEss,
+                   <<"essentials-export">> =>
+                       #{ <<"path">> => Dir(Remote, "export"),
+                          <<"journal">> => Dir(Fast, "journal") } };
+            fs ->
+                #{ <<"essentials-store">> =>
+                       #{ <<"store-module">> => hb_store_fs, <<"name">> => Dir(Remote, "fs") } }
+        end,
+    Port = 20000 + rand:uniform(20000),
+    Opts = maps:merge(#{
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"store">> => [Main],
+        <<"port">> => Port,
+        <<"scheduling-mode">> => local_confirmation,
+        <<"scheduler-publish-remote">> => false,
+        <<"scheduler-default-commitment-spec">> => <<"ans104@1.0">>,
+        <<"scheduler-durable-confirm">> => commit,
+        <<"match-index">> => false
+    }, Extra),
+    W = hb_opts:get(priv_wallet, x, Opts),
+    Node = hb_http_server:start_node(Opts),
+    Addr = hb_util:human_id(ar_wallet:to_address(W)),
+    Pools =
+        [ begin
+            PMsg = hb_message:commit(#{
+                <<"device">> => <<"scheduler@1.0">>,
+                <<"type">> => <<"Process">>,
+                <<"scheduler-location">> => Addr,
+                <<"scheduler">> => Addr,
+                <<"r">> => rand:uniform(1 bsl 40) }, Opts),
+            {ok, _} = hb_http:post(Node, hb_message:commit(#{
+                <<"path">> => <<"/~scheduler@1.0/schedule">>,
+                <<"method">> => <<"POST">>, <<"body">> => PMsg }, Opts), Opts),
+            Target = hb_util:human_id(hb_message:id(PMsg, all, Opts)),
+            Target
+          end
+        || _ <- lists:seq(1, 4) ],
+    Self = self(),
+    Deadline = erlang:monotonic_time(millisecond) + Dur,
+    Pids =
+        [ spawn_link(fun() ->
+              Target = lists:nth((C rem length(Pools)) + 1, Pools),
+              Self ! {lat, self(), ess_client(Node, Target, Opts, Deadline, [])}
+          end)
+        || C <- lists:seq(1, Clients) ],
+    Lats = lists:append([ receive {lat, P, L} -> L end || P <- Pids ]),
+    Sorted = lists:sort(Lats),
+    N = length(Sorted),
+    P = fun(Q) -> lists:nth(max(1, min(N, round(Q * N))), Sorted) / 1000 end,
+    Export =
+        case Variant of
+            export ->
+                [Wrapped | _] = hb_store_essentials:store(Opts),
+                hb_store_export:status(Wrapped);
+            _ -> none
+        end,
+    io:format(user,
+        "ESS_BENCH variant=~p clients=~p n=~p thr=~.1f/s p50=~.2fms p99=~.2fms "
+        "p999=~.2fms max=~.2fms export=~0p~n",
+        [Variant, Clients, N, N * 1000 / Dur, P(0.5), P(0.99), P(0.999),
+         lists:last(Sorted) / 1000, Export]).
+
+ess_client(Node, Target, Opts, Deadline, Acc) ->
+    Req = hb_message:commit(#{
+        <<"path">> => <<"/~scheduler@1.0/schedule">>,
+        <<"method">> => <<"POST">>,
+        <<"body">> => hb_message:commit(#{
+            <<"target">> => Target, <<"type">> => <<"Message">>,
+            <<"data">> => crypto:strong_rand_bytes(512),
+            <<"n">> => rand:uniform(1 bsl 40) }, Opts) }, Opts),
+    T0 = erlang:monotonic_time(microsecond),
+    {ok, _} = hb_http:post(Node, Req, Opts),
+    T1 = erlang:monotonic_time(microsecond),
+    case T1 div 1000 > Deadline of
+        true -> Acc;
+        false -> ess_client(Node, Target, Opts, Deadline, [T1 - T0 | Acc])
+    end.
