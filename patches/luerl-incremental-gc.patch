@@ -2,28 +2,102 @@ diff --git a/src/luerl.erl b/src/luerl.erl
 index 5f92f10..a7f00d2 100644
 --- a/src/luerl.erl
 +++ b/src/luerl.erl
-@@ -508 +508 @@ externalize(S) ->
+@@ -505,7 +505,7 @@ decode_erlmfa(#erl_mfa{m=Mod,f=Func,a=Arg}=_Mfa, _St, _In) ->
+ %% Currently very simple: only random state needs special treatment.
+ 
+ externalize(S) ->
 -    luerl_lib_math:externalize(S).
 +    luerl_lib_math:externalize(luerl_heap:gc_cancel(S)).
+ 
+ internalize(S) ->
+     luerl_lib_math:internalize(S).
+diff --git a/src/luerl.hrl b/src/luerl.hrl
+index 824dcac..72672de 100644
+--- a/src/luerl.hrl
++++ b/src/luerl.hrl
+@@ -58,7 +58,8 @@
+ 		     lvs,			%Local variables
+ 		     env,			%Environment
+ 		     is=[],			%Instructions
+-		     cont=[]			%Continuation
++		     cont=[],			%Continuation
++		     nested=false		%Started by Erlang under live Lua
+ 		    }).
+ %% Loop break frame
+ -record(loop_frame, {lvs,			%Local variables
+diff --git a/src/luerl_emul.erl b/src/luerl_emul.erl
+index 6e26f6b..38df4e7 100644
+--- a/src/luerl_emul.erl
++++ b/src/luerl_emul.erl
+@@ -316,11 +316,22 @@ call(#erl_mfa{}=Func, Args, St0) ->             %Erlang function as MFA triplet
+     {Ret,St1} = functioncall(Func, Args, St0),
+     {Ret,St1}.
+ 
+-functioncall(Func, Args, #luerl{stk=Stk}=St0) ->
+-    Fr = #call_frame{func=Func,args=Args,lvs=[],env=[],is=[],cont=[]},
++%%  A non-empty call stack means an Erlang function is calling back into
++%%  Lua while the frames beneath it are suspended. Those frames are not
++%%  visible from the new call stack, so collection requested inside the
++%%  call is deferred until the outermost call returns. The caller's call
++%%  stack is restored on return so repeated callbacks stay nested.
++functioncall(Func, Args, #luerl{stk=Stk,cs=Cs}=St0) ->
++    Nested = Cs =/= [],
++    Fr = #call_frame{func=Func,args=Args,lvs=[],env=[],is=[],cont=[],
++                     nested=Nested},
+     Cs0 = [Fr],
+-    {_Lvs,[Ret|_],_Env,Cs1,St1} = call_function(Func, Args, Stk, Cs0, St0),
+-    {Ret,St1#luerl{stk=Stk,cs=Cs1}}.		%Reset the stacks
++    {_Lvs,[Ret|_],_Env,_Cs1,St1} = call_function(Func, Args, Stk, Cs0, St0),
++    St2 = St1#luerl{stk=Stk,cs=Cs},		%Reset the stacks
++    case Nested of
++        true -> {Ret,St2};
++        false -> {Ret,luerl_heap:gc_deferred(Ret, St2)}
++    end.
+ 
+ methodcall(Obj, Meth, Args, St0) ->
+     %% Get the function to call from object and method.
 diff --git a/src/luerl_heap.erl b/src/luerl_heap.erl
-index 93449c5..4591172 100644
+index 93449c5..d24a269 100644
 --- a/src/luerl_heap.erl
 +++ b/src/luerl_heap.erl
-@@ -31 +31 @@
+@@ -24,11 +24,13 @@
+ -module(luerl_heap).
+ 
+ -include("luerl.hrl").
++-include("luerl_instrs.hrl").
+ 
+ -export([init/0]).
+ 
+ %% External interface.
 --export([gc/1,
 +-export([gc/1,gc_step/2,gc_count/1,gc_cancel/1,
-@@ -47,0 +48,3 @@
++         gc_nested/1,gc_defer/2,gc_deferred/2,
+          alloc_table/1,alloc_table/2,free_table/2,
+          get_table/2,set_table/3,upd_table/3,chk_table/2,
+          get_global_key/2,set_global_key/3,
+@@ -45,6 +47,10 @@
+ 
+ -import(luerl_lib, [lua_error/2,badarg_error/3]).
+ 
 +-define(GC_STEP_BASELINE, luerl_gc_step_baseline).
 +-define(GC_STEP_CYCLE, luerl_gc_step_cycle).
++-define(GC_DEFERRED, luerl_gc_deferred).
 +
-@@ -591,0 +595,74 @@ set_env_var(#eref{i=N}, Index, Val, #luerl{envs=Est0}=St) ->
+ %% init() -> State
+ %%
+ %% Initialise the heap section of the state and return the state.
+@@ -589,20 +595,159 @@ set_env_var(#eref{i=N}, Index, Val, #luerl{envs=Est0}=St) ->
+ 
+ -record(gct, {t,s}).                            %Gc table info table, seen
+ 
 +%% gc_step(Budget, State) -> {CycleCompleted, State}.
 +%% Incremental snapshot-at-the-beginning mark/sweep. The cycle keeps the
 +%% immutable heap maps and roots that existed when it began. Objects allocated
 +%% later are never swept by that cycle; objects reachable at its start remain
 +%% marked even if Lua drops them while the cycle advances. This makes mutation
 +%% between steps safe without a write barrier, at the cost of retaining some
-+%% floating garbage until the following cycle.
++%% floating garbage until the following cycle. It must only begin a cycle
++%% where root_set/1 sees every live value, see gc_nested/1.
 +gc_step(RawBudget, St0) ->
 +    Budget =
 +        case RawBudget of
@@ -36,6 +110,45 @@ index 93449c5..4591172 100644
 +            Existing -> Existing
 +        end,
 +    advance_gc_cycle(Cycle, Budget, St0).
++
++%% gc_nested(State) -> boolean().
++%% True when called from Lua running inside an Erlang function that was
++%% itself called from Lua, e.g. pcall, table.sort or a host callback. The
++%% suspended outer frames, and values the Erlang function holds, are not
++%% roots there, so collection must wait until the outermost call returns.
++gc_nested(#luerl{cs=Cs}) -> bottom_nested(Cs).
++
++bottom_nested([#call_frame{nested=Nested}]) -> Nested;
++bottom_nested([_|Cs]) -> bottom_nested(Cs);
++bottom_nested([]) -> false.
++
++%% gc_defer(Request, State) -> State.
++%% Record a collection requested where gc_nested/1 holds. Requests merge:
++%% a full collection subsumes steps and step budgets add up.
++gc_defer(Req, #luerl{private=Private}=St) ->
++    Next =
++        case {maps:get(?GC_DEFERRED, Private, none),Req} of
++            {collect,_} -> collect;
++            {_,collect} -> collect;
++            {{step,B0},{step,B1}} -> {step,B0 + B1};
++            {none,_} -> Req
++        end,
++    St#luerl{private=Private#{?GC_DEFERRED => Next}}.
++
++%% gc_deferred(Return, State) -> State.
++%% Run a deferred request once the outermost call has returned; only the
++%% globals and its return values are live then.
++gc_deferred(Ret, #luerl{private=Private,stk=Stk}=St0) ->
++    case maps:take(?GC_DEFERRED, Private) of
++        error -> St0;
++        {Req,Private1} ->
++            St1 = St0#luerl{private=Private1,stk=[Ret|Stk]},
++            St2 = case Req of
++                      collect -> gc(St1);
++                      {step,Budget} -> element(2, gc_step(Budget, St1))
++                  end,
++            St2#luerl{stk=Stk}
++    end.
 +
 +gc_cancel(St) ->
 +    St#luerl{
@@ -62,14 +175,11 @@ index 93449c5..4591172 100644
 +        tabs=#tstruct{data=Tt0},
 +        envs=#tstruct{data=Et0},
 +        usds=#tstruct{data=Ut0},
-+        fncs=#tstruct{data=Ft0},
-+        g=G,stk=Stk,cs=Cs,meta=Meta
-+    }) ->
-+    Root = [Meta#meta.nil,Meta#meta.boolean,Meta#meta.number,Meta#meta.string,
-+            G|Stk],
++        fncs=#tstruct{data=Ft0}
++    }=St) ->
 +    {
-+        Root,
-+        [Cs],
++        root_set(St),
++        [],
 +        #gct{t=Tt0,s=#{}},
 +        #gct{t=Et0,s=#{}},
 +        #gct{t=Ut0,s=#{}},
@@ -91,21 +201,71 @@ index 93449c5..4591172 100644
 +            {true,Collected#luerl{private=Private1}}
 +    end.
 +
-@@ -601,4 +678,4 @@ gc(#luerl{tabs=#tstruct{data=Tt0,free=Tf0}=Tab0,
++%% root_set(State) -> [Value].
++%% Every value the running Lua code can still reach without the heap:
++%% metatables, globals, the value stack and, from the call stack, frame
++%% locals, environments, functions, the arguments held by Erlang functions
++%% and the iterator state generic for loops keep in their continuations.
++root_set(#luerl{g=G,stk=Stk,cs=Cs,meta=Meta}) ->
++    [Meta#meta.nil,Meta#meta.boolean,Meta#meta.number,Meta#meta.string,
++     G,Stk|frame_roots(Cs)].
++
++frame_roots([#call_frame{func=Func,args=Args,lvs=Lvs,env=Env,
++                         is=Is,cont=Cont}|Cs]) ->
++    Held = case Func of
++               #funref{} -> [];                 %Args are in locals/stack
++               _ -> Args                        %Held by Erlang code
++           end,
++    [Func,Held,Env,lvs_roots(Lvs),cont_roots([Is|Cont])|frame_roots(Cs)];
++frame_roots([#loop_frame{lvs=Lvs,stk=Stk,env=Env,is=Is,cont=Cont}|Cs]) ->
++    [Stk,Env,lvs_roots(Lvs),cont_roots([Is|Cont])|frame_roots(Cs)];
++frame_roots([_|Cs]) -> frame_roots(Cs);
++frame_roots([]) -> [].
++
++lvs_roots(Lvs) -> [ tuple_to_list(Lv) || Lv <- Lvs, is_tuple(Lv) ].
++
++cont_roots([[?GFOR_CALL(Func, Data, Val, _)|_]|Cont]) ->
++    [Func,Data,Val|cont_roots(Cont)];
++cont_roots([[?GFOR_LOOP(Func, Data, _)|_]|Cont]) ->
++    [Func,Data|cont_roots(Cont)];
++cont_roots([_|Cont]) -> cont_roots(Cont);
++cont_roots([]) -> [].
++
+ gc(#luerl{tabs=#tstruct{data=Tt0,free=Tf0}=Tab0,
+           envs=#tstruct{data=Et0,free=Ef0}=Env0,
+           usds=#tstruct{data=Ut0,free=Uf0}=Usd0,
+-          fncs=#tstruct{data=Ft0,free=Ff0}=Fnc0,
+-          g=G,stk=Stk,cs=Cs,meta=Meta}=St) ->
+-    %% The root set consisting of global table and stack.
+-    Root = [Meta#meta.nil,Meta#meta.boolean,Meta#meta.number,Meta#meta.string,
+-            G|Stk],
++          fncs=#tstruct{data=Ft0,free=Ff0}=Fnc0}=St) ->
++    %% The root set consisting of global table, stacks and frames.
++    Root = root_set(St),
+     %% Mark all seen tables and frames, i.e. return them.
 -    GcT = #gct{t=Tt0,s=[]},
 -    GcE = #gct{t=Et0,s=[]},
 -    GcU = #gct{t=Ut0,s=[]},
 -    GcF = #gct{t=Ft0,s=[]},
+-    {SeenT,SeenE,SeenU,SeenF} = mark(Root, [Cs], GcT, GcE, GcU, GcF),
 +    GcT = #gct{t=Tt0,s=#{}},
 +    GcE = #gct{t=Et0,s=#{}},
 +    GcU = #gct{t=Ut0,s=#{}},
 +    GcF = #gct{t=Ft0,s=#{}},
-@@ -617 +694,12 @@ gc(#luerl{tabs=#tstruct{data=Tt0,free=Tf0}=Tab0,
++    {SeenT,SeenE,SeenU,SeenF} = mark(Root, [], GcT, GcE, GcU, GcF),
+     %% io:format("gc: ~p\n", [{SeenT,SeenF,SeenU}]),
+     %% Free unseen tables and add freed to free list.
+     {Tf1,Tt1} = filter_tables(SeenT, Tf0, Tt0),
+@@ -614,7 +759,19 @@ gc(#luerl{tabs=#tstruct{data=Tt0,free=Tf0}=Tab0,
+     Env1 = Env0#tstruct{data=Et1,free=Ef1},
+     Usd1 = Usd0#tstruct{data=Ut1,free=Uf1},
+     Fnc1 = Fnc0#tstruct{data=Ft1,free=Ff1},
 -    St#luerl{tabs=Tab1,envs=Env1,usds=Usd1,fncs=Fnc1}.
 +    LiveCount =
 +        maps:size(SeenT) + maps:size(SeenE) +
 +            maps:size(SeenU) + maps:size(SeenF),
-+    Private0 = maps:remove(?GC_STEP_CYCLE, St#luerl.private),
++    %% A full collection completes any pending cycle and deferred request.
++    Private0 = maps:without([?GC_STEP_CYCLE,?GC_DEFERRED], St#luerl.private),
 +    Private1 = maps:put(?GC_STEP_BASELINE, LiveCount, Private0),
 +    St#luerl{
 +        tabs=Tab1,
@@ -114,31 +274,78 @@ index 93449c5..4591172 100644
 +        fncs=Fnc1,
 +        private=Private1
 +    }.
-@@ -628 +716 @@ mark([#tref{i=T}|Todo], More, #gct{t=Tt,s=Ts0}=GcT, GcE, GcU, GcF) ->
+ 
+ %% mark(ToDo, MoreTodo, GcTabs, GcEnv, GcUserdata, GcFuncdefs) ->
+ %%     {SeenTabs,SeenFrames,SeenUserdata,SeenFuncdefs}.
+@@ -625,11 +782,11 @@ mark([{in_table,_}=_T|Todo], More, GcT, GcE, GcU, GcF) ->
+     %%io:format("gc: ~p\n", [_T]),
+     mark(Todo, More, GcT, GcE, GcU, GcF);
+ mark([#tref{i=T}|Todo], More, #gct{t=Tt,s=Ts0}=GcT, GcE, GcU, GcF) ->
 -    case ordsets:is_element(T, Ts0) of
 +    case maps:is_key(T, Ts0) of
-@@ -632 +720 @@ mark([#tref{i=T}|Todo], More, #gct{t=Tt,s=Ts0}=GcT, GcE, GcU, GcF) ->
+         true ->                                 %Already done
+             mark(Todo, More, GcT, GcE, GcU, GcF);
+         false ->                                %Mark it and add to todo
 -            Ts1 = ordsets:add_element(T, Ts0),
 +            Ts1 = Ts0#{ T => true },
-@@ -644 +732 @@ mark([#eref{i=F}|Todo], More, GcT, #gct{t=Et,s=Es0}=GcE, GcU, GcF) ->
+             #table{a=Arr,d=Dict,meta=Meta} = ?GET_TABLE(T, Tt),
+             %% Have to be careful when adding Tab and Meta as Tab is
+             %% [{Key,Val}], Arr is array and Meta is
+@@ -641,21 +798,21 @@ mark([#tref{i=T}|Todo], More, #gct{t=Tt,s=Ts0}=GcT, GcE, GcU, GcF) ->
+     end;
+ mark([#eref{i=F}|Todo], More, GcT, #gct{t=Et,s=Es0}=GcE, GcU, GcF) ->
+     %% io:format("eref0: ~p\ ~p ~pn", [F,Et,Es0]),
 -    case ordsets:is_element(F, Es0) of
 +    case maps:is_key(F, Es0) of
-@@ -648 +736 @@ mark([#eref{i=F}|Todo], More, GcT, #gct{t=Et,s=Es0}=GcE, GcU, GcF) ->
+         true ->                                 %Already done
+             mark(Todo, More, GcT, GcE, GcU, GcF);
+         false ->                                %Mark it and add to todo
 -            Es1 = ordsets:add_element(F, Es0),
 +            Es1 = Es0#{ F => true },
-@@ -654 +742 @@ mark([#usdref{i=U}|Todo], More, GcT, GcE, #gct{s=Us0}=GcU, GcF) ->
+             Ses = tuple_to_list(?GET_TABLE(F, Et)),
+             %% io:format("eref1: ~p ~p\n", [Et,Es1]),
+             mark(Todo, [Ses|More], GcT, GcE#gct{s=Es1}, GcU, GcF)
+     end;
+ mark([#usdref{i=U}|Todo], More, GcT, GcE, #gct{s=Us0}=GcU, GcF) ->
 -    case ordsets:is_element(U, Us0) of
 +    case maps:is_key(U, Us0) of
-@@ -658 +746 @@ mark([#usdref{i=U}|Todo], More, GcT, GcE, #gct{s=Us0}=GcU, GcF) ->
+        true ->                                 %Already done
+            mark(Todo, More, GcT, GcE, GcU, GcF);
+        false ->
 -           Us1 = ordsets:add_element(U, Us0),
 +           Us1 = Us0#{ U => true },
-@@ -666 +754 @@ mark([#funref{i=F,env=Erefs}|ToDo], More, GcT, GcE, GcU,
+            mark(Todo, More, GcT, GcE, GcU#gct{s=Us1}, GcF)
+     end;
+ mark([#funref{i=F,env=Erefs}|ToDo], More, GcT, GcE, GcU,
+@@ -663,12 +820,12 @@ mark([#funref{i=F,env=Erefs}|ToDo], More, GcT, GcE, GcU,
+     %% io:format("funref0: ~p ~p ~p\n", [F,Fs0,Erefs]),
+     %% Each funref has its own environments but we only need to add
+     %% the function definition once.
 -    case ordsets:is_element(F, Fs0) of
 +    case maps:is_key(F, Fs0) of
-@@ -671 +759 @@ mark([#funref{i=F,env=Erefs}|ToDo], More, GcT, GcE, GcU,
+         true ->
+             mark(ToDo, [Erefs|More], GcT, GcE, GcU, GcF);
+         false ->
+             %% And mark the function definition.
 -            Fs1 = ordsets:add_element(F, Fs0),
 +            Fs1 = Fs0#{ F => true },
-@@ -707,0 +796,161 @@ mark([], [], #gct{s=St}, #gct{s=Se}, #gct{s=Su}, #gct{s=Sf}) ->
+             Fdef = ?GET_TABLE(F, Ft0),
+             %% io:format("funref1: ~p ~p ~p\n", [F,Fs1,Erefs]),
+             mark([Fdef|ToDo], [Erefs|More], GcT, GcE, GcU, GcF#gct{s=Fs1})
+@@ -697,6 +854,9 @@ mark([#userdata{meta=Meta}|Todo], More, GcT, GcE, GcU, GcF) ->
+ mark([{K,V}|Todo], More, GcT, GcE, GcU, GcF) -> %Table key-value pair
+     %% io:format("mt: ~p\n", [{K,V}]),
+     mark([K,V|Todo], More, GcT, GcE, GcU, GcF);
++mark([L|Todo], More, GcT, GcE, GcU, GcF) when is_list(L) ->
++    %% Value lists: multiple values on the stack, varargs, root groups.
++    mark(Todo, [L|More], GcT, GcE, GcU, GcF);
+ mark([_|Todo], More, GcT, GcE, GcU, GcF) ->
+     %% Can ignore everything else.
+     mark(Todo, More, GcT, GcE, GcU, GcF);
+@@ -705,6 +865,151 @@ mark([], [M|More], GcT, GcE, GcU, GcF) ->
+ mark([], [], #gct{s=St}, #gct{s=Se}, #gct{s=Su}, #gct{s=Sf}) ->
+     {St,Se,Su,Sf}.
+ 
 +%% The incremental form of mark/6. A budget counts inspected heap values, so a
 +%% Lua call can choose its latency/throughput tradeoff without exposing the
 +%% collector's internal work lists.
@@ -238,24 +445,6 @@ index 93449c5..4591172 100644
 +        GcF,
 +        Budget - 1
 +    );
-+mark_step([#call_frame{func=Funref,lvs=Lvs,env=Env}|Todo], More0,
-+          GcT, GcE, GcU, GcF, Budget) ->
-+    More1 = [ tuple_to_list(Lv) || Lv <- Lvs, is_tuple(Lv) ] ++
-+        [Env|More0],
-+    mark_step(
-+        [Funref|Todo],
-+        More1,
-+        GcT,
-+        GcE,
-+        GcU,
-+        GcF,
-+        Budget - 1
-+    );
-+mark_step([#loop_frame{lvs=Lvs,stk=Stk,env=Env}|Todo], More0,
-+          GcT, GcE, GcU, GcF, Budget) ->
-+    More1 = [ tuple_to_list(Lv) || Lv <- Lvs, is_tuple(Lv) ] ++
-+        [Stk,Env|More0],
-+    mark_step(Todo, More1, GcT, GcE, GcU, GcF, Budget - 1);
 +mark_step([#erl_func{}|Todo], More, GcT, GcE, GcU, GcF, Budget) ->
 +    mark_step(Todo, More, GcT, GcE, GcU, GcF, Budget - 1);
 +mark_step([#erl_mfa{}|Todo], More, GcT, GcE, GcU, GcF, Budget) ->
@@ -267,6 +456,8 @@ index 93449c5..4591172 100644
 +    mark_step([Meta|Todo], More, GcT, GcE, GcU, GcF, Budget - 1);
 +mark_step([{K,V}|Todo], More, GcT, GcE, GcU, GcF, Budget) ->
 +    mark_step([K,V|Todo], More, GcT, GcE, GcU, GcF, Budget - 1);
++mark_step([L|Todo], More, GcT, GcE, GcU, GcF, Budget) when is_list(L) ->
++    mark_step(Todo, [L|More], GcT, GcE, GcU, GcF, Budget - 1);
 +mark_step([_|Todo], More, GcT, GcE, GcU, GcF, Budget) ->
 +    mark_step(Todo, More, GcT, GcE, GcU, GcF, Budget - 1);
 +mark_step([], [Next|More], GcT, GcE, GcU, GcF, Budget) ->
@@ -300,46 +491,97 @@ index 93449c5..4591172 100644
 +        ),
 +    Current#tstruct{data=Current1,free=Free1}.
 +
-@@ -718 +967 @@ filter_tables(Seen, Tf0, Tt0) ->
+ %% filter_tables(Seen, Free, Tables) -> {Free,Tables}.
+ %% filter_environment(Seen, Free, Frames) -> {Free,Frames}.
+ %% filter_userdata(Seen, Free, Frames) -> {Free,Frames}.
+@@ -715,46 +1020,46 @@ mark([], [], #gct{s=St}, #gct{s=Se}, #gct{s=Su}, #gct{s=Sf}) ->
+ filter_tables(Seen, Tf0, Tt0) ->
+     %% Update the free list.
+     Tf1 = ?FOLD_TABLES(fun (K, _, Free) ->
 -                               case ordsets:is_element(K, Seen) of
 +                               case maps:is_key(K, Seen) of
-@@ -723 +972 @@ filter_tables(Seen, Tf0, Tt0) ->
+                                    true -> Free;
+                                    false -> [K|Free]
+                                end
+                        end, Tf0, Tt0),
 -    Tt1 = ?FILTER_TABLES(fun (K, _) -> ordsets:is_element(K, Seen) end, Tt0),
 +    Tt1 = ?FILTER_TABLES(fun (K, _) -> maps:is_key(K, Seen) end, Tt0),
-@@ -730 +979 @@ filter_environment(Seen, Ef0, Et0) ->
+     {Tf1,Tt1}.
+ 
+ filter_environment(Seen, Ef0, Et0) ->
+     %% io:format("env0: ~p ~p ~p\n", [Seen,Ef0,Et0]),
+     %% Update the free list.
+     Ef1 = ?FOLD_TABLES(fun (K, _, Free) ->
 -                               case ordsets:is_element(K, Seen) of
 +                               case maps:is_key(K, Seen) of
-@@ -735 +984 @@ filter_environment(Seen, Ef0, Et0) ->
+                                    true -> Free;
+                                    false -> [K|Free]
+                                end
+                        end, Ef0, Et0),
 -    Et1 = ?FILTER_TABLES(fun (K, _) -> ordsets:is_element(K, Seen) end, Et0),
 +    Et1 = ?FILTER_TABLES(fun (K, _) -> maps:is_key(K, Seen) end, Et0),
-@@ -742 +991 @@ filter_userdata(Seen, Uf0, Ut0) ->
+     %% io:format("env1: ~p ~p\n", [Ef1,Et1]),
+     {Ef1,Et1}.
+ 
+ filter_userdata(Seen, Uf0, Ut0) ->
+     %% Update the free list.
+     Uf1 = ?FOLD_TABLES(fun (K, _, Free) ->
 -                              case ordsets:is_element(K, Seen) of
 +                              case maps:is_key(K, Seen) of
-@@ -748 +997 @@ filter_userdata(Seen, Uf0, Ut0) ->
+                                   true -> Free;
+                                   false -> [K|Free]
+                               end
+                       end, Uf0, Ut0),
+     %% Reclaim free table slots.
 -    Ut1 = ?FILTER_TABLES(fun (K, _) -> ordsets:is_element(K, Seen) end, Ut0),
 +    Ut1 = ?FILTER_TABLES(fun (K, _) -> maps:is_key(K, Seen) end, Ut0),
-@@ -754 +1003 @@ filter_funcdefs(Seen, Ff0, Ft0) ->
+     {Uf1,Ut1}.
+ 
+ filter_funcdefs(Seen, Ff0, Ft0) ->
+     %% Update the free list.
+     Ff1 = ?FOLD_TABLES(fun (K, _, Free) ->
 -                                case ordsets:is_element(K, Seen) of
 +                                case maps:is_key(K, Seen) of
-@@ -759 +1008 @@ filter_funcdefs(Seen, Ff0, Ft0) ->
+                                     true -> Free;
+                                     false -> [K|Free]
+                                 end
+                         end, Ff0, Ft0),
 -    Ft1 = ?FILTER_TABLES(fun (K, _) -> ordsets:is_element(K, Seen) end, Ft0),
 +    Ft1 = ?FILTER_TABLES(fun (K, _) -> maps:is_key(K, Seen) end, Ft0),
+     {Ff1,Ft1}.
 diff --git a/src/luerl_lib_basic.erl b/src/luerl_lib_basic.erl
-index 6b52b62..9fd7aee 100644
+index 6b52b62..b0f19ff 100644
 --- a/src/luerl_lib_basic.erl
 +++ b/src/luerl_lib_basic.erl
-@@ -84 +84,13 @@ collectgarbage(_, [<<"collect">>|_], St) ->
+@@ -80,8 +80,29 @@ assert(_, As, St) ->
+ 
+ collectgarbage(_, [], St) -> collectgarbage(nil, [<<"collect">>], St);
+ collectgarbage(_, [<<"collect">>|_], St) ->
+-    {[],luerl_heap:gc(St)};
 -    %% {[],St};					%No-op for the moment
-+collectgarbage(_, [<<"step">>,RawBudget|_], St) ->
++    case luerl_heap:gc_nested(St) of
++        true -> {[],luerl_heap:gc_defer(collect, St)};
++        false -> {[],luerl_heap:gc(St)}
++    end;
++collectgarbage(_, [<<"step">>|As], St) ->
 +    Budget =
-+        case luerl_lib:arg_to_integer(RawBudget) of
-+            N when is_integer(N), N > 0 -> N;
-+            _ -> 1000
++        case As of
++            [Raw|_] ->
++                case luerl_lib:arg_to_integer(Raw) of
++                    N when is_integer(N), N > 0 -> N;
++                    _ -> 1000
++                end;
++            [] -> 1000
 +        end,
-+    {Complete,NextSt} = luerl_heap:gc_step(Budget, St),
-+    {[Complete],NextSt};
-+collectgarbage(_, [<<"step">>|_], St) ->
-+    {Complete,NextSt} = luerl_heap:gc_step(1000, St),
-+    {[Complete],NextSt};
++    %% A deferred step cannot complete a cycle at this call.
++    case luerl_heap:gc_nested(St) of
++        true -> {[false],luerl_heap:gc_defer({step,Budget}, St)};
++        false ->
++            {Complete,NextSt} = luerl_heap:gc_step(Budget, St),
++            {[Complete],NextSt}
++    end;
 +collectgarbage(_, [<<"count">>|_], St) ->
 +    {[luerl_heap:gc_count(St)],St};
+ collectgarbage(_, _, St) ->			%Ignore everything else
+     {[],St}.
+ 

@@ -535,6 +535,50 @@ snapshot_is_compressed_and_deserializes_test() ->
     ?assertMatch(<<131, 80, _/binary>>, Body),
     ?assert(is_tuple(luerl:internalize(binary_to_term(Body)))).
 
+%% @doc Collection requested from Lua running under an Erlang function (pcall,
+%% sort and gsub callbacks, metamethods, `require', host callbacks) must not
+%% free the locals of the suspended outer frames, nor values only an iterator
+%% or vararg list holds. Every program returns `alice' when nothing is freed
+%% early; churn after the collection reuses any wrongly freed table slots.
+nested_collect_keeps_outer_values_test() ->
+    Churn = <<" Stash = {}; for i = 1, 60 do Stash[i] = {owner = 'mallory'} end ">>,
+    Mine = <<"local mine = {owner = 'alice'}; ">>,
+    Programs = [
+        {pcall_step, [Mine, <<"for i = 1, 300 do pcall(function() collectgarbage('step', 3) end) end;">>, Churn, <<"return mine.owner">>]},
+        {pcall_collect, [Mine, <<"pcall(collectgarbage, 'collect');">>, Churn, <<"return mine.owner">>]},
+        {host_collect, [Mine, <<"host(function() collectgarbage('collect') end);">>, Churn, <<"return mine.owner">>]},
+        {host_step, [Mine, <<"for i = 1, 300 do host(function() collectgarbage('step', 2) end) end;">>, Churn, <<"return mine.owner">>]},
+        {sort, [Mine, <<"local t = {3, 1, 2}; table.sort(t, function(a, b) collectgarbage('collect'); return a < b end);">>, Churn, <<"return mine.owner .. table.concat(t) == 'alice123' and 'alice'">>]},
+        {sort_temporary, [<<"table.sort({{v = 2}, {v = 1}, {v = 3}}, function(a, b) collectgarbage('collect'); return a.v < b.v end);">>, Churn, <<"return 'alice'">>]},
+        {gsub, [Mine, <<"local s = string.gsub('abc', '%w', function(c) collectgarbage('collect'); return c end);">>, Churn, <<"return s == 'abc' and mine.owner">>]},
+        {eq_metamethod, [Mine, <<"local mt = {__eq = function() collectgarbage('collect'); return true end}; local e = setmetatable({}, mt) == setmetatable({}, mt);">>, Churn, <<"return e and mine.owner">>]},
+        {require, [Mine, <<"package.preload.m = function() collectgarbage('collect'); return {} end; require('m');">>, Churn, <<"return mine.owner">>]},
+        {for_iterator_state, [<<"local s = ''; for _, v in ipairs({{x = 'al'}, {x = 'ice'}}) do collectgarbage('collect');">>, Churn, <<"s = s .. v.x end; return s">>]},
+        {varargs, [<<"local function f(...) collectgarbage('collect');">>, Churn, <<"local a = ...; return a.owner end; return f({owner = 'alice'})">>]},
+        {returned_table, [<<"local function g() local t = {owner = 'alice'}; pcall(collectgarbage, 'collect'); return t end; local t = g();">>, Churn, <<"return t.owner">>]}
+    ],
+    {ok, State} =
+        luerl:set_table_keys_dec(
+            [host],
+            fun([F], St) ->
+                {ok, _, St1} = luerl:call_function(F, [], St),
+                {[], St1}
+            end,
+            luerl:init()
+        ),
+    lists:foreach(
+        fun({Name, Program}) ->
+            Result =
+                try luerl:do_dec(iolist_to_binary(Program), State) of
+                    {ok, [Value], _} -> Value;
+                    Other -> {unexpected, element(1, Other)}
+                catch Class:Reason -> {Class, element(1, Reason)}
+                end,
+            ?assertEqual({Name, <<"alice">>}, {Name, Result})
+        end,
+        Programs
+    ).
+
 simple_invocation_test() ->
     {ok, Script} = file:read_file("test/test.lua"),
     Base = #{
