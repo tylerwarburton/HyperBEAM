@@ -462,8 +462,10 @@ snapshot_restore_continuity_test() ->
     ?assertEqual(<<"6">>, hb_ao:get(<<"count">>, State6, Opts)),
     ?assertEqual(<<"6">>, hb_ao:get(<<"results/output/data">>, State6, Opts)).
 
-%% @doc Snapshots discard garbage while keeping closures, aliases and cycles.
-snapshot_collects_unreachable_tables_test() ->
+%% @doc Snapshots keep closures, aliases and cycles. They do not collect: a
+%% restored VM must hold exactly the live heap, or it diverges from the live
+%% VM in table ids and table-keyed iteration order.
+snapshot_restores_live_heap_test() ->
     hb:init(),
     Opts = #{ <<"hashpath">> => ignore },
     Script = <<
@@ -482,12 +484,7 @@ snapshot_collects_unreachable_tables_test() ->
         "end"
     >>,
     {ok, Live} = hb_ao:resolve(base(<<"lua@5.3b">>, Script), request(1), Opts),
-    Heap = hb_private:get(<<"state">>, Live, Opts),
-    Before = erlang:external_size(luerl:externalize(Heap)),
     {ok, Snapshot} = hb_ao:resolve(Live, <<"snapshot">>, Opts),
-    Body = hb_ao:get(<<"body">>, Snapshot, Opts),
-    After = erlang:external_size(binary_to_term(Body)),
-    ?assert(After * 2 < Before),
     Cold = hb_ao:set(hb_private:reset(Live), <<"snapshot">>, Snapshot, Opts),
     {ok, Restored} = hb_ao:resolve(Cold, <<"normalize">>, Opts),
     {ok, Next} = hb_ao:resolve(Restored, request(2), Opts),
@@ -958,7 +955,7 @@ wait_for_worker(Group, Tries) ->
 
 %% @doc Luerl's `step' collector advances a real multi-call mark cycle while
 %% allocations and reachable mutations continue between steps. Externalizing
-%% a pending VM safely cancels its heap snapshot instead of serializing it.
+%% a pending VM keeps its cycle, so a restored VM steps exactly like the live one.
 incremental_gc_step_test() ->
     Script = <<
         "Kept = {}\n"
@@ -979,10 +976,6 @@ incremental_gc_step_test() ->
     {ok, [false, Next, Next], Pending} =
         luerl:call_function_dec([<<"stepper">>], [1], State3),
     External = luerl:externalize(Pending),
-    ?assertError(
-        {badkey, luerl_gc_step_cycle},
-        luerl:get_private(luerl_gc_step_cycle, External)
-    ),
     Restored = luerl:internalize(External),
     {ok, [true, AfterRestore, AfterRestore], _} =
         luerl:call_function_dec([<<"stepper">>], [1000000], Restored),
