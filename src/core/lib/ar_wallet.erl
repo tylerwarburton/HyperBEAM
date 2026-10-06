@@ -14,7 +14,9 @@
 -define(WALLET_DIR, ".").
 -define(WALLET_POOL_TARGET, 6).
 -define(CRT_TABLE, ar_wallet_crt_params).
+-define(CRT_OWNER, ar_wallet_crt_owner).
 -define(CRT_TABLE_LIMIT, 64).
+-define(CRT_IMPORTED_LIMIT, 32).
 
 %%% Public interface.
 
@@ -37,7 +39,7 @@ new_ecdsa() ->
 generate_wallet(KeyType = {KeyAlg, PublicExpnt}) when KeyType =:= {rsa, 65537} ->
     {[_, Pub], [_, Pub, Priv, P1, P2, E1, E2, C]} =
         crypto:generate_key(KeyAlg, {4096, PublicExpnt}),
-    remember_crt_params(Pub, {P1, P2, E1, E2, C}),
+    remember_crt_params(Pub, Priv, {P1, P2, E1, E2, C}, local),
     {{KeyType, Priv, Pub}, {KeyType, Pub}};
 generate_wallet(KeyType = {KeyAlg, KeyCrv}) when KeyAlg =:= ?ECDSA_SIGN_ALG andalso KeyCrv =:= secp256k1 ->
     {OrigPub, Priv} = crypto:generate_key(ecdh, KeyCrv),
@@ -219,7 +221,7 @@ new_keyfile(KeyType, WalletName) ->
             {?RSA_SIGN_ALG, PublicExpnt} ->
                 {[Expnt, Pb], [Expnt, Pb, Prv, P1, P2, E1, E2, C]} =
                     crypto:generate_key(rsa, {?RSA_PRIV_KEY_SZ, PublicExpnt}),
-                remember_crt_params(Pb, {P1, P2, E1, E2, C}),
+                remember_crt_params(Pb, Prv, {P1, P2, E1, E2, C}, local),
                 PrivKey = {KeyType, Prv, Pb},
                 Ky = to_json(PrivKey),
                 {Pb, Prv, Ky};
@@ -282,7 +284,7 @@ load_keyfile(File) ->
 %% @doc Extract the public and private key from a keyfile.
 load_keyfile(File, Opts) ->
     {ok, Body} = file:read_file(File),
-    from_json(Body, Opts).
+    from_json(Body, Opts, local).
 
 %% @doc Convert a wallet private key to JSON (JWK) format
 to_json({PrivKey, _PubKey}) ->
@@ -317,8 +319,13 @@ to_json({{?EDDSA_SIGN_ALG, ed25519}, Priv, Pub}) ->
 from_json(JsonBinary) ->
     from_json(JsonBinary, #{}).
 
-%% @doc Parse a wallet from JSON (JWK) format with options
+%% @doc Parse a wallet from JSON (JWK) format with options. The key may have
+%% been supplied by a caller, so it shares a smaller part of the CRT parameter
+%% table than keys the node generates or loads from its own keyfiles.
 from_json(JsonBinary, Opts) ->
+    from_json(JsonBinary, Opts, imported).
+
+from_json(JsonBinary, Opts, Origin) ->
     Key = hb_json:decode(JsonBinary),
     {Pub, Priv, KeyType} =
         case hb_maps:get(<<"kty">>, Key, undefined, Opts) of
@@ -345,7 +352,7 @@ from_json(JsonBinary, Opts) ->
                 Pb = hb_util:decode(PubEncoded),
                 Prv = hb_util:decode(PrivEncoded),
                 KyType = {?RSA_SIGN_ALG, 65537},
-                remember_jwk_crt_params(Pb, Key, Opts),
+                remember_jwk_crt_params(Pb, Prv, Key, Origin, Opts),
                 {Pb, Prv, KyType}
         end,
     {{KeyType, Priv, Pub}, {KeyType, Pub}}.
@@ -406,13 +413,15 @@ compress_ecdsa_pubkey(<<4:8, PubPoint/binary>>) ->
 %% before returning it, so a key without them signs more slowly but never less
 %% correctly.
 rsa_private_key(PublicExpnt, Priv, Pub) ->
+    Modulus = binary:decode_unsigned(Pub),
+    PrivExpnt = binary:decode_unsigned(Priv),
     Base =
         #'RSAPrivateKey'{
             publicExponent = PublicExpnt,
-            modulus = binary:decode_unsigned(Pub),
-            privateExponent = binary:decode_unsigned(Priv)
+            modulus = Modulus,
+            privateExponent = PrivExpnt
         },
-    case crt_params(Pub) of
+    case crt_params(Modulus, PrivExpnt) of
         not_found ->
             Base;
         {P, Q, DP, DQ, QInv} ->
@@ -425,35 +434,35 @@ rsa_private_key(PublicExpnt, Priv, Pub) ->
             }
     end.
 
-%% @doc Record the Chinese Remainder Theorem parameters of an RSA key against
-%% its modulus, given as the binaries that `crypto' and JWK fields both provide.
-%% These are secret key material: they stay in memory for the lifetime of the
-%% node and must never reach the AO-Core store, so they are held beside it
-%% rather than in it. A pair of primes that does not multiply to the modulus
-%% belongs to a different key and is refused. The table is bounded because
-%% `from_json/2' also parses keys supplied by callers, and a node registers its
-%% own key when it loads it at startup, ahead of any of those.
-remember_crt_params(Pub, {P, Q, DP, DQ, QInv}) ->
+%% @doc Record the Chinese Remainder Theorem parameters of an RSA key, given as
+%% the binaries that `crypto' and JWK fields both provide. These are secret key
+%% material: they stay in memory for the lifetime of the node and must never
+%% reach the AO-Core store, so they are held beside it rather than in it.
+%%
+%% `from_json/2' also parses keys supplied by callers, so nothing here may let
+%% one key's entry influence another's signing. Entries are found by the
+%% modulus together with the private exponent, which only a holder of the key
+%% knows; the table owner refuses any set that is not exactly the key's own
+%% (see `valid_crt_params/3') and never replaces an entry. `Origin' is `local'
+%% for keys the node generates or reads from its keyfiles and `imported' for
+%% keys parsed from caller JSON, which may hold at most half of the table, so a
+%% flood of valid imported keys cannot crowd out the node's own.
+remember_crt_params(Pub, Priv, {P, Q, DP, DQ, QInv}, Origin) ->
     Params =
         list_to_tuple(
             [ crypto:bytes_to_integer(Param) || Param <- [P, Q, DP, DQ, QInv] ]
         ),
     Modulus = binary:decode_unsigned(Pub),
-    case element(1, Params) * element(2, Params) =:= Modulus of
-        true ->
-            ensure_crt_table(),
-            case ets:info(?CRT_TABLE, size) < ?CRT_TABLE_LIMIT of
-                true -> ets:insert(?CRT_TABLE, {key_id(Pub), Params}), ok;
-                false -> ok
-            end;
-        false ->
-            ok
+    PrivExpnt = binary:decode_unsigned(Priv),
+    case valid_crt_params(Modulus, PrivExpnt, Params) of
+        true -> call_crt_owner({remember, Modulus, PrivExpnt, Params, Origin});
+        false -> ok
     end.
 
 %% @doc Record the Chinese Remainder Theorem parameters of a JWK RSA private
 %% key, if it carries the complete set that RFC 7518 section 6.3.2 defines. A
 %% key that omits any of them signs through the full-modulus path.
-remember_jwk_crt_params(Pub, Key, Opts) ->
+remember_jwk_crt_params(Pub, Priv, Key, Origin, Opts) ->
     Encoded =
         [
             hb_maps:get(Field, Key, undefined, Opts)
@@ -466,41 +475,85 @@ remember_jwk_crt_params(Pub, Key, Opts) ->
         false ->
             remember_crt_params(
                 Pub,
-                list_to_tuple([ hb_util:decode(Param) || Param <- Encoded ])
+                Priv,
+                list_to_tuple([ hb_util:decode(Param) || Param <- Encoded ]),
+                Origin
             )
     end.
 
-%% @doc Look up the Chinese Remainder Theorem parameters held for a modulus.
+%% @doc A set of CRT parameters is accepted only if it is exactly the one that
+%% the modulus and private exponent determine: two factors of the modulus, the
+%% private exponent reduced by each less one, and the inverse of the second
+%% factor modulo the first. Every value is then smaller than the modulus, so
+%% no accepted set can make a signature cost more than the full-modulus path.
+valid_crt_params(N, D, {P, Q, DP, DQ, QInv}) ->
+    is_integer(N) andalso is_integer(D) andalso D > 0
+        andalso P > 1 andalso Q > 1
+        andalso P * Q =:= N
+        andalso DP =:= D rem (P - 1)
+        andalso DQ =:= D rem (Q - 1)
+        andalso QInv > 0 andalso QInv < P
+        andalso (QInv * Q) rem P =:= 1;
+valid_crt_params(_, _, _) ->
+    false.
+
+%% @doc Look up the Chinese Remainder Theorem parameters held for a key.
 %% Returns `not_found' when the key was built without them, or before any key
 %% has registered any, in which case signing takes the full-modulus path.
-crt_params(Pub) ->
-    try ets:lookup(?CRT_TABLE, key_id(Pub)) of
-        [{_, Params}] -> Params;
+crt_params(Modulus, PrivExpnt) ->
+    try ets:lookup(?CRT_TABLE, key_id(Modulus, PrivExpnt)) of
+        [{_, Params, _Origin}] -> Params;
         [] -> not_found
     catch
         error:badarg -> not_found
     end.
 
-%% @doc Identify a key by its modulus, without holding the modulus as a key.
-key_id(Pub) ->
-    crypto:hash(sha256, Pub).
+%% @doc Identify a key by its modulus and private exponent, without holding
+%% either as a table key. The modulus is public, so it alone would let anyone
+%% address the entry of any key.
+key_id(Modulus, PrivExpnt) ->
+    NBin = binary:encode_unsigned(Modulus),
+    crypto:hash(
+        sha256,
+        [<<(byte_size(NBin)):32>>, NBin, binary:encode_unsigned(PrivExpnt)]
+    ).
 
-%% @doc The table is owned by a process that never exits: a table dies with its
-%% owner, and the first caller is usually a short-lived request.
-ensure_crt_table() ->
-    case ets:whereis(?CRT_TABLE) of
+%% @doc Send a request to the table owner and wait for its reply. A request
+%% that cannot be answered leaves the key on the full-modulus path.
+call_crt_owner(Request) ->
+    Owner = ensure_crt_owner(),
+    Mon = erlang:monitor(process, Owner),
+    Owner ! {Request, self(), Mon},
+    receive
+        {Mon, Reply} ->
+            erlang:demonitor(Mon, [flush]),
+            Reply;
+        {'DOWN', Mon, process, _, _} ->
+            ok
+    after 5000 ->
+        erlang:demonitor(Mon, [flush]),
+        ok
+    end.
+
+%% @doc The table is `protected': every process may read it, but only its
+%% owner writes, and the owner checks each set itself, so no other process can
+%% place parameters in it. The owner never exits, because a table dies with its
+%% owner and the first caller is usually a short-lived request.
+ensure_crt_owner() ->
+    case whereis(?CRT_OWNER) of
         undefined ->
             Parent = self(),
             Ref = make_ref(),
             {Owner, Mon} =
                 spawn_monitor(
                     fun() ->
-                        try ets:new(?CRT_TABLE,
-                                [named_table, public, set,
-                                    {read_concurrency, true}]) of
-                            _ ->
+                        try register(?CRT_OWNER, self()) of
+                            true ->
+                                ets:new(?CRT_TABLE,
+                                    [named_table, protected, set,
+                                        {read_concurrency, true}]),
                                 Parent ! {Ref, created},
-                                receive after infinity -> ok end
+                                crt_owner_loop(0)
                         catch error:badarg -> Parent ! {Ref, exists}
                         end
                     end
@@ -511,8 +564,38 @@ ensure_crt_table() ->
             after 5000 -> ok
             end,
             erlang:demonitor(Mon, [flush]),
-            ok;
-        _ -> ok
+            case whereis(?CRT_OWNER) of
+                undefined -> Owner;
+                Registered -> Registered
+            end;
+        Owner -> Owner
+    end.
+
+%% @doc Serve writes to the table, counting the entries that came from
+%% imported keys.
+crt_owner_loop(Imported) ->
+    receive
+        {{remember, N, D, Params, Origin}, From, Ref} ->
+            {Reply, NewImported} = crt_owner_remember(N, D, Params, Origin, Imported),
+            From ! {Ref, Reply},
+            crt_owner_loop(NewImported);
+        _ ->
+            crt_owner_loop(Imported)
+    end.
+
+crt_owner_remember(N, D, Params, Origin, Imported) ->
+    HasRoom =
+        ets:info(?CRT_TABLE, size) < ?CRT_TABLE_LIMIT andalso
+            (Origin =:= local orelse Imported < ?CRT_IMPORTED_LIMIT),
+    case HasRoom andalso valid_crt_params(N, D, Params) of
+        false ->
+            {ok, Imported};
+        true ->
+            Entry = {key_id(N, D), Params, Origin},
+            case ets:insert_new(?CRT_TABLE, Entry) of
+                true when Origin =:= imported -> {ok, Imported + 1};
+                _ -> {ok, Imported}
+            end
     end.
 
 %%%===================================================================
@@ -526,8 +609,38 @@ generate_test_key() ->
     {[_, N], [_, N, D, P, Q, DP, DQ, QInv]} =
         crypto:generate_key(rsa, {2048, 65537}),
     KeyType = {?RSA_SIGN_ALG, 65537},
-    remember_crt_params(N, {P, Q, DP, DQ, QInv}),
+    remember_crt_params(N, D, {P, Q, DP, DQ, QInv}, local),
     {{{KeyType, D, N}, {KeyType, N}}, {P, Q, DP, DQ, QInv}}.
+
+%% @doc A JWK for an RSA key, with the given CRT fields beside `n' and `d'.
+test_jwk(N, D, CRT) ->
+    hb_json:encode(
+        maps:merge(
+            #{
+                <<"kty">> => <<"RSA">>,
+                <<"e">> => <<"AQAB">>,
+                <<"n">> => hb_util:encode(N),
+                <<"d">> => hb_util:encode(D)
+            },
+            maps:map(fun(_, V) -> hb_util:encode(V) end, CRT)
+        )
+    ).
+
+%% @doc A freshly generated RSA key as a complete JWK, with its raw parts.
+full_test_jwk(Bits) ->
+    {[_, N], [_, N, D, P, Q, DP, DQ, QInv]} =
+        crypto:generate_key(rsa, {Bits, 65537}),
+    CRT =
+        #{
+            <<"p">> => P, <<"q">> => Q, <<"dp">> => DP,
+            <<"dq">> => DQ, <<"qi">> => QInv
+        },
+    {test_jwk(N, D, CRT), N, D, CRT}.
+
+%% @doc The median time, in microseconds, of `Count' runs of `Fun'.
+median_us(Fun, Count) ->
+    Times = [ element(1, timer:tc(Fun)) || _ <- lists:seq(1, Count) ],
+    lists:nth((Count + 1) div 2, lists:sort(Times)).
 
 %% @doc A key that carries its CRT parameters produces a signature that verifies
 %% against its public key.
@@ -557,23 +670,38 @@ crt_matches_full_modulus_test() ->
     ).
 
 %% @doc A CRT parameter that does not hold yields a signature the public
-%% exponent rejects, so signing falls back to the full modulus, still correct.
+%% exponent rejects, so `rsa_pss' falls back to the full modulus, still
+%% correct. The table refuses such a set, so the record is built directly.
 crt_fallback_on_bad_parameter_test() ->
-    {{PrivKey, PubKey}, {P, Q, DP, DQ, QInv}} = generate_test_key(),
-    {_, _, PubBin} = PrivKey,
-    % The primes still multiply to the modulus, so these are accepted, but the
-    % exchanged exponents produce the wrong residue for each prime.
-    remember_crt_params(PubBin, {P, Q, DQ, DP, QInv}),
+    {[_, N], [_, N, D, P, Q, DP, DQ, QInv]} =
+        crypto:generate_key(rsa, {2048, 65537}),
+    I = fun crypto:bytes_to_integer/1,
+    Key =
+        #'RSAPrivateKey'{
+            publicExponent = 65537,
+            modulus = I(N),
+            privateExponent = I(D),
+            prime1 = I(P),
+            prime2 = I(Q),
+            exponent1 = I(DQ),
+            exponent2 = I(DP),
+            coefficient = I(QInv)
+        },
     Data = crypto:strong_rand_bytes(256),
-    ?assert(verify(PubKey, Data, sign(PrivKey, Data))).
+    ?assert(verify({{?RSA_SIGN_ALG, 65537}, N}, Data,
+        rsa_pss:sign(Data, sha256, Key))).
 
 %% @doc Primes that do not multiply to the modulus belong to a different key and
 %% are refused, leaving that key to sign through the full modulus.
 mismatched_primes_refused_test() ->
     {_, {P, Q, DP, DQ, QInv}} = generate_test_key(),
-    {[_, OtherN], _} = crypto:generate_key(rsa, {2048, 65537}),
-    remember_crt_params(OtherN, {P, Q, DP, DQ, QInv}),
-    ?assertEqual(not_found, crt_params(OtherN)).
+    {[_, OtherN], [_, OtherN, OtherD | _]} =
+        crypto:generate_key(rsa, {2048, 65537}),
+    remember_crt_params(OtherN, OtherD, {P, Q, DP, DQ, QInv}, local),
+    ?assertEqual(
+        not_found,
+        crt_params(binary:decode_unsigned(OtherN), binary:decode_unsigned(OtherD))
+    ).
 
 %% @doc A JWK that omits any CRT field registers nothing for the key.
 partial_jwk_crt_params_refused_test() ->
@@ -588,5 +716,93 @@ partial_jwk_crt_params_refused_test() ->
             <<"dp">> => hb_util:encode(DP),
             <<"dq">> => hb_util:encode(DQ)
         },
-    remember_jwk_crt_params(N, Key, #{}),
-    ?assertEqual(not_found, crt_params(N)).
+    remember_jwk_crt_params(N, D, Key, imported, #{}),
+    ?assertEqual(
+        not_found,
+        crt_params(binary:decode_unsigned(N), binary:decode_unsigned(D))
+    ).
+
+%% @doc Every field of a CRT set is checked against the key: a set that differs
+%% from the key's own in any one of them is refused, even though the factors
+%% still multiply to the modulus.
+inconsistent_crt_params_refused_test() ->
+    {_, N, D, #{<<"p">> := P, <<"q">> := Q, <<"dp">> := DP, <<"dq">> := DQ,
+        <<"qi">> := QInv}} = full_test_jwk(2048),
+    One = <<1>>,
+    Bad =
+        [
+            {DQ, DP, QInv},
+            {DP, DQ, One},
+            {DP, crypto:strong_rand_bytes(300), QInv},
+            {<<(crypto:bytes_to_integer(DP) + crypto:bytes_to_integer(P) - 1):2048>>,
+                DQ, QInv}
+        ],
+    lists:foreach(
+        fun({BDP, BDQ, BQI}) ->
+            remember_crt_params(N, D, {P, Q, BDP, BDQ, BQI}, local),
+            ?assertEqual(
+                not_found,
+                crt_params(binary:decode_unsigned(N), binary:decode_unsigned(D))
+            )
+        end,
+        Bad
+    ),
+    remember_crt_params(N, D, {One, N, One, One, One}, local),
+    ?assertEqual(
+        not_found,
+        crt_params(binary:decode_unsigned(N), binary:decode_unsigned(D))
+    ).
+
+%% @doc A caller-supplied JWK naming another key's modulus cannot change how
+%% that key signs. The hostile set (factors 1 and the modulus, a huge second
+%% exponent) used to replace the key's entry, so that every later signature ran
+%% a long exponentiation, failed its check and was then computed again.
+hostile_jwk_cannot_replace_crt_params_test() ->
+    {JWK, N, _D, _} = full_test_jwk(2048),
+    {Priv, Pub} = from_json(JWK),
+    SignVerify =
+        fun() ->
+            Sig = sign(Priv, <<"x">>),
+            true = verify(Pub, <<"x">>, Sig)
+        end,
+    Before = median_us(SignVerify, 9),
+    Hostile =
+        test_jwk(N, <<1>>,
+            #{
+                <<"p">> => <<1>>, <<"q">> => N, <<"dp">> => <<1>>,
+                <<"dq">> => crypto:strong_rand_bytes(3000), <<"qi">> => <<1>>
+            }
+        ),
+    _ = from_json(Hostile),
+    After = median_us(SignVerify, 9),
+    ?assert(After < 3 * Before + 2000, {before_us, Before, after_us, After}).
+
+%% @doc Only the table's owner can write to it.
+crt_table_not_writable_by_callers_test() ->
+    {JWK, _, _, _} = full_test_jwk(2048),
+    _ = from_json(JWK),
+    ?assertError(badarg, ets:insert(?CRT_TABLE, {<<"id">>, {1, 1, 1, 1, 1}})).
+
+%% @doc Imported keys can fill at most half of the table, leaving the rest for
+%% the keys the node generates or loads from its own keyfiles.
+imported_keys_bounded_test_() ->
+    {timeout, 120, fun() ->
+        case ets:whereis(?CRT_TABLE) of
+            undefined -> ok;
+            _ ->
+                Owner = ets:info(?CRT_TABLE, owner),
+                Mon = erlang:monitor(process, Owner),
+                exit(Owner, kill),
+                receive {'DOWN', Mon, process, Owner, _} -> ok end
+        end,
+        lists:foreach(
+            fun(_) -> _ = from_json(element(1, full_test_jwk(1024))) end,
+            lists:seq(1, ?CRT_TABLE_LIMIT)
+        ),
+        ?assert(ets:info(?CRT_TABLE, size) =< ?CRT_TABLE_LIMIT div 2),
+        {{{_, D, N}, _}, _} = generate_test_key(),
+        ?assertNotEqual(
+            not_found,
+            crt_params(binary:decode_unsigned(N), binary:decode_unsigned(D))
+        )
+    end}.
