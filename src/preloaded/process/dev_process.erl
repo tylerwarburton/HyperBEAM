@@ -299,16 +299,22 @@ target_slot(Req, Opts) ->
         )
     ).
 
-%% @doc Return the slot a `compute' request asks for as a non-negative integer,
-%% `not_found' when it names none, or `{invalid, Raw}'.
+%% @doc Return the slot a `compute' request asks for as an integer of at least
+%% -1, `not_found' when it names none, or `{invalid, Raw}'.
 %%
 %% This is the one reading of a request's slot: `compute/3', the process
 %% worker, its grouper and its waiters all use it, so they cannot disagree on
 %% which slot a request means -- `compute' takes precedence over `slot', as in
-%% `target_slot/2'. A slot that is not an integer, or is negative, can never
-%% name an assignment; it is reported here instead of crashing `hb_util:int/1'
-%% or reaching `compute_to_slot/6', where a negative target rewinds to nothing
-%% and throws.
+%% `target_slot/2'. A slot that is not an integer, or is below -1, can never
+%% name a state; it is reported here instead of crashing `hb_util:int/1' or
+%% reaching `compute_to_slot/6', where such a target rewinds to nothing and
+%% throws.
+%%
+%% -1 is a real state: the initialized process before its first assignment
+%% (`init/3' sets `at-slot' to -1), and the `current' slot the scheduler
+%% reports for a process with no assignments yet. `now/3' asks for exactly
+%% that slot, so rejecting it answered every `now' on a fresh process with a
+%% 400 instead of its initial state.
 %%
 %% A request that carries its slot as a plain literal -- every HTTP `compute'
 %% does -- is read directly: resolving the keys through `message@1.0' costs
@@ -341,10 +347,10 @@ literal_slot(Req = #{ <<"slot">> := Slot })
 literal_slot(_) ->
     not_literal.
 
-parse_slot(Slot) when is_integer(Slot), Slot >= 0 -> Slot;
+parse_slot(Slot) when is_integer(Slot), Slot >= -1 -> Slot;
 parse_slot(Slot) when is_binary(Slot); is_list(Slot) ->
     try hb_util:int(Slot) of
-        Int when Int >= 0 -> Int;
+        Int when Int >= -1 -> Int;
         _ -> {invalid, Slot}
     catch error:badarg -> {invalid, Slot}
     end;
@@ -354,7 +360,7 @@ parse_slot(Slot) -> {invalid, Slot}.
 invalid_slot_error() ->
     #{
         <<"status">> => 400,
-        <<"body">> => <<"Invalid slot: expected a non-negative integer.">>
+        <<"body">> => <<"Invalid slot: expected an integer of at least -1.">>
     }.
 
 %% @doc Unwrap an HTTP typed-result map to the scalar it carries. Any other

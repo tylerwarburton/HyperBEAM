@@ -66,7 +66,7 @@ compute_cached(ProcID, not_found, Opts) ->
     end;
 compute_cached(ProcID, Slot, Opts) ->
     % `dev_process:request_slot/2' has already unwrapped and validated the
-    % slot, so it is a non-negative integer here. The `catch' stays as a
+    % slot, so it is an integer of at least -1 here. The `catch' stays as a
     % backstop: a cache read that fails means "not cached", and an uncomputed
     % slot is a queue, not a fault. (local patch over upstream edge.)
     case (catch dev_process_cache:read(ProcID, Slot, Opts)) of
@@ -204,7 +204,7 @@ live_base(Base) ->
     end.
 
 %% @doc Read the slot a request is asking for, as `dev_process:request_slot/2'
-%% does for `compute/3' and for the grouper: a non-negative integer, `Default'
+%% does for `compute/3' and for the grouper: an integer of at least -1, `Default'
 %% when the request names no slot, or `{invalid, Raw}'. One reading for the
 %% worker, its waiters and the grouper is what makes them agree: a request
 %% naming its slot as `compute=N' was grouped by N but served -- and matched
@@ -745,10 +745,81 @@ invalid_slot_is_rejected_test_() ->
                     ),
                 ?assertMatch({error, #{ <<"status">> := 400 }}, Res)
             end,
-            [<<"-2">>, -1, <<"abc">>]
+            [<<"-2">>, -2, <<"abc">>]
         ),
         ?assert(is_process_alive(Worker)),
         ?assertEqual(Worker, hb_name:lookup(Group))
+    end}.
+
+%% @doc Regression: slot -1 is the initialized state before the first
+%% assignment, not an invalid slot. A worker live at slot 2 answers it by
+%% rewinding, survives, and still computes onward afterwards.
+initial_slot_on_live_worker_test_() ->
+    {timeout, 120, fun() ->
+        {Process, Worker, Group, Opts} = worker_setup(),
+        lists:foreach(
+            fun(Slot) ->
+                {ok, Init} =
+                    bounded_resolve(
+                        Process,
+                        #{ <<"path">> => <<"compute">>, <<"slot">> => Slot },
+                        Opts
+                    ),
+                ?assertEqual(-1, hb_ao:get(<<"at-slot">>, Init, Opts))
+            end,
+            [-1, <<"-1">>]
+        ),
+        {ok, S3} =
+            bounded_resolve(
+                Process,
+                #{ <<"path">> => <<"compute">>, <<"slot">> => 3 },
+                Opts
+            ),
+        ?assertEqual(<<"4">>, hb_ao:get(<<"count">>, S3, Opts)),
+        ?assert(is_process_alive(Worker)),
+        ?assertEqual(Worker, hb_name:lookup(Group))
+    end}.
+
+%% @doc Regression: `now' on a process with no assignments asks `compute' for
+%% the scheduler's current slot, -1, and must be answered with the initialized
+%% state. Rejecting -1 as invalid made it a 400, so every read of a fresh
+%% process's state (a new ledger's balances, say) fell back to its default.
+now_on_unscheduled_process_test_() ->
+    {timeout, 60, fun() ->
+        test_init(),
+        Wallet = ar_wallet:new(),
+        Opts =
+            #{
+                <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+                <<"priv-wallet">> => Wallet
+            },
+        Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+        Process =
+            hb_message:commit(
+                #{
+                    <<"device">> => <<"process@1.0">>,
+                    <<"type">> => <<"Process">>,
+                    <<"scheduler-device">> => <<"scheduler@1.0">>,
+                    <<"execution-device">> => <<"lua@5.3b">>,
+                    <<"module">> =>
+                        #{
+                            <<"content-type">> => <<"application/lua">>,
+                            <<"body">> => counter_script()
+                        },
+                    <<"authority">> => [Address],
+                    <<"scheduler-location">> => Address,
+                    <<"initial">> => <<"value">>,
+                    <<"test-random-seed">> => rand:uniform(1000000)
+                },
+                Opts
+            ),
+        {ok, _} = hb_cache:write(Process, Opts),
+        {ok, Now} = bounded_resolve(Process, <<"now">>, Opts),
+        ?assertEqual(-1, hb_ao:get(<<"at-slot">>, Now, Opts)),
+        ?assertEqual(
+            <<"value">>,
+            hb_ao:get(<<"process/initial">>, Now, Opts)
+        )
     end}.
 
 %% @doc Regression: the worker survives any request delivered to it, whether
