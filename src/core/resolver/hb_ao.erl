@@ -450,6 +450,10 @@ resolve_stage(3, Base, Req, Opts) ->
     ),
     resolve_stage(4, Base, Req, Opts);
 resolve_stage(4, Base, Req, Opts) ->
+    persistent_lookup(Base, Req, Opts, 0).
+
+%% @doc Stage 4, carrying how many times the leader we waited on has died.
+persistent_lookup(Base, Req, Opts, LeaderDeaths) ->
     ?event_debug(debug_ao_core, {stage, 4, persistent_resolver_lookup}, Opts),
     % Persistent-resolver lookup: Search for local (or Distributed
     % Erlang cluster) processes that are already performing the execution.
@@ -474,8 +478,10 @@ resolve_stage(4, Base, Req, Opts) ->
                 {true, SpawnWorker, true, true} when SpawnWorker =/= false ->
                     ?event(worker_spawns, {will_delegate, ExecName}),
                     Worker = hb_persistent:start_worker(ExecName, Base, Opts),
-                    hb_persistent:forward_work(Worker, Opts),
-                    await_or_retry(Worker, ExecName, Base, Req, Opts);
+                    hb_persistent:forward_work(Worker, ExecName, Opts),
+                    await_or_retry(
+                        Worker, ExecName, Base, Req, Opts, LeaderDeaths
+                    );
                 _ ->
                     resolve_stage(5, Base, Req, ExecName, Opts)
             end;
@@ -483,7 +489,7 @@ resolve_stage(4, Base, Req, Opts) ->
             % There is another executor of this resolution in-flight.
             % Bail execution, register to receive the response, then
             % wait.
-            await_or_retry(Leader, GroupName, Base, Req, Opts);
+            await_or_retry(Leader, GroupName, Base, Req, Opts, LeaderDeaths);
         {infinite_recursion, GroupName} ->
             % We are the leader for this resolution, but we executing the 
             % computation again. This may plausibly be OK in _some_ cases,
@@ -515,23 +521,49 @@ resolve_stage(4, Base, Req, Opts) ->
 %% so it returns directly to the outer wrapper. `GroupName' is the name the
 %% owner is registered under, carried from the lookup above: it is the only
 %% name that worker's `receive' can match.
-await_or_retry(Worker, GroupName, Base, Req, Opts) ->
+%%
+%% Re-election is bounded. A leader that dies on a request that crashes it
+%% deterministically dies again under every new leader, and each round of an
+%% unbounded retry spawned a fresh worker, sent it the same request and lost
+%% its live state -- while the requester never returned. After
+%% `leader-died-retries' re-elections the caller gets an error instead.
+await_or_retry(Worker, GroupName, Base, Req, Opts, LeaderDeaths) ->
     case hb_persistent:await(Worker, GroupName, Base, Req, Opts) of
         {error, leader_died} ->
             ?event(
                 ao_core,
                 {leader_died_during_wait,
                     {leader, Worker},
+                    {deaths, LeaderDeaths + 1},
                     {base, Base},
                     {req, Req},
                     {opts, Opts}
                 },
                 Opts
             ),
-            resolve_stage(4, Base, Req, Opts);
+            case LeaderDeaths < hb_opts:get(leader_died_retries, 2, Opts) of
+                true -> persistent_lookup(Base, Req, Opts, LeaderDeaths + 1);
+                false -> error_leader_died(GroupName, LeaderDeaths + 1, Opts)
+            end;
         Res ->
             Res
     end.
+
+%% @doc The error returned when every leader we waited on died.
+error_leader_died(GroupName, Deaths, Opts) ->
+    ?event(
+        ao_core,
+        {error, {type, leader_died}, {group, GroupName}, {deaths, Deaths}},
+        Opts
+    ),
+    {
+        error,
+        #{
+            <<"status">> => 500,
+            <<"body">> =>
+                <<"The executor for this request died repeatedly.">>
+        }
+    }.
 
 resolve_stage(5, Base, Req, ExecName, Opts) ->
     ?event_debug(debug_ao_core, {stage, 5, device_lookup}, Opts),
@@ -788,7 +820,7 @@ resolve_stage(12, _Base, _Req, {ok, Res} = FullRes, ExecName, Opts) ->
         {true, true, SpawnWorker} when SpawnWorker =/= false ->
             % Spawn a worker for the current execution
             WorkerPID = hb_persistent:start_worker(ExecName, Res, Opts),
-            hb_persistent:forward_work(WorkerPID, Opts),
+            hb_persistent:forward_work(WorkerPID, ExecName, Opts),
             FullRes;
         _ ->
             FullRes

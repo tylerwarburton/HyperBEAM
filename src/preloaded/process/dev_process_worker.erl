@@ -7,6 +7,11 @@
 -include_lib("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
+%% Request keys a delegated `compute' carries to the worker's resolution.
+-define(CARRIED_KEYS,
+    [<<"push">>, <<"max-depth">>, <<"result-depth">>, <<"async">>, <<"init">>]
+).
+
 %% @doc Return a group name for a request. Cached compute reads run
 %% ungrouped; uncached compute work groups by process ID; everything
 %% else uses the default grouper.
@@ -26,9 +31,19 @@ group(Base, Req, Opts) ->
 %% reads bypass the per-process queue via `ungrouped_exec'; everything
 %% else is serialised through the worker keyed on the process ID.
 compute_group(Base, Req, Opts) ->
+    case dev_process:request_slot(Req, slot_read_opts(Opts)) of
+        {invalid, _} ->
+            % A slot that cannot name an assignment is answered with an error
+            % by `dev_process:compute/3' in the requester itself. It never
+            % joins the process's queue, so it can never reach -- or harm --
+            % the worker holding the live state.
+            ungrouped_exec;
+        TargetSlot ->
+            compute_group(Base, Req, TargetSlot, Opts)
+    end.
+
+compute_group(Base, Req, TargetSlot, Opts) ->
     ProcID = process_to_group_name(Base, Opts),
-    TargetSlot =
-        slot_number(dev_process:target_slot(Req, slot_read_opts(Opts))),
     case compute_cached(ProcID, TargetSlot, Opts) of
         true ->
             ?event(worker,
@@ -49,16 +64,12 @@ compute_cached(ProcID, not_found, Opts) ->
         {ok, _Slot, _Msg} -> true;
         _ -> false
     end;
-compute_cached(ProcID, RawSlot, Opts) ->
-    % `dev_process:target_slot/2' has already unwrapped any HTTP-wrapped
-    % typed-result map, so RawSlot is a scalar by the time it reaches here and
-    % this function needs no unwrapper of its own -- the same shape being
-    % handled in one place and not the other IS the defect this patch fixes,
-    % and a second local implementation is how it survived the first attempt.
-    % The `catch' stays as a backstop: a value that still won't coerce means
-    % "not cached", and an uncomputed slot is a queue, not a fault.
-    % (local patch over upstream edge.)
-    case (catch dev_process_cache:read(ProcID, hb_util:int(RawSlot), Opts)) of
+compute_cached(ProcID, Slot, Opts) ->
+    % `dev_process:request_slot/2' has already unwrapped and validated the
+    % slot, so it is a non-negative integer here. The `catch' stays as a
+    % backstop: a cache read that fails means "not cached", and an uncomputed
+    % slot is a queue, not a fault. (local patch over upstream edge.)
+    case (catch dev_process_cache:read(ProcID, Slot, Opts)) of
         {ok, _Msg} -> true;
         _ -> false
     end.
@@ -103,9 +114,10 @@ server(GroupName, RawBase, Opts) ->
                 }
             ),
             Res =
-                hb_ao:resolve(
+                execute(
                     Base,
-                    #{ <<"path">> => <<"compute">>, <<"slot">> => TargetSlot },
+                    Req,
+                    TargetSlot,
                     hb_maps:merge(ListenerOpts, ServerOpts, Opts)
                 ),
             ?event(worker, {work_done, {group, GroupName}, {req, Req}, {res, Res}}),
@@ -124,6 +136,50 @@ server(GroupName, RawBase, Opts) ->
         ),
         % Return the current process state.
         {ok, Base}
+    end.
+
+%% @doc Execute one request against the worker's live state.
+%%
+%% The request is rebuilt around the slot `read_slot/3' found, so the worker
+%% computes the slot its waiter is matching on, whichever key named it. The
+%% keys that steer `dev_process' beyond the slot -- `push' and the options the
+%% push it triggers inherits, and `init' -- are carried across, so a delegated
+%% compute behaves as one run in the requester would.
+%%
+%% Nothing a request does may take the worker down: its death loses the live
+%% state, and the next request pays a snapshot restore plus a replay of every
+%% slot since. A request that raises is answered with an error and the worker
+%% keeps the state it had before the request (`next_base/2'), as it already
+%% does for a request that returns one.
+execute(Base, Req, TargetSlot, ExecOpts) ->
+    Carried = hb_maps:with(?CARRIED_KEYS, Req, ExecOpts),
+    WorkReq =
+        case TargetSlot of
+            not_found -> Carried#{ <<"path">> => <<"compute">> };
+            {invalid, Raw} ->
+                Carried#{ <<"path">> => <<"compute">>, <<"slot">> => Raw };
+            Slot -> Carried#{ <<"path">> => <<"compute">>, <<"slot">> => Slot }
+        end,
+    try hb_ao:resolve(Base, WorkReq, ExecOpts)
+    catch
+        throw:{error, Reason} ->
+            ?event(worker, {request_failed, {slot, TargetSlot}, {error, Reason}}),
+            {error, Reason};
+        Class:Reason:Stacktrace ->
+            ?event(worker,
+                {request_crashed,
+                    {slot, TargetSlot},
+                    {class, Class},
+                    {reason, Reason},
+                    {stacktrace, Stacktrace}
+                }
+            ),
+            {error,
+                #{
+                    <<"status">> => 500,
+                    <<"body">> => <<"Process worker failed to compute request.">>
+                }
+            }
     end.
 
 %% @doc Choose the state the worker continues from after a request. A request
@@ -147,9 +203,17 @@ live_base(Base) ->
         false -> Base
     end.
 
-%% @doc Read the slot a request is asking for, as an INTEGER.
+%% @doc Read the slot a request is asking for, as `dev_process:request_slot/2'
+%% does for `compute/3' and for the grouper: a non-negative integer, `Default'
+%% when the request names no slot, or `{invalid, Raw}'. One reading for the
+%% worker, its waiters and the grouper is what makes them agree: a request
+%% naming its slot as `compute=N' was grouped by N but served -- and matched
+%% by its waiter -- as though it named none, answering with the latest state.
 read_slot(Req, Default, Opts) ->
-    slot_number(hb_ao:get(<<"slot">>, Req, Default, slot_read_opts(Opts))).
+    case dev_process:request_slot(Req, slot_read_opts(Opts)) of
+        not_found -> Default;
+        Slot -> Slot
+    end.
 
 %% @doc The options to read a slot out of a request under.
 %%
@@ -170,26 +234,6 @@ read_slot(Req, Default, Opts) ->
 %% read that found a live worker into a 500.
 slot_read_opts(Opts) ->
     Opts#{ <<"force-message">> => false }.
-
-%% @doc Narrow a slot to the integer `dev_process' stores and compares it as.
-%%
-%% The type matters as much as the unwrapping: a slot arrives from HTTP as a
-%% binary, `dev_process' counts in integers, and `<<"9">> == 9' is false -- so
-%% a worker that notified `{slot, <<"9">>}' would be ignored by a waiter
-%% matching `RecvdSlot == 9', which would then block until the worker died.
-%%
-%% `not_found' and `any' are the two callers' defaults and pass through: they
-%% mean "no slot was asked for", which is a real request shape (`compute' with
-%% no slot serves the latest state).
-%%
-%% The map clause is kept even though this fork's `dev_process:target_slot/2'
-%% already unwraps one: `read_slot/3' reads a request directly through
-%% `hb_ao:get/4' and never passes through that unwrapper at all.
-slot_number(not_found) -> not_found;
-slot_number(any) -> any;
-slot_number(#{ <<"ao-result">> := <<"body">>, <<"body">> := Literal }) ->
-    slot_number(Literal);
-slot_number(Slot) -> hb_util:int(Slot).
 
 %% @doc Await a resolution from a worker executing the `process@1.0' device.
 await(Worker, GroupName, Base, Req, Opts) ->
@@ -242,14 +286,25 @@ notify_compute(GroupName, SlotToNotify, Res, Opts, Count) ->
     % receive so the selective match covers each. A request for any OTHER slot
     % has to stay in the mailbox, which is why this is a guard on a selective
     % receive and not a test after the fact.
+    %
+    % `compute' names the slot ahead of `slot' (`dev_process:request_slot/2'),
+    % so a request is matched on `slot' only when it has no `compute', and is
+    % a request for the latest state only when it has neither.
     BinSlotToNotify = hb_util:bin(SlotToNotify),
     receive
-        {resolve, Listener, GroupName, #{ <<"slot">> := Slot }, _ListenerOpts}
+        {resolve, Listener, GroupName, #{ <<"compute">> := Slot }, _ListenerOpts}
                 when Slot =:= SlotToNotify; Slot =:= BinSlotToNotify ->
             send_notification(Listener, GroupName, SlotToNotify, Res),
             notify_compute(GroupName, SlotToNotify, Res, Opts, Count + 1);
+        {resolve, Listener, GroupName, Msg = #{ <<"slot">> := Slot }, _ListenerOpts}
+                when (Slot =:= SlotToNotify orelse Slot =:= BinSlotToNotify)
+                    andalso not is_map_key(<<"compute">>, Msg) ->
+            send_notification(Listener, GroupName, SlotToNotify, Res),
+            notify_compute(GroupName, SlotToNotify, Res, Opts, Count + 1);
         {resolve, Listener, GroupName, Msg, _ListenerOpts}
-                when is_map(Msg) andalso not is_map_key(<<"slot">>, Msg) ->
+                when is_map(Msg)
+                    andalso not is_map_key(<<"slot">>, Msg)
+                    andalso not is_map_key(<<"compute">>, Msg) ->
             send_notification(Listener, GroupName, SlotToNotify, Res),
             notify_compute(GroupName, SlotToNotify, Res, Opts, Count + 1)
     after 0 ->
@@ -424,12 +479,14 @@ slot_read_survives_forced_message_test() ->
     % got there.
     ?assertEqual(
         9,
-        slot_number(#{ <<"ao-result">> => <<"body">>, <<"body">> => <<"9">> })
+        read_slot(
+            #{ <<"slot">> =>
+                #{ <<"ao-result">> => <<"body">>, <<"body">> => <<"9">> } },
+            not_found,
+            #{}
+        )
     ),
-    ?assertEqual(9, slot_number(<<"9">>)),
-    ?assertEqual(9, slot_number(9)),
-    ?assertEqual(any, slot_number(any)),
-    ?assertEqual(not_found, slot_number(not_found)).
+    ?assertEqual(9, read_slot(#{ <<"slot">> => 9 }, not_found, #{})).
 
 %% @doc Regression: a grouper called with the FULL caller options -- rather
 %% than the ones `find_or_register/3' strips -- saw `force-message' where the
@@ -518,3 +575,258 @@ worker_survives_forced_message_slot_test_() ->
         ?assert(is_process_alive(Worker)),
         exit(Worker, normal)
     end}.
+
+%%% Regression tests: requests that reach a live worker over HTTP. Every test
+%%% bounds its own waits so a regression fails instead of hanging the suite.
+
+counter_script() ->
+    <<
+        "Count = Count or 0\n"
+        "function compute(first, second)\n"
+        "  Count = Count + 1\n"
+        "  local value = tostring(Count)\n"
+        "  if second ~= nil then\n"
+        "    first.count = value\n"
+        "    first.results = { output = { data = value } }\n"
+        "    return first\n"
+        "  end\n"
+        "  return {\n"
+        "    patches = { { path = '/count', value = value } },\n"
+        "    results = { output = { data = value } }\n"
+        "  }\n"
+        "end\n"
+    >>.
+
+%% @doc A Lua counter process with four scheduled messages, computed to slot 2
+%% so that a worker holds its live state. Slot N leaves `count' at N + 1.
+worker_setup() ->
+    test_init(),
+    Wallet = ar_wallet:new(),
+    Opts =
+        #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => Wallet,
+            <<"spawn-worker">> => true,
+            <<"process-workers">> => true,
+            <<"await-inprogress">> => named
+        },
+    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Process =
+        hb_message:commit(
+            #{
+                <<"device">> => <<"process@1.0">>,
+                <<"type">> => <<"Process">>,
+                <<"scheduler-device">> => <<"scheduler@1.0">>,
+                <<"execution-device">> => <<"lua@5.3b">>,
+                <<"module">> =>
+                    #{
+                        <<"content-type">> => <<"application/lua">>,
+                        <<"body">> => counter_script()
+                    },
+                <<"authority">> => [Address],
+                <<"scheduler-location">> => Address,
+                <<"test-random-seed">> => rand:uniform(1000000)
+            },
+            Opts
+        ),
+    {ok, _} = hb_cache:write(Process, Opts),
+    ProcID = hb_message:id(Process, all, Opts),
+    lists:foreach(
+        fun(N) ->
+            {ok, _} =
+                hb_ao:resolve(
+                    Process,
+                    hb_message:commit(
+                        #{
+                            <<"path">> => <<"schedule">>,
+                            <<"method">> => <<"POST">>,
+                            <<"body">> =>
+                                hb_message:commit(
+                                    #{
+                                        <<"target">> => ProcID,
+                                        <<"type">> => <<"Message">>,
+                                        <<"number">> => N
+                                    },
+                                    Opts
+                                )
+                        },
+                        Opts
+                    ),
+                    Opts
+                )
+        end,
+        lists:seq(1, 4)
+    ),
+    {ok, S2} =
+        hb_ao:resolve(
+            Process,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 2 },
+            Opts
+        ),
+    ?assertEqual(<<"3">>, hb_ao:get(<<"count">>, S2, Opts)),
+    Group = hb_util:human_id(ProcID),
+    Worker = await_worker(Group, 50),
+    ?assert(is_pid(Worker)),
+    {Process, Worker, Group, Opts}.
+
+await_worker(_Group, 0) -> undefined;
+await_worker(Group, N) ->
+    case hb_name:lookup(Group) of
+        Pid when is_pid(Pid) -> Pid;
+        _ -> timer:sleep(100), await_worker(Group, N - 1)
+    end.
+
+%% @doc Resolve in a separate process, failing rather than hanging if no
+%% answer arrives in time.
+bounded_resolve(Base, Req, Opts) ->
+    Self = self(),
+    Ref = make_ref(),
+    Pid = spawn(fun() -> Self ! {Ref, catch hb_ao:resolve(Base, Req, Opts)} end),
+    receive {Ref, Res} -> Res
+    after 15000 ->
+        exit(Pid, kill),
+        erlang:error({request_did_not_return, Req})
+    end.
+
+%% @doc Regression: `compute=N' names slot N to the grouper, so the worker must
+%% compute slot N and its waiter must accept only slot N. The worker read only
+%% `slot' and its waiter took the first notification it saw, so with a worker
+%% alive the request was answered with the latest state (slot 2) instead.
+compute_key_names_slot_on_worker_test_() ->
+    {timeout, 120, fun() ->
+        {Process, Worker, _Group, Opts} = worker_setup(),
+        {ok, S3} =
+            bounded_resolve(
+                Process,
+                #{ <<"path">> => <<"compute">>, <<"compute">> => 3 },
+                Opts
+            ),
+        ?assertEqual(3, hb_ao:get(<<"at-slot">>, S3, Opts)),
+        ?assertEqual(<<"4">>, hb_ao:get(<<"count">>, S3, Opts)),
+        ?assert(is_process_alive(Worker))
+    end}.
+
+%% @doc Regression: a malformed `slot' beside a valid `compute' was grouped by
+%% `compute' but read by the worker from `slot', killing it in `hb_util:int/1'
+%% and losing the live state.
+malformed_slot_keeps_worker_test_() ->
+    {timeout, 120, fun() ->
+        {Process, Worker, _Group, Opts} = worker_setup(),
+        Res =
+            bounded_resolve(
+                Process,
+                #{
+                    <<"path">> => <<"compute">>,
+                    <<"compute">> => 3,
+                    <<"slot">> => <<"abc">>
+                },
+                Opts
+            ),
+        ?assertMatch({ok, _}, Res),
+        {ok, S3} = Res,
+        ?assertEqual(<<"4">>, hb_ao:get(<<"count">>, S3, Opts)),
+        ?assert(is_process_alive(Worker))
+    end}.
+
+%% @doc Regression: a slot that cannot name an assignment -- negative, or not
+%% an integer -- is a 400 in the requester. A negative slot reached the worker,
+%% whose rewind found nothing and threw; each waiter then re-elected a leader,
+%% spawned a new worker and resent the request, forever.
+invalid_slot_is_rejected_test_() ->
+    {timeout, 120, fun() ->
+        {Process, Worker, Group, Opts} = worker_setup(),
+        lists:foreach(
+            fun(Slot) ->
+                Res =
+                    bounded_resolve(
+                        Process,
+                        #{ <<"path">> => <<"compute">>, <<"slot">> => Slot },
+                        Opts
+                    ),
+                ?assertMatch({error, #{ <<"status">> := 400 }}, Res)
+            end,
+            [<<"-2">>, -1, <<"abc">>]
+        ),
+        ?assert(is_process_alive(Worker)),
+        ?assertEqual(Worker, hb_name:lookup(Group))
+    end}.
+
+%% @doc Regression: the worker survives any request delivered to it, whether
+%% or not the grouper would have admitted it, and answers it with an error.
+worker_survives_bad_requests_test_() ->
+    {timeout, 120, fun() ->
+        {_Process, Worker, Group, Opts} = worker_setup(),
+        lists:foreach(
+            fun(Req) ->
+                MRef = erlang:monitor(process, Worker),
+                Worker ! {resolve, self(), Group, Req, Opts},
+                receive
+                    {resolved, _, Group, _, Res} ->
+                        ?assertMatch({error, _}, Res);
+                    {'DOWN', MRef, process, Worker, Reason} ->
+                        ?assertEqual(worker_alive, {worker_died, Reason})
+                after 15000 ->
+                    ?assertEqual(worker_answered, timed_out)
+                end,
+                erlang:demonitor(MRef, [flush])
+            end,
+            [
+                #{ <<"path">> => <<"compute">>, <<"slot">> => <<"-2">> },
+                #{ <<"path">> => <<"compute">>, <<"slot">> => <<"abc">> },
+                #{ <<"path">> => <<"compute">>, <<"slot">> => -5 }
+            ]
+        ),
+        ?assert(is_process_alive(Worker)),
+        % And it still serves the next slot from its live state.
+        Worker ! {resolve, self(), Group,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 3 }, Opts},
+        receive
+            {resolved, _, Group, {slot, 3}, {ok, S3}} ->
+                ?assertEqual(<<"4">>, hb_ao:get(<<"count">>, S3, Opts))
+        after 15000 ->
+            ?assertEqual(worker_answered, timed_out)
+        end
+    end}.
+
+%% @doc Regression: the keys that steer a compute beyond its slot reach the
+%% worker's resolution. `init' is the one with an observable answer: a
+%% slot-less compute with `init' other than `now' is `not_found', which the
+%% worker answered with the latest state instead, having rebuilt the request
+%% from its slot alone. `push' was dropped the same way, so a delegated
+%% compute never triggered its push.
+worker_carries_request_keys_test_() ->
+    {timeout, 120, fun() ->
+        {_Process, Worker, Group, Opts} = worker_setup(),
+        Worker ! {resolve, self(), Group,
+            #{ <<"path">> => <<"compute">>, <<"init">> => <<"none">> }, Opts},
+        receive
+            {resolved, _, Group, _, Res} ->
+                ?assertEqual({error, not_found}, Res)
+        after 15000 ->
+            ?assertEqual(worker_answered, timed_out)
+        end
+    end}.
+
+%% @doc Regression: a request naming its slot with `compute' is notified only
+%% of that slot. It has no `slot' key, and was taken for a request for the
+%% latest state and answered with whichever slot completed first.
+notify_compute_honours_compute_key_test() ->
+    Group = make_ref(),
+    Self = self(),
+    Self ! {resolve, Self, Group, #{ <<"path">> => <<"compute">>, <<"compute">> => 3 }, #{}},
+    notify_compute(Group, 5, {ok, #{}}, #{}),
+    Notified =
+        receive {resolved, _, Group, {slot, S}, _} -> {notified, S}
+        after 0 -> none
+        end,
+    Pending =
+        receive {resolve, Self, Group, #{ <<"compute">> := 3 }, _} -> pending
+        after 0 -> consumed
+        end,
+    ?assertEqual(none, Notified),
+    ?assertEqual(pending, Pending),
+    Self ! {resolve, Self, Group, #{ <<"path">> => <<"compute">>, <<"compute">> => 5 }, #{}},
+    notify_compute(Group, 5, {ok, #{}}, #{}),
+    receive {resolved, _, Group, {slot, 5}, _} -> ok
+    after 0 -> ?assertEqual(notified, none)
+    end.

@@ -43,7 +43,7 @@
 -device_libraries([lib_process]).
 %%% Public API
 -export([info/1, as/3, compute/3, schedule/3, slot/3, now/3, push/3, snapshot/3]).
--export([target_slot/2, is_cached_state/1]).
+-export([target_slot/2, request_slot/2, is_cached_state/1]).
 -export([default_device/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("include/hb.hrl").
@@ -193,8 +193,11 @@ init(Base, Req, Opts) ->
 compute(Base, Req, Opts) ->
     ProcBase = lib_process:ensure_process_key(Base, Opts),
     ProcID = lib_process:process_id(ProcBase, #{}, Opts),
-    TargetSlot = target_slot(Req, Opts),
+    TargetSlot = request_slot(Req, Opts),
     case TargetSlot of
+        {invalid, RawSlot} ->
+            ?event(compute, {invalid_slot_requested, {slot, RawSlot}}, Opts),
+            {error, invalid_slot_error()};
         not_found ->
             % The slot is not set, so we need to serve the latest known state
             % unless the `init' key is set to a value aside from `now'.
@@ -205,8 +208,7 @@ compute(Base, Req, Opts) ->
                 _ ->
                     {error, not_found}
             end;
-        RawSlot ->
-            Slot = hb_util:int(RawSlot),
+        Slot ->
             case dev_process_cache:read(ProcID, Slot, Opts) of
                 {ok, Result} ->
                     % The result is already cached, so we can return it.
@@ -296,6 +298,64 @@ target_slot(Req, Opts) ->
             Opts
         )
     ).
+
+%% @doc Return the slot a `compute' request asks for as a non-negative integer,
+%% `not_found' when it names none, or `{invalid, Raw}'.
+%%
+%% This is the one reading of a request's slot: `compute/3', the process
+%% worker, its grouper and its waiters all use it, so they cannot disagree on
+%% which slot a request means -- `compute' takes precedence over `slot', as in
+%% `target_slot/2'. A slot that is not an integer, or is negative, can never
+%% name an assignment; it is reported here instead of crashing `hb_util:int/1'
+%% or reaching `compute_to_slot/6', where a negative target rewinds to nothing
+%% and throws.
+%%
+%% A request that carries its slot as a plain literal -- every HTTP `compute'
+%% does -- is read directly: resolving the keys through `message@1.0' costs
+%% ~125us, and this runs in the grouper, the worker and each waiter on every
+%% request. Any other shape (a link, a typed or wrapped value, no literal at
+%% all) takes the full `target_slot/2' path.
+request_slot(Req, Opts) when is_map(Req) ->
+    case literal_slot(Req) of
+        {ok, Raw} -> parse_slot(Raw);
+        not_literal -> request_slot_resolved(Req, Opts)
+    end;
+request_slot(Req, Opts) ->
+    request_slot_resolved(Req, Opts).
+
+request_slot_resolved(Req, Opts) ->
+    case target_slot(Req, Opts) of
+        not_found -> not_found;
+        Raw -> parse_slot(Raw)
+    end.
+
+%% @doc The slot a request carries as a literal value, in `target_slot/2''s
+%% precedence order, if it carries one that way.
+literal_slot(#{ <<"compute">> := Slot }) when is_integer(Slot); is_binary(Slot) ->
+    {ok, Slot};
+literal_slot(Req = #{ <<"slot">> := Slot })
+        when is_integer(Slot) orelse is_binary(Slot),
+            not is_map_key(<<"compute">>, Req),
+            not is_map_key(<<"compute+link">>, Req) ->
+    {ok, Slot};
+literal_slot(_) ->
+    not_literal.
+
+parse_slot(Slot) when is_integer(Slot), Slot >= 0 -> Slot;
+parse_slot(Slot) when is_binary(Slot); is_list(Slot) ->
+    try hb_util:int(Slot) of
+        Int when Int >= 0 -> Int;
+        _ -> {invalid, Slot}
+    catch error:badarg -> {invalid, Slot}
+    end;
+parse_slot(Slot) -> {invalid, Slot}.
+
+%% @doc The error returned for a request whose slot cannot name an assignment.
+invalid_slot_error() ->
+    #{
+        <<"status">> => 400,
+        <<"body">> => <<"Invalid slot: expected a non-negative integer.">>
+    }.
 
 %% @doc Unwrap an HTTP typed-result map to the scalar it carries. Any other
 %% term -- including `not_found', which both callers depend on -- is returned
