@@ -799,7 +799,12 @@ imported_keys_bounded_test_() ->
             fun(_) -> _ = from_json(element(1, full_test_jwk(1024))) end,
             lists:seq(1, ?CRT_TABLE_LIMIT)
         ),
-        ?assert(ets:info(?CRT_TABLE, size) =< ?CRT_TABLE_LIMIT div 2),
+        % Other processes (in a full suite, nodes left by earlier tests) may
+        % add their own keys meanwhile, so only the imported entries count.
+        ?assert(
+            ets:select_count(?CRT_TABLE, [{{'_', '_', imported}, [], [true]}])
+                =< ?CRT_TABLE_LIMIT div 2
+        ),
         {{{_, D, N}, _}, _} = generate_test_key(),
         ?assertNotEqual(
             not_found,
