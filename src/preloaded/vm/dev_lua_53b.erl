@@ -139,9 +139,20 @@ process_response({error, Reason, Trace}, _Base, _Priv, _Opts) ->
     }}.
 
 %% @doc Apply ordered patches, then replace the per-slot result message.
+%% Lua cannot tell an empty array from an empty table, and `decode/2' turns
+%% both into `#{}', so an empty `patches' message is the empty patch list. A
+%% `results' array becomes the equivalent ordered message.
 apply_result(Base, Result, Opts) ->
-    Patches = hb_ao:get(<<"patches">>, Result, [], Opts),
-    Results = hb_ao:get(<<"results">>, Result, #{}, Opts),
+    Patches =
+        case hb_ao:get(<<"patches">>, Result, [], Opts) of
+            Empty when Empty =:= #{} -> [];
+            DecodedPatches -> filter_patches(DecodedPatches, Opts)
+        end,
+    Results =
+        case hb_ao:get(<<"results">>, Result, #{}, Opts) of
+            List when is_list(List) -> hb_ao:normalize_keys(List, Opts);
+            DecodedResults -> DecodedResults
+        end,
     case {is_list(Patches), is_map(Results)} of
         {true, true} ->
             case hb_process_delta:apply(Base, Patches, Results, Opts) of
@@ -159,6 +170,25 @@ apply_result(Base, Result, Opts) ->
                     <<"lua@5.3b requires list `patches' and message `results'.">>
             }}
     end.
+
+%% @doc Apply the node's invalid-patch policy. By default an invalid patch
+%% fails the slot with a 422. With `lua-53b-invalid-patches' set to `drop',
+%% invalid patches are removed before they are applied or stored, so a
+%% contract that publishes a key built from untrusted input cannot halt the
+%% process. Replay reads the stored, already filtered, patch list.
+filter_patches(Patches, Opts) when is_list(Patches) ->
+    case hb_opts:get(<<"lua-53b-invalid-patches">>, <<"reject">>, Opts) of
+        <<"drop">> ->
+            case hb_process_delta:partition(Patches, Opts) of
+                {Valid, []} -> Valid;
+                {Valid, Dropped} ->
+                    ?event(warning, {lua_53b_dropped_patches, {dropped, Dropped}}),
+                    Valid
+            end;
+        _ -> Patches
+    end;
+filter_patches(Patches, _Opts) ->
+    Patches.
 
 %% @doc Decode a Lua value and normalize any message commitments it carries.
 decode(Value, Opts) ->
@@ -489,6 +519,33 @@ patch_validation_test() ->
         {error, #{ <<"status">> := 422 }},
         hb_ao:resolve(base(<<"lua@5.3b">>, ReservedScript), request(1), Opts)
     ).
+
+%% @doc An empty Lua `patches' table is an empty list, a `results' array is an
+%% ordered message, and a `+link' key fails the slot unless the node drops it.
+lua_result_shapes_test() ->
+    hb:init(),
+    Opts = #{ <<"hashpath">> => ignore },
+    Run =
+        fun(Body, RunOpts) ->
+            Script = <<"function compute(req) return ", Body/binary, " end">>,
+            hb_ao:resolve(base(<<"lua@5.3b">>, Script), request(1), RunOpts)
+        end,
+    ?assertMatch({ok, _}, Run(<<"{ patches = {}, results = {} }">>, Opts)),
+    {ok, Listed} = Run(<<"{ patches = {}, results = { 'a', 'b' } }">>, Opts),
+    ?assertEqual(<<"b">>, hb_ao:get(<<"results/2">>, Listed, Opts)),
+    Linked =
+        <<
+            "{ patches = { { path = '/player-x+link', value = 'null' }, "
+            "{ path = '/kept', value = 'yes' } }, results = {} }"
+        >>,
+    ?assertMatch({error, #{ <<"status">> := 422 }}, Run(Linked, Opts)),
+    {ok, Dropped} =
+        Run(Linked, Opts#{ <<"lua-53b-invalid-patches">> => <<"drop">> }),
+    ?assertEqual(<<"yes">>, hb_ao:get(<<"kept">>, Dropped, Opts)),
+    ?assertNot(maps:is_key(<<"player-x+link">>, Dropped)),
+    #{ <<"process-cache-delta">> := #{ <<"patches">> := StoredPatches } } =
+        hb_private:from_message(Dropped),
+    ?assertEqual(1, length(StoredPatches)).
 
 %% @doc Exercise the 5.3b device through process@1.0: slot 0 is a checkpoint,
 %% slot 1 is a delta, and a cold request for slot 2 restores then replays.
