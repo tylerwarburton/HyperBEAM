@@ -37,6 +37,8 @@
 %%% Bounds of the exponential backoff between attempts to publish a slot.
 -define(UPLOAD_BACKOFF_MIN, 1000).
 -define(UPLOAD_BACKOFF_MAX, 300000).
+%%% How long `upload_info/1' waits for the uploader to answer.
+-define(UPLOAD_INFO_TIMEOUT, 1000).
 
 %% @doc Start a scheduling server for a given computation. Once the server has
 %% started it attempts to register on the message ID for the process definition.
@@ -201,13 +203,23 @@ info(ProcID) ->
     receive {info, Info} -> Info end.
 
 %% @doc Get the state of the uploader of a scheduling server, or `undefined' if
-%% remote publication is disabled.
+%% remote publication is disabled. The confirmer forwards the request to its
+%% uploader, which may have died before the confirmer has noticed and replaced
+%% it: the reply goes to a monitor alias, so such a request returns
+%% `unavailable' after a timeout and a late reply is dropped.
 upload_info(ProcID) ->
     case info(ProcID) of
         #{ confirmer := undefined } -> undefined;
         #{ confirmer := Confirmer } ->
-            Confirmer ! {upload_info, self()},
-            receive {upload_info, Info} -> Info end
+            Mon = erlang:monitor(process, Confirmer, [{alias, reply_demonitor}]),
+            Confirmer ! {upload_info, Mon},
+            receive
+                {upload_info, Info} -> Info;
+                {'DOWN', Mon, process, _, _} -> unavailable
+            after ?UPLOAD_INFO_TIMEOUT ->
+                erlang:demonitor(Mon, [flush]),
+                unavailable
+            end
     end.
 
 stop(ProcID) ->
@@ -1151,6 +1163,34 @@ uploader_respawns_test() ->
         )
     ),
     ?assert(is_process_alive(Server)).
+
+%% @doc `upload_info/1' must not block its caller when no answer comes back,
+%% as when the uploader died before the confirmer replaced it.
+upload_info_unanswered_returns_test() ->
+    Wallet = ar_wallet:new(),
+    Proc = hb_message:commit(
+        #{ <<"data">> => <<"test">>, <<"random-key">> => rand:uniform(10000) },
+        #{ <<"priv-wallet">> => Wallet }
+    ),
+    ID = hb_message:id(Proc, all),
+    dev_scheduler_registry:find(ID, Proc, #{}),
+    Server = dev_scheduler_registry:find(ID),
+    #{ confirmer := Confirmer } = info(Server),
+    erlang:suspend_process(Confirmer),
+    try
+        {Caller, Mon} =
+            spawn_monitor(fun() -> exit({result, upload_info(Server)}) end),
+        receive
+            {'DOWN', Mon, process, Caller, Result} ->
+                ?assertEqual({result, unavailable}, Result)
+        after 5000 ->
+            exit(Caller, kill),
+            ?assert(false)
+        end
+    after
+        erlang:resume_process(Confirmer)
+    end,
+    ?assertMatch(#{ pid := _ }, upload_info(Server)).
 
 benchmark_test() ->
     BenchTime = 1,
