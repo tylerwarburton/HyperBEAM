@@ -925,9 +925,11 @@ computed_writes_skip_match_index_and_replay_test_() ->
             {error, not_found},
             hb_cache:match(#{ <<"count">> => <<"2">> }, Opts)
         ),
+        % `~match@1.0' only indexes signed IDs, so the ordinary write is a
+        % signed message.
         NormalMarker = <<"normal-", Marker/binary>>,
         {ok, _} = hb_cache:write(
-            #{ <<"normal-marker">> => NormalMarker },
+            hb_message:commit(#{ <<"normal-marker">> => NormalMarker }, Opts),
             Opts
         ),
         ?assertMatch(

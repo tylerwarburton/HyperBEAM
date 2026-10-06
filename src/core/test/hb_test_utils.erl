@@ -17,6 +17,8 @@
 -define(DEFAULT_STORE_MODULE, hb_store_volatile).
 %%% The number of seconds to run a benchmark for when no time is specified.
 -define(DEFAULT_BENCHMARK_TIME, 1).
+%%% The LMDB map size for test stores: far above what any test writes.
+-define(TEST_LMDB_CAPACITY, 16 * 1024 * 1024 * 1024).
 
 %% @doc Generate a new, unique test store as an isolated context for an execution.
 test_store() ->
@@ -32,7 +34,17 @@ test_store(Mod, Tag) ->
             (hb_util:encode(crypto:strong_rand_bytes(6)))/binary
         >>,
     filelib:ensure_dir(binary_to_list(TestDir)),
-    #{ <<"store-module">> => Mod, <<"name">> => TestDir }.
+    test_store_capacity(Mod, #{ <<"store-module">> => Mod, <<"name">> => TestDir }).
+
+%% @doc LMDB maps its whole capacity into the address space when a store is
+%% opened, and test stores stay open for the rest of the run. At the 2 TiB
+%% default the ~128 TiB of user address space holds only ~62 of them, after
+%% which every new LMDB store fails to open (and, inside a store list, is
+%% silently skipped), so a long suite must give its stores a test-sized map.
+test_store_capacity(hb_store_lmdb, Store) ->
+    Store#{ <<"capacity">> => ?TEST_LMDB_CAPACITY };
+test_store_capacity(_Mod, Store) ->
+    Store.
 
 %% @doc Run each test in a suite with each set of options. Start and reset
 %% the store(s) for each test. Expects suites to be a list of tuples with
