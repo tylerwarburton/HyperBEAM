@@ -100,7 +100,7 @@ info(_Base) ->
 init(Base, Req, Opts) ->
     case hb_private:get(<<"state">>, Base, Opts) of
         not_found ->
-            Strict = Opts#{ <<"lua-minimum-sandbox">> => sandbox(Opts) },
+            Strict = Opts#{ <<"lua-device-sandbox">> => sandbox() },
             case hb_ao:raw(<<"lua@5.3b">>, <<"init">>, Base, Req, Strict) of
                 {ok, Initialized} ->
                     State = hb_private:get(<<"state">>, Initialized, Opts),
@@ -116,12 +116,10 @@ init(Base, Req, Opts) ->
     end.
 
 %% @doc Restrict both global names and package aliases before module loading.
-sandbox(Opts) ->
-    Extra = case hb_opts:get(<<"lua-minimum-sandbox">>, [], Opts) of
-        false -> [];
-        Spec -> Spec
-    end,
-    Extra ++ [
+%% `lua@5.3a' applies these after the node's minimum sandbox, which keeps its
+%% default when the node does not configure one.
+sandbox() ->
+    [
         {[loadfile], <<"sandboxed">>},
         {[dofile], <<"sandboxed">>},
         {[print], <<"sandboxed">>},
@@ -238,6 +236,40 @@ atomic_roundtrip_test() ->
     {ok, Restored} = hb_ao:resolve(Cold, <<"normalize">>, Opts),
     {ok, Second} = hb_ao:resolve(Restored, <<"compute">>, Opts),
     ?assertEqual(<<"2">>, hb_ao:get(<<"count">>, Second, Opts)).
+
+%% @doc Collection inside `ao.atomic' must not free the suspended caller's
+%% locals, whether the batch commits or rolls back, and must still run once the
+%% outermost call returns.
+atomic_gc_keeps_outer_locals_test() ->
+    hb:init(),
+    Opts = #{ <<"hashpath">> => ignore },
+    Script = <<"""
+        function compute(req)
+            local mine = { owner = 'alice', balance = 100 }
+            local committed = ao.atomic(function()
+                collectgarbage('collect')
+                return true
+            end)
+            local refused = ao.atomic(function()
+                collectgarbage('collect')
+                return false, 'refused'
+            end)
+            for i = 1, 400 do
+                ao.atomic(function() collectgarbage('step', 5); return true end)
+            end
+            Stash = {}
+            for i = 1, 60 do Stash[i] = { owner = 'mallory', balance = i } end
+            local seen = table.concat({ tostring(committed), tostring(refused),
+                tostring(mine.owner), tostring(mine.balance) }, ' ')
+            return { patches = {{ path = '/seen', value = seen }} }
+        end
+        """>>,
+    Base = #{
+        <<"device">> => <<"lua@5.3c">>,
+        <<"module">> => #{ <<"content-type">> => <<"application/lua">>, <<"body">> => Script }
+    },
+    {ok, Result} = hb_ao:resolve(Base, <<"compute">>, Opts),
+    ?assertEqual(<<"true false alice 100">>, hb_ao:get(<<"seen">>, Result, Opts)).
 
 %% @doc Unrestricted legacy state cannot acquire the sandbox witness by changing
 %% its device name. A fresh deployment or explicitly designed migration is needed.

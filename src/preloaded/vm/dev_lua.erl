@@ -185,13 +185,21 @@ initialize(Base, Modules, Opts) ->
     % Apply the node's minimum sandbox and install the disk-free `require'
     % before loading any modules, such that code run while a module loads
     % cannot escape them. The message may add further restrictions via
-    % `sandbox', but cannot lift these.
+    % `sandbox', but cannot lift these. A device built on this one adds its
+    % own mandatory entries through `lua-device-sandbox', on top of the node's
+    % minimum rather than in place of it.
+    MinSpec = hb_opts:get(<<"lua-minimum-sandbox">>, ?DEFAULT_MIN_SANDBOX, Opts),
+    DeviceSpec = hb_opts:get(<<"lua-device-sandbox">>, [], Opts),
     State0 =
-        case hb_opts:get(<<"lua-minimum-sandbox">>, ?DEFAULT_MIN_SANDBOX, Opts) of
-            false -> luerl:init();
-            MinSpec ->
+        case {MinSpec, DeviceSpec} of
+            {false, []} -> luerl:init();
+            _ ->
                 dev_lua_require:install(
-                    sandbox(luerl:init(), MinSpec, Opts),
+                    sandbox(
+                        luerl:init(),
+                        sandbox_list(MinSpec) ++ DeviceSpec,
+                        Opts
+                    ),
                     Opts
                 )
         end,
@@ -258,6 +266,11 @@ functions(Base, _Req, Opts) ->
                 ),
             {ok, hb_util:message_to_ordered_list(decode(Res, Opts))}
     end.
+
+%% @doc A sandbox spec as a list; `false' disables the node minimum.
+sandbox_list(false) -> [];
+sandbox_list(Map) when is_map(Map) -> maps:to_list(Map);
+sandbox_list(List) when is_list(List) -> List.
 
 %% @doc Sandbox (render inoperable) a set of Lua functions. Each function is
 %% referred to as if it is a path in AO-Core, with its value being what to 
@@ -385,13 +398,12 @@ snapshot(Base, _Req, Opts) ->
         not_found ->
             {error, <<"Cannot snapshot Lua state: state not initialized.">>};
         State ->
-            % Snapshot only reachable Lua objects. Incremental collection can
-            % leave dead tables in the resident heap between cycles; persisting
-            % them adds storage, compression work and cold-restore allocations.
-            % Collection operates on a copy, leaving the resident VM intact.
-            Collected = luerl:gc(State),
+            % Serialize the VM exactly as it is resident. Collecting a copy here
+            % would give a restored VM other free lists, and so other table
+            % identities, than the live VM it must keep matching. A pending
+            % incremental cycle is carried over by `luerl:externalize/1'.
             {ok, #{ <<"body">> =>
-                term_to_binary(luerl:externalize(Collected), [compressed]) }}
+                term_to_binary(luerl:externalize(State), [compressed]) }}
     end.
 
 %% @doc Restore the Lua state from a snapshot, if it exists.
@@ -534,6 +546,98 @@ snapshot_is_compressed_and_deserializes_test() ->
     ?assert(is_binary(Body)),
     ?assertMatch(<<131, 80, _/binary>>, Body),
     ?assert(is_tuple(luerl:internalize(binary_to_term(Body)))).
+
+%% @doc Collection requested from Lua running under an Erlang function (pcall,
+%% sort and gsub callbacks, metamethods, `require', host callbacks) must not
+%% free the locals of the suspended outer frames, nor values only an iterator
+%% or vararg list holds. Every program returns `alice' when nothing is freed
+%% early; churn after the collection reuses any wrongly freed table slots.
+nested_collect_keeps_outer_values_test() ->
+    Churn = <<" Stash = {}; for i = 1, 60 do Stash[i] = {owner = 'mallory'} end ">>,
+    Mine = <<"local mine = {owner = 'alice'}; ">>,
+    Programs = [
+        {pcall_step, [Mine, <<"for i = 1, 300 do pcall(function() collectgarbage('step', 3) end) end;">>, Churn, <<"return mine.owner">>]},
+        {pcall_collect, [Mine, <<"pcall(collectgarbage, 'collect');">>, Churn, <<"return mine.owner">>]},
+        {host_collect, [Mine, <<"host(function() collectgarbage('collect') end);">>, Churn, <<"return mine.owner">>]},
+        {host_step, [Mine, <<"for i = 1, 300 do host(function() collectgarbage('step', 2) end) end;">>, Churn, <<"return mine.owner">>]},
+        {sort, [Mine, <<"local t = {3, 1, 2}; table.sort(t, function(a, b) collectgarbage('collect'); return a < b end);">>, Churn, <<"return mine.owner .. table.concat(t) == 'alice123' and 'alice'">>]},
+        {sort_temporary, [<<"table.sort({{v = 2}, {v = 1}, {v = 3}}, function(a, b) collectgarbage('collect'); return a.v < b.v end);">>, Churn, <<"return 'alice'">>]},
+        {gsub, [Mine, <<"local s = string.gsub('abc', '%w', function(c) collectgarbage('collect'); return c end);">>, Churn, <<"return s == 'abc' and mine.owner">>]},
+        {eq_metamethod, [Mine, <<"local mt = {__eq = function() collectgarbage('collect'); return true end}; local e = setmetatable({}, mt) == setmetatable({}, mt);">>, Churn, <<"return e and mine.owner">>]},
+        {require, [Mine, <<"package.preload.m = function() collectgarbage('collect'); return {} end; require('m');">>, Churn, <<"return mine.owner">>]},
+        {for_iterator_state, [<<"local s = ''; for _, v in ipairs({{x = 'al'}, {x = 'ice'}}) do collectgarbage('collect');">>, Churn, <<"s = s .. v.x end; return s">>]},
+        {varargs, [<<"local function f(...) collectgarbage('collect');">>, Churn, <<"local a = ...; return a.owner end; return f({owner = 'alice'})">>]},
+        {returned_table, [<<"local function g() local t = {owner = 'alice'}; pcall(collectgarbage, 'collect'); return t end; local t = g();">>, Churn, <<"return t.owner">>]}
+    ],
+    {ok, State} =
+        luerl:set_table_keys_dec(
+            [host],
+            fun([F], St) ->
+                {ok, _, St1} = luerl:call_function(F, [], St),
+                {[], St1}
+            end,
+            luerl:init()
+        ),
+    lists:foreach(
+        fun({Name, Program}) ->
+            Result =
+                try luerl:do_dec(iolist_to_binary(Program), State) of
+                    {ok, [Value], _} -> Value;
+                    Other -> {unexpected, element(1, Other)}
+                catch Class:Reason -> {Class, element(1, Reason)}
+                end,
+            ?assertEqual({Name, <<"alice">>}, {Name, Result})
+        end,
+        Programs
+    ).
+
+%% @doc A VM restored from a snapshot behaves exactly as the live VM it was
+%% taken from: same table identities, table-keyed iteration order, collector
+%% progress and `count', including snapshots taken mid incremental cycle.
+snapshot_restore_matches_live_vm_test() ->
+    Opts = #{},
+    Script = <<"""
+        Kept = {}; Keys = {}
+        function req(n)
+            local garbage = {}
+            for i = 1, 30 do garbage[i] = { i, { i } } end
+            Kept[n % 37] = { n = n, t = {} }
+            local k = {}; Keys[k] = n
+            if n % 3 == 0 then Keys[next(Keys)] = nil end
+            local done = collectgarbage('step', 40)
+            local order = {}
+            for _, v in pairs(Keys) do order[#order + 1] = v end
+            return table.concat({ tostring({}), tostring(done),
+                tostring(collectgarbage('count')), table.concat(order, ',') }, ' ')
+        end
+        """>>,
+    {ok, [], State0} = luerl:do_dec(Script, luerl:init()),
+    Run =
+        fun(State, From, To) ->
+            lists:foldl(
+                fun(N, {Acc, StateIn}) ->
+                    {ok, [Out], StateOut} =
+                        luerl:call_function_dec([<<"req">>], [N], StateIn),
+                    {[Out | Acc], StateOut}
+                end,
+                {[], State},
+                lists:seq(From, To)
+            )
+        end,
+    lists:foreach(
+        fun(Checkpoint) ->
+            {_, Live} = Run(State0, 1, Checkpoint),
+            {ok, #{ <<"body">> := Body }} =
+                snapshot(hb_private:set(#{}, <<"state">>, Live, Opts), #{}, Opts),
+            {ok, RestoredMsg} =
+                normalize(#{ <<"snapshot">> => #{ <<"body">> => Body } }, #{}, Opts),
+            Restored = hb_private:get(<<"state">>, RestoredMsg, Opts),
+            {LiveOut, _} = Run(Live, Checkpoint + 1, 120),
+            {RestoredOut, _} = Run(Restored, Checkpoint + 1, 120),
+            ?assertEqual({Checkpoint, LiveOut}, {Checkpoint, RestoredOut})
+        end,
+        [5, 17, 33, 60]
+    ).
 
 simple_invocation_test() ->
     {ok, Script} = file:read_file("test/test.lua"),
