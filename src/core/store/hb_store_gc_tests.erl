@@ -517,7 +517,12 @@ ess_bench(Variant, Fast, Remote, Dur, Clients) ->
         <<"scheduler-publish-remote">> => false,
         <<"scheduler-default-commitment-spec">> => <<"ans104@1.0">>,
         <<"scheduler-durable-confirm">> => commit,
-        <<"match-index">> => false
+        <<"match-index">> => false,
+        % Production's limits: the default would throttle the benchmark.
+        <<"rate-limit-requests">> => 60000,
+        <<"rate-limit-period">> => 60,
+        <<"rate-limit-max">> => 60000,
+        <<"rate-limit-min">> => 0
     }, Extra),
     W = hb_opts:get(priv_wallet, x, Opts),
     Node = hb_http_server:start_node(Opts),
@@ -538,42 +543,66 @@ ess_bench(Variant, Fast, Remote, Dur, Clients) ->
           end
         || _ <- lists:seq(1, 4) ],
     Self = self(),
-    Deadline = erlang:monotonic_time(millisecond) + Dur,
+    PerClient = list_to_integer(os:getenv("HB_ESS_BENCH_REQS", "150")),
+    % Requests are signed before the clock starts, so the measurement is the
+    % node's, not the client's RSA.
     Pids =
         [ spawn_link(fun() ->
               Target = lists:nth((C rem length(Pools)) + 1, Pools),
-              Self ! {lat, self(), ess_client(Node, Target, Opts, Deadline, [])}
+              Reqs = [ ess_request(Target, Opts) || _ <- lists:seq(1, PerClient) ],
+              Self ! {ready, self()},
+              receive {go, Deadline} -> ok end,
+              Self ! {lat, self(), ess_client(Node, Reqs, Opts, Deadline, [])}
           end)
         || C <- lists:seq(1, Clients) ],
+    [ receive {ready, P} -> ok end || P <- Pids ],
+    Deadline = erlang:monotonic_time(millisecond) + Dur,
+    [ P ! {go, Deadline} || P <- Pids ],
     Lats = lists:append([ receive {lat, P, L} -> L end || P <- Pids ]),
-    Sorted = lists:sort(Lats),
+    Elapsed = max(1, erlang:monotonic_time(millisecond) - (Deadline - Dur)),
+    Errors = length([ E || {error, E} <- Lats ]),
+    Sorted = case lists:sort([ L || L <- Lats, is_integer(L) ]) of [] -> [0]; L -> L end,
     N = length(Sorted),
     P = fun(Q) -> lists:nth(max(1, min(N, round(Q * N))), Sorted) / 1000 end,
     Export =
         case Variant of
             export ->
                 [Wrapped | _] = hb_store_essentials:store(Opts),
-                hb_store_export:status(Wrapped);
+                AtEnd = hb_store_export:status(Wrapped),
+                % How long the slow target takes to drain the backlog once
+                % the load stops.
+                {DrainUs, Drained} = timer:tc(fun() -> hb_store_export:sync_export(Wrapped) end),
+                #{ at_end => maps:with([lag_ms, local_backlog_bytes, local_segments,
+                                        shipped_bytes, dropped_records, errors], AtEnd),
+                   drain_ms => DrainUs div 1000,
+                   after_drain => maps:with([lag_ms, local_backlog_bytes, shipped_bytes,
+                                             shipped_segments, errors], Drained) };
             _ -> none
         end,
     io:format(user,
-        "ESS_BENCH variant=~p clients=~p n=~p thr=~.1f/s p50=~.2fms p99=~.2fms "
+        "ESS_BENCH variant=~p clients=~p n=~p errors=~p thr=~.1f/s p50=~.2fms p99=~.2fms "
         "p999=~.2fms max=~.2fms export=~0p~n",
-        [Variant, Clients, N, N * 1000 / Dur, P(0.5), P(0.99), P(0.999),
+        [Variant, Clients, N, Errors, N * 1000 / min(Dur, Elapsed), P(0.5), P(0.99), P(0.999),
          lists:last(Sorted) / 1000, Export]).
 
-ess_client(Node, Target, Opts, Deadline, Acc) ->
-    Req = hb_message:commit(#{
+ess_request(Target, Opts) ->
+    hb_message:commit(#{
         <<"path">> => <<"/~scheduler@1.0/schedule">>,
         <<"method">> => <<"POST">>,
         <<"body">> => hb_message:commit(#{
             <<"target">> => Target, <<"type">> => <<"Message">>,
-            <<"data">> => crypto:strong_rand_bytes(512),
-            <<"n">> => rand:uniform(1 bsl 40) }, Opts) }, Opts),
+            <<"data">> => hb_util:encode(crypto:strong_rand_bytes(384)),
+            <<"n">> => rand:uniform(1 bsl 40) }, Opts) }, Opts).
+
+ess_client(_Node, [], _Opts, _Deadline, Acc) -> Acc;
+ess_client(Node, [Req | Reqs], Opts, Deadline, Acc) ->
     T0 = erlang:monotonic_time(microsecond),
-    {ok, _} = hb_http:post(Node, Req, Opts),
-    T1 = erlang:monotonic_time(microsecond),
-    case T1 div 1000 > Deadline of
+    Lat =
+        case hb_http:post(Node, Req, Opts) of
+            {ok, _} -> erlang:monotonic_time(microsecond) - T0;
+            _ -> {error, erlang:monotonic_time(microsecond) - T0}
+        end,
+    case erlang:monotonic_time(millisecond) > Deadline of
         true -> Acc;
-        false -> ess_client(Node, Target, Opts, Deadline, [T1 - T0 | Acc])
+        false -> ess_client(Node, Reqs, Opts, Deadline, [Lat | Acc])
     end.

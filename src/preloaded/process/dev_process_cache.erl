@@ -46,7 +46,7 @@ read_stored(ProcID, SlotRef, Opts) ->
     Path = path(ProcID, SlotRef, Opts),
     case hb_cache:read(Path, Opts) of
         {ok, Stored} ->
-            case retention_loaded(materialize(ProcID, Stored, Opts), Opts) of
+            case retention_loaded(Stored, materialize(ProcID, Stored, Opts), Opts) of
                 {ok, Msg} when is_integer(SlotRef) ->
                     % Keep the rebuilt state, so the next read of the
                     % latest slot does not replay the delta chain
@@ -65,7 +65,12 @@ read_stored(ProcID, SlotRef, Opts) ->
 %% retention deletes old checkpoints' rows once newer ones exist: a worker that
 %% kept computing on such a state for hours would otherwise find a field gone
 %% the first time it touched it. Without retention, nothing changes.
-retention_loaded({ok, Msg}, Opts) when is_map(Msg) ->
+%% A delta is materialized onto a base that came through here already and
+%% patches that are loaded whole, so only a stored full state needs it: a
+%% replay of a long delta chain pays the load once, at its checkpoint.
+retention_loaded(#{ <<"cache-format">> := ?DELTA_FORMAT }, Result, _Opts) ->
+    Result;
+retention_loaded(_Stored, {ok, Msg}, Opts) when is_map(Msg) ->
     case hb_util:atom(hb_opts:get(<<"store-retention">>, false, Opts)) of
         true ->
             {ok,
@@ -78,7 +83,7 @@ retention_loaded({ok, Msg}, Opts) when is_map(Msg) ->
             };
         _ -> {ok, Msg}
     end;
-retention_loaded(Other, _Opts) -> Other.
+retention_loaded(_Stored, Other, _Opts) -> Other.
 
 %% @doc Write a process computation result to the cache.
 write(ProcID, Slot, Msg, Opts) ->
