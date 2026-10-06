@@ -23,6 +23,7 @@
 -export([start/3, stop/3, scope/0, scope/1, reset/3]).
 -export([read/3, write/3, list/3, match/3]).
 -export([group/3, link/3, type/3, resolve/3]).
+-export([sync/3]).
 
 %% Test framework and project includes
 -include_lib("eunit/include/eunit.hrl").
@@ -168,6 +169,92 @@ write(Opts, Path, Value) ->
                 }
             ),
             retry
+    end.
+
+%% @doc Make every write that has already returned durable.
+%%
+%% `write/3' only places a value in elmdb's in-memory overlay, which is committed
+%% to LMDB when the overlay reaches `batch-size' or a listing flushes it, so a
+%% crash of the node loses everything written since the last commit. At level
+%% `commit' (the default) this function commits the overlay, after which the
+%% writes are in the OS page cache and survive the node process being killed.
+%% At level `fsync' it also syncs the environment to disk (the store is opened
+%% `no_sync'), so the writes survive a host crash or power loss.
+%%
+%% Callers are grouped: one process per environment performs the commits, and
+%% every request that arrives while a commit is in progress is served by the
+%% next single commit. Concurrent callers therefore share the cost of each
+%% commit rather than queueing one commit each.
+sync(#{ <<"read-only">> := true }, _Req, _NodeOpts) ->
+    ok;
+sync(Opts = #{ <<"name">> := Name }, Req, _NodeOpts) ->
+    Level =
+        case maps:get(<<"level">>, Req, commit) of
+            <<"fsync">> -> fsync;
+            fsync -> fsync;
+            _ -> commit
+        end,
+    #{ <<"db">> := DB, <<"env">> := Env } = ensure_env(Opts),
+    Syncer = hb_name:singleton({?MODULE, syncer, Name}, fun syncer/0),
+    Ref = erlang:monitor(process, Syncer),
+    Syncer ! {sync, self(), Ref, Level, DB, Env},
+    receive
+        {synced, Ref, Result} ->
+            erlang:demonitor(Ref, [flush]),
+            Result;
+        {'DOWN', Ref, process, Syncer, Reason} ->
+            {error, {lmdb_syncer_down, Reason}}
+    end.
+
+%% @doc The group-commit loop for one environment. It waits for a request, then
+%% gathers every request already queued behind it, serves them all with a single
+%% commit (and, if any asked for it, a single environment sync), and replies.
+syncer() ->
+    receive
+        {sync, From, Ref, Level, DB, Env} ->
+            syncer_batch([{From, Ref}], Level, DB, Env)
+    end.
+
+syncer_batch(Waiters, Level, DB, Env) ->
+    receive
+        {sync, From, Ref, NextLevel, NextDB, NextEnv} ->
+            syncer_batch(
+                [{From, Ref} | Waiters],
+                case NextLevel of
+                    fsync -> fsync;
+                    _ -> Level
+                end,
+                NextDB,
+                NextEnv
+            )
+    after 0 ->
+        Result = sync_now(Level, DB, Env),
+        lists:foreach(
+            fun({From, Ref}) -> From ! {synced, Ref, Result} end,
+            Waiters
+        ),
+        syncer()
+    end.
+
+%% @doc Commit the overlay and, at level `fsync', sync the environment.
+sync_now(Level, DB, Env) ->
+    try elmdb:flush(DB) of
+        ok when Level == fsync ->
+            case elmdb:env_sync(Env) of
+                ok -> ok;
+                {error, Type, Description} ->
+                    ?event(error, {lmdb_sync_failed, Type, Description}),
+                    {error, {Type, Description}}
+            end;
+        ok ->
+            ok;
+        {error, Type, Description} ->
+            ?event(error, {lmdb_commit_failed, Type, Description}),
+            {error, {Type, Description}}
+    catch
+        Class:Reason ->
+            ?event(error, {lmdb_sync_failed, Class, Reason}),
+            {error, {Class, Reason}}
     end.
 
 %% @doc Read a value from the database by key, with automatic link resolution.
@@ -1243,4 +1330,37 @@ read_prefix_composite_test() ->
         read(StoreOpts, #{ <<"read">> => <<"root">> }, #{})
     ),
     ?assertEqual({ok, [<<"a">>, <<"b">>]}, test_list(StoreOpts, <<"root">>)),
+    test_stop(StoreOpts).
+
+%% @doc A sync commits every write that has already returned, at either level,
+%% and concurrent callers are all answered.
+sync_commits_overlay_test() ->
+    StoreOpts = hb_test_utils:test_store(?MODULE),
+    test_reset(StoreOpts),
+    #{ <<"db">> := DB } = ensure_env(StoreOpts),
+    lists:foreach(
+        fun(N) -> test_write(StoreOpts, <<"key-", (hb_util:bin(N))/binary>>, <<"v">>) end,
+        lists:seq(1, 10)
+    ),
+    ?assert(elmdb:overlay_count(DB) > 0),
+    ?assertEqual(ok, hb_store:sync(StoreOpts, #{})),
+    ?assertEqual(0, elmdb:overlay_count(DB)),
+    Self = self(),
+    Callers =
+        [
+            spawn(
+                fun() ->
+                    test_write(StoreOpts, <<"par-", (hb_util:bin(N))/binary>>, <<"v">>),
+                    Self ! {done, self(), hb_store:sync(StoreOpts, #{ <<"level">> => fsync }, #{})}
+                end
+            )
+        ||
+            N <- lists:seq(1, 20)
+        ],
+    lists:foreach(
+        fun(Caller) -> receive {done, Caller, Res} -> ?assertEqual(ok, Res) end end,
+        Callers
+    ),
+    ?assertEqual(0, elmdb:overlay_count(DB)),
+    ?assertEqual({ok, <<"v">>}, test_read(StoreOpts, <<"par-7">>)),
     test_stop(StoreOpts).

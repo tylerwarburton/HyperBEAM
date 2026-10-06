@@ -67,6 +67,7 @@
     link/2, link/3,
     resolve/2, resolve/3
 ]).
+-export([sync/2, sync/3]).
 -export([find/1]).
 -export([generate_test_suite/1, generate_test_suite/2, test_stores/0]).
 -include("include/hb.hrl").
@@ -371,6 +372,39 @@ match(Match, Opts) ->
     match(hb_opts:get(store, [], Opts), Match, Opts).
 match(Modules, Match, Opts) ->
     call_function(Modules, match, [Match, Opts]).
+
+%% @doc Make every write that has already returned from the given store(s)
+%% durable before returning. `Req' may carry `<<"level">>': `commit' (the
+%% default) guarantees the writes survive a crash of this node's OS process, and
+%% `fsync' additionally guarantees they survive a crash of the host. Stores whose
+%% writes are durable once they return do not implement the optional `sync/3'
+%% callback and are skipped. Unlike other calls, this applies to every writable
+%% store in the list rather than the first that succeeds, as a write may have
+%% landed in any of them. Returns `ok' or the first error encountered.
+sync(Stores, Opts) ->
+    sync(Stores, #{}, Opts).
+sync(Store, Req, Opts) when not is_list(Store) ->
+    sync([Store], Req, Opts);
+sync([], _Req, _Opts) ->
+    ok;
+sync([Store = #{ <<"store-module">> := Mod } | Rest], Req, Opts) ->
+    Result =
+        case is_admissible(Store, write) of
+            false -> ok;
+            true ->
+                _ = code:ensure_loaded(Mod),
+                case erlang:function_exported(Mod, sync, 3) of
+                    false -> ok;
+                    true -> normalize_result(Mod:sync(Store, Req, Opts))
+                end
+        end,
+    case Result of
+        ok -> sync(Rest, Req, Opts);
+        {ok, _} -> sync(Rest, Req, Opts);
+        Error -> Error
+    end;
+sync([_ | Rest], Req, Opts) ->
+    sync(Rest, Req, Opts).
 
 %% @doc Call a function on the first store module that succeeds. Returns its
 %% result, or `not_found` if none of the stores succeed. If `TIME_CALLS` is set,
