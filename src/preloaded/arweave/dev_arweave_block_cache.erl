@@ -6,12 +6,22 @@
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
+%% Every entry point reads and writes through `hb_store_essentials:opts/1': with
+%% an `essentials-store' configured, these records and the messages they name
+%% are essentials and are written there, self-contained; otherwise the options
+%% are unchanged.
+latest(Opts) -> ess_latest(hb_store_essentials:opts(Opts)).
+heights(Opts) -> ess_heights(hb_store_essentials:opts(Opts)).
+read(A1, Opts) -> ess_read(A1, hb_store_essentials:opts(Opts)).
+write(A1, Opts) -> ess_write(A1, hb_store_essentials:opts(Opts)).
+path(A1, Opts) -> ess_path(A1, hb_store_essentials:opts(Opts)).
+
 %% @doc The pseudo-path prefix which the Arweave block cache should use.
 -define(ARWEAVE_BLOCK_CACHE_PREFIX, <<"~arweave@2.9">>).
 
 %% @doc Get the latest block from the cache.
-latest(Opts) ->
-    case heights(Opts) of
+ess_latest(Opts) ->
+    case ess_heights(Opts) of
         {ok, []} ->
             ?event(arweave_cache, no_blocks_in_cache),
             not_found;
@@ -22,7 +32,7 @@ latest(Opts) ->
     end.
 
 %% @doc Get the list of blocks from the cache.
-heights(Opts) ->
+ess_heights(Opts) ->
     AllBlocks =
         hb_cache:list_numbered(
             hb_path:to_binary([
@@ -36,13 +46,13 @@ heights(Opts) ->
     {ok, AllBlocks}.
 
 %% @doc Read a block from the cache.
-read(Block, Opts) ->
-    Res = hb_cache:read(path(Block, Opts), Opts),
+ess_read(Block, Opts) ->
+    Res = hb_cache:read(ess_path(Block, Opts), Opts),
     ?event(arweave_cache, {read_block, {reference, Block}, {result, Res}}),
     Res.
 
 %% @doc Return the path of a block that will be used in the cache.
-path(Block, _Opts) when is_integer(Block) ->
+ess_path(Block, _Opts) when is_integer(Block) ->
     hb_path:to_binary([
         ?ARWEAVE_BLOCK_CACHE_PREFIX,
         <<"block">>,
@@ -51,7 +61,7 @@ path(Block, _Opts) when is_integer(Block) ->
     ]).
 
 %% @doc Write a block to the cache and create pseudo-paths for it.
-write(Block, Opts) ->
+ess_write(Block, Opts) ->
     {ok, Height} = hb_maps:find(<<"height">>, Block, Opts),
     {ok, BlockID} = hb_maps:find(<<"indep_hash">>, Block, Opts),
     {ok, BlockHash} = hb_maps:find(<<"hash">>, Block, Opts),
@@ -61,6 +71,6 @@ write(Block, Opts) ->
     hb_cache:link(MsgID, BlockID, Opts),
     hb_cache:link(MsgID, BlockHash, Opts),
     % Link the block height pseudo-path to the message.
-    hb_cache:link(MsgID, path(Height, Opts), Opts),
+    hb_cache:link(MsgID, ess_path(Height, Opts), Opts),
     ?event(arweave_cache, {wrote_block, {height, Height}, {message_id, MsgID}}),
     {ok, MsgID}.

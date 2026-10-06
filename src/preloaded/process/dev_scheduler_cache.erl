@@ -11,15 +11,20 @@
 
 %% @doc Merge the scheduler store with the main store. Used before writing
 %% to the cache.
+%% An explicit `scheduler-store' replaces the store entirely, as before.
+%% Otherwise, when an `essentials-store' is configured, it is written first and
+%% the node's stores are read after it (`hb_store_essentials:opts/1'); with
+%% neither set the store is the node's own.
 opts(Opts) ->
-    Opts#{
-        <<"store">> =>
-            hb_opts:get(
-                scheduler_store,
-                hb_opts:get(store, no_viable_store, Opts),
-                Opts
-            )
-    }.
+    case hb_opts:get(scheduler_store, undefined, Opts) of
+        undefined ->
+            EssOpts = hb_store_essentials:opts(Opts),
+            EssOpts#{
+                <<"store">> => hb_opts:get(store, no_viable_store, EssOpts)
+            };
+        SchedStore ->
+            Opts#{ <<"store">> => SchedStore }
+    end.
 
 %% @doc Write an assignment message into the cache.
 write(RawAssignment, RawOpts) ->

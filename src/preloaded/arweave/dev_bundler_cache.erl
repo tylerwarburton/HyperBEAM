@@ -23,6 +23,19 @@
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
+%% Every entry point reads and writes through `hb_store_essentials:opts/1': with
+%% an `essentials-store' configured, these records and the messages they name
+%% are essentials and are written there, self-contained; otherwise the options
+%% are unchanged.
+write_item(A1, Opts) -> ess_write_item(A1, hb_store_essentials:opts(Opts)).
+write_tx(A1, A2, Opts) -> ess_write_tx(A1, A2, hb_store_essentials:opts(Opts)).
+complete_tx(A1, Opts) -> ess_complete_tx(A1, hb_store_essentials:opts(Opts)).
+load_bundle_states(Opts) -> ess_load_bundle_states(hb_store_essentials:opts(Opts)).
+load_tx(A1, Opts) -> ess_load_tx(A1, hb_store_essentials:opts(Opts)).
+load_items(A1, Opts) -> ess_load_items(A1, hb_store_essentials:opts(Opts)).
+load_items(A1, A2, A3, Opts) -> ess_load_items(A1, A2, A3, hb_store_essentials:opts(Opts)).
+list_item_ids(Opts) -> ess_list_item_ids(hb_store_essentials:opts(Opts)).
+
 -define(BUNDLER_PREFIX, <<"~bundler@1.0">>).
 
 %%% Data Item operations
@@ -31,7 +44,7 @@ item_id(Item, Opts) when is_map(Item) ->
     hb_message:id(Item, signed, Opts).
 
 %% @doc Write a data item to cache and create its bundler pseudopath.
-write_item(Item, Opts) when is_map(Item) ->
+ess_write_item(Item, Opts) when is_map(Item) ->
     % Write the actual item to cache
     {ok, _} = hb_cache:write(Item, Opts),
     % Use the committed (structured) item for path generation
@@ -72,7 +85,7 @@ tx_id(TX, _Opts) when is_binary(TX) ->
 tx_id(TX, Opts) when is_map(TX) ->
     hb_message:id(TX, signed, Opts).
 
-write_tx(TX, Items, Opts) when is_map(TX) ->
+ess_write_tx(TX, Items, Opts) when is_map(TX) ->
     {ok, _} = hb_cache:write(TX, Opts),
     set_tx_status(TX, <<"posted">>, Opts),
     lists:foreach(
@@ -83,7 +96,7 @@ write_tx(TX, Items, Opts) when is_map(TX) ->
     ),
     ok.
 
-complete_tx(TX, Opts) ->
+ess_complete_tx(TX, Opts) ->
     set_tx_status(TX, <<"complete">>, Opts).
 
 %% @doc Set the status of a bundle TX.
@@ -114,7 +127,7 @@ tx_path(TX, Opts) ->
 
 %% @doc Load all bundle TX states from cache.
 %% Returns list of {TXID, Status} tuples.
-load_bundle_states(Opts) ->
+ess_load_bundle_states(Opts) ->
     TXRootPath = hb_path:to_binary([?BUNDLER_PREFIX, <<"tx">>]),
     % List all TX IDs
     TXIDs = case hb_cache:list(TXRootPath, Opts) of
@@ -144,7 +157,7 @@ load_bundle_states(Opts) ->
     ).
 
 %% @doc Load a TX from cache by its ID.
-load_tx(TXID, Opts) ->
+ess_load_tx(TXID, Opts) ->
     ?event(debug_bundler, {load_tx, {tx_id, {explicit, TXID}}}),
     case hb_cache:read(TXID, Opts) of
         {ok, TX} ->
@@ -172,7 +185,7 @@ read_pseudopath(Path, Opts) ->
     end.
 
 %% @doc List all cached bundler item IDs.
-list_item_ids(Opts) ->
+ess_list_item_ids(Opts) ->
     ItemsPath = hb_path:to_binary([?BUNDLER_PREFIX, <<"item">>]),
     case hb_cache:list(ItemsPath, Opts) of
         [] -> [];
@@ -180,8 +193,8 @@ list_item_ids(Opts) ->
     end.
 
 %% @doc Load all items whose bundle pseudopath matches BundleID.
-load_items(BundleID, Opts) ->
-    load_items(
+ess_load_items(BundleID, Opts) ->
+    ess_load_items(
         BundleID,
         Opts,
         fun(_ItemID, _Item) -> ok end,
@@ -189,7 +202,7 @@ load_items(BundleID, Opts) ->
     ).
 
 %% @doc Load all items whose bundle pseudopath matches BundleID and invoke callbacks.
-load_items(BundleID, Opts, OnLoaded, OnFailed) ->
+ess_load_items(BundleID, Opts, OnLoaded, OnFailed) ->
     lists:filtermap(
         fun(ItemID) ->
             BundlePath = item_path(ItemID, Opts),
@@ -208,7 +221,7 @@ load_items(BundleID, Opts, OnLoaded, OnFailed) ->
                     false
             end
         end,
-        list_item_ids(Opts)
+        ess_list_item_ids(Opts)
     ).
 
 %%% Tests
@@ -216,15 +229,15 @@ load_items(BundleID, Opts, OnLoaded, OnFailed) ->
 basic_cache_test() ->
     Opts = #{<<"store">> => hb_test_utils:test_store()},
     Item = new_data_item(1, 10, Opts),
-    ok = write_item(Item, Opts),
+    ok = ess_write_item(Item, Opts),
     ItemID = item_id(Item, Opts),
     ?assertEqual(<<>>, get_item_bundle(Item, Opts)),
     TX = new_tx(1, Opts),
-    ok = write_tx(TX, [Item], Opts),
+    ok = ess_write_tx(TX, [Item], Opts),
     TXID = tx_id(TX, Opts),
     ?assertEqual(TXID, get_item_bundle(Item, Opts)),
     ?assertEqual(<<"posted">>, get_tx_status(TX, Opts)),
-    ok = complete_tx(TX, Opts),
+    ok = ess_complete_tx(TX, Opts),
     ?assertEqual(<<"complete">>, get_tx_status(TX, Opts)),
     ?assertEqual(TX, read_cache(TXID, <<"tx@1.0">>, Opts)),
     ?assertEqual(Item, read_cache(ItemID, <<"ans104@1.0">>, Opts)),
@@ -235,14 +248,14 @@ load_unbundled_items_test() ->
     Item1 = new_data_item(1, <<"data1">>, Opts),
     Item2 = new_data_item(2, <<"data2">>, Opts),
     Item3 = new_data_item(3, <<"data3">>, Opts),
-    ok = write_item(Item1, Opts),
-    ok = write_item(Item2, Opts),
-    ok = write_item(Item3, Opts),
+    ok = ess_write_item(Item1, Opts),
+    ok = ess_write_item(Item2, Opts),
+    ok = ess_write_item(Item3, Opts),
     TX = new_tx(1, Opts),
     % Link item2 to a bundle, leave others unbundled
-    ok = write_tx(TX, [Item2], Opts),
+    ok = ess_write_tx(TX, [Item2], Opts),
     % Load unbundled items
-    UnbundledItems1 = load_items(<<>>, Opts),
+    UnbundledItems1 = ess_load_items(<<>>, Opts),
     UnbundledItems2 = [
         hb_message:with_commitments(
             #{ <<"commitment-device">> => <<"ans104@1.0">> },
@@ -256,12 +269,12 @@ load_unbundled_items_test() ->
 recovered_items_relink_to_original_bundle_path_test() ->
     Opts = #{<<"store">> => hb_test_utils:test_store()},
     Item = new_data_item(1, <<"data1">>, Opts),
-    ok = write_item(Item, Opts),
-    [RecoveredItem] = load_items(<<>>, Opts),
+    ok = ess_write_item(Item, Opts),
+    [RecoveredItem] = ess_load_items(<<>>, Opts),
     TX = new_tx(1, Opts),
-    ok = write_tx(TX, [RecoveredItem], Opts),
+    ok = ess_write_tx(TX, [RecoveredItem], Opts),
     ?assertEqual(tx_id(TX, Opts), get_item_bundle(Item, Opts)),
-    ?assertEqual([], load_items(<<>>, Opts)),
+    ?assertEqual([], ess_load_items(<<>>, Opts)),
     ok.
 
 load_bundle_states_test() ->
@@ -272,7 +285,7 @@ load_bundle_states_test() ->
     ok = set_tx_status(TX1, <<"posted">>, Opts),
     ok = set_tx_status(TX2, <<"complete">>, Opts),
     ok = set_tx_status(TX3, <<"posted">>, Opts),
-    States = load_bundle_states(Opts),
+    States = ess_load_bundle_states(Opts),
     ?event(debug_test, {bundle_states, States}),
     % Only non-complete states are loaded
     ?assertEqual(2, length(States)),
@@ -287,15 +300,15 @@ load_bundled_items_test() ->
     Item1 = new_data_item(1, <<"data1">>, Opts),
     Item2 = new_data_item(2, <<"data2">>, Opts),
     Item3 = new_data_item(3, <<"data3">>, Opts),
-    ok = write_item(Item1, Opts),
-    ok = write_item(Item2, Opts),
-    ok = write_item(Item3, Opts),
+    ok = ess_write_item(Item1, Opts),
+    ok = ess_write_item(Item2, Opts),
+    ok = ess_write_item(Item3, Opts),
     TX1 = new_tx(1, Opts),
     TX2 = new_tx(2, Opts),
-    ok = write_tx(TX1, [Item1, Item2], Opts),
-    ok = write_tx(TX2, [Item3], Opts),
+    ok = ess_write_tx(TX1, [Item1, Item2], Opts),
+    ok = ess_write_tx(TX2, [Item3], Opts),
     % Load items for bundle 1
-    Bundle1Items1 = load_items(tx_id(TX1, Opts), Opts),
+    Bundle1Items1 = ess_load_items(tx_id(TX1, Opts), Opts),
     Bundle1Items2 = [
         hb_message:with_commitments(
             #{ <<"commitment-device">> => <<"ans104@1.0">> },
@@ -304,7 +317,7 @@ load_bundled_items_test() ->
     Bundle1Items3 = lists:sort(Bundle1Items2),
     ?assertEqual(lists:sort([Item1, Item2]), Bundle1Items3),
     % Load items for bundle 2
-    Bundle2Items1 = load_items(tx_id(TX2, Opts), Opts),
+    Bundle2Items1 = ess_load_items(tx_id(TX2, Opts), Opts),
     Bundle2Items2 = [
         hb_message:with_commitments(
             #{ <<"commitment-device">> => <<"ans104@1.0">> },
