@@ -19,6 +19,16 @@
 -define(PUSH_WORKERS, dev_push_detached_workers).
 -define(DEFAULT_MAX_PUSH_WORKERS, 32).
 -define(DEFAULT_DETACHED_MAX_DEPTH, 16).
+%% The node-wide delivery queue: hops past the detached depth bound and
+%% entries whose target could not be read yet are driven from here, so a
+%% bound on memory never becomes a bound on delivery.
+-define(CRANKER, dev_push_cranker).
+-define(CRANKER_STATE, dev_push_cranker_state).
+-define(DEFAULT_CRANKER_WORKERS, 4).
+-define(DEFAULT_CRANKER_MAX_QUEUE, 10000).
+-define(DEFAULT_RETRY_MAX_ATTEMPTS, 8).
+-define(DEFAULT_DURABLE_HORIZON_HOURS, 24).
+-define(DEFAULT_TARGET_MISS_MAX, 100000).
 -define(OUTBOX_NON_ENTRY_KEYS,
     ?AO_CORE_KEYS ++ [<<"commitments">>, <<"ao-types">>, <<"device">>]
 ).
@@ -118,7 +128,7 @@ detached_push(Process, Req, Opts) ->
                 true ->
                     Caller = self(),
                     ServerID = erlang:get(server_id),
-                    WorkerOpts = detached_opts(Opts),
+                    WorkerOpts = detached_opts(Req, Opts),
                     {Worker, Monitor} =
                         spawn_monitor(
                             fun() ->
@@ -142,17 +152,27 @@ detached_push(Process, Req, Opts) ->
 %% out of memory. Give the worker a depth bound when the caller did not set one.
 %% The bound is applied here rather than in `do_push/3' because an in-line push
 %% is still cancellable and does not need it.
-detached_opts(Opts) ->
+%% The bound is on memory, not on delivery: it is marked `push-depth-implicit',
+%% and a hop that reaches it is handed to the cranker rather than skipped (see
+%% `push_downstream/4'). A `max-depth' the caller or the operator chose is an
+%% instruction and keeps its documented skip semantics.
+detached_opts(Req, Opts) ->
     Base = Opts#{ <<"push-in-worker">> => true },
-    case hb_opts:get(push_max_depth, undefined, Opts) of
-        undefined ->
+    CallerDepth =
+        case is_map(Req) of
+            true -> hb_maps:get(<<"max-depth">>, Req, undefined, Opts);
+            false -> undefined
+        end,
+    case {CallerDepth, hb_opts:get(push_max_depth, undefined, Opts)} of
+        {undefined, undefined} ->
             Base#{
                 <<"push-max-depth">> =>
                     hb_opts:get(
                         push_detached_max_depth,
                         ?DEFAULT_DETACHED_MAX_DEPTH,
                         Opts
-                    )
+                    ),
+                <<"push-depth-implicit">> => true
             };
         _Set -> Base
     end.
@@ -178,34 +198,7 @@ admit_push_worker(Opts) ->
     catch error:badarg -> false
     end.
 
-%% @doc The table is owned by a process that never exits: a table dies with its
-%% owner, and the first caller is usually a short-lived request.
-ensure_push_worker_table() ->
-    case ets:whereis(?PUSH_WORKERS) of
-        undefined ->
-            Parent = self(),
-            Ref = make_ref(),
-            {Owner, Mon} =
-                spawn_monitor(
-                    fun() ->
-                        try ets:new(?PUSH_WORKERS,
-                                [named_table, public, set]) of
-                            _ ->
-                                Parent ! {Ref, created},
-                                receive after infinity -> ok end
-                        catch error:badarg -> Parent ! {Ref, exists}
-                        end
-                    end
-                ),
-            receive
-                {Ref, _} -> ok;
-                {'DOWN', Mon, process, Owner, _} -> ok
-            after 5000 -> ok
-            end,
-            erlang:demonitor(Mon, [flush]),
-            ok;
-        _ -> ok
-    end.
+ensure_push_worker_table() -> ensure_table(?PUSH_WORKERS).
 
 %% @doc Execute a push, tagging the outcome so that a detached worker can
 %% hand back either a result or the exception it hit.
@@ -347,69 +340,39 @@ do_push(PrimaryProcess, Assignment, Opts) ->
     case {Status, hb_ao:get(<<"outbox">>, Result, #{}, Opts)} of
         {ok, NoResults} when ?IS_EMPTY_MESSAGE(NoResults) ->
             ?event(push_short, {done, {process, {string, ID}}, {slot, Slot}}),
+            mark_slot_done(ID, Slot, Opts),
             {ok, AdditionalRes#{ <<"slot">> => Slot, <<"process">> => ID }};
         {ok, Outbox} ->
             ?event(push, {push_found_outbox, {outbox, Outbox}}),
+            Entries = outbox_entries(Outbox, Opts),
+            record_slot_entries(ID, Slot, hb_maps:keys(Entries, Opts), Opts),
+            Origin =
+                #{
+                    <<"process">> => ID,
+                    <<"slot">> => Slot,
+                    <<"result-depth">> => IncludeDepth,
+                    <<"max-depth">> => MaxDepth,
+                    <<"from-base">> => BaseID,
+                    <<"from-uncommitted">> => UncommittedID,
+                    <<"from-scheduler">> =>
+                        hb_ao:get(<<"scheduler">>, PrimaryProcess, Opts),
+                    <<"from-authority">> =>
+                        hb_ao:get(<<"authority">>, PrimaryProcess, Opts)
+                },
             Downstream =
                 hb_maps:map(
-                    fun(Key, RawMsgToPush = #{ <<"target">> := Target }) ->
-                        MsgToPush =
-                            case maybe_evaluate_message(RawMsgToPush, Opts) of
-                                {ok, R} -> R;
-                                Err ->
-                                    #{
-                                        <<"resolve">> => <<"error">>,
-                                        <<"target">> => ID,
-                                        <<"status">> => 400,
-                                        <<"outbox-index">> => Key,
-                                        <<"reason">> => Err,
-                                        <<"source">> => RawMsgToPush
-                                    }
-                            end,
-                        case read_target(Target, Opts) of
-                            {ok, DownstreamProcess} ->
-                                push_result_message(
-                                    DownstreamProcess,
-                                    MsgToPush,
-                                    #{
-                                        <<"process">> => ID,
-                                        <<"slot">> => Slot,
-                                        <<"outbox-key">> => Key,
-                                        <<"result-depth">> => IncludeDepth,
-                                        <<"max-depth">> => MaxDepth,
-                                        <<"from-base">> => BaseID,
-                                        <<"from-uncommitted">> => UncommittedID,
-                                        <<"from-scheduler">> =>
-                                            hb_ao:get(
-                                                <<"scheduler">>,
-                                                PrimaryProcess,
-                                                Opts
-                                            ),
-                                        <<"from-authority">> =>
-                                            hb_ao:get(
-                                                <<"authority">>,
-                                                PrimaryProcess,
-                                                Opts
-                                            )
-                                    },
-                                    Opts
-                                );
-                            {error, not_found} ->
-                                target_process_not_found(Target)
-                        end;
-                       (Key, Msg) ->
-                            #{
-                                <<"response">> => <<"error">>,
-                                <<"status">> => 404,
-                                <<"outbox-index">> => Key,
-                                <<"reason">> =>
-                                    <<"Target process not available.">>,
-                                <<"message">> => Msg
-                            }
+                    fun(Key, Msg) ->
+                        push_entry(
+                            Key,
+                            Msg,
+                            Origin#{ <<"outbox-key">> => Key },
+                            Opts
+                        )
                     end,
-                    outbox_entries(Outbox, Opts),
+                    Entries,
                     Opts
                 ),
+            maybe_mark_slot_done(ID, Slot, Downstream, Opts),
             {ok, maps:merge(Downstream, AdditionalRes#{
                 <<"slot">> => Slot,
                 <<"process">> => ID
@@ -419,24 +382,110 @@ do_push(PrimaryProcess, Assignment, Opts) ->
             {error, Error}
     end.
 
+%% @doc Push one outbox entry: find its target, schedule it there, and follow
+%% the target's new slot downstream. Under `push-durable' the entry is first
+%% looked up in its delivery record, so that a retried or resumed push of the
+%% same slot neither schedules it twice nor races a delivery still in flight.
+push_entry(Key, RawMsgToPush = #{ <<"target">> := Target }, Origin, Opts) ->
+    case claim_entry(Origin, Opts) of
+        untracked -> deliver_entry(Key, RawMsgToPush, Target, Origin, Opts);
+        {recorded, {scheduled, TargetID, TargetSlot, PushedMsgID}} ->
+            ?event(push_short,
+                {push_already_delivered,
+                    {target, TargetID},
+                    {slot, TargetSlot}
+                }
+            ),
+            #{
+                <<"id">> => PushedMsgID,
+                <<"target">> => TargetID,
+                <<"slot">> => TargetSlot,
+                <<"recorded">> => true,
+                <<"resulted-in">> =>
+                    case continue_recorded(TargetID, TargetSlot, Origin, Opts) of
+                        {ok, Downstream} -> Downstream;
+                        {error, Error} -> #{ <<"response">> => <<"error">>,
+                                             <<"reason">> => Error }
+                    end
+            };
+        {recorded, rejected} ->
+            (target_process_not_found(Target))#{ <<"recorded">> => true };
+        in_flight ->
+            #{
+                <<"status">> => 202,
+                <<"target">> => Target,
+                <<"in-flight">> => true,
+                <<"outbox-index">> => Key
+            };
+        {claimed, Claim} ->
+            try deliver_entry(Key, RawMsgToPush, Target, Origin, Opts)
+            after release_claim(Claim)
+            end
+    end;
+push_entry(Key, Msg, _Origin, _Opts) ->
+    #{
+        <<"response">> => <<"error">>,
+        <<"status">> => 404,
+        <<"outbox-index">> => Key,
+        <<"reason">> => <<"Target process not available.">>,
+        <<"message">> => Msg
+    }.
+
+%% @doc Deliver an entry whose delivery has not been recorded. A target that
+%% cannot be read right now is not the same as a target that does not exist:
+%% only a fresh, definitive miss rejects the entry. A remembered miss or a
+%% failed read defers it to the cranker, which retries it once the miss has
+%% expired.
+deliver_entry(Key, RawMsgToPush, Target, Origin, Opts) ->
+    ID = maps:get(<<"process">>, Origin),
+    MsgToPush =
+        case maybe_evaluate_message(RawMsgToPush, Opts) of
+            {ok, R} -> R;
+            Err ->
+                #{
+                    <<"resolve">> => <<"error">>,
+                    <<"target">> => ID,
+                    <<"status">> => 400,
+                    <<"outbox-index">> => Key,
+                    <<"reason">> => Err,
+                    <<"source">> => RawMsgToPush
+                }
+        end,
+    case read_target(Target, Opts) of
+        {ok, DownstreamProcess} ->
+            push_result_message(DownstreamProcess, MsgToPush, Origin, Opts);
+        {error, not_found} ->
+            record_entry(Origin, rejected, Opts),
+            target_process_not_found(Target);
+        Unavailable ->
+            defer_entry(Target, MsgToPush, Origin, Unavailable, 1, Opts)
+    end.
+
+%% @doc Continue a delivery that its record says was already scheduled. The
+%% target slot's own `done' marker ends the walk: everything below it has been
+%% pushed, so re-walking it would only recompute what is already delivered.
+continue_recorded(TargetID, TargetSlot, Origin, Opts) ->
+    case is_slot_done(TargetID, TargetSlot, Opts) of
+        true -> {ok, <<"already-pushed">>};
+        false -> push_downstream(TargetID, TargetSlot, Origin, Opts)
+    end.
+
 %% @doc Return the outbox entries that should be pushed downstream, discarding
 %% the result metadata that shares the map with them. The outbox arrives as part
 %% of a computed result, so it carries that result's `commitments' and `status'
 %% alongside the messages the process actually emitted.
 outbox_entries(Outbox, Opts) ->
     Normalized = hb_ao:normalize_keys(hb_private:reset(Outbox)),
-    % Normalize the names the process gave its entries, but do not descend into
-    % the entries themselves. `hb_util:lower_case_keys/2' recurses through every
-    % nested map, and the keys of a message's `commitments' are base64url
-    % commitment IDs, which are case-sensitive: lower-casing them yields IDs
-    % that no longer name the commitments they identify, so a pushed entry
-    % carries signatures that can no longer be verified downstream.
+    LowerPayload = not is_true(hb_opts:get(push_preserve_key_case, false, Opts)),
     Entries =
         hb_maps:fold(
             fun(Key, Msg, Acc) ->
                 maps:put(
                     hb_util:to_lower(Key),
-                    normalize_entry_target(Msg, Opts),
+                    case LowerPayload of
+                        true -> lower_case_entry(Msg);
+                        false -> normalize_entry_target(Msg, Opts)
+                    end,
                     Acc
                 )
             end,
@@ -446,16 +495,42 @@ outbox_entries(Outbox, Opts) ->
         ),
     hb_maps:without(?OUTBOX_NON_ENTRY_KEYS, Entries, Opts).
 
+%% @doc Lower-case the keys of an outbox entry, as the reference push device
+%% does with `hb_util:lower_case_keys/2': a recipient reads `action', not
+%% `Action', whichever node delivered it. Two things are left as they were
+%% emitted, because their case is part of what they say: a `commitments' map,
+%% whose keys are case-sensitive base64url commitment IDs, and a signed
+%% sub-message (one that carries `commitments'), whose keys are covered by the
+%% signature. Fold with `hb_util_string:lowercase/1' rather than
+%% `hb_util:to_lower/1': a process names its own fields, `to_lower' throws on a
+%% name that is not valid UTF-8, and one such name would abort delivery of the
+%% whole outbox.
+lower_case_entry(Msg) when is_map(Msg) ->
+    maps:fold(
+        fun(K, V, Acc) ->
+            LowerK =
+                case is_binary(K) of
+                    true -> hb_util_string:lowercase(K);
+                    false -> K
+                end,
+            maps:put(LowerK, lower_case_value(LowerK, V), Acc)
+        end,
+        #{},
+        Msg
+    );
+lower_case_entry(Msg) -> Msg.
+
+lower_case_value(<<"commitments">>, V) -> V;
+lower_case_value(_, V = #{ <<"commitments">> := _ }) -> V;
+lower_case_value(_, V) when is_map(V) -> lower_case_entry(V);
+lower_case_value(_, V) -> V.
+
 %% @doc Give an entry the lower-case `target' that the push path dispatches and
-%% reads on. A legacy AO process names the key `Target', and `hb_ao:get/4'
-%% lowers the key it is asked for but not the keys it searches, so such an entry
-%% matches no clause of the push walk and is answered `Target process not
-%% available.' without ever being delivered. Rename only that key: every other
-%% field is payload that the recipient reads under the name its sender chose.
-%% Fold with `hb_util_string:lowercase/1' rather than `hb_util:to_lower/1': a
-%% process names its own fields, `to_lower' throws on a name that is not valid
-%% UTF-8, and one such name would abort delivery of the whole outbox. `target'
-%% is ASCII, so the two agree on every key that can match.
+%% reads on, when the node is configured to preserve the case of payload keys
+%% (`push-preserve-key-case'). A legacy AO process names the key `Target', and
+%% `hb_ao:get/4' lowers the key it is asked for but not the keys it searches,
+%% so such an entry matches no clause of the push walk and is answered `Target
+%% process not available.' without ever being delivered. Rename only that key.
 normalize_entry_target(Msg, Opts) when is_map(Msg) ->
     maybe
         false ?= hb_maps:is_key(<<"target">>, Msg, Opts),
@@ -477,56 +552,127 @@ normalize_entry_target(Msg, _Opts) -> Msg.
 %% vault or pair are wallets (Credit-Notice, Debit-Notice), which are not
 %% messages at all: a full store read misses locally and then walks every
 %% remote store (three GraphQL gateways here, 0.7-3.6 s) before failing, once
-%% per entry, on every push. Read local stores first -- every process this node
-%% runs is there -- and remember remote misses for a bounded time
-%% (`push-target-miss-ttl' seconds, default 300), so a wallet costs one remote
-%% walk per TTL rather than one per message. A process that exists only
-%% remotely is still found, and a miss is retried after the TTL.
+%% per entry, on every push. Local stores are read first -- every process this
+%% node runs is there. A node may also remember remote misses for a bounded time
+%% (`push-target-miss-ttl' seconds; default 0, off, as in the reference device),
+%% so a wallet costs one remote walk per TTL rather than one per message.
+%%
+%% The gateway store reports a failed request as `not_found', so a remembered
+%% miss cannot be told apart from a gateway outage. It is therefore never a
+%% reason to reject an entry: it is returned as `{cached_miss, At}' and the
+%% entry is deferred until a fresh read decides it. A failed read is
+%% `{transient, Reason}' and is never remembered. Returns `{ok, Msg}',
+%% `{error, not_found}' (a fresh, definitive miss), `{cached_miss, At}' or
+%% `{transient, Reason}'.
 read_target(Target, Opts) ->
     case hb_cache:read(Target, hb_store:scope(Opts, local)) of
         {ok, Msg} -> {ok, Msg};
         _ ->
             case recent_miss(Target, Opts) of
-                true -> {error, not_found};
-                false ->
-                    case hb_cache:read(Target, Opts) of
-                        {ok, Msg} -> {ok, Msg};
-                        Miss ->
-                            remember_miss(Target),
-                            Miss
-                    end
+                {true, At} -> {cached_miss, At};
+                false -> read_target_fresh(Target, Opts)
             end
+    end.
+
+%% @doc Read a target through every store, ignoring remembered misses.
+read_target_fresh(Target, Opts) ->
+    try hb_cache:read(Target, Opts) of
+        {ok, Msg} -> {ok, Msg};
+        {error, not_found} ->
+            remember_miss(Target, Opts),
+            {error, not_found};
+        not_found ->
+            remember_miss(Target, Opts),
+            {error, not_found};
+        Other -> {transient, Other}
+    catch Class:Reason -> {transient, {Class, Reason}}
     end.
 
 -define(TARGET_MISSES, dev_push_target_misses).
 
+miss_ttl_ms(Opts) ->
+    hb_util:int(hb_opts:get(<<"push-target-miss-ttl">>, 0, Opts)) * 1000.
+
 recent_miss(Target, Opts) ->
-    TTL = hb_util:int(hb_opts:get(<<"push-target-miss-ttl">>, 300, Opts)),
-    ensure_miss_table(),
-    try ets:lookup(?TARGET_MISSES, Target) of
-        [{Target, At}] -> erlang:monotonic_time(second) - At < TTL;
-        [] -> false
-    catch error:badarg -> false
+    case miss_ttl_ms(Opts) of
+        TTL when TTL =< 0 -> false;
+        TTL ->
+            case miss_time(Target) of
+                {ok, At} ->
+                    case now_ms() - At < TTL of
+                        true -> {true, At};
+                        false -> false
+                    end;
+                none -> false
+            end
     end.
 
-remember_miss(Target) ->
-    ensure_miss_table(),
-    try ets:insert(?TARGET_MISSES, {Target, erlang:monotonic_time(second)})
-    catch error:badarg -> ok
-    end,
-    ok.
+%% @doc When `Target' last missed on a fresh read, in monotonic milliseconds.
+miss_time(Target) ->
+    ensure_table(?TARGET_MISSES),
+    try ets:lookup(?TARGET_MISSES, Target) of
+        [{Target, At}] -> {ok, At};
+        [] -> none
+    catch error:badarg -> none
+    end.
 
-%% @doc The table is owned by a process that never exits: a table dies with its
-%% owner, and the first caller is usually a short-lived request.
-ensure_miss_table() ->
-    case ets:whereis(?TARGET_MISSES) of
+%% @doc Remember a fresh miss, and keep the table bounded: entries older than
+%% the TTL are swept at most once per TTL, and a table still over
+%% `push-target-miss-max' after a sweep is cleared. Clearing only costs the
+%% wallets a remote walk each; it never loses a message.
+remember_miss(Target, Opts) ->
+    case miss_ttl_ms(Opts) of
+        TTL when TTL =< 0 -> ok;
+        TTL ->
+            ensure_table(?TARGET_MISSES),
+            Now = now_ms(),
+            try
+                ets:insert(?TARGET_MISSES, {Target, Now}),
+                prune_misses(Now, TTL, Opts)
+            catch error:badarg -> ok
+            end,
+            ok
+    end.
+
+prune_misses(Now, TTL, Opts) ->
+    Max =
+        hb_util:int(
+            hb_opts:get(<<"push-target-miss-max">>, ?DEFAULT_TARGET_MISS_MAX, Opts)
+        ),
+    LastSweep =
+        case ets:lookup(?TARGET_MISSES, '$sweep') of
+            [{_, L}] -> L;
+            [] -> undefined
+        end,
+    Size = ets:info(?TARGET_MISSES, size),
+    Due = LastSweep == undefined orelse Now - LastSweep >= TTL,
+    case Due orelse Size > Max of
+        false -> ok;
+        true ->
+            ets:insert(?TARGET_MISSES, {'$sweep', Now}),
+            ets:select_delete(
+                ?TARGET_MISSES,
+                [{{'$1', '$2'}, [{is_binary, '$1'}, {'<', '$2', Now - TTL}], [true]}]
+            ),
+            case ets:info(?TARGET_MISSES, size) > Max of
+                true -> ets:delete_all_objects(?TARGET_MISSES);
+                false -> ok
+            end
+    end.
+
+now_ms() -> erlang:monotonic_time(millisecond).
+
+%% @doc A named public table owned by a process that never exits: a table dies
+%% with its owner, and the first caller is usually a short-lived request.
+ensure_table(Name) ->
+    case ets:whereis(Name) of
         undefined ->
             Parent = self(),
             Ref = make_ref(),
             {Owner, Mon} =
                 spawn_monitor(
                     fun() ->
-                        try ets:new(?TARGET_MISSES, [named_table, public, set]) of
+                        try ets:new(Name, [named_table, public, set]) of
                             _ ->
                                 Parent ! {Ref, created},
                                 receive after infinity -> ok end
@@ -616,6 +762,15 @@ push_result_message(TargetProcess, MsgToPush, Origin, Opts) ->
                     % Get the ID of the message that was pushed. We already have
                     % the 'origin' message, but we need the signed ID.
                     PushedMsgID = hb_message:id(PushedMsg, all, Opts),
+                    % Record the delivery as soon as the target holds it, and
+                    % journal the target's new slot so that its own push is
+                    % resumed if the node stops before it runs.
+                    record_entry(
+                        Origin,
+                        {scheduled, TargetID, NextSlotOnProc, PushedMsgID},
+                        Opts
+                    ),
+                    journal_slot(TargetID, NextSlotOnProc, Opts),
                     ?event(push_short,
                         {pushed_message_to,
                             {process, TargetID},
@@ -655,9 +810,25 @@ push_result_message(TargetProcess, MsgToPush, Origin, Opts) ->
 %% `<<"skipped">>'): the message is already in the target's schedule queue
 %% from the `schedule_result' call above, so the target's own `/push'
 %% invocation will pick it up on its next cron tick or explicit caller.
+%% A depth of `0' that is the detached worker's own memory bound rather than
+%% the caller's choice (`push-depth-implicit') is not a reason to stop: the
+%% hop is handed to the cranker, which continues it under a fresh bound, and
+%% the response carries `<<"deferred">>'.
 push_downstream(TargetID, NextSlotOnProc, Origin, Opts) ->
-    case parse_max_depth(hb_maps:get(<<"max-depth">>, Origin, undefined, Opts)) of
-        0 ->
+    Depth = parse_max_depth(hb_maps:get(<<"max-depth">>, Origin, undefined, Opts)),
+    case {Depth, map_get_true(<<"push-depth-implicit">>, Opts)} of
+        {0, true} ->
+            ?event(push_short,
+                {push_depth_bound_deferred,
+                    {target, TargetID},
+                    {slot, NextSlotOnProc}
+                }
+            ),
+            case enqueue({continue, TargetID, NextSlotOnProc}, 0, Opts) of
+                ok -> {ok, <<"deferred">>};
+                full -> {ok, <<"skipped">>}
+            end;
+        {0, false} ->
             ?event(push_short,
                 {push_max_depth_reached,
                     {target, TargetID},
@@ -1146,6 +1317,595 @@ parse_redirect(Location, Opts) ->
             }
         ),
     {Node, hb_maps:get(path, Parsed, undefined, Opts)}.
+
+%%% Delivery records, deferral and the cranker.
+%%%
+%%% Under `push-durable' (default `false') every outbox entry a push delivers
+%%% is recorded in the node's local store, keyed by the source process, the
+%%% source slot and the entry's outbox key -- the entry's stable identity, as
+%%% the schedule path has no dedup by message ID and a re-signed entry gets a
+%%% new one:
+%%%   push-delivery/<process>/<slot>/<key> -> pending | retrying | rejected |
+%%%                                           {scheduled, Target, Slot, ID}
+%%%   push-slot/<process>/<slot>           -> the slot's outbox keys
+%%%   push-done/<process>/<slot>           -> every entry is resolved
+%%%   push-journal/<hour>/<process>@<slot> -> a slot whose push must run
+%%% A slot is journaled when its outbox is found, and every target slot when
+%%% its message is scheduled; on the first durable push after a start the
+%%% journal of the last `push-durable-horizon' hours is replayed, and every
+%%% slot without a `done' marker is pushed again. A re-push consults the
+%%% records, so it schedules only what was not scheduled before. An entry whose
+%%% record is `pending' is claimed in memory by the live process delivering it,
+%%% so a client that re-POSTs `/push' while the first detached worker runs
+%%% does not deliver it twice. The record is written after the target's
+%%% scheduler returns, so a node that stops between the two can still deliver
+%%% that one entry twice on resume: at-least-once, not exactly-once.
+%%%
+%%% The cranker is a node-wide queue with a bounded worker pool
+%%% (`push-cranker-workers', default 4) and a bounded length
+%%% (`push-cranker-max-queue', default 10000). It drives two kinds of work,
+%%% with or without `push-durable': hops past the detached depth bound
+%%% (`{continue, Process, Slot}') and entries whose target could not be read
+%%% (`{retry, ...}').
+
+is_true(true) -> true;
+is_true(<<"true">>) -> true;
+is_true(_) -> false.
+
+map_get_true(Key, Map) -> is_true(maps:get(Key, Map, false)).
+
+durable(Opts) -> is_true(hb_opts:get(push_durable, false, Opts)).
+
+-define(CLAIMS, dev_push_delivery_claims).
+
+%% @doc Find, or claim, the delivery of one outbox entry. Returns `untracked'
+%% when the node keeps no records, `{recorded, State}' for an entry that a
+%% previous push already resolved, `in_flight' while a live process holds it,
+%% or `{claimed, Claim}' when this process is now the one delivering it.
+claim_entry(Origin, Opts) ->
+    case durable(Opts) of
+        false -> untracked;
+        true ->
+            Path = entry_path(Origin),
+            case resolved_record(Path, Opts) of
+                {recorded, _} = Recorded -> Recorded;
+                unresolved ->
+                    ensure_table(?CLAIMS),
+                    case take_claim(Path, self()) of
+                        false -> in_flight;
+                        true ->
+                            % A delivery may have finished between the read
+                            % and the claim; it is the claim that orders them.
+                            case resolved_record(Path, Opts) of
+                                {recorded, _} = Recorded ->
+                                    release_claim(Path),
+                                    Recorded;
+                                unresolved ->
+                                    write_record(Path, pending, Opts),
+                                    {claimed, Path}
+                            end
+                    end
+            end
+    end.
+
+resolved_record(Path, Opts) ->
+    case read_record(Path, Opts) of
+        {ok, Scheduled = {scheduled, _, _, _}} -> {recorded, Scheduled};
+        {ok, rejected} -> {recorded, rejected};
+        _ -> unresolved
+    end.
+
+take_claim(Path, Self) ->
+    case ets:insert_new(?CLAIMS, {Path, Self}) of
+        true -> true;
+        false ->
+            case ets:lookup(?CLAIMS, Path) of
+                [{_, Self}] -> true;
+                [{_, Owner}] ->
+                    case is_process_alive(Owner) of
+                        true -> false;
+                        false ->
+                            ets:delete_object(?CLAIMS, {Path, Owner}),
+                            take_claim(Path, Self)
+                    end;
+                [] -> take_claim(Path, Self)
+            end
+    end.
+
+release_claim(Path) ->
+    try ets:delete_object(?CLAIMS, {Path, self()})
+    catch error:badarg -> ok
+    end,
+    ok.
+
+%% @doc Record the state of an entry's delivery, when the node keeps records.
+record_entry(Origin, State, Opts) ->
+    case durable(Opts) andalso maps:is_key(<<"outbox-key">>, Origin) of
+        true -> write_record(entry_path(Origin), State, Opts);
+        false -> ok
+    end.
+
+%% @doc Note a slot's outbox keys and journal the slot, so that a push cut
+%% short before every entry is resolved is resumed.
+record_slot_entries(ID, Slot, Keys, Opts) ->
+    case durable(Opts) of
+        false -> ok;
+        true ->
+            maybe_resume_journal(Opts),
+            write_record(slot_path(<<"push-slot">>, ID, Slot), Keys, Opts),
+            journal_slot(ID, Slot, Opts)
+    end.
+
+%% @doc Journal a slot whose push must run, under the current hour.
+journal_slot(ID, Slot, Opts) ->
+    case durable(Opts) of
+        false -> ok;
+        true ->
+            Bucket = hb_util:bin(erlang:system_time(second) div 3600),
+            Group = <<"push-journal/", Bucket/binary>>,
+            ensure_table(?CRANKER_STATE),
+            GroupKey = {journal_group, local_store_hash(Opts), Group},
+            case ets:insert_new(?CRANKER_STATE, {GroupKey, true}) of
+                true -> store_call(group, Group, Opts);
+                false -> ok
+            end,
+            store_call(
+                write,
+                #{ <<Group/binary, "/", ID/binary, "@",
+                        (hb_util:bin(Slot))/binary>> => <<"1">> },
+                Opts
+            )
+    end.
+
+mark_slot_done(ID, Slot, Opts) ->
+    case durable(Opts) of
+        false -> ok;
+        true ->
+            store_call(write, #{ slot_path(<<"push-done">>, ID, Slot) => <<"1">> }, Opts)
+    end.
+
+is_slot_done(ID, Slot, Opts) ->
+    durable(Opts) andalso
+        store_call(read, slot_path(<<"push-done">>, ID, Slot), Opts) =/= not_found.
+
+%% @doc Mark a slot done when none of its entries is left to deliver: a
+%% deferred or in-flight entry, or one whose schedule request failed, keeps
+%% the slot in the journal.
+maybe_mark_slot_done(ID, Slot, Downstream, Opts) ->
+    Unresolved =
+        [
+            K
+        ||
+            {K, R} <- maps:to_list(Downstream),
+            is_map(R),
+            maps:get(<<"deferred">>, R, false) == true
+                orelse maps:is_key(<<"in-flight">>, R)
+                orelse (maps:get(<<"response">>, R, undefined) == <<"error">>
+                    andalso maps:get(<<"status">>, R, undefined) =/= 404)
+        ],
+    case Unresolved of
+        [] -> mark_slot_done(ID, Slot, Opts);
+        _ -> ok
+    end.
+
+%% @doc After a deferred entry is resolved, mark its slot done if it was the
+%% last entry of the slot still open.
+maybe_complete_slot(Origin, Opts) ->
+    case durable(Opts) of
+        false -> ok;
+        true ->
+            ID = maps:get(<<"process">>, Origin),
+            Slot = maps:get(<<"slot">>, Origin),
+            case read_record(slot_path(<<"push-slot">>, ID, Slot), Opts) of
+                {ok, Keys} when is_list(Keys) ->
+                    Open =
+                        [
+                            K
+                        ||
+                            K <- Keys,
+                            resolved_record(
+                                entry_path(Origin#{ <<"outbox-key">> => K }),
+                                Opts
+                            ) == unresolved
+                        ],
+                    case Open of
+                        [] -> mark_slot_done(ID, Slot, Opts);
+                        _ -> ok
+                    end;
+                _ -> ok
+            end
+    end.
+
+entry_path(#{ <<"process">> := ID, <<"slot">> := Slot, <<"outbox-key">> := Key }) ->
+    <<
+        (slot_path(<<"push-delivery">>, ID, Slot))/binary,
+        "/",
+        (hb_util:encode(hb_util:bin(Key)))/binary
+    >>.
+
+slot_path(Prefix, ID, Slot) ->
+    <<Prefix/binary, "/", (hb_util:bin(ID))/binary, "/", (hb_util:bin(Slot))/binary>>.
+
+write_record(Path, Term, Opts) ->
+    store_call(write, #{ Path => term_to_binary(Term) }, Opts).
+
+read_record(Path, Opts) ->
+    case store_call(read, Path, Opts) of
+        {ok, Bin} when is_binary(Bin) ->
+            try {ok, binary_to_term(Bin, [safe])}
+            catch _:_ -> not_found
+            end;
+        _ -> not_found
+    end.
+
+%% @doc Call the node's local store. Records are bookkeeping: a store that
+%% refuses one is logged and delivery carries on, at the old guarantee.
+store_call(Function, Arg, Opts) ->
+    LocalOpts = hb_store:scope(Opts, local),
+    Store = hb_opts:get(store, [], LocalOpts),
+    try hb_store:Function(Store, Arg, LocalOpts) of
+        {ok, Res} -> {ok, Res};
+        ok -> ok;
+        Other when Function == read; Function == list ->
+            ?event(push_durable, {store_miss, {function, Function}, {res, Other}}),
+            not_found;
+        Other ->
+            ?event(push, {push_record_failed, {function, Function}, {res, Other}}),
+            Other
+    catch Class:Reason ->
+        ?event(push, {push_record_failed, {function, Function}, {Class, Reason}}),
+        not_found
+    end.
+
+%% @doc Replay the journal once per store per node start: push every journaled
+%% slot of the last `push-durable-horizon' hours that has no `done' marker.
+maybe_resume_journal(Opts) ->
+    ensure_table(?CRANKER_STATE),
+    Key = {resumed, local_store_hash(Opts)},
+    case ets:insert_new(?CRANKER_STATE, {Key, true}) of
+        true ->
+            ServerID = erlang:get(server_id),
+            spawn(fun() ->
+                hb_http_server:set_proc_server_id(ServerID),
+                resume_journal(Opts)
+            end),
+            ok;
+        false -> ok
+    end.
+
+local_store_hash(Opts) ->
+    erlang:phash2(hb_opts:get(store, [], hb_store:scope(Opts, local))).
+
+resume_journal(Opts) ->
+    Hours =
+        hb_util:int(
+            hb_opts:get(
+                push_durable_horizon,
+                ?DEFAULT_DURABLE_HORIZON_HOURS,
+                Opts
+            )
+        ),
+    Now = erlang:system_time(second) div 3600,
+    Resumed =
+        lists:sum(
+            [
+                resume_bucket(hb_util:bin(Bucket), Opts)
+            ||
+                Bucket <- lists:seq(Now - Hours, Now)
+            ]
+        ),
+    ?event(push, {push_journal_resumed, {slots, Resumed}}),
+    Resumed.
+
+resume_bucket(Bucket, Opts) ->
+    case store_call(list, <<"push-journal/", Bucket/binary>>, Opts) of
+        {ok, Children} ->
+            length(
+                [
+                    ok
+                ||
+                    Child <- Children,
+                    [ID, SlotBin] <- [binary:split(Child, <<"@">>)],
+                    not is_slot_done(ID, SlotBin, Opts),
+                    enqueue({continue, ID, hb_util:int(SlotBin)}, 0, Opts) == ok
+                ]
+            );
+        _ -> 0
+    end.
+
+%% @doc Defer an entry whose target could not be read. `Why' is the read's
+%% outcome: a remembered miss is retried once it has expired, a failed read
+%% with exponential backoff (1 s doubling, at most 300 s) for
+%% `push-retry-max-attempts' attempts. With no room on the queue the entry is
+%% decided now, with a fresh read, rather than dropped.
+defer_entry(Target, MsgToPush, Origin, Why, Attempt, Opts) ->
+    Max =
+        hb_util:int(
+            hb_opts:get(
+                push_retry_max_attempts,
+                ?DEFAULT_RETRY_MAX_ATTEMPTS,
+                Opts
+            )
+        ),
+    case Attempt > Max of
+        true ->
+            ?event(push,
+                {push_retry_abandoned,
+                    {target, Target},
+                    {origin, Origin},
+                    {why, Why}
+                }
+            ),
+            unavailable_target(Target, Why);
+        false ->
+            Delay = retry_delay(Why, Attempt, Opts),
+            record_entry(Origin, retrying, Opts),
+            Item = {retry, Target, MsgToPush, Origin, now_ms(), Attempt},
+            case enqueue(Item, Delay, Opts) of
+                ok ->
+                    ?event(push_short,
+                        {push_entry_deferred,
+                            {target, Target},
+                            {why, Why},
+                            {delay_ms, Delay}
+                        }
+                    ),
+                    #{
+                        <<"status">> => 202,
+                        <<"target">> => Target,
+                        <<"deferred">> => true,
+                        <<"retry-in-ms">> => Delay,
+                        <<"reason">> => why_bin(Why)
+                    };
+                full ->
+                    case read_target_fresh(Target, Opts) of
+                        {ok, DownstreamProcess} ->
+                            push_result_message(
+                                DownstreamProcess,
+                                MsgToPush,
+                                Origin,
+                                Opts
+                            );
+                        {error, not_found} ->
+                            record_entry(Origin, rejected, Opts),
+                            target_process_not_found(Target);
+                        Unavailable ->
+                            ?event(push,
+                                {push_retry_overflow,
+                                    {target, Target},
+                                    {why, Unavailable}
+                                }
+                            ),
+                            unavailable_target(Target, Unavailable)
+                    end
+            end
+    end.
+
+retry_delay({cached_miss, At}, _Attempt, Opts) ->
+    max(0, At + miss_ttl_ms(Opts) - now_ms()) + 50;
+retry_delay(_, Attempt, _Opts) ->
+    min(1000 bsl min(Attempt - 1, 16), 300000).
+
+why_bin({cached_miss, _}) -> <<"target-recently-missing">>;
+why_bin(_) -> <<"target-read-failed">>.
+
+unavailable_target(Target, Why) ->
+    #{
+        <<"response">> => <<"error">>,
+        <<"status">> => 503,
+        <<"target">> => Target,
+        <<"reason">> => why_bin(Why)
+    }.
+
+%% @doc Retry a deferred entry. A miss remembered after the entry was deferred
+%% came from a fresh read, so it decides the entry; a miss remembered before
+%% that is waited out; otherwise the target is read through every store.
+retry_entry(Target, MsgToPush, Origin, DeferredAt, Attempt, Opts) ->
+    Read =
+        case hb_cache:read(Target, hb_store:scope(Opts, local)) of
+            {ok, Local} -> {ok, Local};
+            _ ->
+                case miss_time(Target) of
+                    {ok, At} when At >= DeferredAt -> {error, not_found};
+                    _ ->
+                        case recent_miss(Target, Opts) of
+                            {true, At} -> {cached_miss, At};
+                            false -> read_target_fresh(Target, Opts)
+                        end
+                end
+        end,
+    Res =
+        case Read of
+            {ok, DownstreamProcess} ->
+                push_result_message(DownstreamProcess, MsgToPush, Origin, Opts);
+            {error, not_found} ->
+                ?event(push, {push_retry_rejected, {target, Target}}),
+                record_entry(Origin, rejected, Opts),
+                target_process_not_found(Target);
+            Why ->
+                defer_entry(Target, MsgToPush, Origin, Why, Attempt + 1, Opts)
+        end,
+    maybe_complete_slot(Origin, Opts),
+    Res.
+
+%% @doc Queue work for the cranker, after `Delay' milliseconds. Returns `full'
+%% when the queue is at its bound.
+enqueue(Item, Delay, Opts) ->
+    Max =
+        hb_util:int(
+            hb_opts:get(
+                push_cranker_max_queue,
+                ?DEFAULT_CRANKER_MAX_QUEUE,
+                Opts
+            )
+        ),
+    ensure_cranker(),
+    Size =
+        try ets:lookup(?CRANKER_STATE, size) of
+            [{size, N}] -> N;
+            [] -> 0
+        catch error:badarg -> 0
+        end,
+    case Size < Max of
+        false ->
+            ?event(push, {push_cranker_full, {size, Size}, {item, element(1, Item)}}),
+            full;
+        true ->
+            ets:update_counter(?CRANKER_STATE, size, 1, {size, 0}),
+            Msg = {enqueue, Item, crank_opts(Opts), erlang:get(server_id)},
+            case Delay > 0 of
+                true -> erlang:send_after(Delay, ?CRANKER, Msg);
+                false -> ?CRANKER ! Msg
+            end,
+            ok
+    end.
+
+%% @doc The options the cranker runs an item under: those of a detached worker,
+%% with a fresh implicit depth bound when the enqueuer's bound was implicit.
+crank_opts(Opts) ->
+    Clean =
+        case map_get_true(<<"push-depth-implicit">>, Opts) of
+            true ->
+                maps:without(
+                    [
+                        <<"push-in-worker">>,
+                        <<"push-depth-implicit">>,
+                        <<"push-max-depth">>
+                    ],
+                    Opts
+                );
+            false -> maps:without([<<"push-in-worker">>], Opts)
+        end,
+    detached_opts(#{}, Clean).
+
+ensure_cranker() ->
+    ensure_table(?CRANKER_STATE),
+    case whereis(?CRANKER) of
+        undefined ->
+            Pid =
+                spawn(
+                    fun() ->
+                        receive registered -> ok end,
+                        ets:insert(?CRANKER_STATE, {size, 0}),
+                        cranker_loop(
+                            #{
+                                queue => queue:new(),
+                                keys => #{},
+                                running => #{},
+                                opts => #{},
+                                workers => ?DEFAULT_CRANKER_WORKERS
+                            }
+                        )
+                    end
+                ),
+            try register(?CRANKER, Pid) of
+                true -> Pid ! registered
+            catch error:badarg -> exit(Pid, kill)
+            end,
+            ok;
+        _ -> ok
+    end.
+
+cranker_loop(State = #{ queue := Q, keys := Keys, running := Running }) ->
+    receive
+        {enqueue, Item, Opts, ServerID} ->
+            ItemKey = item_key(Item),
+            case maps:is_key(ItemKey, Keys) of
+                true ->
+                    ets:update_counter(?CRANKER_STATE, size, -1, {size, 1}),
+                    cranker_loop(State);
+                false ->
+                    OptsKey = erlang:phash2(Opts),
+                    Workers =
+                        hb_util:int(
+                            hb_opts:get(
+                                push_cranker_workers,
+                                ?DEFAULT_CRANKER_WORKERS,
+                                Opts
+                            )
+                        ),
+                    cranker_loop(
+                        dispatch(
+                            State#{
+                                queue => queue:in({ItemKey, Item, OptsKey, ServerID}, Q),
+                                keys => Keys#{ ItemKey => true },
+                                opts => (maps:get(opts, State))#{ OptsKey => Opts },
+                                workers => Workers
+                            }
+                        )
+                    )
+            end;
+        {'DOWN', Ref, process, _, _} ->
+            case maps:take(Ref, Running) of
+                {ItemKey, Rest} ->
+                    ets:update_counter(?CRANKER_STATE, size, -1, {size, 1}),
+                    cranker_loop(
+                        dispatch(
+                            prune_crank_opts(
+                                State#{
+                                    running => Rest,
+                                    keys => maps:remove(ItemKey, Keys)
+                                }
+                            )
+                        )
+                    );
+                error -> cranker_loop(State)
+            end
+    end.
+
+dispatch(State = #{ queue := Q, running := Running, workers := Workers, opts := AllOpts }) ->
+    case map_size(Running) < Workers andalso queue:out(Q) of
+        {{value, {ItemKey, Item, OptsKey, ServerID}}, Rest} ->
+            Opts = maps:get(OptsKey, AllOpts),
+            {_, Ref} =
+                spawn_monitor(
+                    fun() ->
+                        hb_http_server:set_proc_server_id(ServerID),
+                        run_item(Item, Opts)
+                    end
+                ),
+            dispatch(
+                State#{
+                    queue => Rest,
+                    running => Running#{ Ref => {ItemKey, OptsKey} }
+                }
+            );
+        _ -> State
+    end;
+dispatch(State) -> State.
+
+%% @doc Keep only the option maps that a queued or running item still needs.
+prune_crank_opts(State = #{ opts := AllOpts }) when map_size(AllOpts) =< 16 ->
+    State;
+prune_crank_opts(State = #{ queue := Q, running := Running, opts := AllOpts }) ->
+    Live =
+        [OK || {_, _, OK, _} <- queue:to_list(Q)] ++
+            [OK || {_, OK} <- maps:values(Running)],
+    State#{ opts => maps:with(Live, AllOpts) }.
+
+item_key({continue, ID, Slot}) -> {continue, ID, Slot};
+item_key({retry, _, _, _, _, _}) -> {retry, make_ref()}.
+
+run_item(Item, Opts) ->
+    try do_run_item(Item, Opts)
+    catch Class:Reason:Stacktrace ->
+        ?event(push,
+            {push_cranker_item_failed,
+                {item, element(1, Item)},
+                {class, Class},
+                {reason, Reason},
+                {stack, {trace, Stacktrace}}
+            }
+        )
+    end.
+
+do_run_item({continue, ID, Slot}, Opts) ->
+    case is_slot_done(ID, Slot, Opts) of
+        true -> ok;
+        false -> push_downstream(ID, Slot, #{ <<"result-depth">> => 0 }, Opts)
+    end;
+do_run_item({retry, Target, MsgToPush, Origin, DeferredAt, Attempt}, Opts) ->
+    retry_entry(Target, MsgToPush, Origin, DeferredAt, Attempt, Opts).
 
 %%% Tests
 
@@ -2375,10 +3135,12 @@ read_target_skips_remote_for_known_misses_test() ->
         RemoteReads(fun() -> {error, not_found} = read_target(Wallet, Opts) end)
             > 0
     ),
-    % ...and then not again within the TTL.
+    % ...and then not again within the TTL. The remembered miss is reported as
+    % such, never as a definitive `not_found': the gateway store cannot tell a
+    % missing ID from a failed request, so it may not be what drops a message.
     ?assertEqual(0,
         RemoteReads(
-            fun() -> {error, not_found} = read_target(Wallet, Opts) end
+            fun() -> {cached_miss, _} = read_target(Wallet, Opts) end
         )
     ),
     % After the TTL, a miss is retried.
@@ -2452,10 +3214,11 @@ outbox_entries_preserve_entry_commitment_ids_test() ->
 %% @doc A legacy AO process names its outbox entry's target `Target'. The push
 %% walk dispatches on a lower-case `target' and `hb_ao:get/4' lowers only the
 %% key it is given, so an entry that keeps the capitalised spelling is answered
-%% with a 404 and never delivered. Such an entry is dispatchable, carries one
-%% spelling of the key downstream, and is otherwise untouched: its payload
-%% fields keep the case its sender chose, and its `commitments' keep their
-%% case-sensitive base64url IDs.
+%% with a 404 and never delivered. By default an entry's keys are lower-cased
+%% as the reference device does; with `push-preserve-key-case' the entry keeps
+%% its payload's case and only `target' is renamed. Either way its
+%% `commitments' keep their case-sensitive base64url IDs, and a name that is
+%% not valid UTF-8 does not abort the outbox.
 outbox_entries_normalizes_legacy_target_key_test() ->
     CommitmentID = <<"aXnLbjnJtgIsjZXS3hSqNLaj2okwHy3N7A1ZpogrnVI">>,
     Outbox =
@@ -2475,9 +3238,398 @@ outbox_entries_normalizes_legacy_target_key_test() ->
     Entry = maps:get(<<"1">>, outbox_entries(Outbox, #{})),
     ?assertMatch(#{ <<"target">> := <<"target-process-id">> }, Entry),
     ?assertNot(maps:is_key(<<"Target">>, Entry)),
+    ?assertEqual(<<"Ping">>, maps:get(<<"action">>, Entry)),
+    ?assertEqual(
+        [CommitmentID],
+        maps:keys(maps:get(<<"commitments">>, Entry))
+    ),
+    ?assertEqual(4, map_size(Entry)),
+    outbox_entries_preserve_key_case().
+
+outbox_entries_preserve_key_case() ->
+    CommitmentID = <<"aXnLbjnJtgIsjZXS3hSqNLaj2okwHy3N7A1ZpogrnVI">>,
+    Outbox =
+        #{
+            <<"1">> =>
+                #{
+                    <<"Target">> => <<"target-process-id">>,
+                    <<"Action">> => <<"Ping">>,
+                    <<"Ta", 16#FF, "g">> => <<"raw">>,
+                    <<"commitments">> =>
+                        #{
+                            CommitmentID =>
+                                #{ <<"type">> => <<"rsa-pss-sha512">> }
+                        }
+                }
+        },
+    Entry =
+        maps:get(
+            <<"1">>,
+            outbox_entries(Outbox, #{ <<"push-preserve-key-case">> => true })
+        ),
+    ?assertMatch(#{ <<"target">> := <<"target-process-id">> }, Entry),
+    ?assertNot(maps:is_key(<<"Target">>, Entry)),
     ?assertEqual(<<"Ping">>, maps:get(<<"Action">>, Entry)),
     ?assertEqual(<<"raw">>, maps:get(<<"Ta", 16#FF, "g">>, Entry)),
     ?assertEqual(
         [CommitmentID],
         maps:keys(maps:get(<<"commitments">>, Entry))
     ).
+
+%%% Regression tests for the push-delivery fixes. They use only the module's
+%%% long-standing internals, so the same file runs against the base revision.
+
+%% @doc A pushed entry reaches its recipient with lower-cased keys, as with the
+%% reference push device: the recipient reads `action' and `quantity', not
+%% `Action' and `Quantity'.
+push_lowercases_payload_keys_test_() ->
+    {timeout, 180, fun test_push_lowercases_payload_keys/0}.
+
+test_push_lowercases_payload_keys() ->
+    Opts = regress_opts(#{}),
+    {Sender, Receiver, MsgSlot} =
+        regress_pair(
+            fun(RecvID) ->
+                <<
+                    "function compute(process, message, opts)\n"
+                    "  process.results = { outbox = { [\"1\"] = {\n"
+                    "    target = \"", RecvID/binary, "\",\n"
+                    "    Action = \"Ping\", Quantity = \"5\", lower = \"x\" } } }\n"
+                    "  return process\n"
+                    "end\n"
+                >>
+            end,
+            Opts
+        ),
+    {ok, _} =
+        hb_ao:resolve(Sender, #{ <<"path">> => <<"push">>, <<"slot">> => MsgSlot }, Opts),
+    RecvID = hb_message:id(Receiver, all, Opts),
+    {ok, A} =
+        hb_cache:read(
+            hb_path:to_binary(
+                [<<"~scheduler@1.0">>, <<"assignments">>, RecvID, <<"1">>]
+            ),
+            Opts
+        ),
+    Body =
+        hb_cache:ensure_all_loaded(
+            hb_ao:get(<<"body">>, hb_cache:ensure_all_loaded(A, Opts), Opts),
+            Opts
+        ),
+    Keys = maps:keys(Body),
+    ?assert(lists:member(<<"action">>, Keys)),
+    ?assert(lists:member(<<"quantity">>, Keys)),
+    ?assertNot(lists:member(<<"Action">>, Keys)),
+    ?assertNot(lists:member(<<"Quantity">>, Keys)).
+
+%% @doc Nested payload maps are lower-cased too, but a signed sub-message --
+%% one that carries `commitments' -- is delivered exactly as it was signed.
+outbox_entries_lowercase_nested_but_not_signed_test() ->
+    Signed =
+        hb_message:commit(
+            #{ <<"Inner">> => <<"v">> },
+            #{ <<"priv-wallet">> => ar_wallet:new() }
+        ),
+    Outbox =
+        #{
+            <<"1">> =>
+                #{
+                    <<"target">> => <<"t">>,
+                    <<"Nested">> => #{ <<"Deep-Key">> => <<"1">> },
+                    <<"Signed">> => Signed
+                }
+        },
+    Entry = maps:get(<<"1">>, outbox_entries(Outbox, #{})),
+    ?assertEqual(#{ <<"deep-key">> => <<"1">> }, maps:get(<<"nested">>, Entry)),
+    ?assertEqual(Signed, maps:get(<<"signed">>, Entry)).
+
+%% @doc A chain longer than the detached depth bound is followed to its end.
+%% The process pings itself 40 times; a detached push bounded at 16 hops used
+%% to stop near slot 18 and nothing ever drove the rest.
+push_follows_chain_past_depth_bound_test_() ->
+    {timeout, 300, fun test_push_follows_chain_past_depth_bound/0}.
+
+test_push_follows_chain_past_depth_bound() ->
+    Opts = regress_opts(#{}),
+    SelfMod =
+        <<
+            "function compute(process, message, opts)\n"
+            "  local b = message.body or message\n"
+            "  local t = message.target or b.target\n"
+            "  local n = tonumber(b.n or 0) + 1\n"
+            "  if n <= 40 then\n"
+            "    process.results = { outbox = { [\"1\"] = {\n"
+            "      target = t, action = \"Ping\", n = tostring(n) } } }\n"
+            "  else\n"
+            "    process.results = { output = { data = \"done\" } }\n"
+            "  end\n"
+            "  return process\n"
+            "end\n"
+        >>,
+    P = lua_push_process(SelfMod, Opts),
+    {ok, _} = hb_cache:write(P, Opts),
+    {ok, _} = schedule_body(P, P, Opts),
+    PID = hb_message:id(P, all, Opts),
+    {ok, MsgSched} =
+        schedule_body(P,
+            hb_message:commit(#{ <<"target">> => PID,
+                <<"type">> => <<"Message">>, <<"action">> => <<"Fire">> }, Opts),
+            Opts),
+    {ok, MsgSlot} = hb_ao:resolve(MsgSched, #{ <<"path">> => <<"slot">> }, Opts),
+    {ok, _} = hb_ao:resolve(P, #{ <<"path">> => <<"push">>, <<"slot">> => MsgSlot }, Opts),
+    Reached =
+        wait_until(
+            fun() ->
+                {ok, Cur} = hb_ao:resolve(P, #{ <<"path">> => <<"slot/current">> }, Opts),
+                Cur >= MsgSlot + 40
+            end,
+            240000
+        ),
+    {ok, Final} = hb_ao:resolve(P, #{ <<"path">> => <<"slot/current">> }, Opts),
+    ?event(debug_push, {chain_reached, Final}),
+    ?assert(Reached),
+    % ...and stops where the program stops: nothing is delivered twice.
+    timer:sleep(2000),
+    {ok, After} = hb_ao:resolve(P, #{ <<"path">> => <<"slot/current">> }, Opts),
+    ?assertEqual(MsgSlot + 40, After).
+
+%% @doc Under `push-durable', pushing a slot again -- a client retrying, or a
+%% resumed push -- does not schedule its entries a second time, whether the
+%% first push has finished or is still in flight.
+push_durable_retry_does_not_duplicate_test_() ->
+    {timeout, 240, fun test_push_durable_retry_does_not_duplicate/0}.
+
+test_push_durable_retry_does_not_duplicate() ->
+    Opts = regress_opts(#{ <<"push-durable">> => true }),
+    {Sender, Receiver, MsgSlot} =
+        regress_pair(fun simple_sender_module/1, Opts),
+    {ok, R0} = hb_ao:resolve(Receiver, #{ <<"path">> => <<"slot/current">> }, Opts),
+    Push =
+        fun() ->
+            hb_ao:resolve(
+                Sender,
+                #{ <<"path">> => <<"push">>, <<"slot">> => MsgSlot },
+                Opts
+            )
+        end,
+    {ok, _} = Push(),
+    {ok, _} = Push(),
+    {ok, R1} = hb_ao:resolve(Receiver, #{ <<"path">> => <<"slot/current">> }, Opts),
+    ?assertEqual(R0 + 1, R1),
+    % Two concurrent pushes of one slot whose compute takes seconds.
+    {SlowSender, SlowReceiver, SlowSlot, SlowOpts} =
+        setup_lua_push_pair_with(Opts),
+    {ok, S0} =
+        hb_ao:resolve(SlowReceiver, #{ <<"path">> => <<"slot/current">> }, SlowOpts),
+    Self = self(),
+    [
+        spawn(fun() ->
+            Self ! {pushed,
+                hb_ao:resolve(
+                    SlowSender,
+                    #{ <<"path">> => <<"push">>, <<"slot">> => SlowSlot },
+                    SlowOpts
+                )}
+        end)
+    ||
+        _ <- [1, 2]
+    ],
+    [ receive {pushed, _} -> ok after 120000 -> erlang:error(push_timeout) end
+    || _ <- [1, 2] ],
+    timer:sleep(500),
+    {ok, S1} =
+        hb_ao:resolve(SlowReceiver, #{ <<"path">> => <<"slot/current">> }, SlowOpts),
+    ?assertEqual(S0 + 1, S1).
+
+%% @doc A target that is remembered as missing is not dropped: once the miss
+%% expires the entry is retried and delivered. The receiver does not exist
+%% when it is missed, nor when the push runs; it appears a moment later.
+push_cached_miss_is_retried_test_() ->
+    {timeout, 180, fun test_push_cached_miss_is_retried/0}.
+
+test_push_cached_miss_is_retried() ->
+    Opts = regress_opts(#{ <<"push-target-miss-ttl">> => 5 }),
+    Receiver = lua_push_process(receiver_module(), Opts),
+    RecvID = hb_message:id(Receiver, all, Opts),
+    Sender = lua_push_process(simple_sender_module(RecvID), Opts),
+    {ok, _} = hb_cache:write(Sender, Opts),
+    {ok, _} = schedule_body(Sender, Sender, Opts),
+    {ok, MsgSched} =
+        schedule_body(Sender,
+            hb_message:commit(#{ <<"target">> => hb_message:id(Sender, all, Opts),
+                <<"type">> => <<"Message">>, <<"action">> => <<"Fire">> }, Opts),
+            Opts),
+    {ok, MsgSlot} = hb_ao:resolve(MsgSched, #{ <<"path">> => <<"slot">> }, Opts),
+    {ok, _} =
+        hb_ao:resolve(Sender, #{ <<"path">> => <<"compute">>, <<"slot">> => MsgSlot }, Opts),
+    % The receiver is missed while it does not exist...
+    _ = read_target(RecvID, Opts),
+    {ok, _} =
+        hb_ao:resolve(Sender, #{ <<"path">> => <<"push">>, <<"slot">> => MsgSlot }, Opts),
+    % ...and is spawned after the push has run.
+    {ok, _} = hb_cache:write(Receiver, Opts),
+    {ok, _} = schedule_body(Receiver, Receiver, Opts),
+    ?assert(
+        wait_until(
+            fun() ->
+                {ok, Cur} =
+                    hb_ao:resolve(
+                        Receiver,
+                        #{ <<"path">> => <<"slot/current">> },
+                        Opts
+                    ),
+                Cur >= 1
+            end,
+            30000
+        )
+    ).
+
+%% @doc Push cost of a slot with `N' outbox entries, scheduled only
+%% (`max-depth' 0), so that the figure is delivery bookkeeping and not the
+%% receiver's compute. Prints the median of `Runs' pushes.
+push_outbox_bench_test_() ->
+    {timeout, 600, fun() ->
+        [
+            push_outbox_bench(Label, Extra, 50, 7)
+        ||
+            {Label, Extra} <-
+                [
+                    {plain, #{}},
+                    {durable, #{ <<"push-durable">> => true }}
+                ]
+        ]
+    end}.
+
+push_outbox_bench(Label, Extra, N, Runs) ->
+    Opts = regress_opts(Extra),
+    Fan =
+        fun(RecvID) ->
+            <<
+                "function compute(process, message, opts)\n"
+                "  local out = {}\n"
+                "  for i = 1, ", (integer_to_binary(N))/binary, " do\n"
+                "    out[tostring(i)] = { target = \"", RecvID/binary, "\",\n"
+                "      action = \"Ping\", i = tostring(i) }\n"
+                "  end\n"
+                "  process.results = { outbox = out }\n"
+                "  return process\n"
+                "end\n"
+            >>
+        end,
+    {Sender, _Receiver, _} = regress_pair(Fan, Opts),
+    SenderID = hb_message:id(Sender, all, Opts),
+    Times =
+        [
+            begin
+                {ok, Sched} =
+                    schedule_body(Sender,
+                        hb_message:commit(#{ <<"target">> => SenderID,
+                            <<"type">> => <<"Message">>,
+                            <<"action">> => <<"Fire">> }, Opts),
+                        Opts),
+                {ok, Slot} = hb_ao:resolve(Sched, #{ <<"path">> => <<"slot">> }, Opts),
+                % Compute first, so that only the delivery is timed.
+                {ok, _} =
+                    hb_ao:resolve(
+                        Sender,
+                        #{ <<"path">> => <<"compute">>, <<"slot">> => Slot },
+                        Opts
+                    ),
+                {T, {ok, _}} =
+                    timer:tc(fun() ->
+                        hb_ao:resolve(
+                            Sender,
+                            #{
+                                <<"path">> => <<"push">>,
+                                <<"slot">> => Slot,
+                                <<"max-depth">> => 0
+                            },
+                            Opts
+                        )
+                    end),
+                T div 1000
+            end
+        ||
+            _ <- lists:seq(1, Runs)
+        ],
+    Sorted = lists:sort(Times),
+    io:format(standard_error,
+        "~nPUSH-BENCH ~p entries=~p runs=~p median_ms=~p all_ms=~p~n",
+        [Label, N, Runs, lists:nth((Runs + 1) div 2, Sorted), Times]).
+
+regress_opts(Extra) ->
+    hb_process_test_vectors:init(),
+    maps:merge(
+        #{
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"cache-control">> => <<"always">>,
+            <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)]
+        },
+        Extra
+    ).
+
+%% @doc A receiver and a sender built from `SenderModFun(ReceiverID)', with one
+%% message staged -- not pushed -- on the sender.
+regress_pair(SenderModFun, Opts) ->
+    Receiver = lua_push_process(receiver_module(), Opts),
+    {ok, _} = hb_cache:write(Receiver, Opts),
+    {ok, _} = schedule_body(Receiver, Receiver, Opts),
+    RecvID = hb_message:id(Receiver, all, Opts),
+    Sender = lua_push_process(SenderModFun(RecvID), Opts),
+    {ok, _} = hb_cache:write(Sender, Opts),
+    {ok, _} = schedule_body(Sender, Sender, Opts),
+    {ok, MsgSched} =
+        schedule_body(Sender,
+            hb_message:commit(#{ <<"target">> => hb_message:id(Sender, all, Opts),
+                <<"type">> => <<"Message">>, <<"action">> => <<"Fire">> }, Opts),
+            Opts),
+    {ok, MsgSlot} = hb_ao:resolve(MsgSched, #{ <<"path">> => <<"slot">> }, Opts),
+    {Sender, Receiver, MsgSlot}.
+
+setup_lua_push_pair_with(Opts) ->
+    {Sender, Receiver, MsgSlot} = regress_pair(fun sender_module/1, Opts),
+    {Sender, Receiver, MsgSlot, Opts}.
+
+simple_sender_module(RecvID) ->
+    <<
+        "function compute(process, message, opts)\n"
+        "  process.results = { outbox = { [\"1\"] = {\n"
+        "    target = \"", RecvID/binary, "\", action = \"Ping\" } } }\n"
+        "  return process\n"
+        "end\n"
+    >>.
+
+%% @doc Under `push-durable' a slot whose push never completed -- the node
+%% stopped mid-delivery -- is found in the journal and pushed on resume, and a
+%% slot marked done is not pushed again.
+push_durable_resume_from_journal_test_() ->
+    {timeout, 120, fun test_push_durable_resume_from_journal/0}.
+
+test_push_durable_resume_from_journal() ->
+    Opts = regress_opts(#{ <<"push-durable">> => true }),
+    {Sender, Receiver, MsgSlot} =
+        regress_pair(fun simple_sender_module/1, Opts),
+    SenderID = hb_message:id(Sender, all, Opts),
+    {ok, R0} = hb_ao:resolve(Receiver, #{ <<"path">> => <<"slot/current">> }, Opts),
+    % What a push leaves behind when the node stops right after it found the
+    % slot's outbox: the slot is journaled, nothing is delivered.
+    ok = journal_slot(SenderID, MsgSlot, Opts),
+    ?assertEqual(1, resume_journal(Opts)),
+    ?assert(
+        wait_until(
+            fun() ->
+                {ok, R} =
+                    hb_ao:resolve(Receiver, #{ <<"path">> => <<"slot/current">> }, Opts),
+                R == R0 + 1
+            end,
+            30000
+        )
+    ),
+    ?assert(wait_until(fun() -> is_slot_done(SenderID, MsgSlot, Opts) end, 30000)),
+    % Both the source slot and the receiver's new slot are now done, so a
+    % second resume pushes nothing, and nothing is delivered twice.
+    ?assert(
+        wait_until(fun() -> resume_journal(Opts) == 0 end, 30000)
+    ),
+    {ok, R1} = hb_ao:resolve(Receiver, #{ <<"path">> => <<"slot/current">> }, Opts),
+    ?assertEqual(R0 + 1, R1).
