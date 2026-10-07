@@ -925,15 +925,18 @@ do_maybe_ship(S = #{ worker := W, journal := J }) ->
     Cfg = export_cfg(S),
     case {Segs, Gaps, maps:get(resync, S), maps:get(dropping, S)} of
         {[], [], false, false} -> S;
-        {[], [], false, true} ->
+        {[], [], _, true} ->
             % The backlog is gone and the queue has drained: journal again,
-            % and catch up on what was dropped meanwhile.
+            % and catch up on what was dropped meanwhile. A base waits for
+            % this too: a gap opened by dropping that is still dropping after
+            % the base's reservation would be closed by the base while its
+            % newest records are in neither (the scan is not a snapshot).
             Max = cfg(maps:get(store, S), <<"max-pending">>, ?DEFAULT_MAX_PENDING),
             case counters:get(maps:get(counters, S), 1) < max(1, Max div 2) of
                 true -> maybe_catchup(S#{ dropping => false });
                 false -> S
             end;
-        {[], [], true, _} ->
+        {[], [], true, false} ->
             % The base takes an id of its own; gaps opened before it are
             % closed by it, gaps opened after it have higher ids.
             S1 = close_segment(S),
