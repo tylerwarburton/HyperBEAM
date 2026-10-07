@@ -101,7 +101,8 @@ round_(Round) ->
                                         end;
                                     _ -> none
                                 end;
-                            4 -> case filelib:is_dir(Remote) of
+                            4 -> case filelib:is_dir(Remote) andalso
+                                          not filelib:is_file(Remote ++ ".off") of
                                      true -> ok = file:rename(Remote, Remote ++ ".off"),
                                              ok = file:write_file(Remote, <<"down">>), outage;
                                      false -> none end;

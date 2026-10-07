@@ -603,7 +603,10 @@ append(S, Recs0, Mode) ->
                       backlog => maps:get(backlog, S1) + byte_size(Bin),
                       live_mutable =>
                           case {Mode, maps:get(catchup, S1)} of
-                              {live, {_, _}} -> mutable_keys(Recs, maps:get(live_mutable, S1, #{}));
+                              % Before dedupe: a live write skipped as equal to
+                              % the last journaled value is still newer than
+                              % what the catch-up read.
+                              {live, {_, _}} -> mutable_keys(Recs0, maps:get(live_mutable, S1, #{}));
                               _ -> maps:get(live_mutable, S1, #{})
                           end,
                       marks => lists:foldl(fun rec_watermarks/2, maps:get(marks, S1), Recs) },
@@ -672,9 +675,12 @@ dedupe(Recs, S = #{ seen := Seen }) ->
                             lists:foldl(
                                 fun({K, V}, {KAcc, X}) ->
                                     H = erlang:md5(term_to_binary({Op, V})),
-                                    case maps:get({Op, K}, X, undefined) of
+                                    % Keyed by the row alone: a catch-up row
+                                    % (`raw') between two equal live writes
+                                    % must not let the second be skipped.
+                                    case maps:get(K, X, undefined) of
                                         H -> {KAcc, X};
-                                        _ -> {[{K, V} | KAcc], X#{ {Op, K} => H }}
+                                        _ -> {[{K, V} | KAcc], X#{ K => H }}
                                     end
                                 end,
                                 {[], Sn}, Pairs),
@@ -2300,3 +2306,13 @@ export_catchup_never_overwrites_newer_live_value_test_() ->
         {ok, _} = restore(Dir ++ "/remote", T, ?LAX),
         ?assertEqual({ok, <<"v2">>}, hb_store:read([T], Loc, #{}))
     end}.
+
+%% @doc A catch-up row between two equal live writes of a key does not let
+%% the second be skipped: replaying the segment must end on the live value
+%% (the rev2 fuzz restored stale `~location@1.0' values from this).
+export_dedupe_raw_between_equal_writes_test() ->
+    K = <<"~location@1.0/p">>,
+    {Out, _} = dedupe([{write, #{ K => <<"0">> }}, {raw, [{K, <<"1">>}]},
+                       {write, #{ K => <<"0">> }}], #{}),
+    ?assertEqual([{write, #{ K => <<"0">> }}, {raw, [{K, <<"1">>}]},
+                  {write, #{ K => <<"0">> }}], Out).
