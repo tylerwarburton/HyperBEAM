@@ -29,21 +29,19 @@
 %%% any of them can be recomputed. This module plans which computed slots to
 %%% retain.
 %%%
-%%% Two halves: `plan/2' sizes the work, `collect/3' enacts it.
+%%% Three parts: `plan/2' sizes the work; `collect/3' enacts it offline by
+%%% copying the retained set into a fresh store; `retain/1' enacts it online,
+%%% deleting in place, on a schedule.
 %%%
-%%% Enactment is <em>copy-based</em>, and that is not a preference. There is no
-%%% delete primitive anywhere in the stack: the pinned `elmdb' Rust NIF exports
-%%% only `env_open', `env_sync', `env_close', `env_close_by_name', `env_status',
-%%% `db_open', `db_close', `put', `put_batch', `get', `flush', `overlay_count',
-%%% `iterator', `iterator_next', `foreach', `fold', `map', `list', `read_prefix'
-%%% and `match' -- no `del', no `mdb_del', no `drop'. The `hb_store' behaviour's
-%%% callbacks are `start/3', `stop/3', `reset/3', `group/3', `link/3', `type/3',
-%%% `read/3', `write/3', `list/3', `match/3' and `resolve/3' -- again no delete.
-%%% And `hb_store_lmdb:reset/3' is `rm -Rf' of the whole store directory. So
-%%% `collect/3' copies the retained set into a fresh store and leaves BOTH in
-%%% place; an operator swaps them after validating the copy.
+%%% `collect/3' was written when there was no delete primitive anywhere in the
+%%% stack (not in the pinned `elmdb' NIF, not in the `hb_store' behaviour;
+%%% `hb_store_lmdb:reset/3' is `rm -Rf'), so it copies the retained set and
+%%% leaves BOTH stores in place for an operator to swap.
+%%% `patches/elmdb-delete.patch' now adds one, with `hb_store:delete/3', and
+%%% `retain/1' (below) uses it; `collect/3' remains the tool for a one-off
+%%% compaction or a migration (`hb_store_essentials:migrate/3').
 %%%
-%%% Because the copy is the only way to drop anything, the copy must be exact.
+%%% A copy that will replace the original must be exact.
 %%% `collect/3' therefore moves <em>raw rows</em> -- key and value byte for byte,
 %%% link markers and group markers included -- rather than re-serialising
 %%% messages through `hb_cache:write/2'. Re-serialising the signed chain would

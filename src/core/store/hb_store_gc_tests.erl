@@ -21,6 +21,9 @@ node_opts(Extra) ->
             <<"hashpath">> => ignore,
             <<"spawn-worker">> => false,
             <<"process-workers">> => false,
+            % As production runs: the reverse match index is a derived
+            % structure retention does not collect (it grows ~9 rows/slot).
+            <<"match-index">> => false,
             <<"process-delta-checkpoint-slots">> => ?CADENCE,
             <<"process-hot-cache-slots">> => 4,
             <<"store-retention">> => true,
@@ -662,7 +665,8 @@ retention_diagnostic_test_() ->
                 N = list_to_integer(NStr),
                 Ess = hb_test_utils:test_store(hb_store_lmdb, <<"ess-diag">>),
                 Base = node_opts(#{ <<"process-delta-checkpoint-slots">> => 50,
-                                    <<"store-retention-recent-slots">> => 32 }),
+                                    <<"store-retention-recent-slots">> => 32,
+                                    <<"store-retention-orphans">> => true }),
                 Opts = Base#{
                     <<"essentials-store">> => Ess,
                     <<"store">> => hb_store_essentials:node_store(
@@ -670,65 +674,72 @@ retention_diagnostic_test_() ->
                 },
                 ok = hb_store:start([Ess], #{}, Opts),
                 Process = lua_process(Opts),
-                _ = run_slots(Process, 0, 5, Opts),
-                % Who writes: the caller of every hb_cache:write/2, by stack.
-                Self = self(),
-                Tracer = spawn(fun() -> diag_tracer(Self, #{}) end),
-                erlang:trace(all, true, [call, {tracer, Tracer}]),
-                erlang:trace_pattern({hb_cache, write, 2},
-                    [{'_', [], [{message, {process_dump}}]}], [local]),
-                _ = run_slots(Process, 5, N, Opts),
-                erlang:trace(all, false, [call]),
-                Tracer ! {done, Self},
-                receive {callers, Callers} ->
-                    [ io:format(user, "DIAG writer ~6b ~s~n", [C, K])
-                    || {K, C} <- lists:sublist(lists:reverse(lists:keysort(2, maps:to_list(Callers))), 25) ]
-                end,
-                R = hb_store_gc:retain(Opts),
-                io:format(user, "~nDIAG report ~p~n", [maps:without([policy], R)]),
                 DB = main_db(Opts),
-                ok = elmdb:flush(DB),
-                Rows = all_rows(DB),
-                Units =
-                    lists:foldl(
-                        fun({K, V}, Acc) ->
-                            case binary:split(K, <<"/">>) of
-                                [Top, Rest] ->
-                                    Field = hd(binary:split(Rest, <<"/">>)),
-                                    maps:update_with(Top, fun(S) -> sets:add_element(Field, S) end,
-                                        sets:from_list([Field]), Acc);
-                                [Top] ->
-                                    case V of
-                                        <<"group">> -> maps:update_with(Top, fun(S) -> S end, sets:new(), Acc);
-                                        <<"link:", _/binary>> -> maps:update_with(Top, fun(S) -> sets:add_element(<<"=alias">>, S) end, sets:from_list([<<"=alias">>]), Acc);
-                                        _ -> maps:update_with(Top, fun(S) -> sets:add_element(<<"=value">>, S) end, sets:from_list([<<"=value">>]), Acc)
-                                    end
-                            end
-                        end,
-                        #{},
-                        Rows
-                    ),
-                Sigs =
-                    maps:fold(
-                        fun(Top, Fields, Acc) ->
-                            Sig =
-                                case Top of
-                                    <<"data">> -> [<<"data/*">>];
-                                    <<"computed">> -> [<<"computed/*">>];
-                                    _ when byte_size(Top) == 43 ->
-                                        lists:sort(sets:to_list(Fields));
-                                    _ -> [Top]
-                                end,
-                            maps:update_with(Sig, fun(C) -> C + 1 end, 1, Acc)
-                        end,
-                        #{},
-                        Units
-                    ),
-                io:format(user, "DIAG rows=~p units=~p~n", [length(Rows), maps:size(Units)]),
-                [ io:format(user, "DIAG ~6b ~p~n", [C, S])
-                || {S, C} <- lists:reverse(lists:keysort(2, maps:to_list(Sigs))) ]
+                lists:foldl(
+                    fun(Step, From) ->
+                        Next = run_slots(Process, From, N, Opts),
+                        R = hb_store_gc:retain(Opts),
+                        ok = elmdb:flush(DB),
+                        Rows = all_rows(DB),
+                        io:format(user, "~nDIAG step=~p slots=~p rows=~p deleted=~p orphans=~p/~p~n",
+                            [Step, Next, length(Rows), maps:get(deleted_keys, R),
+                             maps:get(orphan_deleted_units, R), maps:get(orphan_units, R)]),
+                        [ io:format(user, "DIAG ~6b ~p~n", [C, Sig])
+                        || {Sig, C} <- lists:sublist(signatures(Rows), 4) ],
+                        Named =
+                            lists:foldl(
+                                fun({K, _}, Acc) ->
+                                    Parts = binary:split(K, <<"/">>, [global]),
+                                    Class =
+                                        case Parts of
+                                            [<<"computed">>, _, <<"slot">>, _ | _] -> computed_slot;
+                                            [<<"computed">>, _, X | _] when byte_size(X) == 43 -> computed_alias;
+                                            [<<"computed">> | _] -> computed_other;
+                                            [<<"data">> | _] -> data;
+                                            [T | _] when byte_size(T) == 43 -> unit_rows;
+                                            [T | _] -> T
+                                        end,
+                                    maps:update_with(Class, fun(C) -> C + 1 end, 1, Acc)
+                                end, #{}, Rows),
+                        io:format(user, "DIAG classes ~p~n", [Named]),
+                        Next
+                    end,
+                    0,
+                    lists:seq(1, 4)
+                )
         end
     end}.
+
+%% Top-level units of a store by the sorted set of their field names.
+signatures(Rows) ->
+    Units =
+        lists:foldl(
+            fun({K, V}, Acc) ->
+                case binary:split(K, <<"/">>) of
+                    [<<"data">>, _] -> maps:update_with(<<"data/*">>, fun(S) -> S end, sets:new(), Acc);
+                    [Top, Rest] when byte_size(Top) == 43 ->
+                        Field = hd(binary:split(Rest, <<"/">>)),
+                        maps:update_with(Top, fun(S) -> sets:add_element(Field, S) end,
+                            sets:from_list([Field]), Acc);
+                    [Top] when byte_size(Top) == 43 ->
+                        Tag = case V of <<"group">> -> []; <<"link:", _/binary>> -> [<<"=alias">>]; _ -> [<<"=value">>] end,
+                        maps:update_with(Top, fun(S) -> sets:union(S, sets:from_list(Tag)) end, sets:from_list(Tag), Acc);
+                    [Top | _] -> maps:update_with(<<"ns:", Top/binary>>, fun(S) -> S end, sets:new(), Acc)
+                end
+            end,
+            #{},
+            Rows
+        ),
+    Counts =
+        maps:fold(
+            fun(<<"ns:", _/binary>> = K, _, Acc) -> maps:update_with([K], fun(C) -> C + 1 end, 1, Acc);
+               (<<"data/*">>, _, Acc) -> Acc;
+               (_, Fields, Acc) ->
+                   maps:update_with(lists:sort(sets:to_list(Fields)), fun(C) -> C + 1 end, 1, Acc)
+            end,
+            #{ [<<"data/*">>] => length([ K || {<<"data/", _/binary>> = K, _} <- Rows ]) },
+            Units),
+    lists:reverse(lists:keysort(2, maps:to_list(Counts))).
 
 %% Summarise each traced call by the chain of hb/dev functions on its stack.
 diag_tracer(Parent, Acc) ->
