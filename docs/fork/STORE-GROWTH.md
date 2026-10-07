@@ -421,12 +421,43 @@ restore refuses an uncovered gap); manifest strictness (torn tail repaired,
 unlisted files are errors). The reviewer's tests live in
 `hb_store_gc_rev_tests` (fuzz with `HB_RETENTION_FUZZ=<ms>`).
 
-**Prod values (reviewer's recommendation):** `store-retention-grace-ms`
-120000 (the default now); the FIRST run with `store-retention-dry-run` true;
-`store-retention-orphans` false until a week of clean computed-only retention.
-Backlog mode (`store-retention-backlog-batch-slots`, default 10000) takes one
-reference scan per 10,000 dropped slots when a run drops more than 10x
-`store-retention-batch-slots`. Scan rate measured on the archived prod store:
-3.1-3.4M rows/s, i.e. ~10 s per scan of a 32M-row store and ~3.5 min per scan
-of the 650M-row pre-wipe size; a first run dropping D slots costs about
-D / 10,000 scans plus the closure walk.
+**Prod values:** `store-retention-grace-ms` 120000 (default); the FIRST run
+with `store-retention-dry-run` true; `store-retention-orphans` false until a
+week of clean computed-only retention.
+
+### After the stage swarm run (2026-10-07)
+
+- **Node froze 82-148 s after restarts / during bases.** Cause: the export's
+  file calls used the plain `file` API, which every process shares through
+  one file server process; one call stuck on the NFS mount queued every
+  other file operation in the node (the `hb_store_fs` store reads fall
+  through to, code loading). And the first write after a start waited up to
+  30 s, inside a `global:trans`, for the exporter to list and stat the target.
+  Fixed: raw/prim_file only, one target worker, writer local-only, exporter
+  registered before it initialises, CRC while writing, no read-back. With a
+  target blocked forever: old -- first write 30.0 s and an unrelated
+  `file:read_file` never returned; new -- start 0.6 ms, write+sync p99 0.5 ms,
+  unrelated read 30 us; at node level (HTTP schedule + lua compute, 60 s)
+  schedule p99 313-720 ms vs 541-636 ms healthy, compute p99 1.5-1.8 s vs
+  1.4-2.3 s healthy (same host noise).
+- **Restarts no longer need a base.** Clean stop (docker stop -> SIGTERM ->
+  init:stop -> hb_app:stop) is recorded; verified in a container: after
+  `docker stop` the next start does nothing; after `docker kill` it catches up
+  from per-process assignment watermarks (no base) and restore has all 200
+  assignments. A completed base prunes everything older (verified: two
+  resyncs leave exactly one base).
+- **Retention run cost.** The live 1,104 s run was 8 batches x 120 s grace
+  (960 s) + ~144 s of passes. Now: one grace per run, chunks bounded by
+  `store-retention-max-candidates` (2M rows), a scheduled run is one chunk:
+  one Rust-filtered pass over the main store's reference rows plus one
+  Rust-filtered alias pass. The pass is O(main store), which retention keeps
+  bounded; offline pass rate 3.1-3.4M rows/s. A first run over a big store
+  takes one pass per 2M candidate rows.
+- **Essentials volume** (game-like ans104 messages, 1.3 KB on the wire):
+  90 rows and 8.7 KB of rows per slot in the essentials store (3.3x the
+  2.6 KB logical assignment: field explosion, two commitments, the
+  `original-tags' list), 15.8 KB/slot of LMDB file. The export journal was
+  17.6 KB/slot raw; deduplicated within a segment 10.1 KB, gzipped
+  **2.8 KB/slot** (6.0x). At stage's ~9 slots/s (~780k/day): export
+  13.7 GB/day before -> 2.2 GB/day, local essentials LMDB ~12 GB/day. A 1 TB
+  mount at the 75% ceiling lasts ~340 days at that load.
