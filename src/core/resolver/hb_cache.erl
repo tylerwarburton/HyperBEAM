@@ -105,7 +105,7 @@ ensure_loaded(Ref,
                 false ->
                     % The already had the ID of the submessage, so now we have
                     % the data, we simply return it.
-                    Next
+                    without_foreign_keys(Next, Opts)
             end;
         {error, not_found} ->
             report_ensure_loaded_not_found(Ref, Lk, Opts)
@@ -141,6 +141,31 @@ ensure_loaded(Ref, Link = {link, ID, LinkOpts = #{ <<"lazy">> := true }}, RawOpt
 ensure_loaded(Ref, {link, ID, LinkOpts}, Opts) ->
 	ensure_loaded(Ref, {link, ID, LinkOpts#{ <<"lazy">> => true}}, Opts);
 ensure_loaded(_Ref, Msg, _Opts) when not ?IS_LINK(Msg) ->
+    Msg.
+
+%% @doc A sub-message loaded by its ID. A committed message is only ever
+%% written with its committed keys (`write/2' and the `offload' linkify both
+%% strip the rest), and its ID covers nothing else, so any other key in its
+%% group is not part of the message: older nodes linked binary compute results
+%% at `ID/ReqID' or `ID/Key', inside the group (see `hb_cache_control'). Such a
+%% key changes the sub-message under its parent's signature, so the parent no
+%% longer verifies. Drop it. A message whose commitments name no keys at all is
+%% left as it is.
+without_foreign_keys(Msg, Opts) when is_map(Msg), is_map_key(<<"commitments">>, Msg) ->
+    case hb_message:with_only_committed(Msg, Opts) of
+        {ok, Committed}
+                when map_size(Committed) > 1,
+                    map_size(Committed) < map_size(Msg) ->
+            ?event(cache,
+                {dropped_foreign_keys,
+                    {keys, maps:keys(Msg) -- maps:keys(Committed)}
+                }
+            ),
+            Committed;
+        _ ->
+            Msg
+    end;
+without_foreign_keys(Msg, _Opts) ->
     Msg.
 
 %% @doc Report that a value was not found in the cache. If a key is provided,
@@ -1409,6 +1434,45 @@ cache_suite_test_() ->
         {"immediate marker values", fun test_immediate_marker_values/1},
         {"cache-write hook", fun test_cache_write_hook/1}
     ]).
+
+%% @doc A committed sub-message is loaded with only its committed keys. Older
+%% nodes linked binary compute results inside a message's own group
+%% (`ID/ReqID'); read back as a key of the sub-message, such a result changed
+%% it under its parent's signature and the parent no longer verified.
+foreign_key_in_committed_submessage_group_test() ->
+    Opts =
+        #{
+            <<"store">> => hb_test_utils:test_store(),
+            <<"priv-wallet">> => ar_wallet:new()
+        },
+    Module =
+        hb_message:commit(
+            #{
+                <<"content-type">> => <<"application/lua">>,
+                <<"body">> => <<"x = 1">>
+            },
+            Opts,
+            #{ <<"commitment-device">> => <<"httpsig@1.0">>, <<"type">> => <<"hmac-sha256">> }
+        ),
+    Parent =
+        hb_message:commit(
+            #{ <<"name">> => <<"p">>, <<"module">> => Module },
+            Opts,
+            <<"httpsig@1.0">>
+        ),
+    {ok, _} = write(Parent, Opts),
+    ModuleID = hb_message:id(Module, all, Opts),
+    Foreign = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    % What an older node left behind after resolving a key on the module.
+    write_binary(<<ModuleID/binary, "/", Foreign/binary>>, ModuleID, Opts),
+    write_binary(<<ModuleID/binary, "/id">>, ModuleID, Opts),
+    {ok, Read} = read(hb_message:id(Parent, all, Opts), Opts),
+    Loaded = ensure_all_loaded(Read, Opts),
+    LoadedModule = maps:get(<<"module">>, Loaded),
+    ?assertNot(maps:is_key(Foreign, LoadedModule)),
+    ?assertNot(maps:is_key(<<"id">>, LoadedModule)),
+    ?assertEqual(<<"x = 1">>, maps:get(<<"body">>, LoadedModule)),
+    ?assert(hb_message:verify(Loaded, all, Opts)).
 
 %% @doc Test that message whose device is `#{}' cannot be written. If it were to
 %% be written, it would cause an infinite loop.
