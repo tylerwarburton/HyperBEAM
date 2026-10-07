@@ -122,6 +122,15 @@ round_(Round) ->
     Result = (catch hb_store_export:restore(Remote, Target, #{ <<"require-definitions">> => false })),
     Counts = maps:from_list([ {K, length([ x || X <- Events, X == K ])}
                               || K <- [crash, kill, helper, outage, up, clean_stop, resync] ]),
+    Out = verdict(Result, Store, Inner, Target, Procs, Written, Round, MaxPending, Counts, Fin, Remote, Dir),
+    % Each round's LMDB environments map 2 TiB of address space: close them,
+    % or ~30 rounds exhaust the 128 TiB a process has and the next open fails.
+    catch hb_store:stop([Store], #{}, Opts),
+    catch hb_store:stop([Target], #{}, #{}),
+    Out.
+
+verdict(Result, Store, Inner, Target, Procs, Written, Round, MaxPending, Counts, Fin, Remote, Dir) ->
+    _ = Store,
     case Result of
         {ok, _} ->
             TOpts = #{ <<"store">> => [Target] },
