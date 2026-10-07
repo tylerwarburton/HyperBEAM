@@ -1,6 +1,6 @@
 diff -ruN a/src/elmdb.erl b/src/elmdb.erl
---- a/src/elmdb.erl	2026-10-07 01:46:58.786062716 +0200
-+++ b/src/elmdb.erl	2026-10-07 01:46:58.790062705 +0200
+--- a/src/elmdb.erl	2026-10-07 05:20:40.519348172 +0200
++++ b/src/elmdb.erl	2026-10-07 05:20:40.532348135 +0200
 @@ -17,6 +17,13 @@
  %% Key-value operations
  -export([put/3, put_batch/2, get/2, flush/1]).
@@ -112,8 +112,8 @@ diff -ruN a/src/elmdb.erl b/src/elmdb.erl
  -spec overlay_count(DBInstance :: term()) -> non_neg_integer().
  overlay_count(_DBInstance) ->
 diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
---- a/native/elmdb_nif/src/lib.rs	2026-10-07 01:46:58.788062711 +0200
-+++ b/native/elmdb_nif/src/lib.rs	2026-10-07 01:46:58.792062700 +0200
+--- a/native/elmdb_nif/src/lib.rs	2026-10-07 05:20:40.529348143 +0200
++++ b/native/elmdb_nif/src/lib.rs	2026-10-07 05:20:40.543348103 +0200
 @@ -155,6 +155,8 @@
          bad_val_size,
          bad_dbi,
@@ -165,7 +165,7 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
  }
  
  #[derive(Debug)]
-@@ -263,6 +289,94 @@
+@@ -263,6 +289,114 @@
      SccHashMap::with_hasher(ahash::RandomState::default())
  }
  
@@ -209,16 +209,22 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +            .all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_')
 +}
 +
-+/// Insert into the tracked set that is current when the insert lands: a
-+/// concurrent `track_take` swaps the set, and an entry inserted into the set
-+/// being taken after it was read would be lost, so retry until the set the
-+/// entry went into is still the current one.
-+fn track_insert(db: &LmdbDatabase, entry: &[u8]) {
++/// Record `entry' if it is watched (or nothing is). Returns whether it was.
++fn track_insert(db: &LmdbDatabase, entry: &[u8]) -> bool {
 +    if let Some(ref watch) = **db.watch.load() {
 +        if !watch.contains_sync(entry) {
-+            return;
++            return false;
 +        }
 +    }
++    track_force(db, entry);
++    true
++}
++
++/// Insert into the tracked set that is current when the insert lands,
++/// whatever the watch set: a concurrent `track_take` swaps the set, and an
++/// entry inserted into the set being taken after it was read would be lost,
++/// so retry until the set the entry went into is still the current one.
++fn track_force(db: &LmdbDatabase, entry: &[u8]) {
 +    loop {
 +        let set = db.tracked.load();
 +        let _ = set.insert_sync(entry.to_vec());
@@ -232,35 +238,49 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +/// written again is live again), every path prefix of a `link:` target (the
 +/// row now references that subtree), and a value that is a bare 43-byte ID
 +/// (how a `+link' key names a message, and how an immediate value can name
-+/// one). Called before the put reaches the overlay, so a put that a flush
-+/// commits has always been recorded first. A no-op unless tracking is on.
++/// one). With a watch set, only watched entries are recorded -- but a put
++/// whose value references a watched key also records its own key (and unit),
++/// so a new alias of a watched unit, or a reference to it, is known to the
++/// collector even though the alias itself was never watched.
++///
++/// Called AFTER the put reaches the overlay, and before it returns. A put that
++/// checked tracking before the collector switched it on, and landed after the
++/// collector's flush, would otherwise be neither tracked nor visible to its
++/// scans: checked after the insert, either tracking is already on (recorded)
++/// or the collector's subsequent flush commits the put (scanned).
 +fn track_put(db: &LmdbDatabase, key: &[u8], value: &[u8]) {
 +    if !db.tracking.load(Ordering::Acquire) {
 +        return;
 +    }
++    let unit = unit_of(key).filter(|u| u.len() < key.len());
 +    track_insert(db, key);
-+    if let Some(unit) = unit_of(key) {
-+        if unit.len() < key.len() {
-+            track_insert(db, unit);
-+        }
++    if let Some(u) = unit {
++        track_insert(db, u);
 +    }
++    let mut references_watched = false;
 +    if value.len() > 5 && &value[..5] == b"link:" {
 +        let target = &value[5..];
 +        for (i, c) in target.iter().enumerate() {
 +            if *c == b'/' {
-+                track_insert(db, &target[..i]);
++                references_watched |= track_insert(db, &target[..i]);
 +            }
 +        }
-+        track_insert(db, target);
++        references_watched |= track_insert(db, target);
 +    } else if is_id43(value) {
-+        track_insert(db, value);
++        references_watched |= track_insert(db, value);
++    }
++    if references_watched {
++        track_force(db, key);
++        if let Some(u) = unit {
++            track_force(db, u);
++        }
 +    }
 +}
 +
  fn build_environment(path: &str, options: &EnvOptions) -> Result<Environment, lmdb::Error> {
      let mut env_builder = Environment::new();
  
-@@ -394,15 +508,28 @@
+@@ -394,15 +528,28 @@
  }
  
  fn do_flush(db: &LmdbDatabase) -> Result<(), String> {
@@ -291,7 +311,7 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
      }
  
      let (live_env, live_db) = match db.fast_get_handles() {
-@@ -436,10 +563,43 @@
+@@ -436,10 +583,43 @@
          return Err(e);
      }
  
@@ -336,7 +356,7 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
          }
          Err(e) => {
              restore_failed_flush(db, old_map);
-@@ -462,15 +622,56 @@
+@@ -462,17 +642,58 @@
  
  fn drain_remaining_sync_waiters(rx: &Receiver<WorkerCommand>, fatal_error: Option<String>) {
      while let Ok(cmd) = rx.try_recv() {
@@ -363,10 +383,10 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +                cvar.notify_all();
 +            }
 +            _ => {}
-+        }
-+    }
-+}
-+
+         }
+     }
+ }
+ 
 +fn delete_sync(
 +    db_handle: &LmdbDatabase,
 +    keys: Vec<Vec<u8>>,
@@ -384,8 +404,8 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +                .map_err(|_| "Worker thread is gone".to_string())?;
 +        } else {
 +            return Err("Worker thread is not running".to_string());
-         }
-     }
++        }
++    }
 +    let (lock, cvar) = &*signal;
 +    let mut result = lock
 +        .lock()
@@ -396,10 +416,12 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +            .map_err(|_| "Condvar wait failed".to_string())?;
 +    }
 +    result.take().unwrap()
- }
- 
++}
++
  fn worker_loop(rx: Receiver<WorkerCommand>, db: ResourceArc<LmdbDatabase>) {
-@@ -512,6 +713,31 @@
+     let mut exit_error: Option<String> = None;
+     loop {
+@@ -512,6 +733,31 @@
                      break;
                  }
              }
@@ -431,7 +453,7 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
              Ok(WorkerCommand::Shutdown) => {
                  let result = do_flush(&db);
                  if let Err(e) = result {
-@@ -900,6 +1126,9 @@
+@@ -900,6 +1146,9 @@
          hot_handles: ArcSwap::from_pointee(None),
          worker_tx: Mutex::new(None),
          worker_handle: Mutex::new(None),
@@ -441,27 +463,27 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
      };
      let resource = ResourceArc::new(lmdb_db);
  
-@@ -1132,6 +1361,7 @@
+@@ -1139,6 +1388,7 @@
+             break;
          }
      }
- 
 +    track_put(&db_handle, &key_vec, &value_vec);
-     loop {
-         let map = db_handle.active.load();
-         let _ = map.upsert_sync(key_vec.clone(), value_vec.clone());
-@@ -1284,6 +1514,11 @@
+ 
+     let count = db_handle.op_count.fetch_add(1, Ordering::Relaxed) + 1;
+     let threshold = db_handle.batch_size.load(Ordering::Relaxed);
+@@ -1294,6 +1544,11 @@
+             break;
          }
      }
- 
 +    if db_handle.tracking.load(Ordering::Acquire) {
 +        for (key, value) in key_value_pairs.iter() {
 +            track_put(&db_handle, key.as_slice(), value.as_slice());
 +        }
 +    }
-     loop {
-         let m = db_handle.active.load();
-         let _reserved = m.reserve(key_value_pairs.len());
-@@ -2238,6 +2473,316 @@
+     let count = db_handle.op_count.fetch_add(key_value_pairs.len(), Ordering::Relaxed) + key_value_pairs.len();
+     let threshold = db_handle.batch_size.load(Ordering::Relaxed);
+     if count >= threshold
+@@ -2238,6 +2493,316 @@
  }
  
  ///===================================================================
@@ -553,7 +575,7 @@ diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
 +        let old = db_handle.tracked.swap(Arc::new(new_track_set()));
 +        old.iter_sync(|k| {
 +            if set.contains_sync(k.as_slice()) {
-+                track_insert(&db_handle, k);
++                track_force(&db_handle, k);
 +            }
 +            true
 +        });

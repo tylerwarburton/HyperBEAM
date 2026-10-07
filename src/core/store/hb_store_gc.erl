@@ -1864,11 +1864,14 @@ sweep_chunk(Ctx, Chunk = #{ slots := Slots, keep := Keep }, Acc) ->
     Cand = new_cand(),
     Stop = sets:union(maps:get(pins, Ctx), Keep),
     lists:foreach(fun(R) -> closure(Ctx, Cand, R, Stop) end, Roots),
-    ok = elmdb:track_watch(DB, ets:select(maps:get(tab, Cand), [{{'$1', '_', '_', '_'}, [], ['$1']}])),
+    %% The slot aliases about to be deleted are watched too: one rewritten
+    %% during the run (a historical replay recomputing that slot) vetoes its
+    %% deletion and protects what it reaches.
+    ok = elmdb:track_watch(DB, cand_keys(Cand) ++ Aliases),
     Acc1 = bump(candidate_keys, cand_size(Cand), Acc),
     case maps:get(dry_run, Policy) of
         true ->
-            Acc2 = protect_and_sweep(Ctx, Cand, [], Acc1#{ dry_run => true }),
+            Acc2 = protect_and_sweep(Ctx, Cand, [], Aliases, Acc1#{ dry_run => true }),
             free_cand(Cand),
             Acc2;
         false ->
@@ -1880,7 +1883,7 @@ sweep_chunk(Ctx, Chunk = #{ slots := Slots, keep := Keep }, Acc) ->
             hook(Ctx, aliases_deleted),
             timer:sleep(maps:get(grace, Policy)),
             forget(Chunk, Slots, Revived),
-            Acc3 = protect_and_sweep(Ctx, Cand, Revived, Acc2),
+            Acc3 = protect_and_sweep(Ctx, Cand, Revived, Aliases, Acc2),
             free_cand(Cand),
             ok = clear_journal(Ctx),
             Acc3
@@ -1970,8 +1973,25 @@ pace(Ctx, Count) ->
 
 new_cand() ->
     #{ tab => ets:new(hb_store_gc_cand, [set, private]),
+       alias_of => ets:new(hb_store_gc_alias, [set, private]),
        counter => counters:new(1, []) }.
-free_cand(#{ tab := T }) -> ets:delete(T).
+free_cand(#{ tab := T, alias_of := A }) -> ets:delete(T), ets:delete(A).
+
+cand_keys(#{ tab := T }) -> ets:select(T, [{{'$1', '_', '_', '_'}, [], ['$1']}]).
+
+is_alias(#{ alias_of := A }, K) -> ets:member(A, K).
+
+%% An alias row of a candidate unit: a candidate ordered just before its unit,
+%% so a reader holding the alias never outlives the unit by a batch.
+add_alias(Cand = #{ tab := T, alias_of := A }, AliasKey, Unit) ->
+    case ets:lookup(T, Unit) of
+        [{_, O, _, Protected}] ->
+            ets:insert(A, {AliasKey, Unit}),
+            ets:insert_new(T, {AliasKey, O - 0.5, byte_size(AliasKey) + 48, Protected});
+        [] -> ok
+    end,
+    _ = Cand,
+    ok.
 cand_size(#{ tab := T }) -> ets:info(T, size).
 is_cand(#{ tab := T }, K) -> ets:member(T, K).
 
@@ -2046,28 +2066,35 @@ ref_targets(ID) when byte_size(ID) == 43 -> [ID];
 ref_targets(_) -> [].
 
 %% @doc Find the protected candidates and delete the rest.
-protect_and_sweep(Ctx, Cand, Seeds0, Acc) ->
+protect_and_sweep(Ctx, Cand, Seeds0, SlotAliases, Acc) ->
+    DB = maps:get(src_db, Ctx),
     Pins = maps:get(pins, Ctx),
     PinSeeds = [ K || K <- sets:to_list(Pins), is_cand(Cand, K) ],
+    %% Every write so far is either committed now -- and so seen by the scan --
+    %% or arrives after the flush and is tracked (the candidates are watched).
+    ok = elmdb:flush(DB),
     {ScanSeeds, Aliases, Acc1} = protection_scan(Ctx, Cand, Acc),
+    %% Units' alias rows (`Y -> link:X', written by `hb_cache' for signed and
+    %% `all' IDs) are known only now. Watch them from here, then make every
+    %% write that preceded the watch visible to the alias scan: a reference to
+    %% an alias is then either scanned or tracked, never neither.
+    AliasKeys = [ A || {A, _} <- Aliases ],
+    ok = elmdb:track_watch(DB, cand_keys(Cand) ++ SlotAliases ++ AliasKeys),
+    ok = elmdb:flush(DB),
     AliasSeeds =
         case Aliases of
             [] -> [];
             _ -> alias_scan(Ctx, Cand, Aliases)
         end,
-    {ok, Tracked} = elmdb:track_take(maps:get(src_db, Ctx)),
-    WriteSeeds = [ K || K <- Tracked, is_cand(Cand, K) ],
+    %% An alias row goes with its unit: it is a candidate, ordered just before
+    %% the unit, and dropped from the sweep whenever the unit is protected.
+    lists:foreach(
+        fun({AliasKey, Unit}) -> add_alias(Cand, AliasKey, Unit) end,
+        Aliases),
+    {ok, Tracked} = elmdb:track_take(DB),
+    WriteSeeds = [ K || K <- Tracked, is_cand(Cand, K) orelse is_alias(Cand, K) ],
     Seeds = Seeds0 ++ PinSeeds ++ ScanSeeds ++ AliasSeeds ++ WriteSeeds,
     lists:foreach(fun(S) -> protect(Ctx, Cand, S) end, Seeds),
-    %% Alias rows of a deleted unit go with it, unless the unit is protected.
-    lists:foreach(
-        fun({AliasKey, Unit}) ->
-            case ets:lookup(maps:get(tab, Cand), Unit) of
-                [{_, _, _, false}] -> add_cand(Cand, AliasKey, byte_size(AliasKey) + 48);
-                _ -> ok
-            end
-        end,
-        Aliases),
     Acc2 = Acc1#{
         protected_by_scan => maps:get(protected_by_scan, Acc1) + length(ScanSeeds ++ AliasSeeds),
         protected_by_writes => maps:get(protected_by_writes, Acc1) + length(WriteSeeds)
@@ -2149,7 +2176,16 @@ alias_scan(Ctx, Cand, Aliases) ->
 
 %% @doc Mark a candidate and everything it reaches inside the candidate set as
 %% protected.
-protect(Ctx, Cand = #{ tab := T }, Key) ->
+protect(Ctx, Cand = #{ tab := T, alias_of := AliasOf }, Key) ->
+    %% A protected alias keeps its unit.
+    case ets:lookup(AliasOf, Key) of
+        [{_, Unit}] ->
+            ets:update_element(T, Key, {4, true}),
+            protect(Ctx, Cand, Unit);
+        [] -> protect_key(Ctx, Cand, Key)
+    end.
+
+protect_key(Ctx, Cand = #{ tab := T }, Key) ->
     case ets:lookup(T, Key) of
         [{_, _, _, true}] -> ok;
         [{K, O, B, false}] ->
@@ -2194,8 +2230,8 @@ protect_row(Ctx, Cand = #{ tab := T }, {K, V}) ->
 %% with everything it reaches, and the remaining batches are recomputed.
 sweep(Ctx, Cand = #{ tab := T }, Acc) ->
     Ordered =
-        [ {K, B} || {K, _O, B, false} <-
-              lists:keysort(2, ets:tab2list(T)) ],
+        [ {K, B} || {K, _O, B, false} <- lists:keysort(2, ets:tab2list(T)),
+                    deletable(Cand, K) ],
     Protected = ets:select_count(T, [{{'_', '_', '_', true}, [], [true]}]),
     Acc1 = Acc#{ protected_keys => maps:get(protected_keys, Acc) + Protected },
     case maps:get(dry_run, Acc1, false) of
@@ -2208,14 +2244,26 @@ sweep(Ctx, Cand = #{ tab := T }, Acc) ->
         false -> sweep_batches(Ctx, Cand, Ordered, Acc1)
     end.
 
+%% Unprotected, and -- for an alias row -- its unit unprotected too.
+deletable(#{ tab := T, alias_of := A }, K) ->
+    ets:lookup_element(T, K, 4) == false andalso
+        case ets:lookup(A, K) of
+            [{_, Unit}] ->
+                case ets:lookup(T, Unit) of
+                    [{_, _, _, true}] -> false;
+                    _ -> true
+                end;
+            [] -> true
+        end.
+
 sweep_batches(_Ctx, _Cand, [], Acc) -> Acc;
 sweep_batches(Ctx, Cand = #{ tab := T }, Ordered, Acc) ->
     N = maps:get(delete_batch, maps:get(policy, Ctx)),
     {Batch, Rest} = lists:split(min(N, length(Ordered)), Ordered),
     %% Fold in what was written since the last check before deciding.
     {ok, Tracked} = elmdb:track_take(maps:get(src_db, Ctx)),
-    [ protect(Ctx, Cand, K) || K <- Tracked, is_cand(Cand, K) ],
-    Live = [ {K, B} || {K, B} <- Batch, ets:lookup_element(T, K, 4) == false ],
+    [ protect(Ctx, Cand, K) || K <- Tracked, is_cand(Cand, K) orelse is_alias(Cand, K) ],
+    Live = [ {K, B} || {K, B} <- Batch, deletable(Cand, K) ],
     Store = maps:get(src_store, Ctx),
     case hb_store:delete(Store, #{ <<"delete">> => [ K || {K, _} <- Live ],
                                    <<"guarded">> => true },
@@ -2231,8 +2279,7 @@ sweep_batches(Ctx, Cand = #{ tab := T }, Ordered, Acc) ->
             sweep_batches(Ctx, Cand, Rest, Acc1);
         {error, {conflict, Found}} ->
             [ protect(Ctx, Cand, K) || K <- Found ],
-            Remaining = [ {K, B} || {K, B} <- Batch ++ Rest,
-                                    ets:lookup_element(T, K, 4) == false ],
+            Remaining = [ {K, B} || {K, B} <- Batch ++ Rest, deletable(Cand, K) ],
             sweep_batches(Ctx, Cand, Remaining,
                 Acc#{ conflicts => maps:get(conflicts, Acc) + length(Found),
                       protected_by_writes => maps:get(protected_by_writes, Acc) + length(Found) });
@@ -2269,10 +2316,11 @@ recover_journal(Ctx, Acc) ->
             ?event(store_retention, {recovering_journal, length(Aliases), length(Keys)}),
             Cand = new_cand(),
             [ ets:insert(maps:get(tab, Cand), {K, O, B, false}) || {K, O, B} <- Keys ],
-            ok = elmdb:track_watch(maps:get(src_db, Ctx), [ K || {K, _, _} <- Keys ]),
+            ok = elmdb:track_watch(maps:get(src_db, Ctx), [ K || {K, _, _} <- Keys ] ++ Aliases),
+            ok = elmdb:flush(maps:get(src_db, Ctx)),
             counters:add(maps:get(counter, Cand), 1, length(Keys)),
             {Acc1, Revived} = delete_aliases(Ctx, Aliases, Acc),
-            Acc2 = protect_and_sweep(Ctx, Cand, Revived,
+            Acc2 = protect_and_sweep(Ctx, Cand, Revived, Aliases,
                        Acc1#{ recovered_journal => true }),
             free_cand(Cand),
             ok = clear_journal(Ctx),
