@@ -70,7 +70,7 @@
 -export([retain/1, maybe_start_retention/1, start_retention/1, stop_retention/0,
          run_retention/1, retention_status/0, retain_plan/3,
          copy_essential_namespaces/3, forget_process_cache/3,
-         restore_checkpoint/2]).
+         restore_checkpoint/2, closure_rows/2]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -1377,8 +1377,9 @@ report(Acc, Plans, Policy, SrcStore, DstStore) ->
 
 -define(RET_DEFAULT_INTERVAL, 600000).
 -define(RET_DEFAULT_CHECKPOINTS, 2).
--define(RET_DEFAULT_BATCH_SLOTS, 1000).
--define(RET_DEFAULT_BACKLOG_SLOTS, 10000).
+%% Candidate rows held in memory per chunk (~150 B each): one protection scan
+%% per this many. A scheduled run on a busy node fits in one chunk.
+-define(RET_DEFAULT_MAX_CANDIDATES, 2000000).
 -define(RET_DEFAULT_DELETE_BATCH, 1000).
 -define(RET_DEFAULT_RATE, 20000).
 -define(RET_DEFAULT_SCAN_ROWS, 20000).
@@ -1465,9 +1466,8 @@ retention_policy(Opts) ->
         recent => max(Hot, ret_opt(<<"store-retention-recent-slots">>, Hot, Opts)),
         keep_seconds => ret_opt(<<"store-retention-keep-seconds">>, 0, Opts),
         sparse => ret_opt(<<"store-retention-sparse-slots">>, 0, Opts),
-        batch_slots => ret_opt(<<"store-retention-batch-slots">>, ?RET_DEFAULT_BATCH_SLOTS, Opts),
-        backlog_batch_slots =>
-            ret_opt(<<"store-retention-backlog-batch-slots">>, ?RET_DEFAULT_BACKLOG_SLOTS, Opts),
+        max_candidates =>
+            ret_opt(<<"store-retention-max-candidates">>, ?RET_DEFAULT_MAX_CANDIDATES, Opts),
         delete_batch => ret_opt(<<"store-retention-delete-batch">>, ?RET_DEFAULT_DELETE_BATCH, Opts),
         rate => ret_opt(<<"store-retention-max-deletes-per-sec">>, ?RET_DEFAULT_RATE, Opts),
         scan_rows => ret_opt(<<"store-retention-scan-rows">>, ?RET_DEFAULT_SCAN_ROWS, Opts),
@@ -1525,8 +1525,7 @@ retain(Opts) ->
     ok = elmdb:track(DB, true),
     ok = elmdb:flush(DB),
     try
-        Acc0 = ret_acc(),
-        Acc1 = recover_journal(Ctx, Acc0),
+        Acc1 = ret_acc(),
         Procs = computed_processes(Ctx),
         {Plans, Acc1b} =
             lists:foldl(
@@ -1537,29 +1536,15 @@ retain(Opts) ->
                 {[], Acc1},
                 Procs
             ),
-        %% Backlog mode: a first run over a large existing store drops far more
-        %% slots than a scheduled run. One protection scan per
-        %% `store-retention-batch-slots' would then be one full scan of a big
-        %% store per thousand slots; take `store-retention-backlog-batch-slots'
-        %% per scan instead (memory: ~150 B per candidate row, ~100-300 rows
-        %% per slot).
-        Dropped = lists:sum([ length(maps:get(drop, Pl)) || {_, Pl} <- Plans ]),
-        BatchSlots = maps:get(batch_slots, Policy),
-        Backlog = Dropped > 10 * BatchSlots,
-        Ctx2 =
-            case Backlog of
-                true ->
-                    Ctx#{ policy => Policy#{ batch_slots =>
-                        max(BatchSlots, maps:get(backlog_batch_slots, Policy)) } };
-                false -> Ctx
-            end,
-        {Acc2, Pending} =
-            lists:foldl(
-                fun({P, Plan}, {A, Chunk}) -> add_to_chunk(Ctx2, P, Plan, Chunk, A) end,
-                {Acc1b#{ backlog_mode => Backlog }, new_chunk()},
-                lists:reverse(Plans)
-            ),
-        Acc3a = sweep_chunk(Ctx2, Pending, Acc2),
+        Drops =
+            [ {P, S, R} || {P, #{ drop := D, keep_roots := _ }} <- lists:reverse(Plans),
+                           {S, R} <- D ],
+        Keep =
+            sets:from_list(
+                lists:append([ maps:get(keep_roots, Pl) || {_, Pl} <- Plans ]),
+                [{version, 2}]),
+        Acc1c = recover_journal(Ctx, Keep, Acc1b),
+        Acc3a = sweep_run(Ctx, Drops, Keep, Acc1c),
         Acc3 =
             case hb_util:atom(hb_opts:get(<<"store-retention-orphans">>, false, Opts)) of
                 true -> orphan_sweep(Ctx, Acc3a);
@@ -1591,7 +1576,7 @@ retain(Opts) ->
     end.
 
 ret_acc() ->
-    #{ backlog_mode => false, orphan_units => 0, orphan_deleted_units => 0, orphan_scans => 0,
+    #{ chunks => 0, graces => 0, scan_ms => 0, orphan_units => 0, orphan_deleted_units => 0, orphan_scans => 0,
        dropped_slots => 0, kept_slots => 0, candidate_keys => 0,
        protected_keys => 0, protected_by_scan => 0, protected_by_writes => 0,
        deleted_keys => 0, deleted_bytes => 0, alias_keys => 0, conflicts => 0,
@@ -1730,11 +1715,17 @@ archive_checkpoints(Ctx, P, Below, Classify) ->
             [ S || S <- Selected, archive_checkpoint(Ctx, Cfg, P, S) =/= ok ]
     end.
 
+%% Every target operation holds one of the process-wide target slots
+%% (`hb_store_export:with_target/2'); if none is free the checkpoint is simply
+%% not archived this run, and so not dropped.
 archive_checkpoint(Ctx, Cfg, P, Slot) ->
+    hb_store_export:with_target(fun() -> do_archive_checkpoint(Ctx, Cfg, P, Slot) end, try_once).
+
+do_archive_checkpoint(Ctx, Cfg, P, Slot) ->
     Path = hb_util:list(maps:get(<<"path">>, Cfg)),
     Name = filename:join(hb_util:list(P), integer_to_list(Slot) ++ ".ckpt"),
     File = filename:join(Path, Name),
-    case filelib:is_file(File) of
+    case hb_store_export:raw_is_file(File) of
         true -> ok;
         false ->
             try
@@ -1746,7 +1737,7 @@ archive_checkpoint(Ctx, Cfg, P, Slot) ->
                 Used = archive_used(Path),
                 case hb_store_export:space_ok(Path, Used + byte_size(Bin), Cfg) of
                     ok ->
-                        ok = filelib:ensure_dir(File),
+                        ok = hb_store_export:raw_ensure_dir(File),
                         ok = hb_store_export:put_file(File, Bin),
                         ok = hb_store_export:append_manifest(Path,
                                 {Name, byte_size(Bin), erlang:crc32(Bin)}),
@@ -1768,7 +1759,7 @@ archive_frame(Term) ->
 
 %% Bytes this archive already holds, from its manifest.
 archive_used(Path) ->
-    case file:read_file(filename:join(Path, "manifest.log")) of
+    case prim_file:read_file(filename:join(Path, "manifest.log")) of
         {ok, M} -> lists:sum([ B || {_, B, _} <- unframe(M, []) ]);
         _ -> 0
     end.
@@ -1818,6 +1809,48 @@ archive_rows(Ctx, [K | Rest], Seen, Acc) ->
             archive_rows(Ctx, Next ++ Rest, Seen1, Rows ++ Acc)
     end.
 
+%% @doc Every raw row of the closure of `Keys' in an LMDB `DB': each key's row
+%% or group subtree, then whatever its rows reference -- `link:' targets and
+%% the messages `+link' keys name -- in any namespace. Used by the essentials
+%% export to re-export, from the local store, what a journal gap lost.
+closure_rows(DB, Keys) ->
+    Ctx = #{ src_db => DB },
+    closure_rows(Ctx, Keys, #{}, []).
+closure_rows(_Ctx, [], _Seen, Acc) -> Acc;
+closure_rows(Ctx, [K | Rest], Seen, Acc) ->
+    case maps:is_key(K, Seen) of
+        true -> closure_rows(Ctx, Rest, Seen, Acc);
+        false ->
+            Rows =
+                case raw_get(Ctx, K) of
+                    {ok, <<"group">>} ->
+                        case raw_subtree(Ctx, K) of {ok, Rs} -> Rs; _ -> [] end;
+                    {ok, V} -> [{K, V}];
+                    not_found ->
+                        % An implicit group (children, no marker row).
+                        case raw_subtree(Ctx, K) of {ok, Rs} -> Rs; _ -> [] end
+                end,
+            Next =
+                lists:flatmap(
+                    fun({RK, RV}) ->
+                        Links = case RV of
+                                    <<"link:", T/binary>> when byte_size(T) > 0 -> [T];
+                                    _ -> []
+                                end,
+                        Ids = case hb_link:is_link_key(RK) of
+                                  true ->
+                                      case read_value(Ctx, RV) of
+                                          {ok, ID} when byte_size(ID) == 43 -> [ID];
+                                          _ -> []
+                                      end;
+                                  false -> []
+                              end,
+                        Links ++ Ids
+                    end,
+                    Rows),
+            closure_rows(Ctx, Next ++ Rest, Seen#{ K => true }, Rows ++ Acc)
+    end.
+
 %% @doc Write an archived checkpoint back into the (sole) store of `Opts': its
 %% rows and the `computed/<P>/slot/<N>' and `computed/<P>/<Root>' aliases.
 restore_checkpoint(File, Opts) ->
@@ -1835,33 +1868,73 @@ restore_checkpoint(File, Opts) ->
     {ok, #{ process => P, slot => Slot, root => Root,
             rows => lists:sum([ length(R) || {raw, R} <- Rest ]) }}.
 
-%%% Candidate chunks: dropped slots accumulate across processes until
-%%% `store-retention-batch-slots' is reached, then one protection scan serves
-%%% them all.
+%%% The sweep of a run.
+%%%
+%%% One generation for the whole run: tracking began before planning, so every
+%%% write since is recorded or (flushed) visible to the scans. The run's alias
+%%% rows go first, all of them, guarded, followed by ONE grace period for
+%%% readers that resolved an alias just before -- the first version slept the
+%%% grace once per batch of 1000 slots, which was 960 of the 1,104 s a live
+%%% run took. Then the dropped roots are swept in chunks, each as large as
+%%% `store-retention-max-candidates' allows (in steady state, the whole run in
+%%% one chunk): one protection scan per chunk.
 
-new_chunk() -> #{ slots => [], keep => sets:new([{version, 2}]), procs => #{} }.
+sweep_run(_Ctx, [], _Keep, Acc) -> Acc;
+sweep_run(Ctx, Drops, Keep, Acc) ->
+    Policy = maps:get(policy, Ctx),
+    DB = maps:get(src_db, Ctx),
+    Aliases = lists:append([ slot_aliases(P, S, R, Keep) || {P, S, R} <- Drops ]),
+    Roots = lists:usort([ R || {_P, _S, R} <- Drops, R =/= not_found ]),
+    Procs = lists:foldl(fun({P, S, _}, M) -> maps:update_with(P, fun(X) -> max(X, S) end, S, M) end,
+                        #{}, Drops),
+    %% Watch the aliases from here: a slot rewritten before its alias is
+    %% deleted (a historical replay, or a new slot whose state has the same
+    %% root as a dropped one) vetoes that delete and keeps its root.
+    ok = elmdb:track_watch(DB, Aliases),
+    case maps:get(dry_run, Policy) of
+        true ->
+            sweep_roots(Ctx, Roots, Keep, [], Aliases, Acc#{ dry_run => true });
+        false ->
+            ok = write_journal(Ctx, Aliases, Roots),
+            hook(Ctx, journal_written),
+            {Acc1, Revived} = delete_aliases(Ctx, Aliases, Acc),
+            forget(Procs),
+            hook(Ctx, aliases_deleted),
+            timer:sleep(maps:get(grace, Policy)),
+            forget(Procs),
+            Acc2 = sweep_roots(Ctx, Roots, Keep, Revived, Aliases, bump(graces, 1, Acc1)),
+            ok = clear_journal(Ctx),
+            Acc2
+    end.
 
-add_to_chunk(_Ctx, _P, #{ drop := [] }, Chunk, Acc) ->
-    {Acc, Chunk};
-add_to_chunk(Ctx, P, #{ drop := Drop, keep_roots := KeepRoots }, Chunk0, Acc0) ->
-    Max = maps:get(batch_slots, maps:get(policy, Ctx)),
-    Keep = sets:from_list(KeepRoots, [{version, 2}]),
-    lists:foldl(
-        fun({S, Root}, {A, C}) ->
-            C1 = C#{
-                slots => [{P, S, Root} | maps:get(slots, C)],
-                keep => sets:union(Keep, maps:get(keep, C)),
-                procs => maps:update_with(P, fun(M) -> max(M, S) end, S,
-                                          maps:get(procs, C))
-            },
-            case length(maps:get(slots, C1)) >= Max of
-                true -> {sweep_chunk(Ctx, C1, A), new_chunk()};
-                false -> {A, C1}
-            end
-        end,
-        {Acc0, Chunk0},
-        Drop
-    ).
+%% Sweep the dropped roots in chunks bounded by `max_candidates'.
+sweep_roots(_Ctx, [], _Keep, _Revived, _Aliases, Acc) -> Acc;
+sweep_roots(Ctx, Roots, Keep, Revived, Aliases, Acc) ->
+    Max = maps:get(max_candidates, maps:get(policy, Ctx)),
+    DB = maps:get(src_db, Ctx),
+    Cand = new_cand(),
+    Stop = sets:union(maps:get(pins, Ctx), Keep),
+    Rest = closure_until(Ctx, Cand, Roots, Stop, Max),
+    ok = elmdb:track_watch(DB, cand_keys(Cand) ++ Aliases),
+    case maps:get(dry_run, maps:get(policy, Ctx)) of
+        true -> ok;
+        false ->
+            ok = write_journal(Ctx, Aliases, Rest,
+                    [ {K, B} || {K, _O, B, _} <- ets:tab2list(maps:get(tab, Cand)) ])
+    end,
+    Acc1 = bump(candidate_keys, cand_size(Cand), bump(chunks, 1, Acc)),
+    Acc2 = protect_and_sweep(Ctx, Cand, Revived, Aliases, Acc1),
+    free_cand(Cand),
+    sweep_roots(Ctx, Rest, Keep, Revived, Aliases, Acc2).
+
+%% Close over roots until the candidate set reaches `Max'; return the rest.
+closure_until(_Ctx, _Cand, [], _Stop, _Max) -> [];
+closure_until(Ctx, Cand, [R | Rest], Stop, Max) ->
+    closure(Ctx, Cand, R, Stop),
+    case cand_size(Cand) >= Max of
+        true -> Rest;
+        false -> closure_until(Ctx, Cand, Rest, Stop, Max)
+    end.
 
 %% The alias rows of a dropped slot: `computed/<P>/slot/<N>', and
 %% `computed/<P>/<Root>' unless a kept slot shares that root.
@@ -1870,53 +1943,8 @@ slot_aliases(P, S, Root, Keep) ->
         [ <<"computed/", P/binary, "/", Root/binary>>
         || Root =/= not_found, not sets:is_element(Root, Keep) ].
 
-%%% The sweep of one chunk.
-
-sweep_chunk(_Ctx, #{ slots := [] }, Acc) -> Acc;
-sweep_chunk(Ctx, Chunk = #{ slots := Slots, keep := Keep }, Acc) ->
-    Policy = maps:get(policy, Ctx),
-    Aliases = lists:append([ slot_aliases(P, S, R, Keep) || {P, S, R} <- Slots ]),
-    Roots = lists:usort([ R || {_P, _S, R} <- Slots, R =/= not_found ]),
-    %% Candidates: the closure of the dropped roots, never entering a pin, a
-    %% kept root, or a named namespace.
-    %% A generation per chunk: record every write from here (no watch), make
-    %% every earlier one visible to the scan, then narrow the record -- and the
-    %% scan -- to the candidates once they are known. Neither then grows with
-    %% the node's write rate.
-    DB = maps:get(src_db, Ctx),
-    ok = elmdb:track_watch(DB, clear),
-    ok = elmdb:flush(DB),
-    Cand = new_cand(),
-    Stop = sets:union(maps:get(pins, Ctx), Keep),
-    lists:foreach(fun(R) -> closure(Ctx, Cand, R, Stop) end, Roots),
-    %% The slot aliases about to be deleted are watched too: one rewritten
-    %% during the run (a historical replay recomputing that slot) vetoes its
-    %% deletion and protects what it reaches.
-    ok = elmdb:track_watch(DB, cand_keys(Cand) ++ Aliases),
-    Acc1 = bump(candidate_keys, cand_size(Cand), Acc),
-    case maps:get(dry_run, Policy) of
-        true ->
-            Acc2 = protect_and_sweep(Ctx, Cand, [], Aliases, Acc1#{ dry_run => true }),
-            free_cand(Cand),
-            Acc2;
-        false ->
-            ok = write_journal(Ctx, Aliases, Cand),
-            hook(Ctx, journal_written),
-            %% Aliases first, so no new reader reaches the candidates.
-            {Acc2, Revived} = delete_aliases(Ctx, Aliases, Acc1),
-            forget(Chunk, Slots, Revived),
-            hook(Ctx, aliases_deleted),
-            timer:sleep(maps:get(grace, Policy)),
-            forget(Chunk, Slots, Revived),
-            Acc3 = protect_and_sweep(Ctx, Cand, Revived, Aliases, Acc2),
-            free_cand(Cand),
-            ok = clear_journal(Ctx),
-            Acc3
-    end.
-
-%% Drop the swept slots from the in-memory process caches, except those whose
-%% alias was rewritten during the run.
-forget(#{ procs := Procs }, _Slots, _Revived) ->
+%% Drop the swept slots from the in-memory process caches.
+forget(Procs) ->
     maps:foreach(
         fun(P, MaxSlot) -> forget_process_cache(P, MaxSlot + 1, #{}) end,
         Procs).
@@ -2159,8 +2187,8 @@ protection_scan(Ctx, Cand, Acc) ->
                 {error, T, D} -> erlang:error({store_retention_scan_failed, T, D})
             end
         end,
-    {Seeds, Aliases, Rows} = Loop(<<>>, [], [], 0),
-    {Seeds, Aliases, bump(scans, 1, bump(scanned_rows, Rows, Acc))}.
+    {Us, {Seeds, Aliases, Rows}} = timer:tc(fun() -> Loop(<<>>, [], [], 0) end),
+    {Seeds, Aliases, bump(scan_ms, Us div 1000, bump(scans, 1, bump(scanned_rows, Rows, Acc)))}.
 
 classify_ref(Ctx, Cand, K, V = <<"link:", Target/binary>>, S, A) ->
     %% A pin (a process ID, a trusted device) is a root, never an alias to
@@ -2180,9 +2208,11 @@ alias_scan(Ctx, Cand, Aliases) ->
     ByAlias = maps:from_list(Aliases),
     DB = maps:get(src_db, Ctx),
     Step = maps:get(scan_rows, maps:get(policy, Ctx)),
+    %% Rust-filtered: only rows outside the watch that reference a watched key
+    %% (the aliases are watched by now) come back to Erlang.
     Loop =
         fun L(From, Seeds) ->
-            {ok, Refs, _N, Next} = elmdb:scan_refs(DB, From, Step),
+            {ok, Refs, _N, Next} = elmdb:scan_watched(DB, From, Step),
             Seeds1 =
                 lists:foldl(
                     fun({K, V}, S) ->
@@ -2312,12 +2342,15 @@ sweep_batches(Ctx, Cand = #{ tab := T }, Ordered, Acc) ->
             erlang:error({store_retention_delete_failed, Reason})
     end.
 
-%%% The journal: the candidate keys and alias keys of the sweep in progress,
-%%% written before anything is deleted.
+%%% The journal: written before anything is deleted, and again before each
+%%% chunk is swept: the run's alias keys, the dropped roots not yet swept, and
+%%% the candidate keys of the chunk being swept (whose roots may already be
+%%% gone, so they cannot be found again from the roots).
 
-write_journal(Ctx, Aliases, #{ tab := T }) ->
-    Keys = [ {K, O, B} || {K, O, B, _} <- ets:tab2list(T) ],
-    Bin = term_to_binary({retention_journal, 1, Aliases, Keys}, [compressed]),
+write_journal(Ctx, Aliases, Roots) ->
+    write_journal(Ctx, Aliases, Roots, []).
+write_journal(Ctx, Aliases, Roots, CandKeys) ->
+    Bin = term_to_binary({retention_journal, 2, Aliases, Roots, CandKeys}, [compressed]),
     File = maps:get(journal, Ctx),
     Tmp = File ++ ".tmp",
     ok = file:write_file(Tmp, Bin, [raw, sync]),
@@ -2330,26 +2363,33 @@ clear_journal(Ctx) ->
         Err -> Err
     end.
 
-%% @doc Finish a sweep a crash interrupted: delete its aliases, then protect
-%% and sweep its candidates exactly as if the run had continued. The rows a
-%% partial sweep already deleted are simply absent.
-recover_journal(Ctx, Acc) ->
+%% @doc Finish a sweep a crash interrupted: delete its aliases, sweep the
+%% candidates of the chunk it was in, then the roots it had not reached --
+%% exactly as if the run had continued. Rows already deleted are simply
+%% absent. Runs after planning, so `Keep' is this run's kept roots.
+recover_journal(Ctx, Keep, Acc) ->
     File = maps:get(journal, Ctx),
     case file:read_file(File) of
         {ok, Bin} ->
-            {retention_journal, 1, Aliases, Keys} = binary_to_term(Bin),
-            ?event(store_retention, {recovering_journal, length(Aliases), length(Keys)}),
-            Cand = new_cand(),
-            [ ets:insert(maps:get(tab, Cand), {K, O, B, false}) || {K, O, B} <- Keys ],
-            ok = elmdb:track_watch(maps:get(src_db, Ctx), [ K || {K, _, _} <- Keys ] ++ Aliases),
-            ok = elmdb:flush(maps:get(src_db, Ctx)),
-            counters:add(maps:get(counter, Cand), 1, length(Keys)),
-            {Acc1, Revived} = delete_aliases(Ctx, Aliases, Acc),
-            Acc2 = protect_and_sweep(Ctx, Cand, Revived, Aliases,
-                       Acc1#{ recovered_journal => true }),
-            free_cand(Cand),
+            {retention_journal, 2, Aliases, Roots, Keys} = binary_to_term(Bin),
+            ?event(store_retention, {recovering_journal, length(Aliases), length(Roots), length(Keys)}),
+            DB = maps:get(src_db, Ctx),
+            ok = elmdb:track_watch(DB, Keys ++ Aliases),
+            ok = elmdb:flush(DB),
+            {Acc1, Revived} = delete_aliases(Ctx, Aliases, Acc#{ recovered_journal => true }),
+            Acc2 =
+                case Keys of
+                    [] -> Acc1;
+                    _ ->
+                        Cand = new_cand(),
+                        [ add_cand(Cand, K, B) || {K, B} <- Keys ],
+                        A = protect_and_sweep(Ctx, Cand, Revived, Aliases, Acc1),
+                        free_cand(Cand),
+                        A
+                end,
+            Acc3 = sweep_roots(Ctx, Roots, Keep, Revived, Aliases, Acc2),
             ok = clear_journal(Ctx),
-            Acc2;
+            Acc3;
         {error, enoent} -> Acc
     end.
 

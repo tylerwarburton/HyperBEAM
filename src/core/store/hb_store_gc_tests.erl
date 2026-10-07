@@ -257,24 +257,53 @@ retention_historical_reads_with_worker_test_() ->
         _ = run_slots(Process, Next, 3, Opts)
     end}.
 
-%% @doc A first run over a backlog takes `store-retention-backlog-batch-slots'
-%% per protection scan instead of one scan per `store-retention-batch-slots'.
-retention_backlog_mode_test_() ->
+%% @doc A run sleeps the grace period once, however many chunks it sweeps, and
+%% in steady state sweeps everything in one chunk (one protection scan).
+%% `store-retention-max-candidates' bounds a chunk's memory.
+retention_one_grace_per_run_test_() ->
     {timeout, 300, fun() ->
-        Opts = node_opts(#{ <<"store-retention-batch-slots">> => 2,
-                            <<"store-retention-backlog-batch-slots">> => 1000 }),
+        Opts = node_opts(#{ <<"store-retention-grace-ms">> => 300 }),
         Process = new_process(Opts),
         Next = run_slots(Process, 0, 42, Opts),
-        R = hb_store_gc:retain(Opts),
-        ?assert(maps:get(backlog_mode, R)),
-        ?assertEqual(1, maps:get(scans, R)),
-        ?assert(maps:get(dropped_slots, R) > 20),
+        R = hb_store_gc:retain(Opts#{ <<"store-retention-max-candidates">> => 200 }),
+        ?assert(maps:get(chunks, R) >= 3),
+        ?assertEqual(1, maps:get(graces, R)),
+        ?assert(maps:get(duration_ms, R) < 300 * 2 + 5000),
         clear_process_caches(),
         ?assertEqual(integer_to_binary(Next), count_at(Process, Next - 1, Opts)),
-        % A scheduled run after it is not in backlog mode.
-        _ = run_slots(Process, Next, 6, Opts),
+        Next2 = run_slots(Process, Next, 12, Opts),
         R2 = hb_store_gc:retain(Opts),
-        ?assertNot(maps:get(backlog_mode, R2))
+        ?assertEqual(1, maps:get(chunks, R2)),
+        ?assertEqual(1, maps:get(scans, R2)),
+        clear_process_caches(),
+        [ ?assertEqual(integer_to_binary(S + 1), element(1, state_digest(Process, S, Opts)))
+        || S <- computed_slots(Process, Opts) ],
+        ?assertEqual(integer_to_binary(Next2), count_at(Process, Next2 - 1, Opts))
+    end}.
+
+%% @doc A slot computed after the run planned, whose state has the same root
+%% as a dropped slot, keeps the `computed/<P>/<Root>' alias it shares (N4):
+%% the run watches its aliases from before it plans.
+retention_keeps_root_alias_shared_with_a_new_slot_test_() ->
+    {timeout, 300, fun() ->
+        Opts = node_opts(#{}),
+        Process = new_process(Opts),
+        _ = run_slots(Process, 0, 27, Opts),
+        P = proc_id(Process, Opts),
+        DB = main_db(Opts),
+        {ok, <<"link:", Root/binary>>} = elmdb:get(DB, <<"computed/", P/binary, "/slot/2">>),
+        RootAlias = <<"computed/", P/binary, "/", Root/binary>>,
+        % After planning, before the aliases go: a new slot lands on that root.
+        Hook = fun(journal_written) ->
+                       ok = elmdb:put(DB, <<"computed/", P/binary, "/slot/9999">>, <<"link:", Root/binary>>),
+                       ok = elmdb:put(DB, RootAlias, <<"link:", Root/binary>>);
+                  (_) -> ok
+               end,
+        _ = hb_store_gc:retain(Opts#{ <<"store-retention-test-hook">> => Hook }),
+        ok = elmdb:flush(DB),
+        ?assertEqual({ok, <<"link:", Root/binary>>}, elmdb:get(DB, RootAlias)),
+        {ok, M} = hb_cache:read(RootAlias, Opts),
+        ?assert(is_map(hb_cache:ensure_all_loaded(M, Opts)))
     end}.
 
 %% @doc A cold restart -- fresh in-memory caches, store closed and reopened --
@@ -832,3 +861,98 @@ all_rows(DB) ->
             end
         end,
     Loop(<<>>, []).
+
+%% @doc What one scheduled message costs in the essentials store, and why.
+%% `HB_ESS_SIZE=<messages>'. Game-like messages: ans104-signed by a user
+%% wallet, eight tags, a JSON-ish data field; scheduled through
+%% `~scheduler@1.0' with an ans104 assignment commitment, as on stage. Prints
+%% rows and bytes per slot, the logical size, and the rows by unit kind.
+essentials_size_report_test_() ->
+    {timeout, 1800, fun() ->
+        case os:getenv("HB_ESS_SIZE") of
+            false -> ok;
+            NStr ->
+                N = list_to_integer(NStr),
+                Ess = hb_test_utils:test_store(hb_store_lmdb, <<"ess-size">>),
+                ExpDir = hb_util:bin("cache-TEST/ess-size-export-" ++ integer_to_list(erlang:unique_integer([positive]))),
+                Base = node_opts(#{ <<"scheduler-default-commitment-spec">> => <<"ans104@1.0">>,
+                                    <<"scheduling-mode">> => local_confirmation,
+                                    <<"essentials-export">> =>
+                                        #{ <<"path">> => <<ExpDir/binary, "/remote">>,
+                                           <<"journal">> => <<ExpDir/binary, "/journal">> } }),
+                Opts = Base#{
+                    <<"essentials-store">> => Ess,
+                    <<"store">> => hb_store_essentials:node_store(Base#{ <<"essentials-store">> => Ess })
+                },
+                [EssW] = hb_store_essentials:store(Opts),
+                ok = hb_store:start([EssW], #{}, Opts),
+                Wallet = hb_opts:get(<<"priv-wallet">>, x, Opts),
+                Addr = hb_util:human_id(ar_wallet:to_address(Wallet)),
+                Proc = hb_message:commit(#{ <<"device">> => <<"scheduler@1.0">>,
+                    <<"type">> => <<"Process">>, <<"scheduler">> => Addr,
+                    <<"scheduler-location">> => Addr, <<"r">> => rand:uniform(1 bsl 40) },
+                    Opts, <<"ans104@1.0">>),
+                PID = hb_util:human_id(hb_message:id(Proc, all, Opts)),
+                User = ar_wallet:new(),
+                UOpts = Opts#{ <<"priv-wallet">> => User },
+                #{ <<"db">> := EssDB } = hb_store:find(Ess),
+                MainDB = main_db(Opts),
+                Before = {store_rows(EssDB), store_rows(MainDB)},
+                Logical =
+                    lists:map(
+                        fun(I) ->
+                            Body = hb_message:commit(#{
+                                <<"target">> => PID, <<"type">> => <<"Message">>,
+                                <<"action">> => <<"Battle-Op">>, <<"data-protocol">> => <<"ao">>,
+                                <<"variant">> => <<"ao.TN.1">>, <<"op">> => <<"move">>,
+                                <<"x">> => integer_to_binary(rand:uniform(1000)),
+                                <<"y">> => integer_to_binary(rand:uniform(1000)),
+                                <<"nonce">> => integer_to_binary(I),
+                                <<"data">> => iolist_to_binary(
+                                    ["{\"unit\":\"", hb_util:encode(crypto:strong_rand_bytes(24)),
+                                     "\",\"path\":[", lists:join(",", [ integer_to_list(rand:uniform(99)) || _ <- lists:seq(1, 40) ]), "]}"])
+                            }, UOpts, <<"ans104@1.0">>),
+                            Req = hb_message:commit(#{ <<"path">> => <<"schedule">>,
+                                <<"method">> => <<"POST">>, <<"body">> => Body }, UOpts),
+                            {ok, _} = hb_ao:resolve(Proc, Req, Opts),
+                            byte_size(ar_bundles:serialize(hb_message:convert(Body, <<"ans104@1.0">>, Opts)))
+                        end,
+                        lists:seq(1, N)),
+                ok = elmdb:flush(EssDB), ok = elmdb:flush(MainDB),
+                ExpSt = hb_store_export:sync_export(EssW),
+                io:format(user, "~nESS_SIZE export raw_bytes/slot=~p shipped_bytes/slot=~p ratio=~p~n",
+                    [maps:get(raw_bytes, ExpSt) div N, maps:get(shipped_bytes, ExpSt) div N,
+                     maps:get(compression_ratio, ExpSt)]),
+                Rows = all_rows(EssDB),
+                {E0, M0} = Before,
+                MainAfter = store_rows(MainDB),
+                Bytes = lists:sum([ byte_size(K) + byte_size(V) || {K, V} <- Rows ]),
+                {ok, A1} = hb_cache:read(<<"~scheduler@1.0/assignments/", PID/binary, "/1">>, Opts),
+                ALoaded = hb_cache:ensure_all_loaded(A1, Opts),
+                io:format(user,
+                    "~nESS_SIZE messages=~p ess_rows=~p (~.1f/slot) ess_bytes=~p (~p/slot) "
+                    "main_rows_added=~p (~.1f/slot) ans104_body_bytes=~p assignment_term_bytes=~p "
+                    "ess_lmdb_file=~p~n",
+                    [N, length(Rows) - E0, (length(Rows) - E0) / N, Bytes, Bytes div N,
+                     MainAfter - M0, (MainAfter - M0) / N, lists:sum(Logical) div N,
+                     byte_size(term_to_binary(ALoaded)),
+                     filelib:file_size(filename:join(hb_util:list(maps:get(<<"name">>, Ess)), "data.mdb"))]),
+                [ io:format(user, "ESS_SIZE ~8b ~p~n", [C, Sig])
+                || {Sig, C} <- lists:sublist(signatures(Rows), 16) ],
+                ByKind =
+                    lists:foldl(
+                        fun({K, V}, Acc) ->
+                            Kind = case binary:split(K, <<"/">>) of
+                                       [<<"data">>, _] -> data_blob;
+                                       [<<"~", _/binary>> | _] -> namespace;
+                                       [T] when byte_size(T) == 43 ->
+                                           case V of <<"link:", _/binary>> -> id_alias; <<"group">> -> unit_marker; _ -> top_value end;
+                                       [_, _] -> unit_field;
+                                       _ -> other
+                                   end,
+                            maps:update_with(Kind, fun({C, B}) -> {C + 1, B + byte_size(K) + byte_size(V)} end,
+                                             {1, byte_size(K) + byte_size(V)}, Acc)
+                        end, #{}, Rows),
+                io:format(user, "ESS_SIZE by_kind ~p~n", [ByKind])
+        end
+    end}.

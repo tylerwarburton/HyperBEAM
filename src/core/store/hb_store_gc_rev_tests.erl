@@ -469,7 +469,7 @@ fuzz(Mode, DurMs) ->
         <<"store-retention-orphans">> => true,
         <<"store-retention-delete-batch">> => 7,
         <<"store-retention-scan-rows">> => 400,
-        <<"store-retention-batch-slots">> => 5
+        <<"store-retention-max-candidates">> => 300
     }),
     {Opts, _Ess} =
         case Mode of
@@ -588,8 +588,11 @@ fuzz(Mode, DurMs) ->
     ?assertEqual([], [ E || E <- Errs, element(1, E) =/= retain_failed ]).
 
 %%% Exporter: an exporter that dies (node crash, OOM kill, a badmatch in the
-%%% writer) loses the records in its mailbox and its delayed-write buffer. Does
-%%% the restart notice and resync, or does restore silently miss rows?
+%%% writer) loses the records in its mailbox. Does the restart notice and
+%%% close the gap, or does restore silently miss rows? Adapted from the review:
+%%% the essentials store holds essential shapes -- assignments and what they
+%%% reach -- which is what the catch-up re-exports; arbitrary keys written to
+%%% an essentials store would need `resync/1'.
 export_crash_gap_test_() ->
     {timeout, 300, fun() ->
         application:ensure_all_started(hb),
@@ -602,23 +605,30 @@ export_crash_gap_test_() ->
         Opts = #{ <<"store">> => [Store] },
         ok = hb_store:start([Store], #{}, Opts),
         _ = hb_store_export:sync_export(Store),
+        P = hb_util:human_id(crypto:strong_rand_bytes(32)),
+        Key = fun(I) -> <<"~scheduler@1.0/assignments/", P/binary, "/", (integer_to_binary(I))/binary>> end,
         W = fun(From, To) ->
-                [ ok = hb_store:write([Store], #{ <<"k/", (integer_to_binary(I))/binary>> =>
-                                                   <<"v", (integer_to_binary(I))/binary>> }, Opts)
+                [ begin
+                    {ok, ID} = hb_cache:write(#{ <<"v">> => integer_to_binary(I) }, Opts),
+                    ok = hb_store:link([Store], #{ Key(I) => ID }, Opts)
+                  end
                 || I <- lists:seq(From, To) ] end,
         W(1, 3000),
-        {Pid, _} = persistent_term:get({hb_store_export, maps:get(<<"name">>, Store)}),
+        [{_, Pid, _}] = ets:lookup(hb_store_export_registry, maps:get(<<"name">>, Store)),
         exit(Pid, kill),
         timer:sleep(50),
         W(3001, 3100),
         St = hb_store_export:sync_export(Store),
         Target = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => hb_util:bin(Dir ++ "/restored") },
         R = hb_store_export:restore(Dir ++ "/remote", Target, #{}),
+        TOpts = #{ <<"store">> => [Target] },
         Missing = [ I || I <- lists:seq(1, 3100),
-                         hb_store:read([Target], <<"k/", (integer_to_binary(I))/binary>>, #{}) =/=
-                             {ok, <<"v", (integer_to_binary(I))/binary>>} ],
-        io:format(user, "~nEXPORT_CRASH restore=~p resync_pending=~p missing=~p (first ~p)~n",
-                  [R, maps:get(resync_pending, St), length(Missing), lists:sublist(Missing, 5)]),
+                         case hb_cache:read(Key(I), TOpts) of
+                             {ok, M} -> hb_cache:ensure_all_loaded(M, TOpts) =/= #{ <<"v">> => integer_to_binary(I) };
+                             _ -> true
+                         end ],
+        io:format(user, "~nEXPORT_CRASH restore=~p catchups=~p missing=~p (first ~p)~n",
+                  [R, maps:get(catchups, St), length(Missing), lists:sublist(Missing, 5)]),
         ?assertEqual([], Missing)
     end}.
 
