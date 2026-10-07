@@ -1495,3 +1495,54 @@ scan_refs_returns_reference_rows_test() ->
     ?assertEqual([{<<"b">>, <<"link:a">>}, {<<"c">>, ID}, {<<"e">>, <<"link:d/x">>}], Refs),
     ?assertEqual(3, Steps),
     test_stop(StoreOpts).
+
+%% @doc A put that returns ok while tracking is on is never erased by a guarded
+%% delete of the same key: it is tracked before it reaches the overlay, so a
+%% delete that commits the overlay holding it always finds it tracked (or the
+%% collector's take saw it first). Each key is put once, and every put sleeps
+%% between reaching the overlay and returning (`elmdb:debug_put_delay/1'),
+%% which holds the window open: tracked only after the insert, a delete in that
+%% window erased puts that then returned ok.
+guarded_delete_never_erases_a_returned_put_test_() ->
+    {timeout, 120, fun() ->
+        {StoreOpts, DB} = delete_env(),
+        N = 400,
+        Keys = [ <<"same/", (integer_to_binary(I))/binary>> || I <- lists:seq(1, N) ],
+        ok = elmdb:put_batch(DB, [ {K, <<"old">>} || K <- Keys ]),
+        ok = elmdb:flush(DB),
+        ok = elmdb:track(DB, true),
+        ok = elmdb:debug_put_delay(2000),
+        Self = self(),
+        Writers =
+            [ spawn_link(fun() ->
+                  [ ok = elmdb:put(DB, K, <<"new">>) || K <- Part ],
+                  Self ! {wdone, self()}
+              end)
+            || Part <- [ [ K || {I, K} <- lists:zip(lists:seq(1, N), Keys), I rem 4 == W ]
+                       || W <- [0, 1, 2, 3] ] ],
+        Prot = ets:new(n1prot, [set]),
+        Deleter =
+            fun Loop(0) -> ok;
+                Loop(Rounds) ->
+                    lists:foreach(
+                        fun(Batch) ->
+                            {ok, Tr} = elmdb:track_take(DB),
+                            [ ets:insert(Prot, {K}) || K <- Tr ],
+                            Live = [ K || K <- Batch, not ets:member(Prot, K) ],
+                            case elmdb:delete_batch_guarded(DB, Live) of
+                                {ok, _} -> ok;
+                                {error, conflict, Found} -> [ ets:insert(Prot, {K}) || K <- Found ]
+                            end
+                        end,
+                        chunks(Keys, 10)),
+                    Loop(Rounds - 1)
+            end,
+        Deleter(20),
+        [ receive {wdone, W} -> ok end || W <- Writers ],
+        ok = elmdb:debug_put_delay(0),
+        ok = elmdb:flush(DB),
+        Erased = [ K || K <- Keys, elmdb:get(DB, K) =/= {ok, <<"new">>} ],
+        ok = elmdb:track(DB, false),
+        ?assertEqual([], Erased),
+        test_stop(StoreOpts)
+    end}.
