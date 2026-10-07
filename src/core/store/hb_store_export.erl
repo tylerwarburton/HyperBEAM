@@ -1731,11 +1731,21 @@ export_blocked_target_never_blocks_writers_test_() ->
         {FsUs, {ok, _}} = timer:tc(fun() -> file:read_file("rebar.config") end),
         io:format(user, "BLOCKED_TARGET unrelated_file_read_us=~p~n", [FsUs]),
         ?assert(FsUs < 1000000),
-        % Release the stuck worker: open the FIFO's write end, so its read
-        % returns (empty) instead of holding a dirty I/O thread until exit.
+        % Release the stuck worker for good: move the FIFO aside, put a real
+        % manifest in its place, and open the FIFO read-write, which wakes any
+        % open blocked on it (its next write to it fails, and is retried
+        % against the real file). Otherwise it holds a dirty I/O thread for
+        % the rest of the VM's life, which hangs anything that traces every
+        % process (eprof).
         Fifo = hb_util:list(cfg(Blocked, <<"path">>, undefined)) ++ "/manifest.log",
-        {ok, F} = file:open(Fifo, [write, raw]),
+        ok = file:rename(Fifo, Fifo ++ ".fifo"),
+        ok = file:write_file(Fifo, <<>>),
+        {ok, F} = file:open(Fifo ++ ".fifo", [read, write, raw]),
+        timer:sleep(200),
         ok = file:close(F),
+        {ok, F2} = file:open(Fifo ++ ".fifo", [read, write, raw]),
+        timer:sleep(200),
+        ok = file:close(F2),
         ?assert(S1 < 1000000),
         ?assert(MaxBlocked < 1000000),
         ?assert(P99Blocked < max(3 * P99Ok, 20000))
