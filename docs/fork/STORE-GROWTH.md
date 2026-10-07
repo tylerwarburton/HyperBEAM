@@ -410,3 +410,23 @@ in 0.7 s, all 3,000 messages identical.
 - A checkpoint archive restore is an offline tool; a process with fewer than K
   snapshot checkpoints keeps everything from its oldest one.
 - LMDB never shrinks: expect a plateau at the high-water mark, not a smaller file.
+
+### After the independent review (2026-10-07)
+
+Fixed: aliases and late references (slot aliases and unit aliases watched,
+overlay flushed before every scan, alias rows swept with their unit, elmdb
+records the key of any put that references a watched key, and tracks after
+the overlay insert); exporter unclean stops (gap mark + forced base image,
+restore refuses an uncovered gap); manifest strictness (torn tail repaired,
+unlisted files are errors). The reviewer's tests live in
+`hb_store_gc_rev_tests` (fuzz with `HB_RETENTION_FUZZ=<ms>`).
+
+**Prod values (reviewer's recommendation):** `store-retention-grace-ms`
+120000 (the default now); the FIRST run with `store-retention-dry-run` true;
+`store-retention-orphans` false until a week of clean computed-only retention.
+Backlog mode (`store-retention-backlog-batch-slots`, default 10000) takes one
+reference scan per 10,000 dropped slots when a run drops more than 10x
+`store-retention-batch-slots`. Scan rate measured on the archived prod store:
+3.1-3.4M rows/s, i.e. ~10 s per scan of a 32M-row store and ~3.5 min per scan
+of the 650M-row pre-wipe size; a first run dropping D slots costs about
+D / 10,000 scans plus the closure walk.
