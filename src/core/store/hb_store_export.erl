@@ -101,9 +101,10 @@
 -define(SYNC_WAIT_MS, 2000).
 -define(SCAN_ROWS, 2000).
 -define(REG, hb_store_export_registry).
+-define(GATE, hb_store_export_target_gate).
 -define(SCHED_ASSIGN, "~scheduler@1.0/assignments/").
 -define(SMALL_NAMESPACES,
-    [<<"~location@1.0">>, <<"~bundler@1.0">>, <<"~meta@1.0">>,
+    [<<"~location@1.0">>, <<"~bundler@1.0">>, <<"~meta@1.0">>, <<"~arweave@2.9">>,
      <<"~scheduler@1.0/uploaded">>]).
 
 %% @doc A store message that wraps `Inner' with an export configured by
@@ -353,6 +354,7 @@ init_state(Store, Counters, FirstNeedsBase) ->
            (_, M) -> M
         end, Marks0, Local),
     ok = raw_write_file(StateFile, <<"exporting">>),
+    OpenGaps = read_gaps(Journal),
     Worker = spawn_link(fun() -> target_worker_start(Path) end),
     S0 = #{
         store => Store,
@@ -370,7 +372,7 @@ init_state(Store, Counters, FirstNeedsBase) ->
         dropping => false,
         marks => Marks,
         catchup => undefined,
-        gaps => [],
+        open_gaps => OpenGaps,
         resync => raw_is_file(filename:join(Journal, "resync-needed")),
         target_bytes => 0,
         ceiling => false,
@@ -384,7 +386,7 @@ init_state(Store, Counters, FirstNeedsBase) ->
     Worker ! {job, self(), target_info},
     S1 =
         case PrevState of
-            clean -> S0;
+            clean -> maybe_catchup(S0);
             first ->
                 % A non-empty store with no journal yet (a migration, or a node
                 % that ran without the export) needs a base.
@@ -392,13 +394,16 @@ init_state(Store, Counters, FirstNeedsBase) ->
                     true -> mark_resync(S0);
                     false -> S0
                 end;
-            unclean when Marks == #{}, WSeq == 0 ->
+            unclean when Marks == #{}, WSeq == 0, OpenGaps == [] ->
                 % A journal from before watermarks: nothing to catch up from.
                 ?event(warning, {essentials_export_unclean_start, {journal, Journal}, base}),
                 mark_resync(S0);
             unclean ->
+                % Everything journaled durably is in the recovered watermarks;
+                % anything after them may be lost. Open a gap from them, then
+                % catch up on every open gap.
                 ?event(warning, {essentials_export_unclean_start, {journal, Journal}, catchup}),
-                start_catchup(S0)
+                maybe_catchup(open_gap(S0))
         end,
     erlang:send_after(cfg(Store, <<"ship-interval-ms">>, ?DEFAULT_SHIP_MS), self(), tick),
     S1.
@@ -424,30 +429,28 @@ inner_empty(_) -> false.
 writer_loop(S) ->
     receive
         {rec, Rec} ->
-            Recs = drain([Rec], 1000),
+            {Recs, Next} = drain([Rec], 1000),
             counters:sub(maps:get(counters, S), 1, length(Recs)),
-            writer_loop(append(S, Recs));
+            S1 = append(S, Recs),
+            writer_loop(case Next of overflow -> start_dropping(S1); none -> S1 end);
         overflow ->
             writer_loop(start_dropping(S));
         tick ->
-            S1 = maybe_ship(maybe_roll(S)),
+            S1 = maybe_catchup(maybe_ship(maybe_roll(S))),
             erlang:send_after(
                 cfg(maps:get(store, S), <<"ship-interval-ms">>, ?DEFAULT_SHIP_MS),
                 self(), tick),
             writer_loop(answer_waiters(S1));
         {worker, Result} ->
             writer_loop(answer_waiters(maybe_ship(worker_done(S, Result))));
-        {catchup, Rows} ->
-            writer_loop(append(S, [{raw, Rows}]));
-        {catchup_done, Gap, N, Caught} ->
-            St = maps:get(stats, S),
-            Marks = maps:fold(fun(P, M, Acc) -> maps:update_with(P, fun(O) -> max(O, M) end, M, Acc) end,
-                              maps:get(marks, S), Caught),
-            S1 = append(S#{ catchup => undefined, marks => Marks,
-                            stats => St#{ catchups => maps:get(catchups, St) + 1,
-                                          catchup_rows => maps:get(catchup_rows, St) + N } },
-                        [{gap_filled, Gap}]),
-            writer_loop(close_segment(S1));
+        {catchup, From, Rows} ->
+            % Catch-up rows are never dropped, whatever the live records are
+            % doing; the catch-up sends the next chunk only after this ack.
+            S1 = append(S, [{raw, Rows}], force),
+            From ! catchup_ack,
+            writer_loop(S1);
+        {catchup_done, Gaps, N, Caught} ->
+            writer_loop(catchup_done(S, Gaps, N, Caught));
         {'EXIT', Pid, Reason} ->
             case S of
                 #{ worker := Pid } ->
@@ -456,7 +459,8 @@ writer_loop(S) ->
                     ?event(warning, {essentials_export_worker_down, Reason}),
                     W = spawn_link(fun() -> target_worker_start(maps:get(path, S)) end),
                     writer_loop(S#{ worker => W, worker_busy => false });
-                #{ catchup := Pid } when Reason =/= normal ->
+                #{ catchup := {Pid, _} } when Reason =/= normal ->
+                    % Its gaps stay open; a base closes them.
                     ?event(warning, {essentials_export_catchup_failed, Reason}),
                     writer_loop(mark_resync(S#{ catchup => undefined }));
                 _ -> writer_loop(S)
@@ -485,15 +489,9 @@ writer_loop(S) ->
         {call, From, Ref, stop_export} ->
             S1 = close_segment(drain_all(S)),
             ok = write_watermarks(S1),
-            case maps:get(catchup, S1) of
-                undefined ->
-                    ok = raw_write_file(
-                        filename:join(maps:get(journal, S1), "state"), <<"stopped">>);
-                _ ->
-                    % A catch-up in progress is not finished: the next start
-                    % must redo it.
-                    ok
-            end,
+            % Open gaps are persisted: the next start resumes their catch-up
+            % whether or not this one finished.
+            ok = raw_write_file(filename:join(maps:get(journal, S1), "state"), <<"stopped">>),
             From ! {Ref, ok},
             writer_loop(S1#{ stopped => true });
         {call, From, Ref, quiesce} ->
@@ -518,38 +516,44 @@ quiesce(S = #{ worker := W, catchup := C, path := Path }) ->
                receive {'DOWN', Mon, process, Pid, _} -> ok end
         end,
     Stop(W),
-    Stop(C),
+    case C of {CPid, _} -> Stop(CPid); _ -> ok end,
     receive {worker, _} -> ok after 0 -> ok end,
     W1 = spawn_link(fun() -> target_worker_start(Path) end),
-    % A killed catch-up is redone at the next start: the stop stays unclean.
-    S1 = case C of
-             undefined -> S;
-             _ -> ok = raw_write_file(filename:join(maps:get(journal, S), "state"), <<"exporting">>),
-                  S#{ catchup => undefined }
-         end,
-    S1#{ worker => W1, worker_busy => false }.
+    % A killed catch-up's gaps stay open (persisted) and are redone at the
+    % next start.
+    S#{ worker => W1, worker_busy => false, catchup => undefined }.
 
-drain(Acc, 0) -> lists:reverse(Acc);
+%% Take queued records in arrival order, stopping at an `overflow' message:
+%% a record a sender queued after it dropped one must not be journaled before
+%% the drop is seen (it would raise a watermark past the dropped record).
+drain(Acc, 0) -> {lists:reverse(Acc), none};
 drain(Acc, N) ->
-    receive {rec, R} -> drain([R | Acc], N - 1)
-    after 0 -> lists:reverse(Acc)
+    receive
+        {rec, R} -> drain([R | Acc], N - 1);
+        overflow -> {lists:reverse(Acc), overflow}
+    after 0 -> {lists:reverse(Acc), none}
     end.
 
 drain_all(S) ->
-    receive {rec, R} ->
-        counters:sub(maps:get(counters, S), 1, 1),
-        drain_all(append(S, [R]))
+    receive
+        {rec, R} ->
+            counters:sub(maps:get(counters, S), 1, 1),
+            drain_all(append(S, [R]));
+        overflow ->
+            drain_all(start_dropping(S))
     after 0 -> S
     end.
 
 %% Append records to the current local segment, rolling it by size. Written
 %% straight through (no write-behind buffer): a record appended is in the OS
 %% when this returns, which is what `sync/3' promises.
-append(S = #{ dropping := true }, _Recs) -> S;
-append(S = #{ stopped := true }, Recs) ->
+append(S, Recs) -> append(S, Recs, live).
+
+append(S = #{ dropping := true }, _Recs, live) -> S;
+append(S = #{ stopped := true }, Recs, Mode) ->
     ok = raw_write_file(filename:join(maps:get(journal, S), "state"), <<"exporting">>),
-    append(maps:remove(stopped, S), Recs);
-append(S, Recs0) ->
+    append(maps:remove(stopped, S), Recs, Mode);
+append(S, Recs0, Mode) ->
     S1a = ensure_segment(S),
     {Recs, S1} = dedupe(Recs0, S1a),
     Bin = << <<(frame(R))/binary>> || R <- Recs >>,
@@ -559,7 +563,7 @@ append(S, Recs0) ->
                       backlog => maps:get(backlog, S1) + byte_size(Bin),
                       marks => lists:foldl(fun rec_watermarks/2, maps:get(marks, S1), Recs) },
             Store = maps:get(store, S),
-            case maps:get(backlog, S2) >= cfg(Store, <<"max-backlog-bytes">>,
+            case Mode == live andalso maps:get(backlog, S2) >= cfg(Store, <<"max-backlog-bytes">>,
                                               ?DEFAULT_MAX_BACKLOG) of
                 true -> start_dropping(S2);
                 false ->
@@ -569,9 +573,13 @@ append(S, Recs0) ->
                         false -> S2
                     end
             end;
-        {error, Reason} ->
+        {error, Reason} when Mode == live ->
             ?event(error, {essentials_journal_write_failed, Reason}),
-            start_dropping(bump_stat(S1, errors))
+            start_dropping(bump_stat(S1, errors));
+        {error, Reason} ->
+            % A catch-up row that cannot be written fails the catch-up; its
+            % gaps stay open.
+            erlang:error({essentials_journal_write_failed, Reason})
     end.
 
 frame(Rec) ->
@@ -586,34 +594,32 @@ frame_compressed(Rec) ->
 %% The same row is written many times over: `hb_cache' writes a message's
 %% nested messages while converting it (the offload) and again when it writes
 %% the message, and every message re-writes the blobs and tag messages it
-%% shares with the last. Within a segment each `{Key, Value}' is journaled once
-%% (measured on game-like traffic: ~2x fewer raw journal bytes). Restore
-%% replays every segment, so dropping a repeat loses nothing.
+%% shares with the last. Within a segment a row is journaled only when its
+%% value differs from the last value journaled for that key in the segment, so
+%% replaying the segment in order gives every key its last written value
+%% (V1, V2, V1 restores V1).
 dedupe(Recs, S = #{ seen := Seen }) ->
     {Out, Seen1} =
         lists:foldl(
             fun(Rec, {Acc, Sn}) ->
                 case Rec of
-                    {Op, Req} when (Op == write orelse Op == link) andalso is_map(Req) ->
+                    {Op, Req} when (Op == write orelse Op == link orelse Op == raw)
+                                   andalso (is_map(Req) orelse is_list(Req)) ->
+                        Pairs = case Req of M when is_map(M) -> maps:to_list(M); L -> L end,
                         {Keep, Sn1} =
-                            maps:fold(
-                                fun(K, V, {M, X}) ->
-                                    H = erlang:md5(term_to_binary({Op, K, V})),
-                                    case sets:is_element(H, X) of
-                                        true -> {M, X};
-                                        false -> {M#{ K => V }, sets:add_element(H, X)}
+                            lists:foldl(
+                                fun({K, V}, {KAcc, X}) ->
+                                    H = erlang:md5(term_to_binary({Op, V})),
+                                    case maps:get({Op, K}, X, undefined) of
+                                        H -> {KAcc, X};
+                                        _ -> {[{K, V} | KAcc], X#{ {Op, K} => H }}
                                     end
                                 end,
-                                {#{}, Sn}, Req),
-                        case map_size(Keep) of
-                            0 -> {Acc, Sn1};
-                            _ -> {[{Op, Keep} | Acc], Sn1}
-                        end;
-                    {group, G} ->
-                        H = erlang:md5(term_to_binary({group, G})),
-                        case sets:is_element(H, Sn) of
-                            true -> {Acc, Sn};
-                            false -> {[Rec | Acc], sets:add_element(H, Sn)}
+                                {[], Sn}, Pairs),
+                        case {Keep, Op} of
+                            {[], _} -> {Acc, Sn1};
+                            {_, raw} -> {[{raw, lists:reverse(Keep)} | Acc], Sn1};
+                            _ -> {[{Op, maps:from_list(Keep)} | Acc], Sn1}
                         end;
                     _ -> {[Rec | Acc], Sn}
                 end
@@ -621,7 +627,7 @@ dedupe(Recs, S = #{ seen := Seen }) ->
             {[], Seen}, Recs),
     {lists:reverse(Out), S#{ seen => Seen1 }};
 dedupe(Recs, S) ->
-    dedupe(Recs, S#{ seen => sets:new([{version, 2}]) }).
+    dedupe(Recs, S#{ seen => #{} }).
 
 ensure_segment(S = #{ fd := undefined, journal := J, seq := Seq }) ->
     ok = raw_write_file(filename:join(J, "next-seq"), integer_to_binary(Seq + 1)),
@@ -633,7 +639,7 @@ close_segment(S = #{ fd := undefined }) -> S;
 close_segment(S = #{ fd := Fd, seq := Seq }) ->
     _ = file:close(Fd),
     S1 = S#{ fd => undefined, seq => Seq + 1, seg_bytes => 0, seg_opened => undefined,
-             seen => sets:new([{version, 2}]) },
+             seen => #{} },
     ok = write_watermarks(S1),
     S1.
 
@@ -645,7 +651,12 @@ maybe_roll(S = #{ seg_opened := Opened }) ->
         false -> S
     end.
 
-%%% Watermarks: the highest assignment slot journaled, per process.
+%%% Watermarks: per process, the highest assignment slot S such that every
+%%% slot up to S is journaled -- `{Contiguous, PendingAbove}'. A plain maximum
+%%% is not a lower bound when one process's assignments are journaled out of
+%%% order (several writers of one process): slot 2001 journaled before slot
+%%% 102 was dropped put a maximum-based gap above 102. Slots start at 0; a
+%%% catch-up or a base also moves `Contiguous' up to what they exported.
 
 rec_watermarks({link, Req}, Marks) when is_map(Req) ->
     maps:fold(fun(K, _V, M) -> key_watermark(hb_util:bin(K), M) end, Marks, Req);
@@ -657,12 +668,30 @@ key_watermark(<<?SCHED_ASSIGN, Rest/binary>>, Marks) ->
     case binary:split(Rest, <<"/">>) of
         [P, SlotBin] ->
             try binary_to_integer(SlotBin) of
-                Slot -> maps:update_with(P, fun(Old) -> max(Old, Slot) end, Slot, Marks)
+                Slot -> Marks#{ P => mark_add(maps:get(P, Marks, {-1, []}), Slot) }
             catch _:_ -> Marks
             end;
         _ -> Marks
     end;
 key_watermark(_, Marks) -> Marks.
+
+%% Add a journaled slot to a process's mark.
+mark_add({C, Pending}, Slot) when Slot =< C -> {C, Pending};
+mark_add({C, Pending}, Slot) when Slot == C + 1 -> mark_advance({Slot, Pending});
+mark_add({C, Pending}, Slot) -> {C, ordsets:add_element(Slot, Pending)}.
+
+mark_advance({C, [Next | Rest]}) when Next == C + 1 -> mark_advance({Next, Rest});
+mark_advance({C, [Next | Rest]}) when Next =< C -> mark_advance({C, Rest});
+mark_advance(M) -> M.
+
+%% Everything up to `Upto' is journaled (a catch-up or base exported it).
+mark_raise(Marks, P, Upto) ->
+    {C, Pending} = maps:get(P, Marks, {-1, []}),
+    Marks#{ P => mark_advance({max(C, Upto), Pending}) }.
+
+%% The lower bounds a gap is opened from.
+contiguous_marks(Marks) ->
+    maps:map(fun(_, {C, _}) -> C; (_, C) when is_integer(C) -> C end, Marks).
 
 %% The watermarks file holds them as of the start of segment `Seq': every
 %% segment numbered `Seq' or above may hold more.
@@ -675,7 +704,8 @@ read_watermarks(J) ->
     case prim_file:read_file(filename:join(J, "watermarks")) of
         {ok, Bin} ->
             try binary_to_term(Bin) of
-                {Seq, Marks} when is_map(Marks) -> {Seq, Marks};
+                {Seq, Marks} when is_map(Marks) ->
+                    {Seq, maps:map(fun(_, C) when is_integer(C) -> {C, []}; (_, M) -> M end, Marks)};
                 _ -> {0, #{}}
             catch _:_ -> {0, #{}}
             end;
@@ -712,48 +742,108 @@ valid_prefix(Bin, Off) ->
     end.
 
 %%% Gaps: dropping, unclean starts, catch-up.
+%%%
+%%% A gap is opened whenever records may have been lost: an unclean start, or
+%%% the writer dropping live records past a bound. It is a pair
+%%% `{Id, StartMarks}': every assignment of process P above `StartMarks[P]'
+%%% (every assignment, and the definition, of a process not in it) may be
+%%% missing from the journal. Open gaps are persisted (`gaps', synced) BEFORE
+%%% anything else is journaled, and a gap mark `gap-<Id>.mark' is shipped
+%%% ahead of every later segment. A catch-up covers the open gaps it starts
+%%% with: it re-exports, from the local store, everything above the
+%%% pointwise minimum of their start marks -- never from watermarks raised by
+%%% live appends since -- and finishes with `{gaps_filled, Ids}' naming
+%%% exactly those gaps. Only then are they removed from `gaps'. A gap opened
+%%% while a catch-up runs is left for the next one. A completed base closes
+%%% every gap opened before it began.
 
-%% Past a bound: stop journaling. Resumes, with a catch-up, once the backlog
-%% has shipped.
+%% Past a bound: stop journaling live records, and open a gap from the
+%% watermarks as they are now -- `drain/2' has stopped at the overflow, so they
+%% are below every record dropped. Resumes once the backlog has shipped and the
+%% queue has drained.
 start_dropping(S = #{ dropping := true }) -> S;
 start_dropping(S) ->
     ?event(warning, {essentials_export_backlog_full, status_of(S)}),
-    close_segment(S#{ dropping => true }).
+    open_gap(close_segment(S#{ dropping => true })).
 
 mark_resync(S = #{ journal := J }) ->
     ok = raw_write_file(filename:join(J, "resync-needed"), <<>>),
     S#{ resync => true }.
 
-%% Record a gap before the next segment and re-export, from the local store,
-%% everything the gap can have lost.
-start_catchup(S = #{ journal := J, seq := Seq, inner := Inner, marks := Marks }) ->
-    S1 = close_segment(S),
-    Gap = maps:get(seq, S1),
-    _ = Seq,
-    ok = raw_write_file(filename:join(J, "gap-" ++ seq_str(Gap) ++ ".mark"), <<>>),
-    Self = self(),
-    Pid = spawn_link(fun() -> catchup(Self, Inner, Marks, Gap) end),
-    S1#{ catchup => Pid, gaps => [Gap | maps:get(gaps, S1)] }.
+%% Open a gap from the current watermarks; persist it before returning.
+open_gap(S0 = #{ journal := J, marks := Marks }) ->
+    S = close_segment(S0),
+    Id = maps:get(seq, S),
+    Gaps = maps:get(open_gaps, S) ++ [{Id, contiguous_marks(Marks)}],
+    ok = write_gaps(J, Gaps),
+    ok = raw_write_file(filename:join(J, "gap-" ++ seq_str(Id) ++ ".mark"), <<>>),
+    % The id is used: the next segment is numbered after it.
+    ok = raw_write_file(filename:join(J, "next-seq"), integer_to_binary(Id + 1)),
+    S#{ seq => Id + 1, open_gaps => Gaps }.
 
-catchup(Writer, Inner, Marks, Gap) ->
+write_gaps(J, Gaps) ->
+    File = filename:join(J, "gaps"),
+    {ok, Fd} = file:open(File ++ ".tmp", [write, raw, binary]),
+    ok = file:write(Fd, term_to_binary(Gaps)),
+    ok = file:sync(Fd),
+    ok = file:close(Fd),
+    prim_file:rename(File ++ ".tmp", File).
+
+read_gaps(J) ->
+    case prim_file:read_file(filename:join(J, "gaps")) of
+        {ok, Bin} -> binary_to_term(Bin);
+        _ -> []
+    end.
+
+%% Start a catch-up over every open gap, unless one is running or the writer
+%% is dropping (the catch-up then waits for it to stop).
+maybe_catchup(S = #{ open_gaps := [] }) -> S;
+maybe_catchup(S = #{ catchup := {_, _} }) -> S;
+maybe_catchup(S = #{ dropping := true }) -> S;
+maybe_catchup(S = #{ inner := Inner, open_gaps := Gaps }) ->
+    Ids = [ Id || {Id, _} <- Gaps ],
+    Self = self(),
+    Pid = spawn_link(fun() -> catchup(Self, Inner, Gaps) end),
+    S#{ catchup => {Pid, Ids} }.
+
+catchup_done(S, Ids, N, Caught) ->
+    St = maps:get(stats, S),
+    % Everything up to `Caught' is now journaled for each process.
+    Marks = maps:fold(fun(P, M, Acc) -> mark_raise(Acc, P, M) end, maps:get(marks, S), Caught),
+    S1 = append(S#{ marks => Marks }, [{gaps_filled, Ids}], force),
+    case maps:get(fd, S1) of undefined -> ok; Fd -> ok = file:datasync(Fd) end,
+    S2 = close_segment(S1),
+    Open = [ G || G = {Id, _} <- maps:get(open_gaps, S2), not lists:member(Id, Ids) ],
+    ok = write_gaps(maps:get(journal, S2), Open),
+    maybe_catchup(S2#{ catchup => undefined, open_gaps => Open,
+                       stats => St#{ catchups => maps:get(catchups, St) + 1,
+                                     catchup_rows => maps:get(catchup_rows, St) + N } }).
+
+catchup(Writer, Inner, Gaps) ->
     #{ <<"db">> := DB } = hb_store:find(Inner),
     ok = elmdb:flush(DB),
+    Ids = [ Id || {Id, _} <- Gaps ],
+    Start = fun(P) -> lists:min([ maps:get(P, M, -1) || {_, M} <- Gaps ]) end,
     Procs = children(DB, <<"~scheduler@1.0/assignments">>),
     Send =
         fun(Keys, N) ->
             Rows = hb_store_gc:closure_rows(DB, Keys),
-            [ Writer ! {catchup, Chunk} || Chunk <- chunk_rows(Rows, 2000) ],
+            [ begin
+                Writer ! {catchup, self(), Chunk},
+                receive catchup_ack -> ok end
+              end
+            || Chunk <- chunk_rows(Rows, 500) ],
             N + length(Rows)
         end,
     {N1, Caught} =
         lists:foldl(
             fun(P, {N, C}) ->
-                Mark = maps:get(P, Marks, -1),
-                All = [ S || Ch <- children(DB, <<?SCHED_ASSIGN, P/binary>>),
-                             S <- [catch binary_to_integer(Ch)], is_integer(S) ],
-                Slots = [ S || S <- All, S > Mark ],
-                Keys = [ <<?SCHED_ASSIGN, P/binary, "/", (integer_to_binary(S))/binary>>
-                       || S <- Slots ]
+                Mark = Start(P),
+                All = [ Sl || Ch <- children(DB, <<?SCHED_ASSIGN, P/binary>>),
+                              Sl <- [catch binary_to_integer(Ch)], is_integer(Sl) ],
+                Slots = [ Sl || Sl <- All, Sl > Mark ],
+                Keys = [ <<?SCHED_ASSIGN, P/binary, "/", (integer_to_binary(Sl))/binary>>
+                       || Sl <- lists:sort(Slots) ]
                     ++ [ P || Mark == -1 ],
                 C1 = case All of [] -> C; _ -> C#{ P => lists:max(All) } end,
                 {Send(Keys, N), C1}
@@ -761,7 +851,7 @@ catchup(Writer, Inner, Marks, Gap) ->
             {0, #{}},
             Procs),
     N2 = Send(?SMALL_NAMESPACES, N1),
-    Writer ! {catchup_done, Gap, N2, Caught}.
+    Writer ! {catchup_done, Ids, N2, Caught}.
 
 children(DB, Prefix) ->
     case elmdb:list(DB, <<Prefix/binary, "/">>) of
@@ -789,14 +879,22 @@ do_maybe_ship(S = #{ worker := W, journal := J }) ->
     case {Segs, Gaps, maps:get(resync, S), maps:get(dropping, S)} of
         {[], [], false, false} -> S;
         {[], [], false, true} ->
-            % The backlog is gone: journal again, and catch up on what was
-            % dropped meanwhile.
-            start_catchup(S#{ dropping => false });
+            % The backlog is gone and the queue has drained: journal again,
+            % and catch up on what was dropped meanwhile.
+            Max = cfg(maps:get(store, S), <<"max-pending">>, ?DEFAULT_MAX_PENDING),
+            case counters:get(maps:get(counters, S), 1) < max(1, Max div 2) of
+                true -> maybe_catchup(S#{ dropping => false });
+                false -> S
+            end;
         {[], [], true, _} ->
+            % The base takes an id of its own; gaps opened before it are
+            % closed by it, gaps opened after it have higher ids.
             S1 = close_segment(S),
-            W ! {job, self(), {base, maps:get(inner, S1), maps:get(seq, S1), Cfg,
-                               maps:get(target_bytes, S1)}},
-            S1#{ worker_busy => true };
+            B = maps:get(seq, S1),
+            ok = raw_write_file(filename:join(maps:get(journal, S1), "next-seq"),
+                                integer_to_binary(B + 1)),
+            W ! {job, self(), {base, maps:get(inner, S1), B, Cfg, maps:get(target_bytes, S1)}},
+            S1#{ worker_busy => true, seq => B + 1, base_pending => B };
         _ ->
             W ! {job, self(), {ship, J, Segs, Cfg, maps:get(target_bytes, S)}},
             S#{ worker_busy => true }
@@ -825,9 +923,14 @@ worker_done(S, Result) ->
                      raw_bytes => maps:get(raw_bytes, St) + Raw,
                      last_ship => case N of 0 -> maps:get(last_ship, St);
                                             _ -> os:system_time(millisecond) end } };
-        {based, Bytes, Freed, Pruned} ->
+        {based, Bytes, Freed, Pruned, BaseMaxes} ->
             _ = prim_file:delete(filename:join(maps:get(journal, S0), "resync-needed")),
-            S1 = Ok(at_ceiling(S0, false)),
+            B = maps:get(base_pending, S0, 0),
+            Open = [ G || G = {Id, _} <- maps:get(open_gaps, S0), Id > B ],
+            ok = write_gaps(maps:get(journal, S0), Open),
+            Marks = maps:fold(fun(P, M, Acc) -> mark_raise(Acc, P, M) end,
+                              maps:get(marks, S0), BaseMaxes),
+            S1 = Ok(at_ceiling(S0#{ open_gaps => Open, marks => Marks }, false)),
             St = maps:get(stats, S1),
             S1#{ resync => false,
                  target_bytes => max(0, maps:get(target_bytes, S1) + Bytes - Freed),
@@ -867,6 +970,8 @@ answer_waiters(S = #{ waiters := Ws }) ->
     Idle = not maps:get(worker_busy, S),
     Done = closed_segments(S) == [] andalso not maps:get(resync, S)
         andalso maps:get(catchup, S) == undefined
+        andalso maps:get(open_gaps, S) == []
+        andalso not maps:get(dropping, S)
         andalso segs_in(maps:get(journal, S), "gap-", ".mark") == [],
     Stuck = maps:get(ceiling, S) orelse maps:get(consecutive_errors, maps:get(stats, S)) > 0,
     case Idle andalso (Done orelse Stuck) of
@@ -907,6 +1012,7 @@ status_of(S) ->
         target_bytes => maps:get(target_bytes, S),
         resync_pending => maps:get(resync, S),
         catchup_running => maps:get(catchup, S) =/= undefined,
+        open_gaps => [ Id || {Id, _} <- maps:get(open_gaps, S) ],
         next_segment => maps:get(seq, S),
         shipping => maps:get(worker_busy, S),
         compression_ratio =>
@@ -972,9 +1078,9 @@ job(P, {base, Inner, Seq, Cfg, Used}) ->
     ok = raw_ensure_dir(filename:join(P, "x")),
     case space_ok(P, Used + inner_bytes(Inner), Cfg) of
         ok ->
-            {ok, Bytes} = write_base(Inner, P, Seq),
+            {ok, Bytes, Maxes} = write_base(Inner, P, Seq),
             {Freed, Pruned} = prune(P, Seq),
-            {based, Bytes, Freed, Pruned};
+            {based, Bytes, Freed, Pruned, Maxes};
         Ceiling -> Ceiling
     end.
 
@@ -1047,35 +1153,56 @@ put_file(RawDst, Bin) ->
 %% many dirty I/O scheduler threads, never starve the ones LMDB and every file
 %% read need.
 with_target(Fun, Mode) ->
-    Ref = target_gate(),
-    Max = ?DEFAULT_TARGET_OPS,
+    ensure_gate(),
     Acquire =
         fun A() ->
-            case atomics:add_get(Ref, 1, 1) of
-                N when N =< Max -> ok;
-                _ ->
-                    atomics:sub(Ref, 1, 1),
-                    case Mode of
-                        wait -> timer:sleep(50), A();
-                        try_once -> busy
-                    end
+            case try_acquire() of
+                ok -> ok;
+                busy when Mode == wait -> timer:sleep(50), A();
+                busy -> busy
             end
         end,
     case Acquire() of
         busy -> {error, target_busy};
-        ok -> try Fun() after atomics:sub(Ref, 1, 1) end
+        ok -> try Fun() after ets:delete(?GATE, self()) end
     end.
 
-target_gate() ->
-    case persistent_term:get({?MODULE, target_gate}, undefined) of
-        undefined ->
-            Ref = atomics:new(1, []),
-            % A racing creator's gate is discarded; both converge on one.
-            case persistent_term:get({?MODULE, target_gate}, undefined) of
-                undefined -> persistent_term:put({?MODULE, target_gate}, Ref), Ref;
-                Other -> Other
+%% A slot is a row keyed by the holder's pid, so a holder killed mid-operation
+%% (its writer crashed, a quiesce) cannot leak it: dead holders' rows are
+%% reclaimed whenever the gate is full.
+try_acquire() ->
+    case ets:info(?GATE, size) < ?DEFAULT_TARGET_OPS of
+        true ->
+            ets:insert(?GATE, {self()}),
+            case ets:info(?GATE, size) =< ?DEFAULT_TARGET_OPS of
+                true -> ok;
+                false -> ets:delete(?GATE, self()), busy
             end;
-        Ref -> Ref
+        false ->
+            Dead = [ P || {P} <- ets:tab2list(?GATE), not is_process_alive(P) ],
+            case Dead of
+                [] -> busy;
+                _ -> [ ets:delete(?GATE, P) || P <- Dead ], try_acquire()
+            end
+    end.
+
+ensure_gate() ->
+    case ets:whereis(?GATE) of
+        undefined ->
+            ensure_registry(),
+            Parent = self(),
+            Ref = make_ref(),
+            {Owner, Mon} =
+                spawn_monitor(fun() ->
+                    try ets:new(?GATE, [named_table, public, set]) of
+                        _ -> Parent ! {Ref, ok}, receive after infinity -> ok end
+                    catch error:badarg -> Parent ! {Ref, exists}
+                    end
+                end),
+            receive {Ref, _} -> ok; {'DOWN', Mon, process, Owner, _} -> ok after 5000 -> ok end,
+            erlang:demonitor(Mon, [flush]),
+            ok;
+        _ -> ok
     end.
 
 inner_bytes(#{ <<"name">> := Name }) ->
@@ -1181,8 +1308,10 @@ write_base(Inner = #{ <<"store-module">> := hb_store_lmdb }, P, Seq) ->
     Name = "base-" ++ seq_str(Seq) ++ ".log",
     File = filename:join(P, Name),
     {ok, Fd} = file:open(File ++ ".tmp", [write, raw, binary]),
+    % Also the highest assignment slot per process in the image: everything up
+    % to it is in the base, so the writer's watermarks can be raised to it.
     Loop =
-        fun L(From, Crc, Size) ->
+        fun L(From, Crc, Size, Maxes) ->
             case elmdb:scan_rows(DB, From, ?SCAN_ROWS) of
                 {ok, Rows, _N, Next} ->
                     {Crc1, Size1} =
@@ -1193,16 +1322,17 @@ write_base(Inner = #{ <<"store-module">> := hb_store_lmdb }, P, Seq) ->
                                 ok = file:write(Fd, F),
                                 {erlang:crc32(Crc, F), Size + byte_size(F)}
                         end,
+                    Maxes2 = lists:foldl(fun({K, _}, M) -> slot_max(K, M) end, Maxes, Rows),
                     case Next of
-                        done -> {Crc1, Size1};
-                        _ -> L(Next, Crc1, Size1)
+                        done -> {Crc1, Size1, Maxes2};
+                        _ -> L(Next, Crc1, Size1, Maxes2)
                     end;
                 {error, T, D} -> throw({scan_failed, T, D})
             end
         end,
-    {Crc, Size} =
+    {Crc, Size, BaseMaxes} =
         try
-            R = Loop(<<>>, erlang:crc32(<<>>), 0),
+            R = Loop(<<>>, erlang:crc32(<<>>), 0, #{}),
             ok = file:sync(Fd),
             R
         after file:close(Fd)
@@ -1210,9 +1340,20 @@ write_base(Inner = #{ <<"store-module">> := hb_store_lmdb }, P, Seq) ->
     ok = prim_file:rename(File ++ ".tmp", File),
     ok = append_manifest(P, {Name, Size, Crc}),
     ok = put_file(filename:join(P, "base-" ++ seq_str(Seq) ++ ".done"), <<>>),
-    {ok, Size};
+    {ok, Size, BaseMaxes};
 write_base(Inner, _P, _Seq) ->
     erlang:error({base_needs_lmdb_inner, Inner}).
+
+slot_max(<<?SCHED_ASSIGN, Rest/binary>>, M) ->
+    case binary:split(Rest, <<"/">>) of
+        [P, SlotBin] ->
+            try binary_to_integer(SlotBin) of
+                Slot -> maps:update_with(P, fun(O) -> max(O, Slot) end, Slot, M)
+            catch _:_ -> M
+            end;
+        _ -> M
+    end;
+slot_max(_, M) -> M.
 
 %% @doc Once base `Seq' is complete -- renamed into place, its manifest entry
 %% synced and its `.done' written, all before this runs -- delete what it
@@ -1306,11 +1447,18 @@ raw_ensure_dir(Path) ->
 %%% Restore.
 
 %% @doc Rebuild a store from an export directory: the newest complete base
-%% image, then every segment numbered at or above it, in order. Every file
-%% applied must be in the manifest with the size and CRC recorded there. A gap
-%% newer than the base must be closed by a `{gap_filled, N}' record in the
-%% segments applied, or the restore fails. A torn final record (a segment cut
-%% short by a crash) is ignored; anything else malformed fails the restore.
+%% image, then every segment numbered above it, in order. Fails, loudly,
+%% rather than return an incomplete store:
+%% <ul>
+%%   <li>every file applied must be in the manifest with its size and CRC;</li>
+%%   <li>every segment the manifest lists from the base on must be present:
+%%       no shipped segment can be missing;</li>
+%%   <li>every gap opened after the base must be named by a
+%%       `{gaps_filled, Ids}' record -- exactly, never by a later fill;</li>
+%%   <li>afterwards, every process's assignment slots must be contiguous and
+%%       every assignment must load whole.</li>
+%% </ul>
+%% A torn final record (a segment cut short by a crash) is ignored.
 restore(Path, Target) -> restore(Path, Target, #{}).
 restore(RawPath, Target, Opts) ->
     Path = hb_util:list(RawPath),
@@ -1321,7 +1469,7 @@ restore(RawPath, Target, Opts) ->
     Manifest = manifest(Path),
     {From, BaseRows} =
         case Bases of
-            [] -> {lists:min([1 | Segs]), 0};
+            [] -> {0, 0};
             _ ->
                 B = lists:max(Bases),
                 {ok, BaseN, _} =
@@ -1329,38 +1477,68 @@ restore(RawPath, Target, Opts) ->
                                Manifest, Target, Opts),
                 {B, BaseN}
         end,
-    Wanted = [ Q || Q <- Segs, Q >= From ],
-    case contiguous(From, Wanted, Bases =/= []) of
-        false -> {error, {gap_in_export, From, Wanted}};
-        true ->
-            {Records, Filled} =
-                lists:foldl(
-                    fun(Q, {N, F}) ->
-                        {ok, N1, F1} = apply_file(filename:join(Path, seg_name(Q)),
-                                                  Manifest, Target, Opts),
-                        {N + N1, F1 ++ F}
-                    end,
-                    {0, []},
-                    Wanted),
-            % A fill closes every gap at or below it: a catch-up re-exports
-            % everything above the watermarks, whatever earlier gaps lost.
-            MaxFill = lists:max([-1 | Filled]),
-            case [ G || G <- Gaps, G > From orelse Bases == [], G > MaxFill ] of
-                [] -> ok;
-                Uncovered -> erlang:error({export_gap_not_covered, Uncovered, From})
+    From1 = From,
+    Wanted = [ Q || Q <- Segs, Q >= From1 ],
+    LiveGaps = [ G || G <- Gaps, Bases == [] orelse G > From1 ],
+    % Every segment the manifest lists at or after the base must be here: a
+    % shipped segment that went missing (or a torn manifest's lost tail, whose
+    % files are then unlisted, which `apply_file' refuses) fails the restore.
+    % Ids need not be contiguous: a writer killed between reserving an id and
+    % using it (a base it never finished) leaves one unused.
+    Listed = lists:usort([ Q || N <- maps:keys(Manifest),
+                                {"seg-", Q} <- [parse_seq(N)], Q >= From1 ]),
+    case Listed -- Wanted of
+        [] -> ok;
+        Lost -> erlang:error({export_segments_missing, lists:sublist(Lost, 10)})
+    end,
+    {Records, Filled} =
+        lists:foldl(
+            fun(Q, {N, F}) ->
+                {ok, N1, F1} = apply_file(filename:join(Path, seg_name(Q)),
+                                          Manifest, Target, Opts),
+                {N + N1, F1 ++ F}
             end,
-            ok = hb_store:sync([Target], #{}, Opts),
-            {ok, #{ base => From, base_records => BaseRows,
-                    segments => length(Wanted), records => Records,
-                    gaps_filled => lists:usort(Filled) }}
-    end.
+            {0, []},
+            Wanted),
+    case [ G || G <- LiveGaps, not lists:member(G, Filled) ] of
+        [] -> ok;
+        Uncovered -> erlang:error({export_gap_not_covered, Uncovered, From1})
+    end,
+    ok = hb_store:sync([Target], #{}, Opts),
+    Assignments = verify_assignments(Target, Opts),
+    {ok, #{ base => From1, base_records => BaseRows,
+            segments => length(Wanted), records => Records,
+            gaps_filled => lists:usort(Filled), assignments => Assignments }}.
 
-%% A segment numbered at the base, or a run that starts at the first segment
-%% shipped (a fresh journal starts from the clock, not 1).
-contiguous(_From, [], _HasBase) -> true;
-contiguous(From, [Q | _] = Qs, false) when Q > From -> contiguous(Q, Qs, true);
-contiguous(From, [From | Rest], _) -> contiguous(From + 1, Rest, true);
-contiguous(_, _, _) -> false.
+%% Every process's assignment slots contiguous, every assignment loadable.
+verify_assignments(Target, Opts) ->
+    TOpts = Opts#{ <<"store">> => [Target] },
+    #{ <<"db">> := DB } = hb_store:find(Target),
+    Procs = children(DB, <<"~scheduler@1.0/assignments">>),
+    lists:sum(
+        [ begin
+            Slots = lists:sort([ Sl || C <- children(DB, <<?SCHED_ASSIGN, P/binary>>),
+                                       Sl <- [catch binary_to_integer(C)], is_integer(Sl) ]),
+            case Slots of
+                [] -> ok;
+                _ ->
+                    Expected = lists:seq(hd(Slots), lists:last(Slots)),
+                    case Slots == Expected of
+                        true -> ok;
+                        false -> erlang:error({export_assignments_not_contiguous, P,
+                                               lists:sublist(Expected -- Slots, 10)})
+                    end
+            end,
+            [ case catch hb_cache:ensure_all_loaded(
+                    hb_util:ok(hb_cache:read(<<?SCHED_ASSIGN, P/binary, "/",
+                                               (integer_to_binary(Sl))/binary>>, TOpts)), TOpts) of
+                  M when is_map(M) -> ok;
+                  Other -> erlang:error({export_assignment_unreadable, P, Sl, Other})
+              end
+            || Sl <- Slots ],
+            length(Slots)
+          end
+        || P <- Procs ]).
 
 manifest(Path) ->
     case prim_file:read_file(filename:join(Path, "manifest.log")) of
@@ -1389,7 +1567,7 @@ apply_records(<<Len:32, Crc:32, Bin:Len/binary, Rest/binary>>, Target, Opts, N, 
     case erlang:crc32(Bin) of
         Crc ->
             case binary_to_term(Bin) of
-                {gap_filled, G} -> apply_records(Rest, Target, Opts, N, [G | Filled]);
+                {gaps_filled, Gs} -> apply_records(Rest, Target, Opts, N, Gs ++ Filled);
                 Rec ->
                     apply_record(Rec, Target, Opts),
                     apply_records(Rest, Target, Opts, N + 1, Filled)
@@ -1629,7 +1807,7 @@ export_unclean_stop_catches_up_test_() ->
         ?assertEqual([], Bad),
         % A gap newer than any fill or base: refused.
         ok = file:write_file(Remote ++ "/gap-" ++ seq_str(999999999999) ++ ".mark", <<>>),
-        ?assertError({export_gap_not_covered, _, _}, restore(Remote, restored(Dir, "r2"), #{}))
+        ?assertError(_, restore(Remote, restored(Dir, "r2"), #{}))
     end}.
 
 %% @doc A clean stop (what the node's application stop does on `docker stop')
@@ -1671,14 +1849,14 @@ export_prunes_superseded_bases_test_() ->
         P = hb_util:human_id(crypto:strong_rand_bytes(32)),
         lists:foreach(
             fun(Round) ->
-                [ assign(Store, Opts, P, Round * 100 + N) || N <- lists:seq(1, 20) ],
+                [ assign(Store, Opts, P, Round * 100 + N) || N <- lists:seq(1 - 80 * min(1, Round - 1), 20) ],
                 _ = sync_export(Store),
                 ok = resync(Store),
                 St = sync_export(Store),
                 ?assertEqual(Round, maps:get(resyncs, St))
             end,
             lists:seq(1, 3)),
-        [ assign(Store, Opts, P, 900 + N) || N <- lists:seq(1, 5) ],
+        [ assign(Store, Opts, P, 320 + N) || N <- lists:seq(1, 5) ],
         _ = sync_export(Store),
         [B] = remote_bases(Remote),
         ?assertEqual([B], segs_in(Remote, "base-", ".log")),
@@ -1686,7 +1864,7 @@ export_prunes_superseded_bases_test_() ->
         T = restored(Dir, "restored"),
         {ok, _} = restore(Remote, T, #{}),
         TOpts = #{ <<"store">> => [T] },
-        All = [ R * 100 + N || R <- [1, 2, 3], N <- lists:seq(1, 20) ] ++ [ 900 + N || N <- lists:seq(1, 5) ],
+        All = lists:seq(101, 325),
         ?assertEqual([], [ N || N <- All, assignment_bytes(Opts, P, N) =/= assignment_bytes(TOpts, P, N) ])
     end}.
 
@@ -1749,4 +1927,95 @@ export_blocked_target_never_blocks_writers_test_() ->
         ?assert(S1 < 1000000),
         ?assert(MaxBlocked < 1000000),
         ?assert(P99Blocked < max(3 * P99Ok, 20000))
+    end}.
+
+%% @doc The confirm-path `sync/3' does not wait for a catch-up: the catch-up
+%% sends its rows a small chunk at a time and waits for each to be journaled,
+%% so a sync is served between chunks.
+export_sync_not_slowed_by_catchup_test_() ->
+    {timeout, 300, fun() ->
+        application:ensure_all_started(hb),
+        Dir = export_test_dir("synccu"),
+        Store = export_store(Dir, #{ <<"segment-ms">> => 100000, <<"ship-interval-ms">> => 50 }),
+        Opts = #{ <<"store">> => [Store] },
+        ok = hb_store:start([Store], #{}, Opts),
+        Procs = [ hb_util:human_id(crypto:strong_rand_bytes(32)) || _ <- lists:seq(1, 8) ],
+        [ assign(Store, Opts, P, 0) || P <- Procs ],
+        _ = sync_export(Store),
+        % Lose all that follows with the writer's mailbox: a large catch-up.
+        Pid = writer_pid(Store),
+        erlang:suspend_process(Pid),
+        [ assign(Store, Opts, P, N) || P <- Procs, N <- lists:seq(1, 600) ],
+        exit(Pid, kill),
+        timer:sleep(20),
+        P0 = hb_util:human_id(crypto:strong_rand_bytes(32)),
+        Lats =
+            [ begin
+                assign(Store, Opts, P0, N),
+                {T, ok} = timer:tc(fun() -> hb_store:sync([Store], #{}, Opts) end),
+                Running = maps:get(catchup_running, status(Store)),
+                {T, Running}
+              end
+            || N <- lists:seq(1, 200) ],
+        During = lists:sort([ T || {T, true} <- Lats ]),
+        io:format(user, "~nSYNC_DURING_CATCHUP n=~p max_us=~p~n",
+                  [length(During), lists:last([0 | During])]),
+        ?assert(length(During) > 0),
+        ?assert(lists:last(During) < 500000),
+        St = sync_export(Store),
+        ?assertEqual([], maps:get(open_gaps, St))
+    end}.
+
+%% @doc Within a segment, a key written V1, V2, V1 restores V1 (dedupe keeps
+%% the last write of each key), and a catch-up re-exports `~arweave@2.9'.
+export_dedupe_keeps_last_write_test_() ->
+    {timeout, 120, fun() ->
+        application:ensure_all_started(hb),
+        Dir = export_test_dir("lastwrite"),
+        Store = export_store(Dir, #{ <<"segment-ms">> => 100000, <<"ship-interval-ms">> => 50 }),
+        Opts = #{ <<"store">> => [Store] },
+        ok = hb_store:start([Store], #{}, Opts),
+        [ ok = hb_store:write([Store], #{ <<"~test@1.0/mutable">> => V }, Opts)
+        || V <- [<<"v1">>, <<"v2">>, <<"v1">>] ],
+        _ = sync_export(Store),
+        Pid = writer_pid(Store),
+        erlang:suspend_process(Pid),
+        ok = hb_store:write([Store], #{ <<"~arweave@2.9/block/height/7">> => <<"blk">> }, Opts),
+        exit(Pid, kill),
+        timer:sleep(20),
+        _ = sync_export(Store),
+        T = restored(Dir, "restored"),
+        {ok, _} = restore(Dir ++ "/remote", T, #{}),
+        ?assertEqual({ok, <<"v1">>}, hb_store:read([T], <<"~test@1.0/mutable">>, #{})),
+        ?assertEqual({ok, <<"blk">>}, hb_store:read([T], <<"~arweave@2.9/block/height/7">>, #{}))
+    end}.
+
+%% @doc A target-operation slot held by a process that is killed is reclaimed:
+%% killed holders (a crashed writer's worker) used to leak the gate shut, after
+%% which no export job ever ran again.
+export_target_gate_survives_killed_holders_test() ->
+    Holders = [ spawn(fun() -> with_target(fun() -> receive after infinity -> ok end end, wait) end)
+              || _ <- lists:seq(1, ?DEFAULT_TARGET_OPS) ],
+    timer:sleep(100),
+    ?assertEqual({error, target_busy}, with_target(fun() -> ok end, try_once)),
+    [ exit(H, kill) || H <- Holders ],
+    timer:sleep(50),
+    ?assertEqual(ran, with_target(fun() -> ran end, try_once)).
+
+%% @doc A shipped segment that disappears from the target fails the restore,
+%% even when it is the last one.
+export_missing_segment_fails_restore_test_() ->
+    {timeout, 120, fun() ->
+        application:ensure_all_started(hb),
+        Dir = export_test_dir("missingseg"),
+        Remote = Dir ++ "/remote",
+        Store = export_store(Dir, #{ <<"segment-ms">> => 100000, <<"ship-interval-ms">> => 50 }),
+        Opts = #{ <<"store">> => [Store] },
+        ok = hb_store:start([Store], #{}, Opts),
+        P = hb_util:human_id(crypto:strong_rand_bytes(32)),
+        [ begin [ assign(Store, Opts, P, R * 10 + N) || N <- lists:seq(0, 9) ], _ = sync_export(Store) end
+        || R <- [0, 1, 2] ],
+        Last = lists:last(remote_segments(Remote)),
+        ok = file:delete(Remote ++ "/" ++ seg_name(Last)),
+        ?assertError({export_segments_missing, [Last]}, restore(Remote, restored(Dir, "r"), #{}))
     end}.
