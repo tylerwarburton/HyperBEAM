@@ -1422,7 +1422,8 @@ delete_with_concurrent_readers_test_() ->
             [ spawn_link(fun() -> Reader(sets:new()) end) || _ <- lists:seq(1, 8) ],
         % Writers keep the overlay busy with unrelated keys meanwhile.
         WriteLoop =
-            fun W(N) ->
+            fun W(N) when N >= 200000 -> receive stop -> ok end;
+                W(N) ->
                 receive stop -> ok
                 after 0 ->
                     ok = elmdb:put(DB, <<"other/", (integer_to_binary(N))/binary>>, <<"x">>),

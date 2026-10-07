@@ -127,8 +127,12 @@ start(Store, Req, Opts) ->
     _ = exporter(Store),
     ok.
 
+%% Stopping closes the inner LMDB environment, which the target worker may be
+%% reading (a base image) and the catch-up may be walking: both are stopped
+%% first, and only then is the environment closed.
 stop(Store, Req, Opts) ->
     catch call(Store, stop_export, 30000),
+    catch call(Store, quiesce, 60000),
     hb_store:stop([inner(Store)], Req, Opts).
 
 reset(Store, Req, Opts) ->
@@ -492,10 +496,38 @@ writer_loop(S) ->
             end,
             From ! {Ref, ok},
             writer_loop(S1#{ stopped => true });
+        {call, From, Ref, quiesce} ->
+            % Stop whatever reads the inner store: a base in flight in the
+            % target worker, a catch-up. Their NIF calls complete before the
+            % processes exit, so no read transaction outlives this reply.
+            S1 = quiesce(S),
+            From ! {Ref, ok},
+            writer_loop(S1);
         {call, From, Ref, sync_export} ->
             S1 = maybe_ship(close_segment(drain_all(S#{ next_try => 0 }))),
             writer_loop(answer_waiters(S1#{ waiters => [{From, Ref} | maps:get(waiters, S1)] }))
     end.
+
+quiesce(S = #{ worker := W, catchup := C, path := Path }) ->
+    Stop =
+        fun(undefined) -> ok;
+           (Pid) ->
+               unlink(Pid),
+               Mon = erlang:monitor(process, Pid),
+               exit(Pid, kill),
+               receive {'DOWN', Mon, process, Pid, _} -> ok end
+        end,
+    Stop(W),
+    Stop(C),
+    receive {worker, _} -> ok after 0 -> ok end,
+    W1 = spawn_link(fun() -> target_worker_start(Path) end),
+    % A killed catch-up is redone at the next start: the stop stays unclean.
+    S1 = case C of
+             undefined -> S;
+             _ -> ok = raw_write_file(filename:join(maps:get(journal, S), "state"), <<"exporting">>),
+                  S#{ catchup => undefined }
+         end,
+    S1#{ worker => W1, worker_busy => false }.
 
 drain(Acc, 0) -> lists:reverse(Acc);
 drain(Acc, N) ->
@@ -1699,6 +1731,11 @@ export_blocked_target_never_blocks_writers_test_() ->
         {FsUs, {ok, _}} = timer:tc(fun() -> file:read_file("rebar.config") end),
         io:format(user, "BLOCKED_TARGET unrelated_file_read_us=~p~n", [FsUs]),
         ?assert(FsUs < 1000000),
+        % Release the stuck worker: open the FIFO's write end, so its read
+        % returns (empty) instead of holding a dirty I/O thread until exit.
+        Fifo = hb_util:list(cfg(Blocked, <<"path">>, undefined)) ++ "/manifest.log",
+        {ok, F} = file:open(Fifo, [write, raw]),
+        ok = file:close(F),
         ?assert(S1 < 1000000),
         ?assert(MaxBlocked < 1000000),
         ?assert(P99Blocked < max(3 * P99Ok, 20000))

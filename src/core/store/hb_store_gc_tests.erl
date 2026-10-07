@@ -640,6 +640,15 @@ ess_bench(Variant, Fast, Remote, Dur, Clients) ->
                    <<"essentials-export">> =>
                        #{ <<"path">> => Dir(Remote, "export"),
                           <<"journal">> => Dir(Fast, "journal") } };
+            blocked ->
+                % The target blocks forever (a FIFO manifest: the worker's
+                % first read never returns), as a stalled soft mount does.
+                ok = filelib:ensure_dir(binary_to_list(Dir(Remote, "export")) ++ "/x"),
+                "" = os:cmd("mkfifo " ++ binary_to_list(Dir(Remote, "export")) ++ "/manifest.log"),
+                #{ <<"essentials-store">> => LocalEss,
+                   <<"essentials-export">> =>
+                       #{ <<"path">> => Dir(Remote, "export"),
+                          <<"journal">> => Dir(Fast, "journal") } };
             fs ->
                 #{ <<"essentials-store">> =>
                        #{ <<"store-module">> => hb_store_fs, <<"name">> => Dir(Remote, "fs") } }
@@ -647,7 +656,9 @@ ess_bench(Variant, Fast, Remote, Dur, Clients) ->
     Port = 20000 + rand:uniform(20000),
     Opts = maps:merge(#{
         <<"priv-wallet">> => ar_wallet:new(),
-        <<"store">> => [Main],
+        % As production: a filesystem store behind LMDB, which reads fall
+        % through to (and which the VM's one file server serves).
+        <<"store">> => [Main, #{ <<"store-module">> => hb_store_fs, <<"name">> => Dir(Fast, "fs") }],
         <<"port">> => Port,
         <<"scheduling-mode">> => local_confirmation,
         <<"scheduler-publish-remote">> => false,
@@ -679,6 +690,24 @@ ess_bench(Variant, Fast, Remote, Dur, Clients) ->
           end
         || _ <- lists:seq(1, 4) ],
     Self = self(),
+    % Compute traffic alongside: a lua@5.3b process scheduled and computed in
+    % the node's VM, its latencies recorded.
+    CompOpts = (hb_http_server:get_opts(#{ <<"http-server">> => hb_util:human_id(ar_wallet:to_address(W)) }))#{
+        <<"spawn-worker">> => false, <<"process-workers">> => false, <<"hashpath">> => ignore },
+    CProc = new_process(CompOpts),
+    Computer =
+        spawn_link(fun() ->
+            Loop = fun L(Slot, Acc) ->
+                receive {stop, From} -> From ! {compute_lats, Acc}
+                after 0 ->
+                    T0 = erlang:monotonic_time(microsecond),
+                    ok = schedule(CProc, Slot, CompOpts),
+                    {ok, _} = compute(CProc, Slot, CompOpts),
+                    L(Slot + 1, [erlang:monotonic_time(microsecond) - T0 | Acc])
+                end
+            end,
+            Loop(0, [])
+        end),
     PerClient = list_to_integer(os:getenv("HB_ESS_BENCH_REQS", "150")),
     % Requests are signed before the clock starts, so the measurement is the
     % node's, not the client's RSA.
@@ -695,6 +724,12 @@ ess_bench(Variant, Fast, Remote, Dur, Clients) ->
     Deadline = erlang:monotonic_time(millisecond) + Dur,
     [ P ! {go, Deadline} || P <- Pids ],
     Lats = lists:append([ receive {lat, P, L} -> L end || P <- Pids ]),
+    Computer ! {stop, Self},
+    CLats = lists:sort(receive {compute_lats, CL} -> CL end),
+    CN = max(1, length(CLats)),
+    io:format(user, "ESS_BENCH variant=~p compute n=~p p50=~.2fms p99=~.2fms max=~.2fms~n",
+        [Variant, length(CLats), lists:nth(max(1, CN div 2), CLats ++ [0]) / 1000,
+         lists:nth(max(1, (CN * 99) div 100), CLats ++ [0]) / 1000, lists:last([0 | CLats]) / 1000]),
     Elapsed = max(1, erlang:monotonic_time(millisecond) - (Deadline - Dur)),
     Errors = length([ E || {error, E} <- Lats ]),
     Sorted = case lists:sort([ L || L <- Lats, is_integer(L) ]) of [] -> [0]; L -> L end,
