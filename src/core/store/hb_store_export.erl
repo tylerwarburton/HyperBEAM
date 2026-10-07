@@ -108,7 +108,7 @@ start(Store, Req, Opts) ->
     ok.
 
 stop(Store, Req, Opts) ->
-    catch call(Store, flush, 30000),
+    catch call(Store, stop_export, 30000),
     hb_store:stop([inner(Store)], Req, Opts).
 
 reset(Store, Req, Opts) ->
@@ -248,9 +248,28 @@ init_state(Store, Counters) ->
     Local = local_segments(Journal),
     Remote = remote_segments(Path),
     Next = 1 + lists:max([0 | Local ++ Remote ++ remote_bases(Path)]),
-    FirstEver = not filelib:is_file(filename:join(Journal, "state")),
-    ok = file:write_file(filename:join(Journal, "state"), <<"exporting">>),
-    ResyncFlag = filelib:is_file(filename:join(Journal, "resync-needed")),
+    % `state' says whether the previous writer stopped cleanly. Records are
+    % cast to the writer after the local write, so a writer that died -- a node
+    % crash, an OOM kill, a crash of this process -- lost whatever was in its
+    % mailbox and write buffer: those rows are in the local store but in no
+    % segment. An unclean start therefore records a gap and forces a base
+    % image, which a restore needs to get past the gap.
+    StateFile = filename:join(Journal, "state"),
+    {FirstEver, Unclean} =
+        case file:read_file(StateFile) of
+            {error, enoent} -> {true, false};
+            {ok, <<"stopped">>} -> {false, false};
+            {ok, _} -> {false, true}
+        end,
+    ok = file:write_file(StateFile, <<"exporting">>),
+    case Unclean of
+        true ->
+            ?event(warning, {essentials_export_unclean_start, {journal, Journal}}),
+            mark_gap(Journal, Next);
+        false -> ok
+    end,
+    ResyncFlag = Unclean orelse filelib:is_file(filename:join(Journal, "resync-needed")),
+    catch repair_manifest(Path),
     S0 = #{
         store => Store,
         inner => Inner,
@@ -313,6 +332,12 @@ writer_loop(S) ->
             S1 = close_segment(drain_all(S)),
             From ! {Ref, ok},
             writer_loop(S1);
+        {call, From, Ref, stop_export} ->
+            % A clean stop: everything received is in a closed segment.
+            S1 = close_segment(drain_all(S)),
+            ok = file:write_file(filename:join(maps:get(journal, S1), "state"), <<"stopped">>),
+            From ! {Ref, ok},
+            writer_loop(S1#{ stopped => true });
         {call, From, Ref, sync_export} ->
             % An explicit request does not wait out a backoff.
             S1 = wait_shipper(close_segment(drain_all(S#{ next_try => 0 }))),
@@ -336,6 +361,9 @@ drain_all(S) ->
 
 %% Append records to the current local segment, rolling it by size.
 append(S = #{ dropping := true }, _Recs) -> S;
+append(S = #{ stopped := true }, Recs) ->
+    ok = file:write_file(filename:join(maps:get(journal, S), "state"), <<"exporting">>),
+    append(maps:remove(stopped, S), Recs);
 append(S, Recs) ->
     S1 = ensure_segment(S),
     Bin = << <<(frame(R))/binary>> || R <- Recs >>,
@@ -387,10 +415,49 @@ start_dropping(S = #{ dropping := true }) -> S;
 start_dropping(S) ->
     ?event(warning, {essentials_export_backlog_full, status_of(S)}),
     mark_resync(maps:get(journal, S)),
+    mark_gap(maps:get(journal, S), maps:get(seq, S)),
     close_segment(S#{ dropping => true, resync => true }).
 
 mark_resync(Journal) ->
     file:write_file(filename:join(Journal, "resync-needed"), <<>>).
+
+%% Record locally that records before segment `Seq' may be missing from the
+%% log. Gap marks are shipped before any segment; `restore/3' refuses a target
+%% whose newest base does not cover its newest gap.
+mark_gap(Journal, Seq) ->
+    file:write_file(filename:join(Journal, "gap-" ++ seq_str(Seq) ++ ".mark"), <<>>).
+
+local_gaps(J) -> segs_in(J, "gap-", ".mark").
+remote_gaps(undefined) -> [];
+remote_gaps(P) -> segs_in(P, "gap-", ".mark").
+
+%% A torn final frame of `manifest.log' (a soft mount gave up mid-append) is
+%% cut off, so later appends follow a valid frame.
+repair_manifest(undefined) -> ok;
+repair_manifest(Path) ->
+    File = filename:join(Path, "manifest.log"),
+    case file:read_file(File) of
+        {ok, Bin} ->
+            Good = valid_prefix(Bin, 0),
+            case Good == byte_size(Bin) of
+                true -> ok;
+                false ->
+                    ?event(warning, {essentials_export_manifest_repaired,
+                                     {kept, Good}, {was, byte_size(Bin)}}),
+                    put_file(File, binary:part(Bin, 0, Good))
+            end;
+        _ -> ok
+    end.
+
+valid_prefix(Bin, Off) ->
+    case Bin of
+        <<_:Off/binary, Len:32, Crc:32, Frame:Len/binary, _/binary>> ->
+            case erlang:crc32(Frame) of
+                Crc -> valid_prefix(Bin, Off + 8 + Len);
+                _ -> Off
+            end;
+        _ -> Off
+    end.
 
 %% Ship closed segments in a helper process; when none are left and a resync
 %% is due, write the base image.
@@ -467,7 +534,10 @@ do_start_ship(S = #{ journal := J, path := P }, What, Segs, Inner) ->
                 try
                     case What of
                         segments -> {segments, ship_segments(J, P, Segs)};
-                        base -> {base, write_base(Inner, P, BaseSeq)}
+                        base ->
+                            ok = filelib:ensure_dir(filename:join(P, "x")),
+                            ok = ship_gaps(J, P),
+                            {base, write_base(Inner, P, BaseSeq)}
                     end
                 catch C:R -> {error, {C, R}}
                 end,
@@ -635,6 +705,7 @@ bump_stat(S, K) ->
 %% locally. Stops at the first failure; the rest are retried next tick.
 ship_segments(J, P, Segs) ->
     ok = filelib:ensure_dir(filename:join(P, "x")),
+    ok = ship_gaps(J, P),
     lists:foldl(
         fun(Seq, {ok, N, B}) ->
                 Src = seg_file(J, Seq),
@@ -658,6 +729,19 @@ ship_segments(J, P, Segs) ->
         {ok, 0, 0},
         Segs
     ).
+
+ship_gaps(J, P) ->
+    lists:foldl(
+        fun(Seq, ok) ->
+                Name = "gap-" ++ seq_str(Seq) ++ ".mark",
+                case put_file(filename:join(P, Name), <<>>) of
+                    ok -> file:delete(filename:join(J, Name));
+                    Err -> Err
+                end;
+           (_, Err) -> Err
+        end,
+        ok,
+        local_gaps(J)).
 
 %% Write a file durably and atomically: temp file, sync, rename.
 put_file(RawDst, Bin) ->
@@ -774,6 +858,12 @@ restore(RawPath, Target, Opts) ->
     ok = hb_store:start([Target], #{}, Opts),
     Bases = remote_bases(Path),
     Segs = remote_segments(Path),
+    Gaps = remote_gaps(Path),
+    NewestBase = lists:max([0 | Bases]),
+    case [ G || G <- Gaps, G > NewestBase ] of
+        [] -> ok;
+        Uncovered -> erlang:error({export_gap_not_covered_by_a_base, Uncovered, NewestBase})
+    end,
     {From, BaseRows} =
         case Bases of
             [] -> {1, 0};
@@ -813,7 +903,7 @@ check_manifest(File, Bin) ->
         {ok, M} ->
             Entries = [ E || E = {N, _, _} <- manifest_entries(M, []), N == Name ],
             case Entries of
-                [] -> ok;
+                [] -> erlang:error({export_file_not_in_manifest, Name});
                 _ ->
                     case lists:last(Entries) of
                         {_, Size, Crc} when Size == byte_size(Bin) ->
@@ -824,7 +914,7 @@ check_manifest(File, Bin) ->
                         _ -> erlang:error({export_file_size_mismatch, Name})
                     end
             end;
-        _ -> ok
+        _ -> erlang:error({export_manifest_missing, Dir})
     end.
 
 manifest_entries(<<Len:32, Crc:32, Bin:Len/binary, Rest/binary>>, Acc) ->
@@ -1038,4 +1128,66 @@ export_real_mount_test_() ->
                      maps:get(shipped_bytes, St), maps:get(shipped_segments, St),
                      length(Files), R, maps:get(ceiling, St), maps:get(errors, St)])
         end
+    end}.
+
+%% @doc An exporter that dies with records in its mailbox (deterministic here:
+%% suspended, written to, then killed) loses them. The restart sees the
+%% unclean stop, records a gap and writes a base image, so a restore has every
+%% row. A target with a gap no base covers is refused, loudly.
+export_unclean_stop_resyncs_test_() ->
+    {timeout, 120, fun() ->
+        application:ensure_all_started(hb),
+        Dir = export_test_dir("unclean"),
+        Store = export_store(Dir, #{ <<"segment-ms">> => 100000, <<"ship-interval-ms">> => 50 }),
+        Opts = #{ <<"store">> => [Store] },
+        ok = hb_store:start([Store], #{}, Opts),
+        _ = sync_export(Store),
+        W = fun(From, To) ->
+                [ ok = hb_store:write([Store], #{ <<"k/", (integer_to_binary(I))/binary>> =>
+                                                   <<"v", (integer_to_binary(I))/binary>> }, Opts)
+                || I <- lists:seq(From, To) ] end,
+        W(1, 100),
+        {Pid, _} = persistent_term:get({?MODULE, maps:get(<<"name">>, Store)}),
+        _ = sync_export(Store),
+        erlang:suspend_process(Pid),
+        W(101, 200),
+        exit(Pid, kill),
+        W(201, 210),
+        St = sync_export(Store),
+        ?assert(maps:get(resyncs, St) >= 1),
+        Remote = Dir ++ "/remote",
+        ?assertMatch([_ | _], remote_gaps(Remote)),
+        Target = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => hb_util:bin(Dir ++ "/restored") },
+        {ok, _} = restore(Remote, Target, #{}),
+        Missing = [ I || I <- lists:seq(1, 210),
+                         hb_store:read([Target], <<"k/", (integer_to_binary(I))/binary>>, #{}) =/=
+                             {ok, <<"v", (integer_to_binary(I))/binary>>} ],
+        ?assertEqual([], Missing),
+        % A gap newer than every base: refused.
+        ok = file:write_file(Remote ++ "/gap-" ++ seq_str(999999) ++ ".mark", <<>>),
+        T2 = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => hb_util:bin(Dir ++ "/restored2") },
+        ?assertError({export_gap_not_covered_by_a_base, _, _}, restore(Remote, T2, #{}))
+    end}.
+
+%% @doc A torn manifest tail is cut back on start; a shipped file that the
+%% manifest does not list is a restore error, not silently trusted.
+export_manifest_is_strict_test_() ->
+    {timeout, 120, fun() ->
+        application:ensure_all_started(hb),
+        Dir = export_test_dir("manifest"),
+        Remote = Dir ++ "/remote",
+        Store = export_store(Dir, #{ <<"segment-ms">> => 100, <<"ship-interval-ms">> => 50 }),
+        Opts = #{ <<"store">> => [Store] },
+        ok = hb_store:start([Store], #{}, Opts),
+        ok = hb_store:write([Store], #{ <<"a">> => <<"1">> }, Opts),
+        _ = sync_export(Store),
+        {ok, M0} = file:read_file(Remote ++ "/manifest.log"),
+        ok = file:write_file(Remote ++ "/manifest.log", <<M0/binary, 0, 0, 1, 0, 7, 7>>),
+        ok = repair_manifest(Remote),
+        ?assertEqual({ok, M0}, file:read_file(Remote ++ "/manifest.log")),
+        % An unlisted segment.
+        ok = file:write_file(Remote ++ "/seg-" ++ seq_str(lists:max(remote_segments(Remote)) + 1) ++ ".log",
+                             frame({write, #{ <<"b">> => <<"2">> }})),
+        T = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => hb_util:bin(Dir ++ "/restored") },
+        ?assertError({export_file_not_in_manifest, _}, restore(Remote, T, #{}))
     end}.
