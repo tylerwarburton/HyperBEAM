@@ -1378,10 +1378,11 @@ report(Acc, Plans, Policy, SrcStore, DstStore) ->
 -define(RET_DEFAULT_INTERVAL, 600000).
 -define(RET_DEFAULT_CHECKPOINTS, 2).
 -define(RET_DEFAULT_BATCH_SLOTS, 1000).
+-define(RET_DEFAULT_BACKLOG_SLOTS, 10000).
 -define(RET_DEFAULT_DELETE_BATCH, 1000).
 -define(RET_DEFAULT_RATE, 20000).
 -define(RET_DEFAULT_SCAN_ROWS, 20000).
--define(RET_DEFAULT_GRACE, 30000).
+-define(RET_DEFAULT_GRACE, 120000).
 -define(RET_JOURNAL, "retention-pending.bin").
 -define(RET_SERVER, hb_store_gc_retention).
 -define(RET_STATUS, {?MODULE, retention_status}).
@@ -1465,6 +1466,8 @@ retention_policy(Opts) ->
         keep_seconds => ret_opt(<<"store-retention-keep-seconds">>, 0, Opts),
         sparse => ret_opt(<<"store-retention-sparse-slots">>, 0, Opts),
         batch_slots => ret_opt(<<"store-retention-batch-slots">>, ?RET_DEFAULT_BATCH_SLOTS, Opts),
+        backlog_batch_slots =>
+            ret_opt(<<"store-retention-backlog-batch-slots">>, ?RET_DEFAULT_BACKLOG_SLOTS, Opts),
         delete_batch => ret_opt(<<"store-retention-delete-batch">>, ?RET_DEFAULT_DELETE_BATCH, Opts),
         rate => ret_opt(<<"store-retention-max-deletes-per-sec">>, ?RET_DEFAULT_RATE, Opts),
         scan_rows => ret_opt(<<"store-retention-scan-rows">>, ?RET_DEFAULT_SCAN_ROWS, Opts),
@@ -1525,16 +1528,38 @@ retain(Opts) ->
         Acc0 = ret_acc(),
         Acc1 = recover_journal(Ctx, Acc0),
         Procs = computed_processes(Ctx),
-        {Acc2, Pending} =
+        {Plans, Acc1b} =
             lists:foldl(
-                fun(P, {A, Chunk}) ->
+                fun(P, {Ps, A}) ->
                     {Plan, A1} = retain_plan(Ctx, P, A),
-                    add_to_chunk(Ctx, P, Plan, Chunk, A1)
+                    {[{P, Plan} | Ps], A1}
                 end,
-                {Acc1, new_chunk()},
+                {[], Acc1},
                 Procs
             ),
-        Acc3a = sweep_chunk(Ctx, Pending, Acc2),
+        %% Backlog mode: a first run over a large existing store drops far more
+        %% slots than a scheduled run. One protection scan per
+        %% `store-retention-batch-slots' would then be one full scan of a big
+        %% store per thousand slots; take `store-retention-backlog-batch-slots'
+        %% per scan instead (memory: ~150 B per candidate row, ~100-300 rows
+        %% per slot).
+        Dropped = lists:sum([ length(maps:get(drop, Pl)) || {_, Pl} <- Plans ]),
+        BatchSlots = maps:get(batch_slots, Policy),
+        Backlog = Dropped > 10 * BatchSlots,
+        Ctx2 =
+            case Backlog of
+                true ->
+                    Ctx#{ policy => Policy#{ batch_slots =>
+                        max(BatchSlots, maps:get(backlog_batch_slots, Policy)) } };
+                false -> Ctx
+            end,
+        {Acc2, Pending} =
+            lists:foldl(
+                fun({P, Plan}, {A, Chunk}) -> add_to_chunk(Ctx2, P, Plan, Chunk, A) end,
+                {Acc1b#{ backlog_mode => Backlog }, new_chunk()},
+                lists:reverse(Plans)
+            ),
+        Acc3a = sweep_chunk(Ctx2, Pending, Acc2),
         Acc3 =
             case hb_util:atom(hb_opts:get(<<"store-retention-orphans">>, false, Opts)) of
                 true -> orphan_sweep(Ctx, Acc3a);
@@ -1566,7 +1591,7 @@ retain(Opts) ->
     end.
 
 ret_acc() ->
-    #{ orphan_units => 0, orphan_deleted_units => 0, orphan_scans => 0,
+    #{ backlog_mode => false, orphan_units => 0, orphan_deleted_units => 0, orphan_scans => 0,
        dropped_slots => 0, kept_slots => 0, candidate_keys => 0,
        protected_keys => 0, protected_by_scan => 0, protected_by_writes => 0,
        deleted_keys => 0, deleted_bytes => 0, alias_keys => 0, conflicts => 0,

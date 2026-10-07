@@ -257,6 +257,26 @@ retention_historical_reads_with_worker_test_() ->
         _ = run_slots(Process, Next, 3, Opts)
     end}.
 
+%% @doc A first run over a backlog takes `store-retention-backlog-batch-slots'
+%% per protection scan instead of one scan per `store-retention-batch-slots'.
+retention_backlog_mode_test_() ->
+    {timeout, 300, fun() ->
+        Opts = node_opts(#{ <<"store-retention-batch-slots">> => 2,
+                            <<"store-retention-backlog-batch-slots">> => 1000 }),
+        Process = new_process(Opts),
+        Next = run_slots(Process, 0, 42, Opts),
+        R = hb_store_gc:retain(Opts),
+        ?assert(maps:get(backlog_mode, R)),
+        ?assertEqual(1, maps:get(scans, R)),
+        ?assert(maps:get(dropped_slots, R) > 20),
+        clear_process_caches(),
+        ?assertEqual(integer_to_binary(Next), count_at(Process, Next - 1, Opts)),
+        % A scheduled run after it is not in backlog mode.
+        _ = run_slots(Process, Next, 6, Opts),
+        R2 = hb_store_gc:retain(Opts),
+        ?assertNot(maps:get(backlog_mode, R2))
+    end}.
+
 %% @doc A cold restart -- fresh in-memory caches, store closed and reopened --
 %% resumes from the retained checkpoint and computes on correctly.
 retention_cold_resume_test_() ->
