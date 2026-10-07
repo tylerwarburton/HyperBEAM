@@ -40,7 +40,7 @@ missing(Dir, Store, Opts, P, N) ->
     Fin = settle(Store, 100),
     io:format(user, "~nSETTLED ~P~n", [maps:with([catchup_running, dropping, local_segments, catchups, dropped_records], Fin), 10]),
     Target = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => hb_util:bin(Dir ++ "/restored-" ++ integer_to_list(erlang:unique_integer([positive]))) },
-    R = (catch hb_store_export:restore(Dir ++ "/remote", Target, #{})),
+    R = (catch hb_store_export:restore(Dir ++ "/remote", Target, #{ <<"require-definitions">> => false, <<"allow-partial-processes">> => true })),
     TOpts = #{ <<"store">> => [Target] },
     Miss = [ I || I <- lists:seq(1, N),
                   case catch hb_cache:read(key(P, I), TOpts) of
@@ -185,7 +185,7 @@ overflow_per_process_test_() ->
         St0 = hb_store_export:status(Store),
         Fin = settle(Store, 100),
         Target = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => hb_util:bin(Dir ++ "/restored") },
-        R = (catch hb_store_export:restore(Dir ++ "/remote", Target, #{})),
+        R = (catch hb_store_export:restore(Dir ++ "/remote", Target, #{ <<"require-definitions">> => false, <<"allow-partial-processes">> => true })),
         TOpts = #{ <<"store">> => [Target] },
         Miss = [ {P, I} || P <- Procs, I <- lists:seq(1, 150),
                   case catch hb_cache:read(key(P, I), TOpts) of
@@ -250,7 +250,7 @@ fuzz_round(Round, Ms) ->
                       L(I + 1)
                   end
               end,
-              Loop(1)
+              Loop(0)
           end)
         || P <- Procs ],
     Deadline = erlang:monotonic_time(millisecond) + Ms,
@@ -296,7 +296,7 @@ fuzz_round(Round, Ms) ->
     _ = settle(Store, 300),
     Target = #{ <<"store-module">> => hb_store_lmdb,
                 <<"name">> => hb_util:bin(Dir ++ "/restored") },
-    Result = (catch hb_store_export:restore(Remote, Target, #{})),
+    Result = (catch hb_store_export:restore(Remote, Target, #{ <<"require-definitions">> => false })),
     Local = snapshot(Opts, Procs, Written),
     Counts = maps:from_list([ {K, length([ x || X <- Events, X == K ])}
                               || K <- [crash, kill, outage, up, clean_stop] ]),
@@ -328,4 +328,4 @@ snapshot(Opts, Procs, Written) ->
                        {ok, M} -> catch hb_cache:ensure_all_loaded(M, Opts);
                        E -> {missing, E}
                    end}
-        || P <- Procs, I <- lists:seq(1, maps:get(P, Written)) ]).
+        || P <- Procs, I <- lists:seq(0, maps:get(P, Written)) ]).

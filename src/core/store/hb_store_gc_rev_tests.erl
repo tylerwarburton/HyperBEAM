@@ -620,7 +620,7 @@ export_crash_gap_test_() ->
         W(3001, 3100),
         St = hb_store_export:sync_export(Store),
         Target = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => hb_util:bin(Dir ++ "/restored") },
-        R = hb_store_export:restore(Dir ++ "/remote", Target, #{}),
+        R = hb_store_export:restore(Dir ++ "/remote", Target, #{ <<"require-definitions">> => false, <<"allow-partial-processes">> => true }),
         TOpts = #{ <<"store">> => [Target] },
         Missing = [ I || I <- lists:seq(1, 3100),
                          case hb_cache:read(Key(I), TOpts) of

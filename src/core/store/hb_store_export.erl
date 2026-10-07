@@ -83,6 +83,7 @@
 -export([wrap/2, status/1, restore/2, restore/3, sync_export/1, resync/1]).
 -export([space_ok/3, put_file/2, append_manifest/2, dir_bytes/1, shutdown_all/0]).
 -export([with_target/2, raw_is_file/1, raw_ensure_dir/1, raw_write_file/2]).
+-export([verify_restorable/1, verify_restorable/2]).
 -export([start/3, stop/3, reset/3, scope/1]).
 -export([read/3, write/3, list/3, match/3, group/3, link/3, type/3,
          resolve/3, sync/3, delete/3]).
@@ -99,8 +100,12 @@
 -define(DEFAULT_SHIP_MS, 1000).
 -define(DEFAULT_TARGET_OPS, 2).
 -define(SYNC_WAIT_MS, 2000).
+-define(DEFAULT_AUDIT_MS, 3600000).
 -define(SCAN_ROWS, 2000).
 -define(REG, hb_store_export_registry).
+%% Test fixtures write assignments for made-up process IDs with no
+%% definitions, some starting above slot 0.
+-define(LAX, #{ <<"require-definitions">> => false, <<"allow-partial-processes">> => true }).
 -define(GATE, hb_store_export_target_gate).
 -define(SCHED_ASSIGN, "~scheduler@1.0/assignments/").
 -define(SMALL_NAMESPACES,
@@ -436,16 +441,21 @@ writer_loop(S) ->
         overflow ->
             writer_loop(start_dropping(S));
         tick ->
-            S1 = maybe_catchup(maybe_ship(maybe_roll(S))),
+            S1 = maybe_audit(maybe_catchup(maybe_ship(maybe_roll(S)))),
             erlang:send_after(
                 cfg(maps:get(store, S), <<"ship-interval-ms">>, ?DEFAULT_SHIP_MS),
                 self(), tick),
             writer_loop(answer_waiters(S1));
         {worker, Result} ->
             writer_loop(answer_waiters(maybe_ship(worker_done(S, Result))));
-        {catchup, From, Rows} ->
+        {catchup, From, Rows0} ->
             % Catch-up rows are never dropped, whatever the live records are
             % doing; the catch-up sends the next chunk only after this ack.
+            % A mutable key (outside the content-addressed units) journaled
+            % live since the catch-up began has a newer value than the row
+            % the catch-up read: the row is not journaled after it.
+            Fresh = maps:get(live_mutable, S, #{}),
+            Rows = [ R || R = {K, _} <- Rows0, not maps:is_key(K, Fresh) ],
             S1 = append(S, [{raw, Rows}], force),
             From ! catchup_ack,
             writer_loop(S1);
@@ -561,6 +571,11 @@ append(S, Recs0, Mode) ->
         ok ->
             S2 = S1#{ seg_bytes => maps:get(seg_bytes, S1) + byte_size(Bin),
                       backlog => maps:get(backlog, S1) + byte_size(Bin),
+                      live_mutable =>
+                          case {Mode, maps:get(catchup, S1)} of
+                              {live, {_, _}} -> mutable_keys(Recs, maps:get(live_mutable, S1, #{}));
+                              _ -> maps:get(live_mutable, S1, #{})
+                          end,
                       marks => lists:foldl(fun rec_watermarks/2, maps:get(marks, S1), Recs) },
             Store = maps:get(store, S),
             case Mode == live andalso maps:get(backlog, S2) >= cfg(Store, <<"max-backlog-bytes">>,
@@ -590,6 +605,23 @@ frame(Rec) ->
 frame_compressed(Rec) ->
     Bin = term_to_binary(Rec, [{compressed, 6}]),
     <<(byte_size(Bin)):32, (erlang:crc32(Bin)):32, Bin/binary>>.
+
+mutable_keys(Recs, Acc) ->
+    lists:foldl(
+        fun({Op, Req}, A) when (Op == write orelse Op == link) andalso is_map(Req) ->
+                maps:fold(fun(K, _, A2) ->
+                              KB = hb_util:bin(K),
+                              case unit_key(KB) of
+                                  true -> A2;
+                                  false -> A2#{ KB => true }
+                              end
+                          end, A, Req);
+           (_, A) -> A
+        end, Acc, Recs).
+
+%% Keys of content-addressed units are immutable; everything else may change.
+unit_key(<<"data/", _/binary>>) -> true;
+unit_key(K) -> byte_size(hd(binary:split(K, <<"/">>))) == 43.
 
 %% The same row is written many times over: `hb_cache' writes a message's
 %% nested messages while converting it (the offload) and again when it writes
@@ -804,7 +836,7 @@ maybe_catchup(S = #{ inner := Inner, open_gaps := Gaps }) ->
     Ids = [ Id || {Id, _} <- Gaps ],
     Self = self(),
     Pid = spawn_link(fun() -> catchup(Self, Inner, Gaps) end),
-    S#{ catchup => {Pid, Ids} }.
+    S#{ catchup => {Pid, Ids}, live_mutable => #{} }.
 
 catchup_done(S, Ids, N, Caught) ->
     St = maps:get(stats, S),
@@ -872,6 +904,21 @@ maybe_ship(S = #{ next_try := Next }) ->
         true -> do_maybe_ship(S)
     end.
 
+%% The periodic audit (`audit-interval-ms', default 1 h): with the worker
+%% idle, check the target as a restore would see it -- one listing and one
+%% manifest read -- and keep the result in the status as `last_audit'.
+maybe_audit(S = #{ worker_busy := true }) -> S;
+maybe_audit(S = #{ worker := W, path := Path }) ->
+    Every = cfg(maps:get(store, S), <<"audit-interval-ms">>, ?DEFAULT_AUDIT_MS),
+    Now = erlang:system_time(millisecond),
+    case Now - maps:get(last_audit_start, S, 0) >= Every of
+        false -> S;
+        true ->
+            Open = [ Id || {Id, _} <- maps:get(open_gaps, S) ],
+            W ! {job, self(), {audit, Path, Open}},
+            S#{ worker_busy => true, last_audit_start => Now }
+    end.
+
 do_maybe_ship(S = #{ worker := W, journal := J }) ->
     Segs = closed_segments(S),
     Gaps = segs_in(J, "gap-", ".mark"),
@@ -906,6 +953,12 @@ worker_done(S, Result) ->
     Ok = fun(X) -> X#{ next_try => 0, stats => (maps:get(stats, X))#{ consecutive_errors => 0 } } end,
     case Result of
         {target_info, Bytes} -> S0#{ target_bytes => Bytes };
+        {audited, Audit} ->
+            case maps:get(ok, Audit) of
+                true -> ok;
+                false -> ?event(warning, {essentials_export_audit_failed, Audit})
+            end,
+            S0#{ last_audit => Audit };
         {shipped, N, Raw, Bytes, Ceiling} ->
             S1a = Ok(at_ceiling(S0, Ceiling)),
             % At the ceiling, look again after an interval, not at once.
@@ -1010,6 +1063,7 @@ status_of(S) ->
         dropping => maps:get(dropping, S),
         ceiling => maps:get(ceiling, S),
         target_bytes => maps:get(target_bytes, S),
+        last_audit => maps:get(last_audit, S, undefined),
         resync_pending => maps:get(resync, S),
         catchup_running => maps:get(catchup, S) =/= undefined,
         open_gaps => [ Id || {Id, _} <- maps:get(open_gaps, S) ],
@@ -1070,6 +1124,8 @@ target_worker(Path) ->
 
 job(Path, target_info) ->
     {target_info, dir_bytes(Path)};
+job(_Path, {audit, P, OpenGaps}) ->
+    {audited, audit(P, OpenGaps)};
 job(P, {ship, J, Segs, Cfg, Used}) ->
     ok = raw_ensure_dir(filename:join(P, "x")),
     ok = ship_gaps(J, P),
@@ -1130,6 +1186,57 @@ partial(0, _Raw, _Bytes, Err) -> Err;
 partial(N, Raw, Bytes, {error, _} = Err) ->
     ?event(warning, {essentials_export_ship_failed_after, N, Err}),
     {shipped, N, Raw, Bytes, false}.
+
+%% What a restore would refuse, found from one listing and the manifest:
+%% a listed segment from the newest base on that is missing, a base without
+%% its file, a manifest that cannot be read. Gaps still open are reported (a
+%% restore made now would refuse them); gaps closed by the writer have their
+%% fill journaled ahead of the close.
+audit(P, OpenGaps) ->
+    At = os:system_time(second),
+    try
+        {ok, Names} = prim_file:list_dir(P),
+        Bases = lists:sort([ Q || N <- Names, {"base-", Q} <- [parse_seq(N)],
+                                  lists:suffix(".done", N) ]),
+        B = lists:max([0 | Bases]),
+        Manifest = manifest(P),
+        Listed = [ Q || N <- maps:keys(Manifest), {"seg-", Q} <- [parse_seq(N)], Q >= B ],
+        Present = [ Q || N <- Names, {"seg-", Q} <- [parse_seq(N)], lists:suffix(".log", N) ],
+        Missing = Listed -- Present,
+        BaseOk = B == 0 orelse lists:member("base-" ++ seq_str(B) ++ ".log", Names),
+        RemoteGaps = [ Q || N <- Names, {"gap-", Q} <- [parse_seq(N)], Q > B ],
+        Pending = [ G || G <- RemoteGaps, lists:member(G, OpenGaps) ],
+        #{ at => At, ok => Missing == [] andalso BaseOk andalso Pending == [],
+           base => B, segments => length(Listed), missing_segments => Missing,
+           base_present => BaseOk, open_gaps_on_target => Pending }
+    catch C:R -> #{ at => At, ok => false, error => {C, R} }
+    end.
+
+%% @doc The deep check, on demand: restore the export into a scratch store
+%% and compare its assignments with the local essentials store's. Returns
+%% `{ok, Counts}' or `{error, Reason}'. Reads the whole export: run it off
+%% peak, or against a copy.
+verify_restorable(Store) -> verify_restorable(Store, #{}).
+verify_restorable(Store, RestoreOpts) ->
+    Path = hb_util:list(cfg(Store, <<"path">>, undefined)),
+    Scratch = hb_util:bin(journal_dir(Store) ++ "/verify-" ++
+                          integer_to_list(erlang:unique_integer([positive]))),
+    Target = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => Scratch },
+    try restore(Path, Target, RestoreOpts) of
+        {ok, R} ->
+            #{ <<"db">> := DB } = hb_store:find(inner(Store)),
+            ok = elmdb:flush(DB),
+            Local = lists:sum([ length(children(DB, <<?SCHED_ASSIGN, P/binary>>))
+                              || P <- children(DB, <<"~scheduler@1.0/assignments">>) ]),
+            case maps:get(assignments, R) of
+                Local -> {ok, #{ assignments => Local }};
+                Got -> {error, {assignments, Got, local, Local}}
+            end
+    catch C:E -> {error, {C, E}}
+    after
+        catch hb_store:stop([Target], #{}, #{}),
+        os:cmd("rm -rf " ++ hb_util:list(Scratch))
+    end.
 
 %% Write a file durably and atomically: temp file, sync, rename.
 put_file(RawDst, Bin) ->
@@ -1305,6 +1412,23 @@ repair_manifest(Path) ->
 write_base(Inner = #{ <<"store-module">> := hb_store_lmdb }, P, Seq) ->
     #{ <<"db">> := DB } = hb_store:find(Inner),
     ok = elmdb:flush(DB),
+    % The base is a key-order scan over many short read transactions, not a
+    % snapshot: a message written during it can sort before the cursor while
+    % its assignment link (`~scheduler@1.0/...' sorts last) is still ahead,
+    % so the image can hold a link without its message. The watermarks it may
+    % raise are therefore the assignments present BEFORE the scan began --
+    % whole closures, which the scan cannot miss -- never what it saw.
+    PreMaxes =
+        lists:foldl(
+            fun(Pr, M) ->
+                case [ Sl || C <- children(DB, <<?SCHED_ASSIGN, Pr/binary>>),
+                             Sl <- [catch binary_to_integer(C)], is_integer(Sl) ] of
+                    [] -> M;
+                    Sls -> M#{ Pr => lists:max(Sls) }
+                end
+            end,
+            #{},
+            children(DB, <<"~scheduler@1.0/assignments">>)),
     Name = "base-" ++ seq_str(Seq) ++ ".log",
     File = filename:join(P, Name),
     {ok, Fd} = file:open(File ++ ".tmp", [write, raw, binary]),
@@ -1322,7 +1446,7 @@ write_base(Inner = #{ <<"store-module">> := hb_store_lmdb }, P, Seq) ->
                                 ok = file:write(Fd, F),
                                 {erlang:crc32(Crc, F), Size + byte_size(F)}
                         end,
-                    Maxes2 = lists:foldl(fun({K, _}, M) -> slot_max(K, M) end, Maxes, Rows),
+                    Maxes2 = Maxes,
                     case Next of
                         done -> {Crc1, Size1, Maxes2};
                         _ -> L(Next, Crc1, Size1, Maxes2)
@@ -1332,7 +1456,7 @@ write_base(Inner = #{ <<"store-module">> := hb_store_lmdb }, P, Seq) ->
         end,
     {Crc, Size, BaseMaxes} =
         try
-            R = Loop(<<>>, erlang:crc32(<<>>), 0, #{}),
+            R = Loop(<<>>, erlang:crc32(<<>>), 0, PreMaxes),
             ok = file:sync(Fd),
             R
         after file:close(Fd)
@@ -1344,16 +1468,7 @@ write_base(Inner = #{ <<"store-module">> := hb_store_lmdb }, P, Seq) ->
 write_base(Inner, _P, _Seq) ->
     erlang:error({base_needs_lmdb_inner, Inner}).
 
-slot_max(<<?SCHED_ASSIGN, Rest/binary>>, M) ->
-    case binary:split(Rest, <<"/">>) of
-        [P, SlotBin] ->
-            try binary_to_integer(SlotBin) of
-                Slot -> maps:update_with(P, fun(O) -> max(O, Slot) end, Slot, M)
-            catch _:_ -> M
-            end;
-        _ -> M
-    end;
-slot_max(_, M) -> M.
+
 
 %% @doc Once base `Seq' is complete -- renamed into place, its manifest entry
 %% synced and its `.done' written, all before this runs -- delete what it
@@ -1506,9 +1621,26 @@ restore(RawPath, Target, Opts) ->
     end,
     ok = hb_store:sync([Target], #{}, Opts),
     Assignments = verify_assignments(Target, Opts),
+    NoDefinition = verify_definitions(Target, Opts),
     {ok, #{ base => From1, base_records => BaseRows,
             segments => length(Wanted), records => Records,
-            gaps_filled => lists:usort(Filled), assignments => Assignments }}.
+            gaps_filled => lists:usort(Filled), assignments => Assignments,
+            processes_without_definition => NoDefinition }}.
+
+%% Every process with assignments must have its definition (the message at
+%% its ID), unless the caller allows it (`require-definitions' false), in which
+%% case the processes without one are returned.
+verify_definitions(Target, Opts) ->
+    TOpts = Opts#{ <<"store">> => [Target] },
+    #{ <<"db">> := DB } = hb_store:find(Target),
+    Missing =
+        [ P || P <- children(DB, <<"~scheduler@1.0/assignments">>),
+               not is_map(catch hb_cache:ensure_all_loaded(hb_util:ok(hb_cache:read(P, TOpts)), TOpts)) ],
+    case {Missing, maps:get(<<"require-definitions">>, Opts, true)} of
+        {[], _} -> 0;
+        {_, false} -> length(Missing);
+        _ -> erlang:error({export_definitions_missing, lists:sublist(Missing, 10)})
+    end.
 
 %% Every process's assignment slots contiguous, every assignment loadable.
 verify_assignments(Target, Opts) ->
@@ -1519,10 +1651,17 @@ verify_assignments(Target, Opts) ->
         [ begin
             Slots = lists:sort([ Sl || C <- children(DB, <<?SCHED_ASSIGN, P/binary>>),
                                        Sl <- [catch binary_to_integer(C)], is_integer(Sl) ]),
+            % A scheduler numbers a process's assignments from 0. Only when the
+            % caller says the export holds processes it never saw begin
+            % (`allow-partial-processes') may they start later.
+            First = case maps:get(<<"allow-partial-processes">>, Opts, false) of
+                        true -> hd(Slots ++ [0]);
+                        _ -> 0
+                    end,
             case Slots of
                 [] -> ok;
                 _ ->
-                    Expected = lists:seq(hd(Slots), lists:last(Slots)),
+                    Expected = lists:seq(First, lists:last(Slots)),
                     case Slots == Expected of
                         true -> ok;
                         false -> erlang:error({export_assignments_not_contiguous, P,
@@ -1615,7 +1754,7 @@ export_and_restore_roundtrip_test_() ->
         ?assert(maps:get(shipped_segments, St) >= 1),
         Target = #{ <<"store-module">> => hb_store_lmdb,
                     <<"name">> => hb_util:bin(Dir ++ "/restored") },
-        {ok, R} = restore(Dir ++ "/remote", Target, Opts),
+        {ok, R} = restore(Dir ++ "/remote", Target, maps:merge(Opts, ?LAX)),
         ?assert(maps:get(records, R) + maps:get(base_records, R) > 0),
         TOpts = Opts#{ <<"store">> => [Target] },
         lists:foreach(
@@ -1667,7 +1806,7 @@ export_pauses_at_fill_ceiling_test_() ->
         ?assert(maps:get(shipped_segments, St2) >= 1),
         Target = #{ <<"store-module">> => hb_store_lmdb,
                     <<"name">> => hb_util:bin(Dir ++ "/restored") },
-        {ok, _} = restore(Dir ++ "/remote", Target, Opts),
+        {ok, _} = restore(Dir ++ "/remote", Target, maps:merge(Opts, ?LAX)),
         TOpts = Opts#{ <<"store">> => [Target] },
         [ ?assertMatch({ok, _}, hb_cache:read(ID, TOpts)) || ID <- IDs ],
         % A byte budget already exceeded pauses it again.
@@ -1710,7 +1849,7 @@ export_real_mount_test_() ->
                 {SyncUs, St} = timer:tc(fun() -> sync_export(Store) end),
                 Target = #{ <<"store-module">> => hb_store_lmdb,
                             <<"name">> => hb_util:bin(Local ++ "/restored") },
-                {RestoreUs, {ok, R}} = timer:tc(fun() -> restore(Real ++ "/essentials", Target, Opts) end),
+                {RestoreUs, {ok, R}} = timer:tc(fun() -> restore(Real ++ "/essentials", Target, maps:merge(Opts, ?LAX)) end),
                 TOpts = Opts#{ <<"store">> => [Target] },
                 Bad = [ ID || ID <- IDs,
                               hb_cache:ensure_all_loaded(element(2, hb_cache:read(ID, Opts)), Opts) =/=
@@ -1746,7 +1885,7 @@ export_manifest_is_strict_test_() ->
         ok = file:write_file(Remote ++ "/seg-" ++ seq_str(lists:max(remote_segments(Remote)) + 1) ++ ".log",
                              frame({write, #{ <<"b">> => <<"2">> }})),
         T = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => hb_util:bin(Dir ++ "/restored") },
-        ?assertError({export_file_not_in_manifest, _}, restore(Remote, T, #{}))
+        ?assertError({export_file_not_in_manifest, _}, restore(Remote, T, ?LAX))
     end}.
 
 %% An assignment-shaped essential: a message, and the scheduler's link to it.
@@ -1799,7 +1938,7 @@ export_unclean_stop_catches_up_test_() ->
         ?assertMatch([_ | _], remote_gaps(Remote)),
         ?assertEqual([], remote_bases(Remote)),
         T = restored(Dir, "restored"),
-        {ok, R} = restore(Remote, T, #{}),
+        {ok, R} = restore(Remote, T, ?LAX),
         ?assertMatch([_ | _], maps:get(gaps_filled, R)),
         TOpts = #{ <<"store">> => [T] },
         Bad = [ N || N <- lists:seq(1, 110),
@@ -1807,7 +1946,7 @@ export_unclean_stop_catches_up_test_() ->
         ?assertEqual([], Bad),
         % A gap newer than any fill or base: refused.
         ok = file:write_file(Remote ++ "/gap-" ++ seq_str(999999999999) ++ ".mark", <<>>),
-        ?assertError(_, restore(Remote, restored(Dir, "r2"), #{}))
+        ?assertError(_, restore(Remote, restored(Dir, "r2"), ?LAX))
     end}.
 
 %% @doc A clean stop (what the node's application stop does on `docker stop')
@@ -1830,7 +1969,7 @@ export_clean_stop_needs_nothing_test_() ->
         ?assertEqual(0, maps:get(catchups, St)),
         ?assertEqual(0, maps:get(resyncs, St)),
         ?assertEqual([], remote_gaps(Dir ++ "/remote")),
-        {ok, _} = restore(Dir ++ "/remote", restored(Dir, "restored"), #{}),
+        {ok, _} = restore(Dir ++ "/remote", restored(Dir, "restored"), ?LAX),
         TOpts = #{ <<"store">> => [restored(Dir, "restored")] },
         ?assertEqual([], [ N || N <- lists:seq(1, 30),
                                 assignment_bytes(Opts, P, N) =/= assignment_bytes(TOpts, P, N) ])
@@ -1862,7 +2001,7 @@ export_prunes_superseded_bases_test_() ->
         ?assertEqual([B], segs_in(Remote, "base-", ".log")),
         ?assert(lists:all(fun(Q) -> Q >= B end, remote_segments(Remote))),
         T = restored(Dir, "restored"),
-        {ok, _} = restore(Remote, T, #{}),
+        {ok, _} = restore(Remote, T, ?LAX),
         TOpts = #{ <<"store">> => [T] },
         All = lists:seq(101, 325),
         ?assertEqual([], [ N || N <- All, assignment_bytes(Opts, P, N) =/= assignment_bytes(TOpts, P, N) ])
@@ -1985,7 +2124,7 @@ export_dedupe_keeps_last_write_test_() ->
         timer:sleep(20),
         _ = sync_export(Store),
         T = restored(Dir, "restored"),
-        {ok, _} = restore(Dir ++ "/remote", T, #{}),
+        {ok, _} = restore(Dir ++ "/remote", T, ?LAX),
         ?assertEqual({ok, <<"v1">>}, hb_store:read([T], <<"~test@1.0/mutable">>, #{})),
         ?assertEqual({ok, <<"blk">>}, hb_store:read([T], <<"~arweave@2.9/block/height/7">>, #{}))
     end}.
@@ -2017,5 +2156,57 @@ export_missing_segment_fails_restore_test_() ->
         || R <- [0, 1, 2] ],
         Last = lists:last(remote_segments(Remote)),
         ok = file:delete(Remote ++ "/" ++ seg_name(Last)),
-        ?assertError({export_segments_missing, [Last]}, restore(Remote, restored(Dir, "r"), #{}))
+        ?assertError({export_segments_missing, [Last]}, restore(Remote, restored(Dir, "r"), ?LAX))
+    end}.
+
+%% @doc The periodic audit reports a healthy export, and notices a listed
+%% segment that went missing; the deep check restores and compares.
+export_audit_notices_missing_segment_test_() ->
+    {timeout, 120, fun() ->
+        application:ensure_all_started(hb),
+        Dir = export_test_dir("audit"),
+        Remote = Dir ++ "/remote",
+        Store = export_store(Dir, #{ <<"segment-ms">> => 100000, <<"ship-interval-ms">> => 50,
+                                     <<"audit-interval-ms">> => 200 }),
+        Opts = #{ <<"store">> => [Store] },
+        ok = hb_store:start([Store], #{}, Opts),
+        P = hb_util:human_id(crypto:strong_rand_bytes(32)),
+        [ begin [ assign(Store, Opts, P, R * 10 + N) || N <- lists:seq(0, 9) ], _ = sync_export(Store) end
+        || R <- [0, 1] ],
+        ?assertMatch({ok, #{ assignments := 20 }}, verify_restorable(Store, ?LAX)),
+        ?assert(hb_util:wait_until(fun() ->
+            case maps:get(last_audit, status(Store)) of #{ ok := true } -> true; _ -> false end end, 5000)),
+        ok = file:delete(Remote ++ "/" ++ seg_name(lists:last(remote_segments(Remote)))),
+        ?assert(hb_util:wait_until(fun() ->
+            case maps:get(last_audit, status(Store)) of #{ ok := false, missing_segments := [_] } -> true; _ -> false end end, 5000)),
+        ?assertMatch({error, _}, verify_restorable(Store, ?LAX))
+    end}.
+
+%% @doc A catch-up row never overwrites a newer live write of a mutable key:
+%% the catch-up reads ~location@1.0 as V1, the key is then written V2 live,
+%% and the restore has V2.
+export_catchup_never_overwrites_newer_live_value_test_() ->
+    {timeout, 120, fun() ->
+        application:ensure_all_started(hb),
+        Dir = export_test_dir("stale"),
+        Store = export_store(Dir, #{ <<"segment-ms">> => 100000, <<"ship-interval-ms">> => 50 }),
+        Opts = #{ <<"store">> => [Store] },
+        ok = hb_store:start([Store], #{}, Opts),
+        P = hb_util:human_id(crypto:strong_rand_bytes(32)),
+        Loc = <<"~location@1.0/", P/binary>>,
+        [ assign(Store, Opts, P, N) || N <- lists:seq(0, 5) ],
+        _ = sync_export(Store),
+        W1 = writer_pid(Store),
+        erlang:suspend_process(W1),
+        ok = hb_store:write([Store], #{ Loc => <<"v1">> }, Opts),
+        [ assign(Store, Opts, P, N) || N <- lists:seq(6, 3000) ],
+        exit(W1, kill),
+        timer:sleep(20),
+        % The restarted writer's catch-up is running; write the newer value.
+        ok = hb_store:write([Store], #{ Loc => <<"v2">> }, Opts),
+        St = sync_export(Store),
+        ?assert(maps:get(catchups, St) >= 1),
+        T = restored(Dir, "restored"),
+        {ok, _} = restore(Dir ++ "/remote", T, ?LAX),
+        ?assertEqual({ok, <<"v2">>}, hb_store:read([T], Loc, #{}))
     end}.
