@@ -1601,7 +1601,12 @@ retain(Opts) ->
 %%%     its head. A process the main store keeps no checkpoint for (or does
 %%%     not compute) keeps everything;
 %%%   - a process's newest assignment (its head slot);
-%%%   - with the export on, an assignment not yet durably exported: only slots
+%%%   - anything, unless `essentials-export' is configured (no export: the
+%%%     run is a no-op with an error event), and anything at all unless
+%%%     `essentials-retention-dry-run' (default true) is set to false;
+%%%   - with remote publishing on (`scheduler-publish-remote', default true),
+%%%     an assignment above the process's upload mark;
+%%%   - an assignment not yet durably exported: only slots
 %%%     at or below the process's mark as of the newest shipped segment, and
 %%%     only once the target carries the `local-pruned' marker (after which a
 %%%     base no longer supersedes older files and a restore replays the whole
@@ -1651,9 +1656,14 @@ retain_essentials(Opts, Needs, Ess, DaysMs) ->
                     true -> {I, hb_store_export:exported_marks(Ess)};
                     false -> {I, waiting}
                 end;
-            _ -> {Ess, all}
+            _ -> {Ess, no_export}
         end,
     case Exported of
+        no_export ->
+            % Without an export the essentials store is the only copy of its
+            % assignments: nothing may be pruned.
+            ?event(error, {essentials_retention_refused, essentials_export_not_configured}),
+            #{ status => refused_no_export };
         waiting -> #{ status => waiting_for_export_marker };
         _ -> retain_essentials(Opts, Needs, Inner, Exported, DaysMs, Start)
     end.
@@ -1661,7 +1671,10 @@ retain_essentials(Opts, Needs, Ess, DaysMs) ->
 retain_essentials(Opts, Needs, Inner, Exported, DaysMs, Start) ->
     ok = hb_store:start([Inner], #{}, Opts),
     DB = store_db(Inner),
-    Policy = retention_policy(Opts),
+    % Its own dry-run switch, on unless set to false, whatever the main
+    % store's retention does.
+    EssDry = hb_util:atom(hb_opts:get(<<"essentials-retention-dry-run">>, true, Opts)) =/= false,
+    Policy = (retention_policy(Opts))#{ dry_run => EssDry },
     Seen = ets:new(hb_store_gc_ess_seen, [set, private]),
     Ctx = #{
         src_db => DB,
@@ -1684,10 +1697,9 @@ retain_essentials(Opts, Needs, Inner, Exported, DaysMs, Start) ->
         {Drops, Held, _} =
             lists:foldl(
                 fun(P, {D, H, B}) ->
-                    Mark = case Exported of
-                               all -> infinity;
-                               _ -> maps:get(P, Exported, -1)
-                           end,
+                    % At or below what has durably shipped, and -- when the
+                    % scheduler publishes remotely -- what it has uploaded.
+                    Mark = min(maps:get(P, Exported, -1), upload_limit(Ctx, P, Opts)),
                     {PD, Why} = ess_plan(Ctx, P, maps:get(P, Needs, none), Mark, Cutoff, B),
                     {PD ++ D, maps:update_with(Why, fun(X) -> X + 1 end, 1, H), B - length(PD)}
                 end,
@@ -1703,12 +1715,26 @@ retain_essentials(Opts, Needs, Inner, Exported, DaysMs, Start) ->
                  pruned_assignments => length(Drops),
                  processes => length(Procs),
                  stopped_by => Held,
-                 exported => Exported =/= all,
+                 dry_run => EssDry,
                  duration_ms => erlang:monotonic_time(millisecond) - Start }
     after
         catch elmdb:track_watch(DB, clear),
         catch elmdb:track(DB, false),
         ets:delete(Seen)
+    end.
+
+%% The highest slot the scheduler has published (`~scheduler@1.0/uploaded/P'),
+%% when it publishes remotely; -1 when it has published nothing. Without
+%% remote publishing (`scheduler-publish-remote' false) there is no mark and
+%% the export is the only guard.
+upload_limit(Ctx, P, Opts) ->
+    case hb_util:atom(hb_opts:get(<<"scheduler-publish-remote">>, true, Opts)) of
+        false -> infinity;
+        _ ->
+            case read_row_value(Ctx, <<"~scheduler@1.0/uploaded/", P/binary>>) of
+                {ok, B} -> try binary_to_integer(B) catch _:_ -> -1 end;
+                _ -> -1
+            end
     end.
 
 %% The assignments of one process to drop, oldest first: a prefix of its

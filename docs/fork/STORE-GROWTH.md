@@ -479,3 +479,19 @@ supersede nothing and restore replays the whole chain from the newest base
 before the marker), and only slots at or below the process's mark as of the
 newest shipped segment. Report: `essentials` in the run report /
 `retention_status()`.
+
+Guards added after review (2026-10-07): essentials pruning is a no-op (with an
+error event, status `refused_no_export`) unless `essentials-export` is
+configured; it deletes only slots durably shipped; with
+`scheduler-publish-remote` true (the default) it never deletes above the
+process's `~scheduler@1.0/uploaded/<P>` mark (none = nothing); and it has its
+own `essentials-retention-dry-run`, default **true**, independent of
+`store-retention-dry-run`.
+
+Restore strictness: `hb_store_export:restore/3` requires every process's
+assignments contiguous from slot 0 and its definition present. For an export
+of processes whose local slots start above 0 (e.g. migrated from a node that
+already lacked a prefix) or whose definition is elsewhere, pass
+`#{ <<"allow-partial-processes">> => true }` and/or
+`#{ <<"require-definitions">> => false }` -- knowingly, since they also hide a
+lost prefix or definition.

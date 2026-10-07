@@ -994,8 +994,20 @@ essentials_size_report_test_() ->
 
 %%% Essentials retention (`essentials-retention-days').
 
-ess_node(Tag, Extra) ->
+%% An essentials store with an export (pruning refuses to run without one),
+%% pruning live (`essentials-retention-dry-run' false) and, as in production,
+%% no remote publishing (the export is then the only guard).
+ess_node(Tag, Extra0) ->
     Ess = hb_test_utils:test_store(hb_store_lmdb, Tag),
+    Dir = "cache-TEST/ess-exp-" ++ integer_to_list(erlang:unique_integer([positive])),
+    Extra = maps:merge(
+        #{ <<"essentials-export">> =>
+               #{ <<"path">> => hb_util:bin(Dir ++ "/remote"),
+                  <<"journal">> => hb_util:bin(Dir ++ "/journal"),
+                  <<"segment-ms">> => 100, <<"ship-interval-ms">> => 20 },
+           <<"essentials-retention-dry-run">> => false,
+           <<"scheduler-publish-remote">> => false },
+        Extra0),
     Opts0 = node_opts(Extra),
     Opts1 = Opts0#{ <<"essentials-store">> => Ess },
     Opts = Opts1#{ <<"store">> => hb_store_essentials:node_store(Opts1) },
@@ -1011,6 +1023,13 @@ ess_slots(EssDB, P) ->
         {ok, L} -> lists:sort([ binary_to_integer(S) || S <- L ]);
         _ -> []
     end.
+
+%% Everything written so far shipped, and the target marked for pruning.
+ess_shipped(Opts) ->
+    [Ess | _] = hb_store_essentials:store(Opts),
+    ?assert(hb_util:wait_until(fun() -> hb_store_export:prepare_prune(Ess) end, 5000)),
+    _ = hb_store_export:sync_export(Ess),
+    ok.
 
 %% The lowest checkpoint the main store keeps for a process.
 oldest_kept_checkpoint(Process, Opts) ->
@@ -1035,11 +1054,13 @@ essentials_retention_prunes_old_assignments_test_() ->
             elmdb:get(EssDB, <<"~scheduler@1.0/assignments/", P/binary, "/1">>),
         ok = elmdb:put(EssDB, <<"~other@1.0/keeps">>, <<"link:", Root1/binary>>),
         Before = assignments(Process, Opts),
+        ok = ess_shipped(Opts),
         % A week of retention: everything is younger, nothing goes.
         R1 = hb_store_gc:retain(Opts#{ <<"essentials-retention-days">> => 7 }),
         ?assertMatch(#{ pruned_assignments := 0 }, maps:get(essentials, R1)),
         ?assertEqual(lists:seq(0, Next - 1), ess_slots(EssDB, P)),
         % Zero days: everything is older than the cutoff.
+        ok = ess_shipped(Opts),
         R2 = hb_store_gc:retain(Opts#{ <<"essentials-retention-days">> => 0 }),
         Need = oldest_kept_checkpoint(Process, Opts),
         ?assert(Need > 0),
@@ -1064,6 +1085,7 @@ essentials_retention_prunes_old_assignments_test_() ->
         [ ?assertEqual(integer_to_binary(S + 1), element(1, state_digest(Process, S, Opts)))
         || S <- computed_slots(Process, Opts) ],
         _ = run_slots(Process, Next, 6, Opts),
+        ok = ess_shipped(Opts),
         % A second run has nothing more to take below the (moved) window
         % than what the new checkpoint frees.
         R3 = hb_store_gc:retain(Opts#{ <<"essentials-retention-days">> => 0 }),
@@ -1080,6 +1102,7 @@ essentials_retention_keeps_processes_without_checkpoints_test_() ->
         Process = lua_process(Opts),
         % Fewer slots than the checkpoint cadence: no checkpoint yet.
         Next = run_slots(Process, 0, 4, Opts),
+        ok = ess_shipped(Opts),
         R = hb_store_gc:retain(Opts#{ <<"essentials-retention-days">> => 0 }),
         ?assertEqual(0, maps:get(pruned_assignments, maps:get(essentials, R))),
         ?assertEqual(lists:seq(0, Next - 1), ess_slots(EssDB, proc_id(Process, Opts)))
@@ -1097,6 +1120,7 @@ essentials_retention_restart_mid_prune_test_() ->
                 P = proc_id(Process, Opts),
                 _ = hb_store_gc:retain(Opts),
                 Need = oldest_kept_checkpoint(Process, Opts),
+                ok = ess_shipped(Opts),
                 Kill = fun(Phase) ->
                            case Phase of
                                KillAt -> exit(simulated_crash);
@@ -1132,6 +1156,7 @@ essentials_retention_never_prunes_ahead_of_the_export_test_() ->
                     <<"journal">> => hb_util:bin(Dir ++ "/journal"),
                     <<"segment-ms">> => 3600000, <<"ship-interval-ms">> => 20 },
         {Opts0, Ess, EssDB} = ess_node(<<"ess-export">>, #{ <<"essentials-export">> => Export }),
+        _ = Opts0,
         Opts = Opts0#{ <<"essentials-retention-days">> => 0 },
         ?assertMatch(#{ <<"store-module">> := hb_store_export }, Ess),
         Process = lua_process(Opts),
@@ -1167,4 +1192,52 @@ essentials_retention_never_prunes_ahead_of_the_export_test_() ->
               <<"~scheduler@1.0/assignments/", P/binary, "/", (integer_to_binary(S))/binary>>,
               TOpts)), TOpts))
         || S <- lists:seq(0, Next + 2) ]
+    end}.
+
+%% @doc Review regressions (rev_essret): without an export nothing is pruned,
+%% whatever the age; with the scheduler publishing remotely nothing above its
+%% upload mark goes; and the dry-run default deletes nothing.
+essentials_retention_guards_test_() ->
+    {timeout, 600, fun() ->
+        % No export: refused, every assignment kept, the process rebuilds
+        % from the essentials store after a main-store wipe.
+        Ess = hb_test_utils:test_store(hb_store_lmdb, <<"ess-noexport">>),
+        O0 = node_opts(#{ <<"essentials-retention-days">> => 0,
+                          <<"essentials-retention-dry-run">> => false }),
+        O1 = O0#{ <<"essentials-store">> => Ess },
+        Opts = O1#{ <<"store">> => hb_store_essentials:node_store(O1) },
+        ok = hb_store:start([Ess], #{}, Opts),
+        Process = lua_process(Opts),
+        Next = run_slots(Process, 0, 23, Opts),
+        Before = assignments(Process, Opts),
+        R = hb_store_gc:retain(Opts),
+        ?assertMatch(#{ status := refused_no_export }, maps:get(essentials, R)),
+        ?assertEqual(Before, assignments(Process, Opts)),
+        [Main | _] = hb_opts:get(<<"store">>, [], O0),
+        ok = hb_store:reset([Main], #{}, Opts),
+        ok = hb_store:start([Main], #{}, Opts),
+        clear_process_caches(),
+        ?assertEqual(integer_to_binary(Next), count_at(Process, Next - 1, Opts)),
+        % Remote publishing on, uploaded up to slot 2: only slots 0..2 may go.
+        {OptsU0, _EssU, EssDB} = ess_node(<<"ess-upload">>,
+                                         #{ <<"scheduler-publish-remote">> => true }),
+        OptsU = OptsU0#{ <<"essentials-retention-days">> => 0 },
+        PU = lua_process(OptsU),
+        _ = run_slots(PU, 0, 23, OptsU),
+        P = proc_id(PU, OptsU),
+        ok = elmdb:put(EssDB, <<"~scheduler@1.0/uploaded/", P/binary>>, <<"2">>),
+        ok = ess_shipped(OptsU),
+        RU = hb_store_gc:retain(OptsU),
+        ?assertEqual(3, maps:get(pruned_assignments, maps:get(essentials, RU))),
+        ?assertEqual(lists:seq(3, 22), ess_slots(EssDB, P)),
+        % Dry run by default: nothing deleted.
+        {OptsD0, _EssD, EssDBD} = ess_node(<<"ess-dry">>, #{}),
+        OptsD = maps:remove(<<"essentials-retention-dry-run">>,
+                            OptsD0#{ <<"essentials-retention-days">> => 0 }),
+        PD = lua_process(OptsD),
+        _ = run_slots(PD, 0, 23, OptsD),
+        ok = ess_shipped(OptsD),
+        RD = hb_store_gc:retain(OptsD),
+        ?assertMatch(#{ status := dry_run, dry_run := true }, maps:get(essentials, RD)),
+        ?assertEqual(lists:seq(0, 22), ess_slots(EssDBD, proc_id(PD, OptsD)))
     end}.

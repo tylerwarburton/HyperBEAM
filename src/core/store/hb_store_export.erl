@@ -1672,10 +1672,20 @@ raw_ensure_dir(Path) ->
 %%       no shipped segment can be missing;</li>
 %%   <li>every gap opened after the base must be named by a
 %%       `{gaps_filled, Ids}' record -- exactly, never by a later fill;</li>
-%%   <li>afterwards, every process's assignment slots must be contiguous and
-%%       every assignment must load whole.</li>
+%%   <li>afterwards, every process's assignment slots must be contiguous
+%%       from slot 0 and every assignment must load whole;</li>
+%%   <li>every process with assignments must have its definition.</li>
 %% </ul>
 %% A torn final record (a segment cut short by a crash) is ignored.
+%%
+%% Two options relax the last two checks, for exports that legitimately
+%% hold partial processes -- one started from a migration of a node whose
+%% local slots began above 0, or whose definitions live only elsewhere:
+%% `allow-partial-processes' (true: contiguity is checked from each process's
+%% lowest exported slot, not from 0) and `require-definitions' (false: a
+%% missing definition is counted in `processes_without_definition' instead of
+%% failing). Use them only when the gap is known and expected: they also hide
+%% a lost prefix or a lost definition.
 restore(Path, Target) -> restore(Path, Target, #{}).
 restore(RawPath, Target, Opts) ->
     Path = hb_util:list(RawPath),
