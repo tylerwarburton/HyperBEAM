@@ -33,7 +33,8 @@ complete_tx(A1, Opts) -> ess_complete_tx(A1, hb_store_essentials:opts(Opts)).
 load_bundle_states(Opts) -> ess_load_bundle_states(hb_store_essentials:opts(Opts)).
 load_tx(A1, Opts) -> ess_load_tx(A1, hb_store_essentials:opts(Opts)).
 load_items(A1, Opts) -> ess_load_items(A1, hb_store_essentials:opts(Opts)).
-load_items(A1, A2, A3, Opts) -> ess_load_items(A1, A2, A3, hb_store_essentials:opts(Opts)).
+load_items(BundleID, Opts, OnLoaded, OnFailed) ->
+    ess_load_items(BundleID, hb_store_essentials:opts(Opts), OnLoaded, OnFailed).
 list_item_ids(Opts) -> ess_list_item_ids(hb_store_essentials:opts(Opts)).
 
 -define(BUNDLER_PREFIX, <<"~bundler@1.0">>).
