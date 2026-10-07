@@ -1186,10 +1186,33 @@ target_worker(Path) ->
             target_worker(Path)
     end.
 
+%% The target's root is created only the first time it is used in this VM:
+%% once seen, a missing root is an outage (an unmounted or renamed target),
+%% and writing into a fresh directory in its place would ship files no restore
+%% of the real target will see.
+ensure_root(P) ->
+    Key = {?MODULE, target_seen, P},
+    case prim_file:read_file_info(P) of
+        {ok, #file_info{ type = directory }} ->
+            case persistent_term:get(Key, false) of
+                true -> ok;
+                false -> persistent_term:put(Key, true)
+            end;
+        {ok, _} -> {error, {target_not_a_directory, P}};
+        {error, enoent} ->
+            case persistent_term:get(Key, false) of
+                true -> {error, {target_missing, P}};
+                false ->
+                    ok = raw_ensure_dir(filename:join(P, "x")),
+                    persistent_term:put(Key, true)
+            end;
+        Err -> Err
+    end.
+
 job(Path, target_info) ->
     {target_info, dir_bytes(Path)};
 job(_Path, {mark_pruned, P, Seq}) ->
-    ok = raw_ensure_dir(filename:join(P, "x")),
+    ok = ensure_root(P),
     case put_file(filename:join(P, ?PRUNED_MARK), integer_to_binary(Seq)) of
         ok -> marked_pruned;
         Err -> {error, Err}
@@ -1197,11 +1220,11 @@ job(_Path, {mark_pruned, P, Seq}) ->
 job(_Path, {audit, P, OpenGaps}) ->
     {audited, audit(P, OpenGaps)};
 job(P, {ship, J, Segs, Cfg, Used}) ->
-    ok = raw_ensure_dir(filename:join(P, "x")),
+    ok = ensure_root(P),
     ok = ship_gaps(J, P),
     ship_segments(J, P, Segs, Cfg, Used);
 job(P, {base, Inner, Seq, Cfg, Used}) ->
-    ok = raw_ensure_dir(filename:join(P, "x")),
+    ok = ensure_root(P),
     case space_ok(P, Used + inner_bytes(Inner), Cfg) of
         ok ->
             {ok, Bytes, Maxes} = write_base(Inner, P, Seq),
@@ -2316,3 +2339,27 @@ export_dedupe_raw_between_equal_writes_test() ->
                        {write, #{ K => <<"0">> }}], #{}),
     ?assertEqual([{write, #{ K => <<"0">> }}, {raw, [{K, <<"1">>}]},
                   {write, #{ K => <<"0">> }}], Out).
+
+%% @doc A target root that disappears after first use is an outage: the
+%% worker does not recreate it (an empty directory in its place would receive
+%% segments the real target never sees); shipping resumes when it is back.
+export_missing_root_is_an_outage_test_() ->
+    {timeout, 120, fun() ->
+        application:ensure_all_started(hb),
+        Dir = export_test_dir("rootgone"),
+        Remote = Dir ++ "/remote",
+        Store = export_store(Dir, #{ <<"segment-ms">> => 50, <<"ship-interval-ms">> => 20 }),
+        Opts = #{ <<"store">> => [Store] },
+        ok = hb_store:start([Store], #{}, Opts),
+        P = hb_util:human_id(crypto:strong_rand_bytes(32)),
+        [ assign(Store, Opts, P, N) || N <- lists:seq(0, 4) ],
+        _ = sync_export(Store),
+        ok = file:rename(Remote, Remote ++ ".off"),
+        [ assign(Store, Opts, P, N) || N <- lists:seq(5, 9) ],
+        timer:sleep(500),
+        ?assertNot(filelib:is_dir(Remote)),
+        ok = file:rename(Remote ++ ".off", Remote),
+        _ = sync_export(Store),
+        {ok, R} = restore(Remote, restored(Dir, "r"), ?LAX),
+        ?assertEqual(10, maps:get(assignments, R))
+    end}.

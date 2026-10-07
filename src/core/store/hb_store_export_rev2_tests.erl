@@ -104,7 +104,10 @@ round_(Round) ->
                             4 -> case filelib:is_dir(Remote) andalso
                                           not filelib:is_file(Remote ++ ".off") of
                                      true -> ok = file:rename(Remote, Remote ++ ".off"),
-                                             ok = file:write_file(Remote, <<"down">>), outage;
+                                             case file:write_file(Remote, <<"down">>) of
+                                                 ok -> outage;
+                                                 Er -> erlang:error({harness_outage_failed, Er})
+                                             end;
                                      false -> none end;
                             5 -> up(Remote), up;
                             6 -> catch hb_store_export:shutdown_all(), clean_stop;
