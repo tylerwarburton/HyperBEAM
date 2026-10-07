@@ -1794,6 +1794,69 @@ http_post_schedule() ->
     ?assertEqual(<<"test-message">>, hb_ao:get(<<"body/inner">>, Res2, Opts)),
     ?assertMatch({ok, #{ <<"current">> := 1 }}, http_get_slot(N, PMsg)).
 
+%% Spawns as the `@runerealm/ao/spawn' client makes them: a `process@1.0'
+%% definition with a `module' sub-message, signed with httpsig and posted to
+%% `/~scheduler@1.0/schedule'. Reading `/<pid>/module/id' linked its result
+%% inside the module's cache group; the next spawn with a byte-identical module
+%% read the module back with that extra key, its signature no longer verified,
+%% and every such spawn failed (`process_not_verified', a 500). A module or tag
+%% with non-ASCII bytes must spawn too, and a tampered module must still fail.
+http_spawn_after_module_read_test_parallel_() ->
+    {timeout, 60, fun http_spawn_after_module_read/0}.
+http_spawn_after_module_read() ->
+    {Node, Opts} = http_init(),
+    Address =
+        hb_util:human_id(
+            ar_wallet:to_address(hb_opts:get(priv_wallet, no_wallet, Opts))
+        ),
+    Lua =
+        <<"-- spawn after read \xe2\x80\x94 ",
+            (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary, "\nx = 1\n">>,
+    Sign =
+        fun(Name, Body) ->
+            hb_message:commit(
+                #{
+                    <<"device">> => <<"process@1.0">>,
+                    <<"type">> => <<"Process">>,
+                    <<"scheduler-device">> => <<"scheduler@1.0">>,
+                    <<"execution-device">> => <<"lua@5.3a">>,
+                    <<"scheduler-location">> => Address,
+                    <<"authority">> => [Address],
+                    <<"name">> => Name,
+                    <<"module">> =>
+                        #{
+                            <<"content-type">> => <<"application/lua">>,
+                            <<"body">> => Body
+                        }
+                },
+                Opts,
+                <<"httpsig@1.0">>
+            )
+        end,
+    Post = fun(Proc) -> hb_http:post(Node, <<"/~scheduler@1.0/schedule">>, Proc, Opts) end,
+    Spawn = fun(Name, Body) -> Proc = Sign(Name, Body), {Proc, Post(Proc)} end,
+    {A, ResA} = Spawn(<<"a">>, Lua),
+    ?assertMatch({ok, _}, ResA),
+    ?assertMatch({ok, _}, element(2, Spawn(<<"b \xe2\x80\x94">>, Lua))),
+    AID = hb_message:id(A, all, Opts),
+    ?assertMatch(
+        {ok, ModID} when ?IS_ID(ModID),
+        hb_http:get(Node, <<"/", AID/binary, "/module/id">>, Opts)
+    ),
+    ?assertMatch({ok, _}, element(2, Spawn(<<"c">>, Lua))),
+    ?assertMatch({ok, _}, element(2, Spawn(<<"d">>, Lua))),
+    % A module changed after signing still fails.
+    E = hb_cache:ensure_all_loaded(Sign(<<"e">>, Lua), Opts),
+    Tampered =
+        E#{
+            <<"module">> =>
+                (maps:get(<<"module">>, E))#{
+                    <<"body">> => <<Lua/binary, "y = 2\n">>
+                }
+        },
+    ?assertNotMatch({ok, _}, Post(Tampered)),
+    ?assertMatch({ok, _}, Post(E)).
+
 http_get_schedule_test_parallel_() ->
 	{timeout, 20, fun() ->
 		{Node, Opts} = http_init(),

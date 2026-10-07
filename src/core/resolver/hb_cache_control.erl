@@ -153,16 +153,40 @@ perform_cache_write(Base, Req, Res, Opts) ->
     hb_cache:write(Req, Opts),
     case Res of
         <<_/binary>> ->
-            hb_cache:write_binary(
-                hb_path:hashpath(Base, Req, Opts),
-                Res,
-                Opts
-            );
+            write_binary_result(Base, Req, Res, Opts);
         Map when is_map(Map) ->
             hb_cache:write(Res, Opts);
         _ ->
             ?event({cannot_write_result, Res}),
             skip_caching
+    end.
+
+%% @doc Link a binary result at its hashpath, unless the base has no hashpath
+%% of its own. Such a base is addressed by its ID, and `ID/Key' is where the
+%% cache keeps the message's own keys: a result linked there (`GET /ID/id', or
+%% any request carrying extra keys, whose request ID becomes the key) becomes a
+%% key the message never had, and every later read of the message by its ID
+%% returns it. A committed sub-message read back that way no longer matches
+%% the signature over its parent, so e.g. every later spawn with the same
+%% `module' fails as `process_not_verified'. The base itself is written above,
+%% so its real keys stay readable at `ID/Key'.
+write_binary_result(Base, Req, Res, Opts) ->
+    BaseHashpath = hb_path:hashpath(Base, Opts),
+    case hb_path:term_to_path_parts(BaseHashpath, Opts) of
+        [_] ->
+            ?event(caching, {skip_store, {binary_result_on_message_id, BaseHashpath}}),
+            not_caching;
+        _ ->
+            hb_cache:write_binary(
+                hb_path:hashpath(
+                    BaseHashpath,
+                    Req,
+                    hb_path:hashpath_alg(Base, Opts),
+                    Opts
+                ),
+                Res,
+                Opts
+            )
     end.
 
 %% @doc Generate a message to return when `only_if_cached' was specified, and
@@ -456,4 +480,41 @@ process_cached_state_not_stored_test() ->
     ?assertEqual(
         not_caching,
         maybe_store(Cached, #{ <<"path">> => <<"count">> }, <<"1">>, Always)
+    ).
+
+%% A binary result computed on a message addressed by its ID (here `id', with
+%% and without extra request keys) is not linked inside the message's own
+%% group: a later read of the message by its ID has only its own keys.
+binary_result_not_linked_into_message_group_test() ->
+    Opts =
+        #{
+            <<"store">> => hb_test_utils:test_store(),
+            <<"cache-control">> => [<<"always">>]
+        },
+    Msg =
+        #{
+            <<"content-type">> => <<"application/lua">>,
+            <<"body">> => <<"x = 1">>
+        },
+    {ok, ID} = hb_cache:write(Msg, Opts),
+    {ok, _} = hb_ao:resolve(Msg, #{ <<"path">> => <<"id">> }, Opts),
+    {ok, _} =
+        hb_ao:resolve(
+            Msg,
+            #{ <<"path">> => <<"id">>, <<"accept">> => <<"*/*">> },
+            Opts
+        ),
+    {ok, Read} = hb_cache:read(ID, Opts),
+    ?assertEqual(Msg, hb_cache:ensure_all_loaded(Read, Opts)),
+    % A real key of the message is still served from the cache.
+    ?assertEqual(
+        {ok, <<"x = 1">>},
+        hb_ao:resolve(
+            Msg,
+            <<"body">>,
+            #{
+                <<"store">> => hb_opts:get(store, no_store, Opts),
+                <<"cache-control">> => [<<"only-if-cached">>]
+            }
+        )
     ).
