@@ -44,8 +44,25 @@
 %%%       writer stops journaling and schedules a resync.</li>
 %%%   <li>`max-pending' (100000): records queued to the writer above which new
 %%%       records are dropped (and a resync scheduled) rather than queued.</li>
-%%%   <li>`ship-interval-ms' (1000): how often the shipper looks for work.</li>
+%%%   <li>`ship-interval-ms' (1000): how often the shipper looks for work.
+%%%       A failed ship (any error: `eio', `etimedout', `estale' from a soft
+%%%       NFS mount, a full disk) is retried with exponential backoff up to 5
+%%%       minutes while the local backlog grows.</li>
+%%%   <li>`max-fill-pct' (75): never write to the target if that would take
+%%%       its filesystem above this fill. Other tenants of a shared mount have
+%%%       ceilings of their own (the AutoGrow backup push refuses above 85%).
+%%%       At the ceiling the export pauses -- the local backlog grows, nothing
+%%%       is lost -- emits `essentials_export_ceiling' events and reports
+%%%       `ceiling => true', and resumes by itself when space appears.</li>
+%%%   <li>`max-bytes' (none): a byte budget for everything this export keeps
+%%%       at the target, enforced the same way.</li>
 %%% </ul>
+%%%
+%%% The target only ever sees whole files written once: `seg-N.log' (a few MB,
+%%% `.tmp' + sync + rename), `base-N.log'/`.done', and `manifest.log', an
+%%% append-only list of every file shipped with its size and CRC, which
+%%% `restore/3' checks. No per-key file is ever created on the target: a
+%%% network mount pays a round trip per file operation.
 %%%
 %%% Metrics: `status/1' and the `essentials_export' event counters: queued and
 %%% dropped records, local backlog bytes and segments, the age of the oldest
@@ -53,6 +70,7 @@
 %%% resyncs.
 -module(hb_store_export).
 -export([wrap/2, status/1, restore/2, restore/3, sync_export/1, resync/1]).
+-export([space_ok/3, put_file/2, append_manifest/2, dir_bytes/1]).
 -export([start/3, stop/3, reset/3, scope/1]).
 -export([read/3, write/3, list/3, match/3, group/3, link/3, type/3,
          resolve/3, sync/3, delete/3]).
@@ -60,7 +78,9 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(DEFAULT_SEGMENT_BYTES, 8 * 1024 * 1024).
--define(DEFAULT_SEGMENT_MS, 5000).
+-define(DEFAULT_SEGMENT_MS, 60000).
+-define(DEFAULT_MAX_FILL_PCT, 75).
+-define(MAX_BACKOFF_MS, 300000).
 -define(DEFAULT_MAX_BACKLOG, 4 * 1024 * 1024 * 1024).
 -define(DEFAULT_MAX_PENDING, 100000).
 -define(DEFAULT_SHIP_MS, 1000).
@@ -245,7 +265,11 @@ init_state(Store, Counters) ->
         dropping => false,
         resync => FirstEver orelse ResyncFlag,
         shipper => undefined,
+        target_bytes => dir_bytes(Path),
+        ceiling => false,
+        next_try => 0,
         stats => #{ shipped_segments => 0, shipped_bytes => 0, errors => 0,
+                    consecutive_errors => 0, ceiling_hits => 0,
                     resyncs => 0, last_ship => undefined, last_error => undefined }
     },
     case S0 of
@@ -290,7 +314,8 @@ writer_loop(S) ->
             From ! {Ref, ok},
             writer_loop(S1);
         {call, From, Ref, sync_export} ->
-            S1 = wait_shipper(close_segment(drain_all(S))),
+            % An explicit request does not wait out a backoff.
+            S1 = wait_shipper(close_segment(drain_all(S#{ next_try => 0 }))),
             S2 = ship_now(S1),
             From ! {Ref, status_of(S2)},
             writer_loop(S2)
@@ -370,18 +395,24 @@ mark_resync(Journal) ->
 %% Ship closed segments in a helper process; when none are left and a resync
 %% is due, write the base image.
 maybe_ship(S = #{ shipper := Pid }) when is_pid(Pid) -> S;
-maybe_ship(S = #{ dropping := true }) ->
+maybe_ship(S = #{ next_try := Next }) ->
+    case erlang:system_time(millisecond) >= Next of
+        false -> S;
+        true -> do_maybe_ship(S)
+    end.
+
+do_maybe_ship(S = #{ dropping := true }) ->
     % Resume journaling once the backlog is gone, with a base to bridge the gap.
     case closed_segments(S) of
         [] -> start_ship(S#{ dropping => false }, base);
         _ -> start_ship(S, segments)
     end;
-maybe_ship(S = #{ resync := true }) ->
+do_maybe_ship(S = #{ resync := true }) ->
     case closed_segments(S) of
         [] -> start_ship(S, base);
         _ -> start_ship(S, segments)
     end;
-maybe_ship(S) ->
+do_maybe_ship(S) ->
     case closed_segments(S) of
         [] -> S;
         _ -> start_ship(S, segments)
@@ -389,9 +420,10 @@ maybe_ship(S) ->
 
 ship_now(S) ->
     Errors = maps:get(errors, maps:get(stats, S)),
-    S1 = wait_shipper(maybe_ship(S)),
+    S1 = wait_shipper(maybe_ship(S#{ next_try => 0 })),
     Pending = closed_segments(S1) =/= [] orelse maps:get(resync, S1),
-    case Pending andalso maps:get(errors, maps:get(stats, S1)) == Errors of
+    case Pending andalso not maps:get(ceiling, S1)
+            andalso maps:get(errors, maps:get(stats, S1)) == Errors of
         true -> ship_now(S1);
         false -> S1
     end.
@@ -405,9 +437,26 @@ wait_shipper(S = #{ shipper := Pid }) ->
     end.
 
 start_ship(S = #{ journal := J, path := P }, What) ->
-    Self = self(),
-    Segs = closed_segments(S),
+    Segs0 = closed_segments(S),
     Inner = maps:get(inner, S),
+    Need =
+        case What of
+            segments -> segment_bytes(J, Segs0);
+            base -> inner_bytes(Inner)
+        end,
+    case space_ok(P, Need + maps:get(target_bytes, S), export_cfg(S)) of
+        ok -> do_start_ship(at_ceiling(S, false, ok), What, Segs0, Inner);
+        {ceiling, _} = Why when What == segments ->
+            % Ship the oldest segments that fit, if any do.
+            case fitting(J, P, Segs0, S) of
+                [] -> at_ceiling(S, true, Why);
+                Fit -> do_start_ship(at_ceiling(S, true, Why), What, Fit, Inner)
+            end;
+        Why -> at_ceiling(S, true, Why)
+    end.
+
+do_start_ship(S = #{ journal := J, path := P }, What, Segs, Inner) ->
+    Self = self(),
     BaseSeq = maps:get(seq, S),
     % A base is numbered with the segment the writer opens next, so every
     % write it might miss is in a segment numbered at or above it.
@@ -427,26 +476,156 @@ start_ship(S = #{ journal := J, path := P }, What) ->
     S1#{ shipper => Pid }.
 
 shipped(S, Result) ->
-    S1 = S#{ shipper => undefined },
+    S0 = S#{ shipper => undefined },
+    St0 = maps:get(stats, S0),
+    S1 =
+        case Result of
+            {_, {error, _}} -> S0;
+            {error, _} -> S0;
+            _ -> S0#{ next_try => 0, stats => St0#{ consecutive_errors => 0 } }
+        end,
     case Result of
         {segments, {ok, N, Bytes}} ->
             St = maps:get(stats, S1),
             S1#{ backlog => max(0, maps:get(backlog, S1) - Bytes),
+                 target_bytes => maps:get(target_bytes, S1) + Bytes,
                  stats => St#{
                 shipped_segments => maps:get(shipped_segments, St) + N,
                 shipped_bytes => maps:get(shipped_bytes, St) + Bytes,
                 last_ship => os:system_time(millisecond) } };
-        {base, ok} ->
+        {base, {ok, BaseBytes}} ->
             _ = file:delete(filename:join(maps:get(journal, S1), "resync-needed")),
-            bump_stat(S1#{ resync => false }, resyncs);
+            bump_stat(S1#{ resync => false,
+                           target_bytes => maps:get(target_bytes, S1) + BaseBytes }, resyncs);
         {_, {error, Reason}} -> ship_error(S1, Reason);
         {error, Reason} -> ship_error(S1, Reason)
     end.
 
+%% Any failure is retried, with exponential backoff, while the backlog grows.
 ship_error(S, Reason) ->
     ?event(warning, {essentials_export_ship_failed, Reason}),
     St = maps:get(stats, S),
-    S#{ stats => St#{ errors => maps:get(errors, St) + 1, last_error => Reason } }.
+    N = maps:get(consecutive_errors, St) + 1,
+    Base = cfg(maps:get(store, S), <<"ship-interval-ms">>, ?DEFAULT_SHIP_MS),
+    Delay = min(?MAX_BACKOFF_MS, Base bsl min(N, 20)),
+    S#{ next_try => erlang:system_time(millisecond) + Delay,
+        stats => St#{ errors => maps:get(errors, St) + 1, last_error => Reason,
+                      consecutive_errors => N } }.
+
+%% Enter or leave the fill ceiling, loudly on each transition.
+at_ceiling(S = #{ ceiling := Was }, Now, Why) ->
+    case {Was, Now} of
+        {false, true} ->
+            ?event(warning, {essentials_export_ceiling, paused, Why}),
+            St = maps:get(stats, S),
+            S#{ ceiling => true, stats => St#{ ceiling_hits => maps:get(ceiling_hits, St) + 1 } };
+        {true, false} ->
+            ?event(warning, {essentials_export_ceiling, resumed}),
+            S#{ ceiling => false };
+        _ -> S
+    end.
+
+export_cfg(#{ store := Store }) -> maps:get(<<"export">>, Store, #{}).
+
+segment_bytes(J, Segs) -> lists:sum([ filelib:file_size(seg_file(J, Q)) || Q <- Segs ]).
+
+inner_bytes(#{ <<"name">> := Name }) ->
+    filelib:file_size(filename:join(hb_util:list(Name), "data.mdb"));
+inner_bytes(_) -> 0.
+
+%% The oldest closed segments whose total still fits under the limits.
+fitting(J, P, Segs, S) ->
+    {Fit, _} =
+        lists:foldl(
+            fun(Q, {Acc, Used}) ->
+                Size = filelib:file_size(seg_file(J, Q)),
+                case Acc =/= stop andalso
+                        space_ok(P, Used + Size, export_cfg(S)) == ok of
+                    true -> {[Q | Acc], Used + Size};
+                    false -> {stop, Used}
+                end
+            end,
+            {[], maps:get(target_bytes, S)},
+            Segs
+        ),
+    case Fit of stop -> []; _ -> lists:reverse(Fit) end.
+
+%% @doc May `Path' take more data so that this exporter's files total `Bytes'?
+%% Checks the byte budget (`max-bytes') against `Bytes', and the filesystem
+%% fill (`max-fill-pct', default 75) after the new bytes would land.
+%% `stat-fun' (a fun of the path returning `{TotalBytes, AvailBytes}')
+%% replaces `df' -- for tests, and for filesystems `df' cannot read.
+space_ok(Path, Bytes, Cfg) ->
+    Budget = maps:get(<<"max-bytes">>, Cfg, undefined),
+    MaxPct = maps:get(<<"max-fill-pct">>, Cfg, ?DEFAULT_MAX_FILL_PCT),
+    case is_integer(Budget) andalso Bytes > Budget of
+        true -> {ceiling, {budget, Bytes, Budget}};
+        false ->
+            case fs_stat(Path, Cfg) of
+                {Total, Avail} when is_integer(Total), Total > 0 ->
+                    Used = Total - Avail,
+                    % The new bytes are the part of `Bytes' not yet written:
+                    % callers pass totals, so charge the worst case of all.
+                    Pct = (Used * 100) div Total,
+                    case Pct >= MaxPct of
+                        true -> {ceiling, {fill, Pct, MaxPct}};
+                        false -> ok
+                    end;
+                _ -> ok
+            end
+    end.
+
+fs_stat(Path, Cfg) ->
+    case maps:get(<<"stat-fun">>, Cfg, undefined) of
+        F when is_function(F, 1) -> F(Path);
+        _ ->
+            Dir = existing_parent(hb_util:list(Path)),
+            try
+                Out = os:cmd("df -Pk '" ++ Dir ++ "' 2>/dev/null"),
+                case string:tokens(Out, "\n") of
+                    [_Header, Line | _] ->
+                        case string:tokens(Line, " ") of
+                            [_FS, Total, _Used, Avail | _] ->
+                                {list_to_integer(Total) * 1024, list_to_integer(Avail) * 1024};
+                            _ -> unknown
+                        end;
+                    _ -> unknown
+                end
+            catch _:_ -> unknown
+            end
+    end.
+
+existing_parent(Dir) ->
+    case filelib:is_dir(Dir) of
+        true -> Dir;
+        false ->
+            case filename:dirname(Dir) of
+                Dir -> Dir;
+                Parent -> existing_parent(Parent)
+            end
+    end.
+
+%% @doc Total size of the files directly in `Dir' (one listing, one stat each:
+%% done once, at start, since every file operation on a network mount costs a
+%% round trip).
+dir_bytes(undefined) -> 0;
+dir_bytes(Dir) ->
+    case file:list_dir(Dir) of
+        {ok, Names} -> lists:sum([ max(0, filelib:file_size(filename:join(Dir, N))) || N <- Names ]);
+        _ -> 0
+    end.
+
+%% @doc Append one framed `{File, Bytes, Crc32}' record to `Dir/manifest.log'
+%% and sync it.
+append_manifest(Dir, Entry) ->
+    File = filename:join(Dir, "manifest.log"),
+    case file:open(File, [append, raw, binary]) of
+        {ok, Fd} ->
+            Res = case file:write(Fd, frame(Entry)) of ok -> file:sync(Fd); E -> E end,
+            _ = file:close(Fd),
+            Res;
+        Err -> Err
+    end.
 
 bump_stat(S, K) ->
     St = maps:get(stats, S),
@@ -461,10 +640,15 @@ ship_segments(J, P, Segs) ->
                 Src = seg_file(J, Seq),
                 case file:read_file(Src) of
                     {ok, Bin} ->
-                        case put_file(filename:join(P, seg_name(Seq)), Bin) of
+                        Name = seg_name(Seq),
+                        case put_file(filename:join(P, Name), Bin) of
                             ok ->
-                                ok = file:delete(Src),
-                                {ok, N + 1, B + byte_size(Bin)};
+                                case append_manifest(P, {Name, byte_size(Bin), erlang:crc32(Bin)}) of
+                                    ok ->
+                                        ok = file:delete(Src),
+                                        {ok, N + 1, B + byte_size(Bin)};
+                                    Err -> Err
+                                end;
                             Err -> Err
                         end;
                     Err -> Err
@@ -476,7 +660,8 @@ ship_segments(J, P, Segs) ->
     ).
 
 %% Write a file durably and atomically: temp file, sync, rename.
-put_file(Dst, Bin) ->
+put_file(RawDst, Bin) ->
+    Dst = hb_util:list(RawDst),
     Tmp = Dst ++ ".tmp",
     case file:open(Tmp, [write, raw, binary]) of
         {ok, Fd} ->
@@ -515,7 +700,10 @@ write_base(Inner = #{ <<"store-module">> := hb_store_lmdb }, P, Seq) ->
     {ok, Fd2} = file:open(Name ++ ".tmp", [read, raw]),
     ok = file:sync(Fd2), ok = file:close(Fd2),
     ok = file:rename(Name ++ ".tmp", Name),
-    file:write_file(filename:join(P, "base-" ++ seq_str(Seq) ++ ".done"), <<>>);
+    {ok, Bin} = file:read_file(Name),
+    ok = append_manifest(P, {filename:basename(Name), byte_size(Bin), erlang:crc32(Bin)}),
+    ok = file:write_file(filename:join(P, "base-" ++ seq_str(Seq) ++ ".done"), <<>>),
+    {ok, byte_size(Bin)};
 write_base(Inner, _P, _Seq) ->
     {error, {base_needs_lmdb_inner, Inner}}.
 
@@ -540,6 +728,8 @@ status_of(S) ->
         local_segments => length(Segs),
         lag_ms => Oldest,
         dropping => maps:get(dropping, S),
+        ceiling => maps:get(ceiling, S),
+        target_bytes => maps:get(target_bytes, S),
         resync_pending => maps:get(resync, S),
         next_segment => maps:get(seq, S),
         shipping => maps:get(shipper, S) =/= undefined
@@ -612,7 +802,37 @@ contiguous(_, _) -> false.
 
 apply_file(File, Target, Opts) ->
     {ok, Bin} = file:read_file(File),
+    ok = check_manifest(File, Bin),
     apply_records(Bin, Target, Opts, 0).
+
+%% A file listed in the manifest must have the size and CRC recorded there.
+check_manifest(File, Bin) ->
+    Dir = filename:dirname(File),
+    Name = filename:basename(File),
+    case file:read_file(filename:join(Dir, "manifest.log")) of
+        {ok, M} ->
+            Entries = [ E || E = {N, _, _} <- manifest_entries(M, []), N == Name ],
+            case Entries of
+                [] -> ok;
+                _ ->
+                    case lists:last(Entries) of
+                        {_, Size, Crc} when Size == byte_size(Bin) ->
+                            case erlang:crc32(Bin) of
+                                Crc -> ok;
+                                _ -> erlang:error({export_file_corrupt, Name})
+                            end;
+                        _ -> erlang:error({export_file_size_mismatch, Name})
+                    end
+            end;
+        _ -> ok
+    end.
+
+manifest_entries(<<Len:32, Crc:32, Bin:Len/binary, Rest/binary>>, Acc) ->
+    case erlang:crc32(Bin) of
+        Crc -> manifest_entries(Rest, [binary_to_term(Bin) | Acc]);
+        _ -> lists:reverse(Acc)
+    end;
+manifest_entries(_, Acc) -> lists:reverse(Acc).
 
 apply_records(<<Len:32, Crc:32, Bin:Len/binary, Rest/binary>>, Target, Opts, N) ->
     case erlang:crc32(Bin) of
@@ -724,4 +944,98 @@ export_survives_unreachable_target_test_() ->
             end,
             Res
         )
+    end}.
+
+%% @doc At the fill ceiling (here a mocked filesystem at 80% against the
+%% default 75%) nothing is shipped and nothing is lost: the backlog grows, the
+%% status says so, and when space appears the export resumes by itself and a
+%% restore is complete. A byte budget is enforced the same way.
+export_pauses_at_fill_ceiling_test_() ->
+    {timeout, 120, fun() ->
+        application:ensure_all_started(hb),
+        Dir = export_test_dir("ceiling"),
+        Key = {?MODULE, fill, Dir},
+        persistent_term:put(Key, {1000, 200}),
+        Stat = fun(_Path) -> persistent_term:get(Key) end,
+        Store = export_store(Dir, #{ <<"segment-ms">> => 50,
+                                     <<"ship-interval-ms">> => 50,
+                                     <<"stat-fun">> => Stat }),
+        Opts = #{ <<"store">> => [Store], <<"priv-wallet">> => ar_wallet:new() },
+        ok = hb_store:start([Store], #{}, Opts),
+        IDs = [ begin {ok, ID} = hb_cache:write(#{ <<"n">> => integer_to_binary(N),
+                    <<"data">> => crypto:strong_rand_bytes(300) }, Opts), ID end
+              || N <- lists:seq(1, 100) ],
+        timer:sleep(500),
+        St1 = sync_export(Store),
+        ?assert(maps:get(ceiling, St1)),
+        ?assert(maps:get(ceiling_hits, St1) >= 1),
+        ?assertEqual(0, maps:get(shipped_segments, St1)),
+        ?assert(maps:get(local_backlog_bytes, St1) > 0),
+        ?assertEqual(0, maps:get(dropped_records, St1)),
+        ?assertNot(filelib:is_file(Dir ++ "/remote/manifest.log")),
+        % Space appears: the export resumes without being asked.
+        persistent_term:put(Key, {1000, 900}),
+        ?assert(hb_util:wait_until(fun() -> not maps:get(ceiling, status(Store)) andalso
+                                         maps:get(local_segments, status(Store)) == 0 end, 10000)),
+        St2 = sync_export(Store),
+        ?assert(maps:get(shipped_segments, St2) >= 1),
+        Target = #{ <<"store-module">> => hb_store_lmdb,
+                    <<"name">> => hb_util:bin(Dir ++ "/restored") },
+        {ok, _} = restore(Dir ++ "/remote", Target, Opts),
+        TOpts = Opts#{ <<"store">> => [Target] },
+        [ ?assertMatch({ok, _}, hb_cache:read(ID, TOpts)) || ID <- IDs ],
+        % A byte budget already exceeded pauses it again.
+        ?assertMatch({ceiling, {budget, _, 10}},
+            space_ok(Dir ++ "/remote", 11, #{ <<"max-bytes">> => 10, <<"stat-fun">> => Stat })),
+        ?assertMatch({ceiling, {fill, 80, 75}},
+            space_ok("x", 0, #{ <<"stat-fun">> => fun(_) -> {100, 20} end })),
+        ?assertEqual(ok, space_ok("x", 0, #{ <<"stat-fun">> => fun(_) -> {100, 26} end }))
+    end}.
+
+
+%% @doc Integration against a real (network) mount: `HB_EXPORT_REAL_DIR=<dir>'.
+%% Writes `HB_EXPORT_REAL_N' messages, ships them as a few MB-sized segments,
+%% restores from the mount, verifies every message, and prints the timings.
+export_real_mount_test_() ->
+    {timeout, 1800, fun() ->
+        case os:getenv("HB_EXPORT_REAL_DIR") of
+            false -> ok;
+            Real ->
+                application:ensure_all_started(hb),
+                N = list_to_integer(os:getenv("HB_EXPORT_REAL_N", "3000")),
+                Local = export_test_dir("real"),
+                Inner = #{ <<"store-module">> => hb_store_lmdb,
+                           <<"name">> => hb_util:bin(Local ++ "/lmdb") },
+                Store = wrap(Inner, #{ <<"path">> => hb_util:bin(Real ++ "/essentials"),
+                                       <<"journal">> => hb_util:bin(Local ++ "/journal"),
+                                       <<"segment-bytes">> => 2 * 1024 * 1024,
+                                       <<"segment-ms">> => 3600000 }),
+                Opts = #{ <<"store">> => [Store], <<"priv-wallet">> => ar_wallet:new() },
+                ok = hb_store:start([Store], #{}, Opts),
+                {WriteUs, IDs} =
+                    timer:tc(fun() ->
+                        [ begin
+                            {ok, ID} = hb_cache:write(#{ <<"n">> => integer_to_binary(I),
+                                <<"data">> => hb_util:encode(crypto:strong_rand_bytes(1500)) }, Opts),
+                            ID
+                          end
+                        || I <- lists:seq(1, N) ]
+                    end),
+                {SyncUs, St} = timer:tc(fun() -> sync_export(Store) end),
+                Target = #{ <<"store-module">> => hb_store_lmdb,
+                            <<"name">> => hb_util:bin(Local ++ "/restored") },
+                {RestoreUs, {ok, R}} = timer:tc(fun() -> restore(Real ++ "/essentials", Target, Opts) end),
+                TOpts = Opts#{ <<"store">> => [Target] },
+                Bad = [ ID || ID <- IDs,
+                              hb_cache:ensure_all_loaded(element(2, hb_cache:read(ID, Opts)), Opts) =/=
+                              hb_cache:ensure_all_loaded(element(2, hb_cache:read(ID, TOpts)), TOpts) ],
+                ?assertEqual([], Bad),
+                {ok, Files} = file:list_dir(Real ++ "/essentials"),
+                io:format(user,
+                    "~nEXPORT_REAL messages=~p write_ms=~p ship_ms=~p restore_ms=~p "
+                    "shipped_bytes=~p segments=~p files=~p restore=~0p ceiling=~p errors=~p~n",
+                    [N, WriteUs div 1000, SyncUs div 1000, RestoreUs div 1000,
+                     maps:get(shipped_bytes, St), maps:get(shipped_segments, St),
+                     length(Files), R, maps:get(ceiling, St), maps:get(errors, St)])
+        end
     end}.

@@ -450,6 +450,45 @@ orphan_retention_keeps_what_is_used_test_() ->
         _ = run_slots(Process, Next, 6, Opts)
     end}.
 
+%% @doc Sparse checkpoints go to the archive before retention deletes them
+%% locally; an archived one restores (offline) and reads back. At the fill
+%% ceiling nothing is archived and the checkpoints stay local.
+retention_archives_sparse_checkpoints_test_() ->
+    {timeout, 300, fun() ->
+        Dir = "cache-TEST/archive-" ++ integer_to_list(erlang:unique_integer([positive])),
+        Full = fun(_) -> {1000, 100} end,
+        Free = fun(_) -> {1000, 900} end,
+        Run =
+            fun(Stat) ->
+                Opts = node_opts(#{ <<"store-retention-archive">> =>
+                                        #{ <<"path">> => hb_util:bin(Dir ++ "/" ++ pid_to_list(self()) ++ atom_to_list(element(2, erlang:fun_info(Stat, name)))),
+                                           <<"every">> => 10,
+                                           <<"stat-fun">> => Stat } }),
+                Process = new_process(Opts),
+                _ = run_slots(Process, 0, 42, Opts),
+                _ = hb_store_gc:retain(Opts),
+                {Opts, Process}
+            end,
+        {OptsF, ProcF} = Run(Full),
+        KeptF = computed_slots(ProcF, OptsF),
+        % At the ceiling: the selected checkpoints were not dropped.
+        ?assert(lists:member(0, KeptF) andalso lists:member(10, KeptF) andalso lists:member(20, KeptF)),
+        {Opts, Process} = Run(Free),
+        Kept = computed_slots(Process, Opts),
+        ?assertNot(lists:member(10, Kept)),
+        #{ <<"path">> := Path } = hb_opts:get(<<"store-retention-archive">>, x, Opts),
+        P = proc_id(Process, Opts),
+        File = filename:join([hb_util:list(Path), P, "10.ckpt"]),
+        ?assert(filelib:is_file(File)),
+        ?assert(filelib:is_file(filename:join(hb_util:list(Path), "manifest.log"))),
+        [Store | _] = hb_opts:get(<<"store">>, [], Opts),
+        {ok, #{ slot := 10 }} = hb_store_gc:restore_checkpoint(File, Opts#{ <<"store">> => [Store] }),
+        clear_process_caches(),
+        ?assert(lists:member(10, computed_slots(Process, Opts))),
+        {Count, _, _} = state_digest(Process, 10, Opts),
+        ?assertEqual(<<"11">>, Count)
+    end}.
+
 %% @doc With an essentials store, the essentials of a node that kept everything
 %% in one store are copied over by `migrate/3' and verified byte-for-byte.
 essentials_migration_verifies_test_() ->

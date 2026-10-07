@@ -69,7 +69,8 @@
 -export([assignment_timestamp_probe/3]).
 -export([retain/1, maybe_start_retention/1, start_retention/1, stop_retention/0,
          run_retention/1, retention_status/0, retain_plan/3,
-         copy_essential_namespaces/3, forget_process_cache/3]).
+         copy_essential_namespaces/3, forget_process_cache/3,
+         restore_checkpoint/2]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -1633,7 +1634,11 @@ retain_plan(Ctx, P, Acc) ->
                     W = lower_to_full_state(Slots, Raw, Policy, Classify),
                     Below = [ S || S <- Slots, S < W ],
                     Sparse = sparse_keep(Below, maps:get(sparse, Policy), Classify),
-                    Drop = [ S || S <- Below, not lists:member(S, Sparse) ],
+                    % Sparse checkpoints may instead go to the archive: kept
+                    % locally only until archiving succeeds.
+                    NotArchived = archive_checkpoints(Ctx, P, Below, Classify),
+                    Drop = [ S || S <- Below, not lists:member(S, Sparse),
+                                  not lists:member(S, NotArchived) ],
                     KeepSlots = (Slots -- Drop),
                     KeepRoots = [ R || S <- KeepSlots, R <- [deref(Ctx, computed_path(P, S))],
                                        R =/= not_found ],
@@ -1667,6 +1672,143 @@ sparse_keep(Below, M, Classify) ->
             end
         end,
         maps:values(Buckets)).
+
+%%% Checkpoint archive (optional): one checkpoint per process every `every'
+%%% slots, exported before retention deletes it locally.
+%%%
+%%% `store-retention-archive' = `#{ path, every, max-fill-pct, max-bytes }'.
+%%% Each archived checkpoint is one file, `<path>/<ProcID>/<Slot>.ckpt': the raw
+%%% rows of its whole closure (state, VM snapshot, every blob it reaches), so it
+%%% restores on its own. Written once (`.tmp', sync, rename) and listed in
+%%% `<path>/manifest.log' with its size and CRC. The same fill ceiling and byte
+%%% budget as the essentials export apply. Until a checkpoint is archived it is
+%%% simply not dropped, so a slow or full target costs local space, never the
+%%% checkpoint. Restoring is an offline tool for now: `restore_checkpoint/2'
+%%% writes the rows and the slot's two aliases back into a store, after which
+%%% `dev_process' can rewind to it (with retention off, or before the next run
+%%% drops it again).
+
+archive_cfg(Ctx) ->
+    case hb_opts:get(<<"store-retention-archive">>, undefined, maps:get(node_opts, Ctx)) of
+        Cfg = #{ <<"path">> := _, <<"every">> := _ } -> Cfg;
+        _ -> undefined
+    end.
+
+%% @doc Archive the selected checkpoints below the window; return the selected
+%% slots that are NOT archived (and so must be kept this run).
+archive_checkpoints(Ctx, P, Below, Classify) ->
+    case archive_cfg(Ctx) of
+        undefined -> [];
+        Cfg ->
+            Every = hb_util:int(maps:get(<<"every">>, Cfg)),
+            Selected = sparse_keep(Below, Every, Classify),
+            [ S || S <- Selected, archive_checkpoint(Ctx, Cfg, P, S) =/= ok ]
+    end.
+
+archive_checkpoint(Ctx, Cfg, P, Slot) ->
+    Path = hb_util:list(maps:get(<<"path">>, Cfg)),
+    Name = filename:join(hb_util:list(P), integer_to_list(Slot) ++ ".ckpt"),
+    File = filename:join(Path, Name),
+    case filelib:is_file(File) of
+        true -> ok;
+        false ->
+            try
+                Root = deref(Ctx, computed_path(P, Slot)),
+                Rows = archive_rows(Ctx, Root),
+                Bin = iolist_to_binary(
+                    [ archive_frame({checkpoint, #{ process => P, slot => Slot, root => Root }})
+                    | [ archive_frame({raw, R}) || R <- chunks(Rows, 2000) ] ]),
+                Used = archive_used(Path),
+                case hb_store_export:space_ok(Path, Used + byte_size(Bin), Cfg) of
+                    ok ->
+                        ok = filelib:ensure_dir(File),
+                        ok = hb_store_export:put_file(File, Bin),
+                        ok = hb_store_export:append_manifest(Path,
+                                {Name, byte_size(Bin), erlang:crc32(Bin)}),
+                        ?event(store_retention, {checkpoint_archived, P, Slot, byte_size(Bin)}),
+                        ok;
+                    Ceiling ->
+                        ?event(warning, {retention_archive_ceiling, Ceiling}),
+                        Ceiling
+                end
+            catch C:R ->
+                ?event(warning, {retention_archive_failed, P, Slot, C, R}),
+                {error, {C, R}}
+            end
+    end.
+
+archive_frame(Term) ->
+    Bin = term_to_binary(Term),
+    <<(byte_size(Bin)):32, (erlang:crc32(Bin)):32, Bin/binary>>.
+
+%% Bytes this archive already holds, from its manifest.
+archive_used(Path) ->
+    case file:read_file(filename:join(Path, "manifest.log")) of
+        {ok, M} -> lists:sum([ B || {_, B, _} <- unframe(M, []) ]);
+        _ -> 0
+    end.
+
+unframe(<<Len:32, Crc:32, Bin:Len/binary, Rest/binary>>, Acc) ->
+    case erlang:crc32(Bin) of
+        Crc -> unframe(Rest, [binary_to_term(Bin) | Acc]);
+        _ -> lists:reverse(Acc)
+    end;
+unframe(_, Acc) -> lists:reverse(Acc).
+
+%% Every raw row of a root's closure: its subtree, `link:' targets and `+link'
+%% messages, following content units only.
+archive_rows(Ctx, Root) ->
+    archive_rows(Ctx, [Root], #{}, []).
+archive_rows(_Ctx, [], _Seen, Acc) -> Acc;
+archive_rows(Ctx, [K | Rest], Seen, Acc) ->
+    case maps:is_key(K, Seen) orelse not content_key(K) of
+        true -> archive_rows(Ctx, Rest, Seen, Acc);
+        false ->
+            Seen1 = Seen#{ K => true },
+            Rows =
+                case raw_get(Ctx, K) of
+                    {ok, <<"group">>} ->
+                        case raw_subtree(Ctx, K) of {ok, Rs} -> Rs; _ -> [] end;
+                    {ok, V} -> [{K, V}];
+                    not_found -> []
+                end,
+            Next =
+                lists:flatmap(
+                    fun({RK, RV}) ->
+                        Links = case RV of
+                                    <<"link:", T/binary>> when byte_size(T) > 0 -> [T];
+                                    _ -> []
+                                end,
+                        Ids = case hb_link:is_link_key(RK) of
+                                  true ->
+                                      case read_value(Ctx, RV) of
+                                          {ok, ID} when byte_size(ID) == 43 -> [ID];
+                                          _ -> []
+                                      end;
+                                  false -> []
+                              end,
+                        Links ++ Ids
+                    end,
+                    Rows),
+            archive_rows(Ctx, Next ++ Rest, Seen1, Rows ++ Acc)
+    end.
+
+%% @doc Write an archived checkpoint back into the (sole) store of `Opts': its
+%% rows and the `computed/<P>/slot/<N>' and `computed/<P>/<Root>' aliases.
+restore_checkpoint(File, Opts) ->
+    {ok, Bin} = file:read_file(File),
+    [{checkpoint, #{ process := P, slot := Slot, root := Root }} | Rest] = unframe(Bin, []),
+    Store = sole_store(Opts),
+    ok = hb_store:start([Store], #{}, Opts),
+    lists:foreach(
+        fun({raw, Rows}) -> ok = hb_store:write([Store], maps:from_list(Rows), Opts) end,
+        Rest),
+    ok = hb_store:link([Store],
+            #{ computed_path(P, Slot) => Root,
+               <<"computed/", P/binary, "/", Root/binary>> => Root }, Opts),
+    ok = hb_store:sync([Store], #{}, Opts),
+    {ok, #{ process => P, slot => Slot, root => Root,
+            rows => lists:sum([ length(R) || {raw, R} <- Rest ]) }}.
 
 %%% Candidate chunks: dropped slots accumulate across processes until
 %%% `store-retention-batch-slots' is reached, then one protection scan serves
