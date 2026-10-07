@@ -991,3 +991,180 @@ essentials_size_report_test_() ->
                 io:format(user, "ESS_SIZE by_kind ~p~n", [ByKind])
         end
     end}.
+
+%%% Essentials retention (`essentials-retention-days').
+
+ess_node(Tag, Extra) ->
+    Ess = hb_test_utils:test_store(hb_store_lmdb, Tag),
+    Opts0 = node_opts(Extra),
+    Opts1 = Opts0#{ <<"essentials-store">> => Ess },
+    Opts = Opts1#{ <<"store">> => hb_store_essentials:node_store(Opts1) },
+    [EssStore | _] = hb_store_essentials:store(Opts),
+    ok = hb_store:start([EssStore], #{}, Opts),
+    Inner = case EssStore of #{ <<"inner">> := I } -> I; _ -> EssStore end,
+    #{ <<"db">> := EssDB } = hb_store:find(Inner),
+    {Opts, EssStore, EssDB}.
+
+ess_slots(EssDB, P) ->
+    ok = elmdb:flush(EssDB),
+    case elmdb:list(EssDB, <<"~scheduler@1.0/assignments/", P/binary, "/">>) of
+        {ok, L} -> lists:sort([ binary_to_integer(S) || S <- L ]);
+        _ -> []
+    end.
+
+%% The lowest checkpoint the main store keeps for a process.
+oldest_kept_checkpoint(Process, Opts) ->
+    hd([ S || S <- computed_slots(Process, Opts),
+              hb_store_gc:classify_slot(#{ src_db => main_db(Opts) }, proc_id(Process, Opts), S)
+                  == checkpoint ]).
+
+%% @doc Old assignments go; the ones a process needs from its oldest kept
+%% checkpoint stay (even though they too are older than the cutoff); recent
+%% assignments are untouched by a longer retention; the definition, a small
+%% namespace, and content a kept row shares with a pruned assignment survive;
+%% a cold node resumes and computes on.
+essentials_retention_prunes_old_assignments_test_() ->
+    {timeout, 300, fun() ->
+        {Opts, _Ess, EssDB} = ess_node(<<"ess-ret">>, #{}),
+        Process = lua_process(Opts),
+        Next = run_slots(Process, 0, 23, Opts),
+        P = proc_id(Process, Opts),
+        Loc = <<"~location@1.0/", P/binary>>,
+        ok = elmdb:put(EssDB, Loc, <<"here">>),
+        {ok, <<"link:", Root1/binary>>} =
+            elmdb:get(EssDB, <<"~scheduler@1.0/assignments/", P/binary, "/1">>),
+        ok = elmdb:put(EssDB, <<"~other@1.0/keeps">>, <<"link:", Root1/binary>>),
+        Before = assignments(Process, Opts),
+        % A week of retention: everything is younger, nothing goes.
+        R1 = hb_store_gc:retain(Opts#{ <<"essentials-retention-days">> => 7 }),
+        ?assertMatch(#{ pruned_assignments := 0 }, maps:get(essentials, R1)),
+        ?assertEqual(lists:seq(0, Next - 1), ess_slots(EssDB, P)),
+        % Zero days: everything is older than the cutoff.
+        R2 = hb_store_gc:retain(Opts#{ <<"essentials-retention-days">> => 0 }),
+        Need = oldest_kept_checkpoint(Process, Opts),
+        ?assert(Need > 0),
+        ?assertMatch(#{ status := ok }, maps:get(essentials, R2)),
+        ?assertEqual(Need, maps:get(pruned_assignments, maps:get(essentials, R2))),
+        ?assert(maps:get(deleted_keys, maps:get(essentials, R2)) > Need),
+        ?assertEqual(lists:seq(Need, Next - 1), ess_slots(EssDB, P)),
+        % What stays is byte-identical.
+        ?assertEqual([ A || A = {S, _} <- Before, S >= Need ], assignments(Process, Opts)),
+        % The definition (with its module blob), the small namespace, and a
+        % pruned assignment's message another row references are intact.
+        EssOpts = Opts#{ <<"store">> => [hd(hb_store_essentials:store(Opts))] },
+        ?assertMatch(#{ <<"module">> := #{} },
+                     hb_cache:ensure_all_loaded(hb_util:ok(hb_cache:read(P, EssOpts)), EssOpts)),
+        ?assertEqual({ok, <<"here">>}, elmdb:get(EssDB, Loc)),
+        ?assertMatch(#{}, hb_cache:ensure_all_loaded(
+                              hb_util:ok(hb_cache:read(<<"~other@1.0/keeps">>, EssOpts)), EssOpts)),
+        % Cold resume: caches gone, main store reopened; compute on.
+        [Main | _] = hb_opts:get(<<"store">>, [], Opts),
+        ok = hb_store:stop([Main], #{}, Opts),
+        clear_process_caches(),
+        [ ?assertEqual(integer_to_binary(S + 1), element(1, state_digest(Process, S, Opts)))
+        || S <- computed_slots(Process, Opts) ],
+        _ = run_slots(Process, Next, 6, Opts),
+        % A second run has nothing more to take below the (moved) window
+        % than what the new checkpoint frees.
+        R3 = hb_store_gc:retain(Opts#{ <<"essentials-retention-days">> => 0 }),
+        ?assertEqual(lists:seq(oldest_kept_checkpoint(Process, Opts), Next + 5),
+                     ess_slots(EssDB, P)),
+        ?assertMatch(#{ status := ok }, maps:get(essentials, R3))
+    end}.
+
+%% @doc A process the main store keeps no checkpoint for keeps every
+%% assignment.
+essentials_retention_keeps_processes_without_checkpoints_test_() ->
+    {timeout, 300, fun() ->
+        {Opts, _Ess, EssDB} = ess_node(<<"ess-nockpt">>, #{}),
+        Process = lua_process(Opts),
+        % Fewer slots than the checkpoint cadence: no checkpoint yet.
+        Next = run_slots(Process, 0, 4, Opts),
+        R = hb_store_gc:retain(Opts#{ <<"essentials-retention-days">> => 0 }),
+        ?assertEqual(0, maps:get(pruned_assignments, maps:get(essentials, R))),
+        ?assertEqual(lists:seq(0, Next - 1), ess_slots(EssDB, proc_id(Process, Opts)))
+    end}.
+
+%% @doc A prune killed after its aliases are gone, or mid-delete, is
+%% finished by the next run; the process computes throughout.
+essentials_retention_restart_mid_prune_test_() ->
+    {timeout, 300, fun() ->
+        lists:foreach(
+            fun(KillAt) ->
+                {Opts, _Ess, EssDB} = ess_node(<<"ess-crash">>, #{}),
+                Process = lua_process(Opts),
+                Next = run_slots(Process, 0, 23, Opts),
+                P = proc_id(Process, Opts),
+                _ = hb_store_gc:retain(Opts),
+                Need = oldest_kept_checkpoint(Process, Opts),
+                Kill = fun(Phase) ->
+                           case Phase of
+                               KillAt -> exit(simulated_crash);
+                               {deleted, _} when KillAt == deleting -> exit(simulated_crash);
+                               _ -> ok
+                           end
+                       end,
+                EOpts = Opts#{ <<"essentials-retention-days">> => 0,
+                               <<"store-retention-delete-batch">> => 20 },
+                ?assertMatch(#{ status := failed },
+                    hb_store_gc:retain_essentials(
+                        EOpts#{ <<"store-retention-test-hook">> => Kill }, #{ P => Need })),
+                clear_process_caches(),
+                ?assertEqual(integer_to_binary(Next), count_at(Process, Next - 1, Opts)),
+                R = hb_store_gc:retain_essentials(EOpts, #{ P => Need }),
+                ?assert(maps:get(recovered_journal, R)),
+                ?assertEqual(lists:seq(Need, Next - 1), ess_slots(EssDB, P)),
+                ?assertEqual(not_found,
+                    elmdb:get(EssDB, <<"~scheduler@1.0/assignments/", P/binary, "/0">>)),
+                _ = run_slots(Process, Next, 4, Opts)
+            end,
+            [aliases_deleted, deleting])
+    end}.
+
+%% @doc With the export on, nothing is pruned before the target carries the
+%% `local-pruned' marker, nor above what has durably shipped; a restore of
+%% the export (even after a base) still has every assignment from slot 0.
+essentials_retention_never_prunes_ahead_of_the_export_test_() ->
+    {timeout, 300, fun() ->
+        Dir = "cache-TEST/ess-ret-export-" ++ integer_to_list(erlang:unique_integer([positive])),
+        Remote = Dir ++ "/remote",
+        Export = #{ <<"path">> => hb_util:bin(Remote),
+                    <<"journal">> => hb_util:bin(Dir ++ "/journal"),
+                    <<"segment-ms">> => 3600000, <<"ship-interval-ms">> => 20 },
+        {Opts0, Ess, EssDB} = ess_node(<<"ess-export">>, #{ <<"essentials-export">> => Export }),
+        Opts = Opts0#{ <<"essentials-retention-days">> => 0 },
+        ?assertMatch(#{ <<"store-module">> := hb_store_export }, Ess),
+        Process = lua_process(Opts),
+        Next = run_slots(Process, 0, 23, Opts),
+        P = proc_id(Process, Opts),
+        % First run: the marker is not on the target yet.
+        R1 = hb_store_gc:retain(Opts),
+        ?assertEqual(#{ status => waiting_for_export_marker }, maps:get(essentials, R1)),
+        ?assert(hb_util:wait_until(fun() -> hb_store_export:prepare_prune(Ess) end, 5000)),
+        ?assert(filelib:is_file(Remote ++ "/local-pruned")),
+        % Nothing has shipped (the open segment is an hour long): nothing goes.
+        R2 = hb_store_gc:retain(Opts),
+        ?assertEqual(0, maps:get(pruned_assignments, maps:get(essentials, R2))),
+        ?assertEqual(lists:seq(0, Next - 1), ess_slots(EssDB, P)),
+        % Ship everything; now the prune may proceed.
+        _ = hb_store_export:sync_export(Ess),
+        R3 = hb_store_gc:retain(Opts),
+        Need = oldest_kept_checkpoint(Process, Opts),
+        ?assertEqual(Need, maps:get(pruned_assignments, maps:get(essentials, R3))),
+        ?assertEqual(lists:seq(Need, Next - 1), ess_slots(EssDB, P)),
+        % A base (resync) after the prune supersedes nothing.
+        ok = hb_store_export:resync(Ess),
+        _ = run_slots(Process, Next, 3, Opts),
+        _ = hb_store_export:sync_export(Ess),
+        ?assert(maps:get(resyncs, hb_store_export:status(Ess)) >= 1),
+        Target = hb_test_utils:test_store(hb_store_lmdb, <<"ess-export-restored">>),
+        {ok, _} = hb_store_export:restore(Remote, Target, #{}),
+        TOpts = Opts#{ <<"store">> => [Target] },
+        ?assertEqual(lists:seq(0, Next + 2),
+                     lists:sort(hb_cache:list_numbered(
+                         <<"~scheduler@1.0/assignments/", P/binary>>, TOpts))),
+        [ ?assertMatch(#{}, hb_cache:ensure_all_loaded(hb_util:ok(hb_cache:read(
+              <<"~scheduler@1.0/assignments/", P/binary, "/", (integer_to_binary(S))/binary>>,
+              TOpts)), TOpts))
+        || S <- lists:seq(0, Next + 2) ]
+    end}.

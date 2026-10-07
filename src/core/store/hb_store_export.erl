@@ -83,7 +83,8 @@
 -export([wrap/2, status/1, restore/2, restore/3, sync_export/1, resync/1]).
 -export([space_ok/3, put_file/2, append_manifest/2, dir_bytes/1, shutdown_all/0]).
 -export([with_target/2, raw_is_file/1, raw_ensure_dir/1, raw_write_file/2]).
--export([verify_restorable/1, verify_restorable/2]).
+-export([verify_restorable/1, verify_restorable/2, exported_marks/1, prepare_prune/1]).
+-define(PRUNED_MARK, "local-pruned").
 -export([start/3, stop/3, reset/3, scope/1]).
 -export([read/3, write/3, list/3, match/3, group/3, link/3, type/3,
          resolve/3, sync/3, delete/3]).
@@ -278,6 +279,27 @@ call_pid(Pid, Msg, Timeout) ->
     after Timeout -> erlang:demonitor(Mon, [flush]), {error, timeout}
     end.
 
+%% @doc Per process, the highest assignment slot S such that every slot up to
+%% S is in a segment already shipped to the target (as of the newest shipped
+%% segment). A process absent from the map has nothing guaranteed exported.
+exported_marks(Store) ->
+    case call(Store, exported_marks, 10000) of
+        M when is_map(M) -> M;
+        _ -> #{}
+    end.
+
+%% @doc Ask the export to become the only copy of history, ahead of the local
+%% store being pruned (`essentials-retention-days'). Returns `true' once the
+%% target carries the `local-pruned' marker -- from then on a base never
+%% supersedes (deletes) older files, and a restore replays the whole chain
+%% from the start -- and `false' until then (the marker is written by the
+%% target worker at its next opportunity).
+prepare_prune(Store) ->
+    case call(Store, prepare_prune, 10000) of
+        true -> true;
+        _ -> false
+    end.
+
 %% @doc Export status and lag metrics.
 status(Store) -> call(Store, status, 10000).
 
@@ -379,6 +401,8 @@ init_state(Store, Counters, FirstNeedsBase) ->
         catchup => undefined,
         open_gaps => OpenGaps,
         resync => raw_is_file(filename:join(Journal, "resync-needed")),
+        pruned_marker => raw_is_file(filename:join(Journal, ?PRUNED_MARK)),
+        want_marker => false,
         target_bytes => 0,
         ceiling => false,
         next_try => 0,
@@ -477,6 +501,12 @@ writer_loop(S) ->
             end;
         {call, From, Ref, status} ->
             From ! {Ref, status_of(S)},
+            writer_loop(S);
+        {call, From, Ref, prepare_prune} ->
+            From ! {Ref, maps:get(pruned_marker, S)},
+            writer_loop(S#{ want_marker => true });
+        {call, From, Ref, exported_marks} ->
+            From ! {Ref, maps:get(exported, S, #{})},
             writer_loop(S);
         {call, From, Ref, inner} ->
             From ! {Ref, maps:get(inner, S)},
@@ -668,8 +698,17 @@ ensure_segment(S = #{ fd := undefined, journal := J, seq := Seq }) ->
 ensure_segment(S) -> S.
 
 close_segment(S = #{ fd := undefined }) -> S;
-close_segment(S = #{ fd := Fd, seq := Seq }) ->
+close_segment(S0 = #{ fd := Fd, seq := Seq }) ->
     _ = file:close(Fd),
+    % What this segment completes, for `exported_marks/1' once it ships.
+    % Only a segment closed with no gap open and nothing being dropped
+    % completes its marks: with a gap open, rows below them may be missing.
+    S = case {maps:get(open_gaps, S0), maps:get(dropping, S0), maps:get(catchup, S0)} of
+            {[], false, undefined} ->
+                S0#{ closed_marks => (maps:get(closed_marks, S0, #{}))#{
+                         Seq => contiguous_marks(maps:get(marks, S0)) } };
+            _ -> S0
+        end,
     S1 = S#{ fd => undefined, seq => Seq + 1, seg_bytes => 0, seg_opened => undefined,
              seen => #{} },
     ok = write_watermarks(S1),
@@ -919,6 +958,11 @@ maybe_audit(S = #{ worker := W, path := Path }) ->
             S#{ worker_busy => true, last_audit_start => Now }
     end.
 
+do_maybe_ship(S = #{ want_marker := true, pruned_marker := false, worker := W,
+                      path := Path }) ->
+    % Every base from here on has a higher id than the marker records.
+    W ! {job, self(), {mark_pruned, Path, maps:get(seq, S)}},
+    S#{ worker_busy => true };
 do_maybe_ship(S = #{ worker := W, journal := J }) ->
     Segs = closed_segments(S),
     Gaps = segs_in(J, "gap-", ".mark"),
@@ -947,7 +991,7 @@ do_maybe_ship(S = #{ worker := W, journal := J }) ->
             S1#{ worker_busy => true, seq => B + 1, base_pending => B };
         _ ->
             W ! {job, self(), {ship, J, Segs, Cfg, maps:get(target_bytes, S)}},
-            S#{ worker_busy => true }
+            S#{ worker_busy => true, shipping_segs => Segs }
     end.
 
 worker_done(S, Result) ->
@@ -956,6 +1000,9 @@ worker_done(S, Result) ->
     Ok = fun(X) -> X#{ next_try => 0, stats => (maps:get(stats, X))#{ consecutive_errors => 0 } } end,
     case Result of
         {target_info, Bytes} -> S0#{ target_bytes => Bytes };
+        marked_pruned ->
+            ok = raw_write_file(filename:join(maps:get(journal, S0), ?PRUNED_MARK), <<>>),
+            S0#{ pruned_marker => true };
         {audited, Audit} ->
             case maps:get(ok, Audit) of
                 true -> ok;
@@ -963,7 +1010,15 @@ worker_done(S, Result) ->
             end,
             S0#{ last_audit => Audit };
         {shipped, N, Raw, Bytes, Ceiling} ->
-            S1a = Ok(at_ceiling(S0, Ceiling)),
+            Shipped = lists:sublist(maps:get(shipping_segs, S0, []), N),
+            Closed = maps:get(closed_marks, S0, #{}),
+            Exported =
+                case [ maps:get(Q, Closed) || Q <- Shipped, maps:is_key(Q, Closed) ] of
+                    [] -> maps:get(exported, S0, #{});
+                    Ms -> lists:last(Ms)
+                end,
+            S0b = S0#{ exported => Exported, closed_marks => maps:without(Shipped, Closed) },
+            S1a = Ok(at_ceiling(S0b, Ceiling)),
             % At the ceiling, look again after an interval, not at once.
             S1 = case Ceiling of
                      false -> S1a;
@@ -1127,6 +1182,12 @@ target_worker(Path) ->
 
 job(Path, target_info) ->
     {target_info, dir_bytes(Path)};
+job(_Path, {mark_pruned, P, Seq}) ->
+    ok = raw_ensure_dir(filename:join(P, "x")),
+    case put_file(filename:join(P, ?PRUNED_MARK), integer_to_binary(Seq)) of
+        ok -> marked_pruned;
+        Err -> {error, Err}
+    end;
 job(_Path, {audit, P, OpenGaps}) ->
     {audited, audit(P, OpenGaps)};
 job(P, {ship, J, Segs, Cfg, Used}) ->
@@ -1138,7 +1199,13 @@ job(P, {base, Inner, Seq, Cfg, Used}) ->
     case space_ok(P, Used + inner_bytes(Inner), Cfg) of
         ok ->
             {ok, Bytes, Maxes} = write_base(Inner, P, Seq),
-            {Freed, Pruned} = prune(P, Seq),
+            % Once the local store is pruned the export holds history the
+            % base does not: it supersedes nothing.
+            {Freed, Pruned} =
+                case raw_is_file(filename:join(P, ?PRUNED_MARK)) of
+                    true -> {0, 0};
+                    false -> prune(P, Seq)
+                end,
             {based, Bytes, Freed, Pruned, Maxes};
         Ceiling -> Ceiling
     end.
@@ -1201,7 +1268,10 @@ audit(P, OpenGaps) ->
         {ok, Names} = prim_file:list_dir(P),
         Bases = lists:sort([ Q || N <- Names, {"base-", Q} <- [parse_seq(N)],
                                   lists:suffix(".done", N) ]),
-        B = lists:max([0 | Bases]),
+        B = case prim_file:read_file(filename:join(P, ?PRUNED_MARK)) of
+                {ok, MB} -> lists:max([0 | [ X || X <- Bases, X < binary_to_integer(MB) ]]);
+                _ -> lists:max([0 | Bases])
+            end,
         Manifest = manifest(P),
         Listed = [ Q || N <- maps:keys(Manifest), {"seg-", Q} <- [parse_seq(N)], Q >= B ],
         Present = [ Q || N <- Names, {"seg-", Q} <- [parse_seq(N)], lists:suffix(".log", N) ],
@@ -1585,9 +1655,19 @@ restore(RawPath, Target, Opts) ->
     Segs = remote_segments(Path),
     Gaps = remote_gaps(Path),
     Manifest = manifest(Path),
+    % `local-pruned' holds the first id after which bases superseded nothing.
+    History =
+        case prim_file:read_file(filename:join(Path, ?PRUNED_MARK)) of
+            {ok, MB} -> binary_to_integer(MB);
+            _ -> false
+        end,
     {From, BaseRows} =
         case Bases of
             [] -> {0, 0};
+            % History kept: replay from the newest base before the marker
+            % (it superseded the files before it), or from the start.
+            _ when is_integer(History) ->
+                {lists:max([0 | [ B || B <- Bases, B < History ]]), 0};
             _ ->
                 B = lists:max(Bases),
                 {ok, BaseN, _} =
@@ -1597,7 +1677,9 @@ restore(RawPath, Target, Opts) ->
         end,
     From1 = From,
     Wanted = [ Q || Q <- Segs, Q >= From1 ],
-    LiveGaps = [ G || G <- Gaps, Bases == [] orelse G > From1 ],
+    % A gap is closed by a fill recorded in a later segment, or by a base
+    % with a higher id.
+    LiveGaps = [ G || G <- Gaps, not lists:any(fun(B) -> B >= G end, Bases) ],
     % Every segment the manifest lists at or after the base must be here: a
     % shipped segment that went missing (or a torn manifest's lost tail, whose
     % files are then unlisted, which `apply_file' refuses) fails the restore.
@@ -1609,15 +1691,20 @@ restore(RawPath, Target, Opts) ->
         [] -> ok;
         Lost -> erlang:error({export_segments_missing, lists:sublist(Lost, 10)})
     end,
+    % With history kept (the local store was pruned) every base is replayed
+    % in its place in the chain, between the segments around it.
+    Files = lists:keysort(1, [ {Q, seg_name(Q)} || Q <- Wanted ] ++
+                             [ {B, "base-" ++ seq_str(B) ++ ".log"}
+                             || is_integer(History), B <- Bases, B >= From1 ]),
     {Records, Filled} =
         lists:foldl(
-            fun(Q, {N, F}) ->
-                {ok, N1, F1} = apply_file(filename:join(Path, seg_name(Q)),
+            fun({_, Name}, {N, F}) ->
+                {ok, N1, F1} = apply_file(filename:join(Path, Name),
                                           Manifest, Target, Opts),
                 {N + N1, F1 ++ F}
             end,
             {0, []},
-            Wanted),
+            Files),
     case [ G || G <- LiveGaps, not lists:member(G, Filled) ] of
         [] -> ok;
         Uncovered -> erlang:error({export_gap_not_covered, Uncovered, From1})

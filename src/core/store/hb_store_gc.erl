@@ -67,6 +67,7 @@
 -export([collect/3, collect/4]).
 -export([classify_root/2, classify_slot/3, retention/4, window_start/4]).
 -export([assignment_timestamp_probe/3]).
+-export([retain_essentials/2]).
 -export([retain/1, maybe_start_retention/1, start_retention/1, stop_retention/0,
          run_retention/1, retention_status/0, retain_plan/3,
          copy_essential_namespaces/3, forget_process_cache/3,
@@ -1385,6 +1386,8 @@ report(Acc, Plans, Policy, SrcStore, DstStore) ->
 -define(RET_DEFAULT_SCAN_ROWS, 20000).
 -define(RET_DEFAULT_GRACE, 120000).
 -define(RET_JOURNAL, "retention-pending.bin").
+-define(ESS_JOURNAL, "essentials-retention-pending.bin").
+-define(ESS_DEFAULT_MAX_SLOTS, 100000).
 -define(RET_SERVER, hb_store_gc_retention).
 -define(RET_STATUS, {?MODULE, retention_status}).
 
@@ -1550,7 +1553,14 @@ retain(Opts) ->
                 true -> orphan_sweep(Ctx, Acc3a);
                 _ -> Acc3a
             end,
+        % What each process still needs to rebuild: every assignment from its
+        % oldest kept checkpoint on. A process with none is not in the map,
+        % and keeps everything.
+        Needs = maps:from_list(
+            [ {P, C} || {P, #{ oldest_checkpoint := C }} <- Plans, is_integer(C) ]),
+        EssReport = retain_essentials(Opts, Needs),
         Report = Acc3#{
+            essentials => EssReport,
             started_at => os:system_time(second),
             duration_ms => erlang:monotonic_time(millisecond) - Start,
             processes => length(Procs),
@@ -1573,6 +1583,180 @@ retain(Opts) ->
         catch elmdb:track_watch(DB, clear),
         catch elmdb:track(DB, false),
         ets:delete(Seen)
+    end.
+
+%%% Essentials retention (`essentials-retention-days', unset = keep forever).
+%%%
+%%% Deletes, from the essentials store, the assignments older than N days
+%%% (by their `timestamp', else `block-timestamp'; an assignment with neither
+%%% is kept) and the rows of their closures nothing else references. Never:
+%%%
+%%%   - a process definition, or a small namespace (`~location@1.0',
+%%%     `~bundler@1.0', `~arweave@2.9', upload marks): only assignment keys
+%%%     and the closures of their messages are ever candidates, definitions are
+%%%     pins, and anything another row references is protected by the same
+%%%     scan the main-store sweep uses;
+%%%   - an assignment a process needs to rebuild: every slot from the oldest
+%%%     checkpoint the main-store run keeps for it (`oldest_checkpoint') to
+%%%     its head. A process the main store keeps no checkpoint for (or does
+%%%     not compute) keeps everything;
+%%%   - a process's newest assignment (its head slot);
+%%%   - with the export on, an assignment not yet durably exported: only slots
+%%%     at or below the process's mark as of the newest shipped segment, and
+%%%     only once the target carries the `local-pruned' marker (after which a
+%%%     base no longer supersedes older files and a restore replays the whole
+%%%     chain).
+%%%
+%%% Only a prefix of each process's assignments goes (the oldest first,
+%%% stopping at the first one that must stay), at most
+%%% `essentials-retention-max-slots' per run, paced like the main sweep. The
+%%% deletes go to the store under the exporter: they are not exported. Runs
+%%% in the same schedule as the main store's retention, after it, with its
+%%% own journal so a crash mid-prune is finished by the next run.
+
+%% @doc One essentials retention run. `Needs' maps a process ID to the lowest
+%% slot it must keep.
+retain_essentials(Opts, Needs) ->
+    case ess_days_ms(Opts) of
+        undefined -> #{ status => off };
+        DaysMs ->
+            case hb_store_essentials:store(Opts) of
+                undefined -> #{ status => no_essentials_store };
+                [Ess | _] ->
+                    try retain_essentials(Opts, Needs, Ess, DaysMs)
+                    catch C:R:St ->
+                        ?event(error, {essentials_retention_failed, C, R, {trace, St}}),
+                        #{ status => failed, error => {C, R} }
+                    end
+            end
+    end.
+
+ess_days_ms(Opts) ->
+    case hb_opts:get(<<"essentials-retention-days">>, undefined, Opts) of
+        undefined -> undefined;
+        not_found -> undefined;
+        D when is_number(D), D >= 0 -> round(D * 86400000);
+        D when is_binary(D) ->
+            N = try binary_to_integer(D) catch _:_ -> binary_to_float(D) end,
+            round(N * 86400000);
+        _ -> undefined
+    end.
+
+retain_essentials(Opts, Needs, Ess, DaysMs) ->
+    Start = erlang:monotonic_time(millisecond),
+    {Inner, Exported} =
+        case Ess of
+            #{ <<"store-module">> := hb_store_export, <<"inner">> := I } ->
+                case hb_store_export:prepare_prune(Ess) of
+                    true -> {I, hb_store_export:exported_marks(Ess)};
+                    false -> {I, waiting}
+                end;
+            _ -> {Ess, all}
+        end,
+    case Exported of
+        waiting -> #{ status => waiting_for_export_marker };
+        _ -> retain_essentials(Opts, Needs, Inner, Exported, DaysMs, Start)
+    end.
+
+retain_essentials(Opts, Needs, Inner, Exported, DaysMs, Start) ->
+    ok = hb_store:start([Inner], #{}, Opts),
+    DB = store_db(Inner),
+    Policy = retention_policy(Opts),
+    Seen = ets:new(hb_store_gc_ess_seen, [set, private]),
+    Ctx = #{
+        src_db => DB,
+        src_store => Inner,
+        src_opts => Opts#{ <<"store">> => [Inner] },
+        node_opts => Opts,
+        policy => Policy,
+        seen => Seen,
+        pins => pins(DB, Opts),
+        journal => filename:join(hb_util:list(maps:get(<<"name">>, Inner)), ?ESS_JOURNAL),
+        aliases_of => fun(P, S, _Root, _Keep) -> [assignment_path(P, S)] end,
+        forget => false
+    },
+    Cutoff = os:system_time(millisecond) - DaysMs,
+    Budget = ret_opt(<<"essentials-retention-max-slots">>, ?ESS_DEFAULT_MAX_SLOTS, Opts),
+    ok = elmdb:track(DB, true),
+    ok = elmdb:flush(DB),
+    try
+        Procs = list_children(DB, ?SCHED_PREFIX),
+        {Drops, Held, _} =
+            lists:foldl(
+                fun(P, {D, H, B}) ->
+                    Mark = case Exported of
+                               all -> infinity;
+                               _ -> maps:get(P, Exported, -1)
+                           end,
+                    {PD, Why} = ess_plan(Ctx, P, maps:get(P, Needs, none), Mark, Cutoff, B),
+                    {PD ++ D, maps:update_with(Why, fun(X) -> X + 1 end, 1, H), B - length(PD)}
+                end,
+                {[], #{}, Budget},
+                Procs),
+        Empty = sets:new([{version, 2}]),
+        Acc0 = recover_journal(Ctx, Empty, ret_acc()),
+        Acc = sweep_run(Ctx, lists:reverse(Drops), Empty, Acc0),
+        Report = maps:with([deleted_keys, deleted_bytes, alias_keys, candidate_keys,
+                            protected_keys, protected_by_scan, protected_by_writes,
+                            conflicts, recovered_journal, chunks], Acc),
+        Report#{ status => case maps:get(dry_run, Policy) of true -> dry_run; false -> ok end,
+                 pruned_assignments => length(Drops),
+                 processes => length(Procs),
+                 stopped_by => Held,
+                 exported => Exported =/= all,
+                 duration_ms => erlang:monotonic_time(millisecond) - Start }
+    after
+        catch elmdb:track_watch(DB, clear),
+        catch elmdb:track(DB, false),
+        ets:delete(Seen)
+    end.
+
+%% The assignments of one process to drop, oldest first: a prefix of its
+%% slots below every bound. Returns `{[{P, Slot, Root}], StoppedBy}'.
+ess_plan(_Ctx, _P, none, _Mark, _Cutoff, _Budget) -> {[], no_checkpoint};
+ess_plan(_Ctx, _P, _Need, _Mark, _Cutoff, Budget) when Budget =< 0 -> {[], budget};
+ess_plan(Ctx, P, Need, Mark, Cutoff, Budget) ->
+    case lists:sort(assignment_slots(Ctx, P)) of
+        [] -> {[], empty};
+        Slots ->
+            Head = lists:last(Slots),
+            Limit = lists:min([Need - 1, Head - 1, Mark]),
+            ess_take(Ctx, P, Slots, Limit, Cutoff, Budget, [])
+    end.
+
+ess_take(_Ctx, _P, [], _Limit, _Cutoff, _Budget, Acc) -> {lists:reverse(Acc), end_of_slots};
+ess_take(_Ctx, _P, _Slots, _Limit, _Cutoff, 0, Acc) -> {lists:reverse(Acc), budget};
+ess_take(_Ctx, _P, [S | _], Limit, _Cutoff, _Budget, Acc) when S > Limit ->
+    {lists:reverse(Acc), window};
+ess_take(Ctx, P, [S | Rest], Limit, Cutoff, Budget, Acc) ->
+    Key = assignment_path(P, S),
+    case deref(Ctx, Key) of
+        not_found -> {lists:reverse(Acc), unreadable};
+        Root ->
+            case ess_timestamp(Ctx, Root) of
+                T when is_integer(T), T < Cutoff ->
+                    ess_take(Ctx, P, Rest, Limit, Cutoff, Budget - 1, [{P, S, Root} | Acc]);
+                T when is_integer(T) -> {lists:reverse(Acc), age};
+                _ -> {lists:reverse(Acc), no_timestamp}
+            end
+    end.
+
+%% An assignment's time in milliseconds: `timestamp', else `block-timestamp'
+%% (seconds); `unknown' when it has neither.
+ess_timestamp(Ctx, Root) ->
+    Int = fun(K) ->
+              case read_row_value(Ctx, <<Root/binary, "/", K/binary>>) of
+                  {ok, B} -> try binary_to_integer(B) catch _:_ -> unknown end;
+                  _ -> unknown
+              end
+          end,
+    case Int(<<"timestamp">>) of
+        T when is_integer(T), T > 0 -> T;
+        _ ->
+            case Int(<<"block-timestamp">>) of
+                B when is_integer(B), B > 0 -> B * 1000;
+                _ -> unknown
+            end
     end.
 
 ret_acc() ->
@@ -1653,13 +1837,23 @@ retain_plan(Ctx, P, Acc) ->
                     KeepRoots = [ R || S <- KeepSlots, R <- [deref(Ctx, computed_path(P, S))],
                                        R =/= not_found ],
                     DropRoots = [ {S, deref(Ctx, computed_path(P, S))} || S <- Drop ],
-                    {#{ drop => DropRoots, keep_roots => KeepRoots, window_start => W },
+                    Oldest = first_checkpoint(lists:sort(KeepSlots), Classify),
+                    {#{ drop => DropRoots, keep_roots => KeepRoots, window_start => W,
+                        oldest_checkpoint => Oldest },
                      bump(kept_slots, length(KeepSlots), bump(dropped_slots, length(Drop), Acc))}
             end
     end.
 
 newest_checkpoints(Desc, Classify, K) ->
     newest_checkpoints(Desc, Classify, K, []).
+
+%% The lowest kept slot holding a checkpoint, or `none'.
+first_checkpoint([], _Classify) -> none;
+first_checkpoint([S | Rest], Classify) ->
+    case Classify(S) of
+        checkpoint -> S;
+        _ -> first_checkpoint(Rest, Classify)
+    end.
 newest_checkpoints(_, _Classify, 0, Acc) -> Acc;
 newest_checkpoints([], _Classify, _K, Acc) -> Acc;
 newest_checkpoints([S | Rest], Classify, K, Acc) ->
@@ -1883,7 +2077,8 @@ sweep_run(_Ctx, [], _Keep, Acc) -> Acc;
 sweep_run(Ctx, Drops, Keep, Acc) ->
     Policy = maps:get(policy, Ctx),
     DB = maps:get(src_db, Ctx),
-    Aliases = lists:append([ slot_aliases(P, S, R, Keep) || {P, S, R} <- Drops ]),
+    AliasesOf = maps:get(aliases_of, Ctx, fun slot_aliases/4),
+    Aliases = lists:append([ AliasesOf(P, S, R, Keep) || {P, S, R} <- Drops ]),
     Roots = lists:usort([ R || {_P, _S, R} <- Drops, R =/= not_found ]),
     Procs = lists:foldl(fun({P, S, _}, M) -> maps:update_with(P, fun(X) -> max(X, S) end, S, M) end,
                         #{}, Drops),
@@ -1898,10 +2093,10 @@ sweep_run(Ctx, Drops, Keep, Acc) ->
             ok = write_journal(Ctx, Aliases, Roots),
             hook(Ctx, journal_written),
             {Acc1, Revived} = delete_aliases(Ctx, Aliases, Acc),
-            forget(Procs),
+            forget(Ctx, Procs),
             hook(Ctx, aliases_deleted),
             timer:sleep(maps:get(grace, Policy)),
-            forget(Procs),
+            forget(Ctx, Procs),
             Acc2 = sweep_roots(Ctx, Roots, Keep, Revived, Aliases, bump(graces, 1, Acc1)),
             ok = clear_journal(Ctx),
             Acc2
@@ -1943,7 +2138,11 @@ slot_aliases(P, S, Root, Keep) ->
         [ <<"computed/", P/binary, "/", Root/binary>>
         || Root =/= not_found, not sets:is_element(Root, Keep) ].
 
-%% Drop the swept slots from the in-memory process caches.
+%% Drop the swept slots from the in-memory process caches (computed slots
+%% only: an essentials sweep deletes assignments, never states).
+forget(#{ forget := false }, _Procs) -> ok;
+forget(_Ctx, Procs) -> forget(Procs).
+
 forget(Procs) ->
     maps:foreach(
         fun(P, MaxSlot) -> forget_process_cache(P, MaxSlot + 1, #{}) end,

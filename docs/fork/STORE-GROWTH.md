@@ -461,3 +461,21 @@ week of clean computed-only retention.
   **2.8 KB/slot** (6.0x). At stage's ~9 slots/s (~780k/day): export
   13.7 GB/day before -> 2.2 GB/day, local essentials LMDB ~12 GB/day. A 1 TB
   mount at the 75% ceiling lasts ~340 days at that load.
+
+## 20. Essentials retention (`essentials-retention-days`)
+
+Unset (the default) keeps the essentials store forever. Set to N (prod: 7),
+each retention run (same schedule, after the main-store sweep, same
+`store-retention-dry-run`, delete pacing and grace) prunes from the
+essentials store the assignments older than N days (`timestamp`, else
+`block-timestamp`; neither = kept) and the closure rows nothing else
+references, via the same journaled, guarded mark/protect sweep. Never pruned:
+definitions (pins), small namespaces (never candidates), anything another row
+references, each process's head slot, every slot from the oldest checkpoint the
+main store keeps for it (a process with no kept checkpoint keeps everything),
+at most `essentials-retention-max-slots` (100000) per run. With the export
+on, nothing goes until the target carries `local-pruned` (after which bases
+supersede nothing and restore replays the whole chain from the newest base
+before the marker), and only slots at or below the process's mark as of the
+newest shipped segment. Report: `essentials` in the run report /
+`retention_status()`.
