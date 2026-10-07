@@ -340,3 +340,73 @@ store.
 - The source must carry `read-only => true` and `access => [<<"read">>]` or
   `collect/3` refuses to start, and it refuses if source and destination name the
   same store.
+
+## 19. Built: delete primitive, essentials store, online retention (2026-10-07)
+
+Branch `feat/retention` (base `fix/audit-all` = prod image `audit-fixes-20261006c`).
+Everything is off by default; with no new opt set the node behaves as before.
+
+### Pieces
+
+| piece | where | what |
+|---|---|---|
+| delete primitive | `patches/elmdb-delete.patch` (applied in `Dockerfile.prod` after `get-deps`), `hb_store:delete/3`, `hb_store_lmdb:delete/3` | `delete_batch/2`: the write worker commits the overlay and deletes in one txn, so a pending put is never resurrected. `delete_batch_guarded/2` + `track/2`, `track_watch/2`, `track_take/1`: vetoed atomically if a key was written or referenced since tracking began. `scan_refs/3`, `scan_watched/3`, `scan_units/3`, `scan_unit_refs/3`, `scan_rows/3`: bounded key-order scans in short read txns, Rust-filtered. |
+| essentials store | `hb_store_essentials`, routing in `dev_scheduler_cache`, `dev_location_cache`, `dev_bundler_cache`, `dev_arweave_block_cache` | `essentials-store`: written first, self-contained (`hb_cache:write` puts the whole graph there); node store list gains it read-only after its first store. `migrate/3` + `verify/3`. |
+| export | `hb_store_export` | `essentials-export`: local journal -> few-MB segments shipped async to a (slow, remote) path; backlog bounded, base image closes gaps; backoff on EIO/ETIMEDOUT/ESTALE; fill ceiling (default 75%) and byte budget; `manifest.log`; `restore/3`. |
+| retention | `hb_store_gc:retain/1` (+ background server) | per-process window, guarded alias-then-content sweep, protection scan + write tracking, journal for crash recovery, opt-in orphan pass, optional checkpoint archive. |
+
+### Namespace classification (census of real stores)
+
+Full census of `archives/reset-20261001T195924Z` (32.3M entries) and a
+`~`-namespace skip-scan plus 20,000 random probes of `store.pre-wipe-20261006`
+(201 GB) found only four top-level classes: 43-byte IDs, `data/`, `computed`,
+`~scheduler@1.0` (only `assignments`).
+
+| namespace | class | retention |
+|---|---|---|
+| `~scheduler@1.0/assignments`, `/uploaded` | essential | never deleted; written to the essentials store when configured |
+| `<ProcID>` (definition) | essential | pinned |
+| trusted-device IDs (`token@1.0`, `process-outbox@1.0`, `security@1.0`) | essential | pinned; copied by `migrate/3` |
+| `~location@1.0`, `~bundler@1.0`, `~arweave@2.9` | essential (small) | routed to the essentials store; never deleted |
+| `~meta@1.0` (`preloaded-devices-index`) | essential (small) | never deleted (normally in the preloaded store) |
+| `computed`, `computed/<P>`, `computed/<P>/slot` markers | structure | kept |
+| `computed/<P>/slot/<N>`, `computed/<P>/<Root>` | derived | dropped outside the window |
+| 43-byte IDs, `data/<h>` | content | deleted only when reached from a dropped slot (or, opt-in, orphaned) AND referenced by nothing outside the candidates |
+| `~match@1.0&...` | derived index | not collected (grows ~9 rows/slot when `match-index` is on; prod has it off) |
+| anything else | unknown | kept; its rows protect what they reference |
+
+### Steady state (in-VM, lua@5.3b, cadence 50, recent 32, essentials store on)
+
+| slots | main rows, off | main rows, computed only | main rows, computed+orphans | essentials rows |
+|---|---|---|---|---|
+| 300 | 25,736 | 12,675 | 12,675 | 15,074 |
+| 1,500 | 128,768 | 36,675 | 12,675 | 75,074 |
+| 3,000 | 257,558 | 66,675 | 12,666 | 150,074 |
+
+Off: 86 rows/slot. Computed-only: 20 rows/slot -- the offloaded copies
+(`hb_link:normalize/3` writes every converted message's nested messages to the
+node store). With orphans: flat. Essentials: 50 rows/slot, forever.
+
+### POST /schedule with a throttled export target
+
+Node on tmpfs, export target on a disk throttled to 256 KB/s and 20 IOPS, 16
+clients, pre-signed requests, 20 s: base 93.6 req/s p99 207 ms vs export
+91.0/s p99 212 ms (repeat: 101.8/194 vs 97.8/361; 81.0/436 vs 83.2/454 --
+host noise); backlog 31.5 MB at the end, drained in 117 s, 0 dropped, 0
+errors. `hb_store_fs` directly on the same throttled dir: 0 of 16 requests
+succeeded in 20 s (all `scheduler_timeout`).
+
+Real mount (`/mnt/pxe-backup`, NFS 4.2 over WireGuard, ~115 ms RTT): 3,000
+messages, 4 segments of 2 MB + a 6.9 MB base = 14 MB shipped in 12.9 s, restore
+in 0.7 s, all 3,000 messages identical.
+
+### Limits
+
+- The protection scan reads every reference row of the main store once per
+  batch of `store-retention-batch-slots`. Bounded when the essentials live
+  elsewhere; with them in the main store it grows with the ledger.
+- Orphan collection deletes content reachable only by ID; opt-in for that
+  reason.
+- A checkpoint archive restore is an offline tool; a process with fewer than K
+  snapshot checkpoints keeps everything from its oldest one.
+- LMDB never shrinks: expect a plateau at the high-water mark, not a smaller file.
