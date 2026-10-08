@@ -1,0 +1,137 @@
+{
+  "gateway": "https://arweave.net",
+  "node-host": "hyperbeam.tylerw.ai",
+  "process-snapshot-time": 900,
+  "process-snapshot-slots": 1000,
+  "process-now-from-cache": true,
+  "spawn-worker": true,
+  "process-worker-max-idle": 86400000,
+  "idle-timeout": 900000,
+  "scheduler-default-commitment-spec": "ans104@1.0",
+  "rate-limit-requests": 60000,
+  "rate-limit-period": 60,
+  "rate-limit-max": 60000,
+  "rate-limit-min": 0,
+  "store-all-signed": false,
+  "trusted-devices": {
+    "token@1.0": "vucDtiNHWzUXJ625HtiFXrdlzvUAigUgkTWe8dwUvOs",
+    "process-outbox@1.0": "HOcPV7wxMHYb3rSQ3EfykQhHx_b8waRWhXolhcBNgHo",
+    "security@1.0": "ARgymad5oYZcWPpxuV-A9hoSgmm4ElgPIvxMwmeh674"
+  },
+  "store": [
+    {
+      "store-module": "hb_store_lmdb",
+      "name": "/app/cache-mainnet/lmdb",
+      "capacity": 429496729600,
+      "ao-types": "store-module=\"atom\", capacity=\"integer\""
+    },
+    {
+      "store-module": "hb_store_fs",
+      "name": "/app/cache-mainnet",
+      "ao-types": "store-module=\"atom\""
+    },
+    {
+      "store-module": "hb_store_arweave",
+      "name": "/app/cache-arweave",
+      "remote-index": "true",
+      "arweave-node": "https://arweave.net",
+      "index-store": [
+        {
+          "store-module": "hb_store_lmdb",
+          "name": "/app/cache-mainnet/gw-cache",
+          "capacity": 17179869184,
+          "ao-types": "store-module=\"atom\", capacity=\"integer\""
+        }
+      ],
+      "local-store": [
+        {
+          "store-module": "hb_store_lmdb",
+          "name": "/app/cache-mainnet/gw-cache",
+          "capacity": 17179869184,
+          "ao-types": "store-module=\"atom\", capacity=\"integer\""
+        }
+      ],
+      "ao-types": "store-module=\"atom\", remote-index=\"atom\""
+    },
+    {
+      "store-module": "hb_store_gateway",
+      "subindex": [
+        {
+          "name": "Data-Protocol",
+          "value": "ao"
+        }
+      ],
+      "local-store": [
+        {
+          "store-module": "hb_store_lmdb",
+          "name": "/app/cache-mainnet/gw-cache",
+          "capacity": 17179869184,
+          "ao-types": "store-module=\"atom\", capacity=\"integer\""
+        }
+      ],
+      "ao-types": "store-module=\"atom\""
+    },
+    {
+      "store-module": "hb_store_gateway",
+      "local-store": [
+        {
+          "store-module": "hb_store_lmdb",
+          "name": "/app/cache-mainnet/gw-cache",
+          "capacity": 17179869184,
+          "ao-types": "store-module=\"atom\", capacity=\"integer\""
+        }
+      ],
+      "ao-types": "store-module=\"atom\""
+    }
+  ],
+  "process-workers": true,
+  "scheduler-lookahead": false,
+  "scheduler-upload-workers": 1,
+  "scheduler-publish-remote": false,
+  "await-inprogress": "named",
+  "scheduling-mode": "local_confirmation",
+  "rate-limit-exempt": [
+    "79.127.132.238",
+    "45.88.217.94",
+    "206.206.95.122",
+    "45.88.217.217",
+    "206.206.95.43",
+    "206.206.95.50",
+    "206.206.95.51"
+  ],
+  "push-max-workers": 512,
+  "match-index": false,
+  "process-hot-cache-slots": 2048,
+  "process-hot-cache-mb": 12288,
+  "profiling": false,
+  "process-delta-checkpoint-slots": 1000,
+  "process-replay-cache-slots": 512,
+  "process-replay-cache-mb": 4096,
+  "scheduler-durable-confirm": "commit",
+  "push-durable": true,
+  "push-target-miss-ttl": 300,
+  "lua-53b-invalid-patches": "drop",
+  "process-historical-replay-limit": 64,
+  "essentials-store": {
+    "store-module": "hb_store_lmdb",
+    "name": "/app/cache-mainnet/essentials",
+    "capacity": 268435456000,
+    "ao-types": "store-module=\"atom\", capacity=\"integer\""
+  },
+  "store-retention": true,
+  "store-retention-dry-run": false,
+  "store-retention-checkpoints": 2,
+  "store-retention-recent-slots": 2048,
+  "store-retention-grace-ms": 120000,
+  "store-retention-interval-ms": 600000,
+  "store-retention-max-candidates": 2000000,
+  "store-retention-orphans": false,
+  "essentials-export": {
+    "path": "/app/export/essentials",
+    "journal": "/app/cache-mainnet/essentials-journal",
+    "max-fill-pct": 75,
+    "ao-types": "max-fill-pct=\"integer\""
+  },
+  "essentials-retention-days": 7,
+  "essentials-retention-dry-run": true
+}
