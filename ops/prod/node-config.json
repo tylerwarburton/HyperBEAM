@@ -101,12 +101,12 @@
   ],
   "push-max-workers": 512,
   "match-index": false,
-  "process-hot-cache-slots": 2048,
-  "process-hot-cache-mb": 12288,
+  "process-hot-cache-slots": 512,
+  "process-hot-cache-mb": 4096,
   "profiling": false,
   "process-delta-checkpoint-slots": 1000,
   "process-replay-cache-slots": 512,
-  "process-replay-cache-mb": 4096,
+  "process-replay-cache-mb": 1024,
   "scheduler-durable-confirm": "commit",
   "push-durable": true,
   "push-target-miss-ttl": 300,
@@ -121,7 +121,7 @@
   "store-retention": true,
   "store-retention-dry-run": false,
   "store-retention-checkpoints": 2,
-  "store-retention-recent-slots": 2048,
+  "store-retention-recent-slots": 512,
   "store-retention-grace-ms": 120000,
   "store-retention-interval-ms": 600000,
   "store-retention-max-candidates": 2000000,
@@ -133,5 +133,6 @@
     "ao-types": "max-fill-pct=\"integer\""
   },
   "essentials-retention-days": 7,
-  "essentials-retention-dry-run": false
+  "essentials-retention-dry-run": false,
+  "process-async-checkpoints": true
 }

@@ -52,3 +52,4 @@ beside the originals and has a `rollback <STAMP>` mode.
 - The node still looks up unknown push targets (wallets, deleted processes) in
   remote stores; when arweave.net is slow, pushes can take ~90 s. Removing the
   remote stores from `store` ends that dependency (not yet done).
+| `scripts/deploy-async.sh` | async checkpoints (`process-async-checkpoints`), cache limits 4096/1024 MB, recent-slots 512, image upgrades-j (2026-10-09) |
