@@ -877,7 +877,19 @@ dispatch_push(Process, Slot, MaxDepth, Req, Opts) ->
 %% @doc Store the resulting state in the cache, potentially with the snapshot
 %% key. The write is synchronous: callers may notify waiters or run push hooks
 %% as soon as this returns, so the slot must already be cache-visible.
+%%
+%% With `process-async-checkpoints' (default false), a delta (`lua@5.3b')
+%% process stores every slot as a delta and hands its checkpoints to a
+%% background writer instead: see `store_result_async/5'.
+store_result(false, ProcID, Slot, Res, Req, Opts) ->
+    case async_checkpoints(Res, Opts) of
+        true -> store_result_async(ProcID, Slot, Res, Req, Opts);
+        false -> store_result_sync(false, ProcID, Slot, Res, Req, Opts)
+    end;
 store_result(ForceSnapshot, ProcID, Slot, Res, Req, Opts) ->
+    store_result_sync(ForceSnapshot, ProcID, Slot, Res, Req, Opts).
+
+store_result_sync(ForceSnapshot, ProcID, Slot, Res, Req, Opts) ->
     % Cache the `Snapshot' key as frequently as the node is configured to.
     ResMaybeWithSnapshot =
         case ForceSnapshot orelse should_snapshot(Slot, Res, Opts) of
@@ -930,6 +942,164 @@ store_result(ForceSnapshot, ProcID, Slot, Res, Req, Opts) ->
     dev_process_cache:write(ProcID, Slot, ResMaybeWithSnapshot, Opts),
     ?event(compute, {caching_completed, {proc_id, ProcID}, {slot, Slot}}, Opts),
     hb_maps:without([<<"snapshot">>], ResMaybeWithSnapshot, Opts).
+
+%% @doc Asynchronous checkpoints: the compute path never waits for one.
+%%
+%% A checkpoint of a large process (the VM snapshot: `luerl:externalize',
+%% `term_to_binary' and compression; then the full public state and snapshot
+%% written to the store) took seconds of the slot it fell on (measured on prod:
+%% `store_ms' 5.8-11.4 s on the game authority), and every compute and push
+%% behind it queued. Here the slot is stored as an ordinary delta, so the delta
+%% chain stays gapless and the slot is readable before waiters are notified,
+%% and the state of exactly that slot -- an immutable term, which the next slots
+%% never mutate -- is copied to a writer process that builds the snapshot and
+%% publishes the checkpoint with `dev_process_cache:write_checkpoint/5' (data
+%% durable first, the slot alias last). Until it lands, readers, cold restores
+%% and retention see the previous checkpoint and the deltas after it.
+%%
+%% At most one writer per process is in flight. A checkpoint that falls due
+%% while one is still writing is not queued: the state is marked overdue and
+%% the next slot after the writer finishes is checkpointed instead (a
+%% checkpoint is found by its content, never by its slot number). The only
+%% cost left on the compute path is copying the state to the writer.
+%%
+%% Only delta processes take this path; a full-state process (`lua@5.3a',
+%% WASM) keeps the synchronous checkpoint, whose slot is a full state anyway.
+async_checkpoints(Res, Opts) ->
+    is_map(maps:get(<<"process-cache-delta">>, hb_private:from_message(Res), undefined))
+        andalso hb_util:atom(
+            hb_opts:get(<<"process-async-checkpoints">>, false, Opts)
+        ) == true.
+
+store_result_async(ProcID, Slot, Res, Req, Opts) ->
+    Due = checkpoint_overdue(Res) orelse should_snapshot(Slot, Res, Opts),
+    dev_process_cache:write(
+        ProcID,
+        Slot,
+        Res,
+        Opts#{ <<"process-cache-defer-checkpoint">> => true }
+    ),
+    Next =
+        case Due of
+            false -> Res;
+            true ->
+                case start_checkpoint_writer(ProcID, Slot, Res, Req, Opts) of
+                    started -> set_checkpoint_overdue(Res, false);
+                    busy ->
+                        ?event(compute_short,
+                            {checkpoint_deferred,
+                                {proc_id, ProcID},
+                                {slot, Slot},
+                                {reason, writer_busy}
+                            }
+                        ),
+                        set_checkpoint_overdue(Res, true)
+                end
+        end,
+    hb_maps:without([<<"snapshot">>], Next, Opts).
+
+checkpoint_overdue(Res) ->
+    maps:get(<<"checkpoint-overdue">>, hb_private:from_message(Res), false)
+        =:= true.
+
+set_checkpoint_overdue(Res, Overdue) ->
+    Priv = hb_private:from_message(Res),
+    case {Overdue, maps:is_key(<<"checkpoint-overdue">>, Priv)} of
+        {false, false} -> Res;
+        {false, true} ->
+            hb_private:set_priv(Res, maps:remove(<<"checkpoint-overdue">>, Priv));
+        {true, _} ->
+            hb_private:set_priv(Res, Priv#{ <<"checkpoint-overdue">> => true })
+    end.
+
+%% @doc Start the checkpoint writer for `Slot', unless one is already in flight
+%% for the process. The writer is registered under the process's name before
+%% it does anything, so the check and the claim are atomic (`hb_name' inserts
+%% with `insert_new'); a writer that dies is dropped from the registry by the
+%% next lookup. Spawning copies `Res' (the VM included) into the writer: that
+%% copy is all the compute path pays. The writer is not linked to the caller:
+%% a process worker that stops lets it finish, and a node that stops abandons
+%% it, which is safe, as nothing is visible until its final link.
+start_checkpoint_writer(ProcID, Slot, Res, Req, Opts) ->
+    Name = checkpoint_writer_name(ProcID, Opts),
+    case hb_name:lookup(Name) of
+        Pid when is_pid(Pid) -> busy;
+        undefined ->
+            % Low priority: the writer's compression must not take
+            % schedulers from the compute and push paths it is moved off.
+            Writer =
+                spawn_opt(
+                    fun() ->
+                        receive {go, Name} -> ok end,
+                        write_checkpoint(Name, ProcID, Slot, Res, Req, Opts)
+                    end,
+                    [{priority, low}]
+                ),
+            case hb_name:register(Name, Writer) of
+                ok ->
+                    Writer ! {go, Name},
+                    started;
+                error ->
+                    exit(Writer, kill),
+                    busy
+            end
+    end.
+
+checkpoint_writer_name(ProcID, Opts) ->
+    {
+        ?MODULE,
+        checkpoint_writer,
+        ProcID,
+        hb_opts:get(<<"process-cache-scope">>, local, Opts)
+    }.
+
+%% @doc The body of a checkpoint writer: snapshot, write, publish. Failure is
+%% logged and leaves no checkpoint, which costs a longer replay on the next
+%% cold restore, never correctness.
+write_checkpoint(Name, ProcID, Slot, Res, Req, Opts) ->
+    Hook =
+        case hb_opts:get(<<"process-async-checkpoint-hook">>, undefined, Opts) of
+            Fun when is_function(Fun, 2) -> Fun;
+            _ -> fun(_, _) -> ok end
+        end,
+    Start = erlang:monotonic_time(microsecond),
+    try
+        Hook(started, Slot),
+        {ok, Snapshot} = snapshot(Res, Req, Opts),
+        Snapped = erlang:monotonic_time(microsecond),
+        Hook(snapshot_taken, Slot),
+        {ok, _} =
+            dev_process_cache:write_checkpoint(
+                ProcID,
+                Slot,
+                hb_ao:set(Res, <<"snapshot">>, Snapshot, Opts),
+                fun() -> Hook(data_written, Slot) end,
+                Opts
+            ),
+        Done = erlang:monotonic_time(microsecond),
+        Hook(linked, Slot),
+        ?event(compute_short,
+            {checkpoint_written,
+                {proc_id, ProcID},
+                {slot, Slot},
+                {snapshot_ms, (Snapped - Start) div 1000},
+                {write_ms, (Done - Snapped) div 1000}
+            }
+        )
+    catch
+        Class:Reason:Stack ->
+            ?event(error,
+                {checkpoint_write_failed,
+                    {proc_id, ProcID},
+                    {slot, Slot},
+                    {class, Class},
+                    {reason, Reason},
+                    {stacktrace, {trace, Stack}}
+                }
+            )
+    after
+        hb_name:unregister(Name)
+    end.
 
 %% @doc Should we snapshot a new full state result? First, we check if the 
 %% `process_snapshot_time' option is set. If it is, we check if the elapsed time
@@ -1304,3 +1474,568 @@ historical_read_is_bounded_test() ->
     ?assert(within_replay_limit(8, infinity)),
     ?assert(within_replay_limit(8, <<"8">>)),
     ?assertNot(within_replay_limit(9, 8)).
+
+%%% Asynchronous checkpoints (`process-async-checkpoints').
+
+ckpt_opts(Extra) ->
+    hb:init(),
+    application:ensure_all_started(hb),
+    Store = hb_test_utils:test_store(hb_store_lmdb),
+    ok = hb_store:start([Store], #{}, #{}),
+    maps:merge(
+        #{
+            <<"store">> => [Store],
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"hashpath">> => ignore,
+            <<"spawn-worker">> => false,
+            <<"process-workers">> => false,
+            <<"match-index">> => false,
+            <<"process-delta-checkpoint-slots">> => 4,
+            <<"process-async-checkpoints">> => true
+        },
+        Extra
+    ).
+
+%% A counter, and a Lua table that grows every slot and is summed every slot:
+%% a VM that did not continue exactly from the right state reports another sum.
+ckpt_script() ->
+    <<
+        "Count = Count or 0\n"
+        "Big = Big or {}\n"
+        "function compute(req)\n"
+        "  Count = Count + 1\n"
+        "  Big[Count] = { n = Count, s = string.rep('x', Count % 5) }\n"
+        "  local sum = 0\n"
+        "  for i = 1, #Big do sum = sum + Big[i].n end\n"
+        "  return {\n"
+        "    patches = {\n"
+        "      { path = '/count', value = tostring(Count) },\n"
+        "      { path = '/sum', value = tostring(sum) }\n"
+        "    },\n"
+        "    results = { output = { data = tostring(Count) } }\n"
+        "  }\n"
+        "end\n"
+    >>.
+
+ckpt_process(Script, Opts) ->
+    Wallet = hb_opts:get(<<"priv-wallet">>, hb:wallet(), Opts),
+    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Process =
+        hb_message:commit(
+            #{
+                <<"device">> => <<"process@1.0">>,
+                <<"type">> => <<"Process">>,
+                <<"scheduler-device">> => <<"scheduler@1.0">>,
+                <<"execution-device">> => <<"lua@5.3b">>,
+                <<"module">> => #{
+                    <<"content-type">> => <<"application/lua">>,
+                    <<"body">> => Script
+                },
+                <<"authority">> => [Address],
+                <<"scheduler-location">> => Address,
+                <<"test-random-seed">> => rand:uniform(1000000)
+            },
+            Opts
+        ),
+    {ok, _} = hb_cache:write(Process, Opts),
+    Process.
+
+ckpt_schedule(Process, Slots, Opts) ->
+    ProcID = hb_message:id(Process, all, Opts),
+    lists:foreach(
+        fun(N) ->
+            Req =
+                hb_message:commit(
+                    #{
+                        <<"path">> => <<"schedule">>,
+                        <<"method">> => <<"POST">>,
+                        <<"body">> =>
+                            hb_message:commit(
+                                #{
+                                    <<"target">> => ProcID,
+                                    <<"type">> => <<"Message">>,
+                                    <<"action">> => <<"Increment">>,
+                                    <<"number">> => N
+                                },
+                                Opts
+                            )
+                    },
+                    Opts
+                ),
+            {ok, _} = hb_ao:resolve(Process, Req, Opts)
+        end,
+        Slots
+    ).
+
+%% The live state a process worker would hold before its first slot.
+ckpt_live(Process, Opts) ->
+    Base = lib_process:ensure_process_key(Process, Opts),
+    ProcID = lib_process:process_id(Base, #{}, Opts),
+    {ok, Loaded} = ensure_loaded(Base, #{ <<"slot">> => 0 }, Opts),
+    {ProcID, Loaded}.
+
+%% Compute `Slots' one at a time from a live state, as the worker does.
+ckpt_run(ProcID, State, Slots, Opts) ->
+    lists:foldl(
+        fun(Slot, S) ->
+            {ok, Next} =
+                compute_to_slot(
+                    ProcID,
+                    S,
+                    #{ <<"path">> => <<"compute">>, <<"slot">> => Slot },
+                    Slot,
+                    Opts
+                ),
+            Next
+        end,
+        State,
+        Slots
+    ).
+
+%% Restore `Slot' cold: newest visible checkpoint at or below it, then replay.
+ckpt_cold(Process, Slot, Opts) ->
+    Base = lib_process:ensure_process_key(Process, Opts),
+    ProcID = lib_process:process_id(Base, #{}, Opts),
+    Req = #{ <<"path">> => <<"compute">>, <<"slot">> => Slot },
+    {ok, Restored} = rewind(Base, Req, Slot, Opts),
+    From = loaded_slot(Restored, Opts),
+    {ok, State} = compute_to_slot(ProcID, Restored, Req, Slot, Opts),
+    {From, State}.
+
+%% A hook that reports every writer phase to `Test' and, where `Block' says
+%% so, waits for `go' or `crash' (a kill: no `after', as a node crash).
+%% Messages carry the test's `Ref': eunit may run several tests in one
+%% process, and a writer of an earlier test may still be reporting.
+ckpt_hook(Test, Ref, Block) ->
+    fun(Phase, Slot) ->
+        Test ! {ckpt, Ref, Phase, Slot, self()},
+        case Block(Phase, Slot) of
+            false -> ok;
+            true ->
+                receive
+                    {ckpt_cmd, Slot, go} -> ok;
+                    {ckpt_cmd, Slot, crash} -> exit(self(), kill)
+                end
+        end
+    end.
+
+ckpt_wait(Ref, Phase, Slot) ->
+    receive {ckpt, Ref, Phase, Slot, Writer} -> Writer
+    after 60000 -> erlang:error({checkpoint_phase_not_reached, Phase, Slot})
+    end.
+
+ckpt_vm(State) ->
+    term_to_binary(
+        luerl:externalize(maps:get(<<"state">>, hb_private:from_message(State)))
+    ).
+
+ckpt_public(State, Opts) ->
+    {
+        hb_ao:get(<<"at-slot">>, State, Opts),
+        hb_ao:get(<<"count">>, State, Opts),
+        hb_ao:get(<<"sum">>, State, Opts),
+        hb_ao:get(<<"results/output/data">>, State, Opts)
+    }.
+
+ckpt_writer_idle(ProcID, Opts) ->
+    hb_util:wait_until(
+        fun() -> hb_name:lookup(checkpoint_writer_name(ProcID, Opts)) == undefined end,
+        30000
+    ).
+
+%% @doc A checkpoint never blocks the slots after it: slots 5-7 compute while
+%% slot 4's writer is held before it starts, nothing is visible until it is
+%% done, and a cold restore from the async checkpoint equals the live state,
+%% VM included.
+async_checkpoint_does_not_block_compute_test_() ->
+    {timeout, 180, fun() ->
+        Test = self(),
+        Ref = make_ref(),
+        Opts =
+            ckpt_opts(#{
+                <<"process-async-checkpoint-hook">> =>
+                    ckpt_hook(Test, Ref, fun(P, S) -> P == started andalso S == 4 end)
+            }),
+        Process = ckpt_process(ckpt_script(), Opts),
+        ckpt_schedule(Process, lists:seq(0, 9), Opts),
+        {ProcID, L0} = ckpt_live(Process, Opts),
+        L3 = ckpt_run(ProcID, L0, lists:seq(0, 3), Opts),
+        _ = ckpt_wait(Ref, linked, 0),
+        L4 = ckpt_run(ProcID, L3, [4], Opts),
+        Writer = ckpt_wait(Ref, started, 4),
+        L7 = ckpt_run(ProcID, L4, [5, 6, 7], Opts),
+        % Three slots computed while the writer is still held.
+        ?assert(is_process_alive(Writer)),
+        ?assertEqual(0, checkpoint_slot(ProcID, 7, Opts)),
+        % Slot 4 is readable, as a delta, the whole time.
+        ?assertEqual(
+            {4, <<"5">>, <<"15">>, <<"5">>},
+            ckpt_public(hb_util:ok(dev_process_cache:read(ProcID, 4, Opts)), Opts)
+        ),
+        Writer ! {ckpt_cmd, 4, go},
+        _ = ckpt_wait(Ref, linked, 4),
+        ?assertEqual(4, checkpoint_slot(ProcID, 7, Opts)),
+        ?assertEqual({7, <<"8">>, <<"36">>, <<"8">>}, ckpt_public(L7, Opts)),
+        dev_process_cache_clear(ProcID, Opts),
+        {From, Cold7} = ckpt_cold(Process, 7, Opts),
+        ?assertEqual(4, From),
+        ?assertEqual(ckpt_public(L7, Opts), ckpt_public(Cold7, Opts)),
+        ?assertEqual(ckpt_vm(L7), ckpt_vm(Cold7))
+    end}.
+
+%% @doc The same slots give the same states with checkpoints sync and async.
+async_checkpoint_is_deterministic_test_() ->
+    {timeout, 180, fun() ->
+        Run =
+            fun(Async) ->
+                Opts = ckpt_opts(#{ <<"process-async-checkpoints">> => Async }),
+                Process = ckpt_process(ckpt_script(), Opts),
+                ckpt_schedule(Process, lists:seq(0, 9), Opts),
+                {ProcID, L0} = ckpt_live(Process, Opts),
+                L9 = ckpt_run(ProcID, L0, lists:seq(0, 9), Opts),
+                ckpt_writer_idle(ProcID, Opts),
+                {_, Cold9} = ckpt_cold(Process, 9, Opts),
+                {ckpt_public(L9, Opts), ckpt_public(Cold9, Opts),
+                    checkpoint_slot(ProcID, 9, Opts)}
+            end,
+        {Live, Cold, Ckpt} = Run(true),
+        ?assertEqual(Live, Cold),
+        ?assertEqual(8, Ckpt),
+        ?assertEqual({Live, Cold, Ckpt}, Run(false))
+    end}.
+
+%% @doc A writer killed after its data is durable but before its link leaves
+%% no visible checkpoint: the slot still reads as its delta, a cold restore
+%% resumes from the previous checkpoint and replays to the live state, and the
+%% next checkpoint is written normally.
+async_checkpoint_writer_crash_leaves_previous_test_() ->
+    {timeout, 180, fun() ->
+        Test = self(),
+        Ref = make_ref(),
+        Opts =
+            ckpt_opts(#{
+                <<"process-async-checkpoint-hook">> =>
+                    ckpt_hook(Test, Ref, fun(P, S) -> P == data_written andalso S == 4 end)
+            }),
+        Process = ckpt_process(ckpt_script(), Opts),
+        ckpt_schedule(Process, lists:seq(0, 9), Opts),
+        {ProcID, L0} = ckpt_live(Process, Opts),
+        L4 = ckpt_run(ProcID, L0, lists:seq(0, 4), Opts),
+        Writer = ckpt_wait(Ref, data_written, 4),
+        Mon = erlang:monitor(process, Writer),
+        Writer ! {ckpt_cmd, 4, crash},
+        receive {'DOWN', Mon, process, Writer, killed} -> ok
+        after 30000 -> erlang:error(writer_not_killed)
+        end,
+        L6 = ckpt_run(ProcID, L4, [5, 6], Opts),
+        ?assertEqual(0, checkpoint_slot(ProcID, 6, Opts)),
+        {ok, Raw4} =
+            hb_cache:read(dev_process_cache_path(ProcID, 4), Opts),
+        ?assertEqual(<<"process-delta@1.0">>, hb_ao:get(<<"cache-format">>, Raw4, Opts)),
+        dev_process_cache_clear(ProcID, Opts),
+        % The cold replay passes slot 4 again, which is due: let that writer go.
+        Self = self(),
+        Releaser =
+            spawn(fun() ->
+                receive {ckpt, Ref, data_written, 4, W} -> W ! {ckpt_cmd, 4, go} end,
+                Self ! released
+            end),
+        {From, Cold6} =
+            ckpt_cold(Process, 6, Opts#{
+                <<"process-async-checkpoint-hook">> =>
+                    ckpt_hook(Releaser, Ref, fun(P, S) -> P == data_written andalso S == 4 end)
+            }),
+        ?assertEqual(0, From),
+        ?assertEqual(ckpt_public(L6, Opts), ckpt_public(Cold6, Opts)),
+        ?assertEqual(ckpt_vm(L6), ckpt_vm(Cold6)),
+        receive released -> ok after 30000 -> erlang:error(replay_writer_missing) end,
+        ckpt_writer_idle(ProcID, Opts),
+        % The registry is free again: the next checkpoint is written.
+        _ = ckpt_run(ProcID, L6, [7, 8], Opts),
+        _ = ckpt_wait(Ref, linked, 8),
+        ?assertEqual(8, checkpoint_slot(ProcID, 9, Opts))
+    end}.
+
+%% @doc Retention running while a checkpoint is in flight (its data durable,
+%% its link not yet written) deletes nothing a restore needs: the previous
+%% checkpoint and the deltas after it stay, and the in-flight checkpoint is
+%% whole once it lands.
+async_checkpoint_survives_retention_in_flight_test_() ->
+    {timeout, 240, fun() ->
+        Test = self(),
+        Ref = make_ref(),
+        Opts =
+            ckpt_opts(#{
+                <<"process-async-checkpoint-hook">> =>
+                    ckpt_hook(Test, Ref, fun(P, S) -> P == data_written andalso S == 8 end),
+                <<"process-hot-cache-slots">> => 1,
+                <<"store-retention">> => true,
+                <<"store-retention-recent-slots">> => 1,
+                <<"store-retention-checkpoints">> => 1,
+                <<"store-retention-grace-ms">> => 0,
+                <<"store-retention-max-deletes-per-sec">> => 0,
+                <<"store-retention-scan-rows">> => 5000
+            }),
+        Process = ckpt_process(ckpt_script(), Opts),
+        ckpt_schedule(Process, lists:seq(0, 11), Opts),
+        {ProcID, L0} = ckpt_live(Process, Opts),
+        L9 = ckpt_run(ProcID, L0, lists:seq(0, 9), Opts),
+        _ = ckpt_wait(Ref, linked, 4),
+        Writer = ckpt_wait(Ref, data_written, 8),
+        Report = hb_store_gc:retain(Opts),
+        ?assert(maps:get(dropped_slots, Report) > 0),
+        ?assert(is_process_alive(Writer)),
+        ?assertEqual(4, checkpoint_slot(ProcID, 9, Opts)),
+        dev_process_cache_clear(ProcID, Opts),
+        {From4, Cold9} = ckpt_cold(Process, 9, Opts#{
+            % This replay must not start a second writer for slot 8.
+            <<"process-async-checkpoint-hook">> => fun(_, _) -> ok end
+        }),
+        ?assertEqual(4, From4),
+        ?assertEqual(ckpt_public(L9, Opts), ckpt_public(Cold9, Opts)),
+        Writer ! {ckpt_cmd, 8, go},
+        _ = ckpt_wait(Ref, linked, 8),
+        ?assertEqual(8, checkpoint_slot(ProcID, 9, Opts)),
+        dev_process_cache_clear(ProcID, Opts),
+        {From8, Cold9b} = ckpt_cold(Process, 9, Opts),
+        ?assertEqual(8, From8),
+        ?assertEqual(ckpt_public(L9, Opts), ckpt_public(Cold9b, Opts)),
+        ?assertEqual(ckpt_vm(L9), ckpt_vm(Cold9b))
+    end}.
+
+%% @doc One writer per process: a checkpoint that falls due while one is in
+%% flight is not queued but coalesced into the first slot after it finishes.
+async_checkpoint_coalesces_when_writer_busy_test_() ->
+    {timeout, 180, fun() ->
+        Test = self(),
+        Ref = make_ref(),
+        Opts =
+            ckpt_opts(#{
+                <<"process-async-checkpoint-hook">> =>
+                    ckpt_hook(Test, Ref, fun(P, S) -> P == started andalso S == 4 end)
+            }),
+        Process = ckpt_process(ckpt_script(), Opts),
+        ckpt_schedule(Process, lists:seq(0, 12), Opts),
+        {ProcID, L0} = ckpt_live(Process, Opts),
+        L4 = ckpt_run(ProcID, L0, lists:seq(0, 4), Opts),
+        Writer = ckpt_wait(Ref, started, 4),
+        L9 = ckpt_run(ProcID, L4, lists:seq(5, 9), Opts),
+        % Slot 8 fell due while slot 4 was writing: no second writer.
+        receive {ckpt, Ref, started, Other, _} when Other > 4 ->
+            erlang:error({second_writer, Other})
+        after 0 -> ok
+        end,
+        ?assert(checkpoint_overdue(L9)),
+        Writer ! {ckpt_cmd, 4, go},
+        _ = ckpt_wait(Ref, linked, 4),
+        ckpt_writer_idle(ProcID, Opts),
+        L10 = ckpt_run(ProcID, L9, [10], Opts),
+        _ = ckpt_wait(Ref, linked, 10),
+        ?assertNot(checkpoint_overdue(L10)),
+        _ = ckpt_run(ProcID, L10, [11], Opts),
+        ckpt_writer_idle(ProcID, Opts),
+        receive {ckpt, Ref, started, 11, _} -> erlang:error(not_coalesced)
+        after 0 -> ok
+        end,
+        ?assertEqual(10, checkpoint_slot(ProcID, 11, Opts)),
+        ?assertEqual(4, checkpoint_slot(ProcID, 9, Opts)),
+        dev_process_cache_clear(ProcID, Opts),
+        {From, Cold11} = ckpt_cold(Process, 11, Opts),
+        ?assertEqual(10, From),
+        ?assertEqual({11, <<"12">>, <<"78">>, <<"12">>}, ckpt_public(Cold11, Opts))
+    end}.
+
+%% @doc A process worker that stops while its checkpoint is in flight does not
+%% take the writer with it: the checkpoint is completed, and is restorable.
+async_checkpoint_outlives_worker_stop_test_() ->
+    {timeout, 180, fun() ->
+        Test = self(),
+        Ref = make_ref(),
+        Opts =
+            ckpt_opts(#{
+                <<"spawn-worker">> => true,
+                <<"process-workers">> => true,
+                <<"await-inprogress">> => named,
+                <<"process-async-checkpoint-hook">> =>
+                    ckpt_hook(Test, Ref, fun(P, S) -> P == started andalso S == 4 end)
+            }),
+        Process = ckpt_process(ckpt_script(), Opts),
+        ckpt_schedule(Process, lists:seq(0, 6), Opts),
+        {ok, State5} =
+            hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => 5 }, Opts),
+        ?assertEqual(<<"6">>, hb_ao:get(<<"count">>, State5, Opts)),
+        Writer = ckpt_wait(Ref, started, 4),
+        Group = hb_util:human_id(hb_message:id(Process, all, Opts)),
+        Worker = hb_name:lookup(Group),
+        ?assert(is_pid(Worker)),
+        Mon = erlang:monitor(process, Worker),
+        Worker ! stop,
+        receive {'DOWN', Mon, process, Worker, _} -> ok
+        after 30000 -> erlang:error(worker_did_not_stop)
+        end,
+        ?assert(is_process_alive(Writer)),
+        Writer ! {ckpt_cmd, 4, go},
+        _ = ckpt_wait(Ref, linked, 4),
+        dev_process_cache_clear(Group, Opts),
+        {From, Cold6} = ckpt_cold(Process, 6, Opts#{ <<"spawn-worker">> => false }),
+        ?assertEqual(4, From),
+        ?assertEqual({6, <<"7">>, <<"28">>, <<"7">>}, ckpt_public(Cold6, Opts))
+    end}.
+
+dev_process_cache_path(ProcID, Slot) ->
+    <<"computed/", (hb_util:human_id(ProcID))/binary, "/slot/",
+        (integer_to_binary(Slot))/binary>>.
+
+%% Drop a process's in-memory cache entries, so reads come from the store.
+dev_process_cache_clear(_ProcID, _Opts) ->
+    [ catch ets:delete_all_objects(T)
+    || T <- [dev_process_delta_hot_cache, dev_process_delta_recent_cache,
+             dev_process_delta_replay_cache] ],
+    ok.
+
+%% @doc Manual checkpoint benchmark and profile, on a large Lua state. Example:
+%% `HB_ASYNC_CKPT_BENCH=200000:3000:600:200 rebar3 device test --module dev_process'
+%% (Lua table entries : public-state keys : slots : checkpoint cadence).
+async_checkpoint_benchmark_report_test_() ->
+    {timeout, 3600, fun() ->
+        case os:getenv("HB_ASYNC_CKPT_BENCH") of
+            false -> ok;
+            Spec ->
+                [BigN, PubN, Slots, Interval] =
+                    [ list_to_integer(X) || X <- string:tokens(Spec, ":") ],
+                Sync = ckpt_bench(false, BigN, PubN, Slots, Interval),
+                io:format(user, "ASYNC_CKPT_BENCH sync ~p~n", [Sync]),
+                Async = ckpt_bench(true, BigN, PubN, Slots, Interval),
+                io:format(user, "ASYNC_CKPT_BENCH async ~p~n", [Async])
+        end
+    end}.
+
+ckpt_bench_script(BigN, PubN) ->
+    iolist_to_binary([
+        "Count = Count or 0\n"
+        "BIG_N = ", integer_to_list(BigN), "\n"
+        "PUB_N = ", integer_to_list(PubN), "\n"
+        "function compute(req)\n"
+        "  Count = Count + 1\n"
+        "  local patches = {}\n"
+        "  if not Big then\n"
+        "    Big = {}\n"
+        "    for i = 1, BIG_N do\n"
+        "      Big[i] = { id = i, name = 'player-' .. i, hp = i % 100,"
+        "        inv = { i, i + 1, 'sword' } }\n"
+        "    end\n"
+        "    for i = 1, PUB_N do\n"
+        "      patches[#patches + 1] = { path = '/world/k' .. i, value = 'v' .. i }\n"
+        "    end\n"
+        "  end\n"
+        "  local k = (Count * 7919) % BIG_N + 1\n"
+        "  Big[k].hp = Count\n"
+        "  Big[k].name = 'p' .. Count\n"
+        "  patches[#patches + 1] = { path = '/count', value = tostring(Count) }\n"
+        "  patches[#patches + 1] ="
+        "    { path = '/world/k' .. ((Count % PUB_N) + 1), value = 'c' .. Count }\n"
+        "  return { patches = patches, results = { output = { data = tostring(Count) } } }\n"
+        "end\n"
+    ]).
+
+ckpt_bench(Async, BigN, PubN, Slots, Interval) ->
+    Test = self(),
+    Hook =
+        fun(Phase, Slot) ->
+            Mem =
+                case Phase of
+                    data_written ->
+                        {memory, M} = process_info(self(), memory),
+                        {binary, Bs} = process_info(self(), binary),
+                        M + lists:sum([ Sz || {_, Sz, _} <- Bs ]);
+                    _ -> 0
+                end,
+            Test ! {bench, Phase, Slot, erlang:monotonic_time(microsecond), Mem}
+        end,
+    Opts =
+        ckpt_opts(#{
+            <<"process-async-checkpoints">> => Async,
+            <<"process-delta-checkpoint-slots">> => Interval,
+            <<"process-async-checkpoint-hook">> => Hook
+        }),
+    Process = ckpt_process(ckpt_bench_script(BigN, PubN), Opts),
+    ckpt_schedule(Process, lists:seq(0, Slots), Opts),
+    {ProcID, L0} = ckpt_live(Process, Opts),
+    {Slot0Us, L1} = timer:tc(fun() -> ckpt_run(ProcID, L0, [0], Opts) end),
+    ckpt_writer_idle(ProcID, Opts),
+    Start = erlang:monotonic_time(microsecond),
+    {Times, Last} =
+        lists:foldl(
+            fun(Slot, {Acc, S}) ->
+                {Us, Next} = timer:tc(fun() -> ckpt_run(ProcID, S, [Slot], Opts) end),
+                {[{Slot, Us} | Acc], Next}
+            end,
+            {[], L1},
+            lists:seq(1, Slots)
+        ),
+    Elapsed = erlang:monotonic_time(microsecond) - Start,
+    ckpt_writer_idle(ProcID, Opts),
+    Phases = ckpt_bench_drain(#{}),
+    Ckpt = [ Us || {S, Us} <- Times, S rem Interval == 0 ],
+    Normal = lists:sort([ Us || {S, Us} <- Times, S rem Interval =/= 0 ]),
+    Writes =
+        [ {S, (L - St) div 1000, maps:get({data_written, S}, Phases, 0) div 1}
+        || {{started, S}, St} <- maps:to_list(Phases),
+           L <- [maps:get({linked, S}, Phases, St)] ],
+    Mems = [ M || {{mem, _}, M} <- maps:to_list(Phases) ],
+    #{
+        mode => case Async of true -> async; false -> sync end,
+        slot0_ms => Slot0Us div 1000,
+        checkpoint_slot_ms => [ U div 1000 || U <- Ckpt ],
+        normal_slot_p50_ms => ckpt_pct(Normal, 50) / 1000,
+        normal_slot_p99_ms => ckpt_pct(Normal, 99) / 1000,
+        normal_slot_max_ms => lists:last(Normal) / 1000,
+        slots => Slots,
+        elapsed_ms => Elapsed div 1000,
+        slots_per_sec => Slots * 1000000 / Elapsed,
+        writer_ms => lists:sort([ {S, Ms} || {S, Ms, _} <- Writes ]),
+        writer_peak_bytes => lists:max([0 | Mems]),
+        checkpoint => checkpoint_slot(ProcID, Slots, Opts),
+        profile => ckpt_profile(ProcID, Last, Opts)
+    }.
+
+ckpt_bench_drain(Acc) ->
+    receive
+        {bench, data_written, S, T, Mem} ->
+            ckpt_bench_drain(Acc#{ {data_written, S} => T, {mem, S} => Mem });
+        {bench, Phase, S, T, _} -> ckpt_bench_drain(Acc#{ {Phase, S} => T })
+    after 0 -> Acc
+    end.
+
+ckpt_pct(Sorted, P) -> lists:nth(max(1, (length(Sorted) * P + 99) div 100), Sorted).
+
+%% Where a synchronous checkpoint's time goes, step by step, on `State'.
+ckpt_profile(_ProcID, State, Opts) ->
+    T = fun(F) -> {Us, R} = timer:tc(F), {Us div 1000, R} end,
+    VM = maps:get(<<"state">>, hb_private:from_message(State)),
+    {CopyMs, Pid} =
+        T(fun() -> spawn(fun() -> receive go -> erlang:phash2(State) end end) end),
+    exit(Pid, kill),
+    {ExtMs, Ext} = T(fun() -> luerl:externalize(VM) end),
+    {EncMs, Raw} = T(fun() -> term_to_binary(Ext) end),
+    {ZipMs, Zipped} = T(fun() -> term_to_binary(Ext, [compressed]) end),
+    {SnapMs, {ok, Snap}} = T(fun() -> snapshot(State, #{}, Opts) end),
+    WithSnap = hb_ao:set(State, <<"snapshot">>, Snap, Opts),
+    StoreOpts = Opts#{ <<"match-index">> => false },
+    {PubMs, _} = T(fun() -> hb_cache:write(hb_private:reset(State), StoreOpts) end),
+    {FullMs, _} = T(fun() -> hb_cache:write(hb_private:reset(WithSnap), StoreOpts) end),
+    {SyncMs, ok} =
+        T(fun() -> hb_store:sync(hb_opts:get(<<"store">>, [], Opts), Opts) end),
+    #{
+        state_heap_mb => erts_debug:flat_size(State) * 8 div 1048576,
+        copy_to_writer_ms => CopyMs,
+        externalize_ms => ExtMs,
+        term_to_binary_ms => EncMs,
+        raw_snapshot_mb => byte_size(Raw) div 1048576,
+        term_to_binary_compressed_ms => ZipMs,
+        snapshot_kb => byte_size(Zipped) div 1024,
+        device_snapshot_ms => SnapMs,
+        public_state_write_ms => PubMs,
+        full_state_with_snapshot_write_ms => FullMs,
+        store_sync_ms => SyncMs
+    }.

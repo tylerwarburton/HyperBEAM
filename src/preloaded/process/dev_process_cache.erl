@@ -4,6 +4,7 @@
 %%% message ID.
 -module(dev_process_cache).
 -export([latest/2, latest/3, latest/4, read/2, read/3, write/4]).
+-export([write_checkpoint/5]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 
@@ -185,7 +186,6 @@ should_checkpoint(ProcID, Slot, Msg, Opts) ->
     % here would execute that function and build the full VM snapshot merely
     % to test for its presence.
     HasSnapshot = maps:is_key(<<"snapshot">>, Msg),
-    Interval = delta_checkpoint_slots(Opts),
     MissingBase =
         Slot > 0 andalso
             hb_store:read(
@@ -193,7 +193,40 @@ should_checkpoint(ProcID, Slot, Msg, Opts) ->
                 path(ProcID, Slot - 1, Opts),
                 Opts
             ) =:= {error, not_found},
-    Slot =< 0 orelse HasSnapshot orelse Slot rem Interval =:= 0 orelse MissingBase.
+    Slot =< 0 orelse HasSnapshot orelse cadence_checkpoint(Slot, Opts)
+        orelse MissingBase.
+
+%% @doc Whether `Slot' is a full checkpoint by cadence alone. Not when the
+%% caller defers the checkpoint to a background writer
+%% (`dev_process:store_result/6' with `process-async-checkpoints'): the slot is
+%% then stored as a delta like any other, and the writer re-points it to the
+%% full state once that is durable (`write_checkpoint/5').
+cadence_checkpoint(Slot, Opts) ->
+    case maps:get(<<"process-cache-defer-checkpoint">>, Opts, false) of
+        true -> false;
+        _ -> Slot rem delta_checkpoint_slots(Opts) =:= 0
+    end.
+
+%% @doc Publish the full state (with its VM `snapshot') of a slot that is
+%% already stored, as a delta, as that slot's checkpoint. Called by the
+%% background checkpoint writer, never on the compute path.
+%%
+%% Crash-safe by ordering: every row of the state is written and committed
+%% (`hb_store:sync/2') before the slot alias is re-pointed at it, and that
+%% alias is the only thing `latest/4' (`snapshot+link'), a cold restore and
+%% `hb_store_gc' retention look at. A writer that dies earlier leaves only
+%% unreferenced rows; the slot still reads as its delta, and the previous
+%% checkpoint plus the gapless delta chain after it remain the resume point.
+%% Re-pointing changes no reader's answer: the delta and the full state are
+%% the same public state. `BeforeLink' is called once the data is durable
+%% (a test hook).
+write_checkpoint(ProcID, Slot, Msg, BeforeLink, Opts) ->
+    PublicMsg = hb_private:reset(Msg),
+    {ok, Root} = hb_cache:write(PublicMsg, storage_opts(Opts)),
+    ok = hb_store:sync(hb_opts:get(<<"store">>, no_viable_store, Opts), Opts),
+    BeforeLink(),
+    ok = link_result(ProcID, Slot, Root, Root, Opts),
+    {ok, path(ProcID, Slot, Opts)}.
 
 delta_checkpoint_slots(Opts) ->
     Raw = hb_opts:get(
