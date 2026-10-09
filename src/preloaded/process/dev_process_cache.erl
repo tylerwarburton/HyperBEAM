@@ -4,7 +4,7 @@
 %%% message ID.
 -module(dev_process_cache).
 -export([latest/2, latest/3, latest/4, read/2, read/3, write/4]).
--export([write_checkpoint/5]).
+-export([write_checkpoint/5, latest_slot/4, newest_slot_after/4]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 
@@ -706,6 +706,59 @@ hot_newest(ProcID, Opts) ->
     end.
 
 latest_from_store(ProcID, RawRequiredPath, Limit, RawOpts) ->
+    {Opts, RequiredPath, CappedSlots} =
+        slot_candidates(ProcID, RawRequiredPath, Limit, RawOpts),
+    % Find the highest slot that has the necessary path.
+    BestSlot =
+        first_with_path(
+            ProcID,
+            RequiredPath,
+            lists:reverse(lists:sort(CappedSlots)),
+            Opts
+        ),
+    case BestSlot of
+        {failure, _} = Failure ->
+            Failure;
+        {error, _} = Error ->
+            Error;
+        not_found ->
+            % No slot found with the necessary path was found.
+            {error, not_found};
+        SlotNum ->
+            % Found. Return the slot number and the message at that slot. A
+            % required path (in practice `snapshot+link', for a cold restore)
+            % may name a key the in-memory caches strip, so read the store.
+            {ok, Msg} =
+                case RequiredPath of
+                    [] -> read(ProcID, SlotNum, Opts);
+                    _ -> read_stored(ProcID, SlotNum, Opts)
+                end,
+            {ok, SlotNum, Msg}
+    end.
+
+%% @doc The newest slot at or below `Limit' (`undefined' for none) that has
+%% `RequiredPath', as `latest/4' finds it, but without reading its message:
+%% `{ok, Slot}', or `not_found' (also for a store failure).
+latest_slot(ProcID, RequiredPath, Limit, Opts) ->
+    slot_in(ProcID, RequiredPath, Limit, fun(_) -> true end, Opts).
+
+%% @doc The newest slot strictly above `After' that has `RequiredPath':
+%% `{ok, Slot}' or `not_found'. Reads no message.
+newest_slot_after(ProcID, RequiredPath, After, Opts) ->
+    slot_in(ProcID, RequiredPath, undefined, fun(S) -> S > After end, Opts).
+
+slot_in(ProcID, RawRequiredPath, Limit, Keep, RawOpts) ->
+    {Opts, RequiredPath, CappedSlots} =
+        slot_candidates(ProcID, RawRequiredPath, Limit, RawOpts),
+    Slots = lists:reverse(lists:sort(lists:filter(Keep, CappedSlots))),
+    case first_with_path(ProcID, RequiredPath, Slots, Opts) of
+        Slot when is_integer(Slot) -> {ok, Slot};
+        _ -> not_found
+    end.
+
+%% @doc The store-scoped options, the required path as binary keys, and the
+%% process's computed slots at or below `Limit'.
+slot_candidates(ProcID, RawRequiredPath, Limit, RawOpts) ->
     Scope = hb_opts:get(<<"process-cache-scope">>, local, RawOpts),
     % Normalize the store descriptor to a list of stores.
     UnscopedStore =
@@ -744,33 +797,7 @@ latest_from_store(ProcID, RawRequiredPath, Limit, RawOpts) ->
             {slots_in_range, CappedSlots}
         }
     ),
-    % Find the highest slot that has the necessary path.
-    BestSlot =
-        first_with_path(
-            ProcID,
-            RequiredPath,
-            lists:reverse(lists:sort(CappedSlots)),
-            Opts
-        ),
-    case BestSlot of
-        {failure, _} = Failure ->
-            Failure;
-        {error, _} = Error ->
-            Error;
-        not_found ->
-            % No slot found with the necessary path was found.
-            {error, not_found};
-        SlotNum ->
-            % Found. Return the slot number and the message at that slot. A
-            % required path (in practice `snapshot+link', for a cold restore)
-            % may name a key the in-memory caches strip, so read the store.
-            {ok, Msg} =
-                case RequiredPath of
-                    [] -> read(ProcID, SlotNum, Opts);
-                    _ -> read_stored(ProcID, SlotNum, Opts)
-                end,
-            {ok, SlotNum, Msg}
-    end.
+    {Opts, RequiredPath, CappedSlots}.
 
 %% @doc Find the latest assignment with the requested path suffix.
 first_with_path(ProcID, RequiredPath, Slots, Opts) ->

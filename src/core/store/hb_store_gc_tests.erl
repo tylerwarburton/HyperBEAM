@@ -257,6 +257,103 @@ retention_historical_reads_with_worker_test_() ->
         _ = run_slots(Process, Next, 3, Opts)
     end}.
 
+%% @doc A COLD worker (after a restart) asked for a slot retention dropped,
+%% below every retained checkpoint, of a process already past it: answered
+%% with a 503 at once beyond `process-historical-replay-limit', never replayed
+%% from slot 0, and never taken as the worker's base -- the next head request
+%% resumes from the newest checkpoint. In production a durable push resumed
+%% after a restart asked for slot 43,827 of a process at 50,737 (checkpoints
+%% kept near 49,000 and 50,000) and replayed from 0 for hours, blocking every
+%% live request for the process. A slot whose result is stored is still
+%% served, and a process with no checkpoint past the target still computes.
+retention_cold_historical_read_is_bounded_test_() ->
+    {timeout, 300, fun() ->
+        Opts = node_opts(#{
+            <<"spawn-worker">> => true,
+            <<"process-workers">> => true,
+            <<"await-inprogress">> => named
+        }),
+        Process = new_process(Opts),
+        Next = run_slots(Process, 0, 27, Opts),
+        _ = hb_store_gc:retain(Opts),
+        Kept = computed_slots(Process, Opts),
+        ?assertNot(lists:member(12, Kept)),
+        ?assert(lists:min(Kept) > 12),
+        Restart =
+            fun() ->
+                stop_worker(Process, Opts),
+                clear_process_caches()
+            end,
+        Restart(),
+        LimitOpts = Opts#{ <<"process-historical-replay-limit">> => 2 },
+        {{T, Refused}, Executed} =
+            executed_slots(fun() -> timer:tc(fun() -> compute(Process, 12, LimitOpts) end) end),
+        ?debugFmt("cold read of 12: ~p slots executed, ~p us, ~p",
+            [Executed, T, element(1, Refused)]),
+        ?assertMatch({error, #{ <<"status">> := 503 }}, Refused),
+        ?assertEqual(0, Executed),
+        ?assert(T < 2000000),
+        % A stored slot older than the newest checkpoint is served as stored.
+        Stored = lists:max([ S || S <- Kept, S < lists:max(Kept) - 1 ]),
+        {{ok, StoredState}, 0} =
+            executed_slots(fun() -> compute(Process, Stored, LimitOpts#{ <<"process-historical-replay-limit">> => 0 }) end),
+        ?assertEqual(integer_to_binary(Stored + 1), hb_ao:get(<<"count">>, StoredState, Opts)),
+        % The head resumes from the newest checkpoint, not from slot 0.
+        {Next2, HeadExecuted} = executed_slots(fun() -> run_slots(Process, Next, 2, Opts) end),
+        ?debugFmt("head after the refused read: ~p slots executed", [HeadExecuted]),
+        ?assert(HeadExecuted =< 2 + ?CADENCE),
+        % Within the limit the slot is rebuilt as an answer only: a cold worker
+        % that serves it does not keep it as its base.
+        Restart(),
+        ?assertEqual(<<"13">>, count_at(Process, 12, Opts)),
+        {_, HeadExecuted2} = executed_slots(fun() -> run_slots(Process, Next2, 1, Opts) end),
+        ?debugFmt("head after a rebuilt read: ~p slots executed", [HeadExecuted2]),
+        ?assert(HeadExecuted2 =< 1 + ?CADENCE),
+        % A process with no checkpoint past the target computes from init,
+        % however far that is.
+        Fresh = new_process(Opts),
+        lists:foreach(fun(N) -> ok = schedule(Fresh, N, Opts) end, lists:seq(0, 11)),
+        ?assertEqual(<<"12">>, count_at(Fresh, 11, LimitOpts))
+    end}.
+
+stop_worker(Process, Opts) ->
+    Group = proc_id(Process, Opts),
+    case await_worker(Group, 100) of
+        Worker when is_pid(Worker) ->
+            Ref = erlang:monitor(process, Worker),
+            Worker ! stop,
+            receive {'DOWN', Ref, process, Worker, _} -> ok
+            after 30000 -> erlang:error(worker_did_not_stop)
+            end;
+        _ -> erlang:error(no_worker_to_stop)
+    end,
+    hb_util:wait_until(fun() -> hb_name:lookup(Group) == undefined end, 30000).
+
+await_worker(_Group, 0) -> undefined;
+await_worker(Group, N) ->
+    case hb_name:lookup(Group) of
+        Pid when is_pid(Pid) -> Pid;
+        _ -> timer:sleep(100), await_worker(Group, N - 1)
+    end.
+
+%% Run `Fun' and return its result with the number of slots it executed.
+executed_slots(Fun) ->
+    % Devices are loaded from the preloaded store, under their own module
+    % names: find the process device by its exports.
+    [Mod | _] =
+        [ M || {M, _} <- code:all_loaded(),
+               erlang:function_exported(M, is_cached_state, 1),
+               erlang:function_exported(M, request_slot, 2) ],
+    MFA = {Mod, compute_slot, 6},
+    true = erlang:trace_pattern(MFA, true, [local, call_count]) >= 1,
+    try
+        Res = Fun(),
+        {call_count, N} = erlang:trace_info(MFA, call_count),
+        {Res, N}
+    after
+        erlang:trace_pattern(MFA, false, [local, call_count])
+    end.
+
 %% @doc A run sleeps the grace period once, however many chunks it sweeps, and
 %% in steady state sweeps everything in one chunk (one protection scan).
 %% `store-retention-max-candidates' bounds a chunk's memory.

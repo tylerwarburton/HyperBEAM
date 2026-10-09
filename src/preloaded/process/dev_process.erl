@@ -260,18 +260,58 @@ compute(Base, Req, Opts) ->
                       case recoverable_miss(Res) of
                           false -> Res;
                           true ->
-                              {ok, Loaded} =
-                                  ensure_loaded(ProcBase, Req, Opts),
-                              ?event(compute,
-                                  {recomputing_uncached_slot,
-                                      {process_id, ProcID},
-                                      {to_slot, Slot},
-                                      {cache_said, Res}},
-                                  Opts
-                              ),
-                              compute_from(ProcID, Loaded, Req, Slot, Opts)
+                              compute_miss(ProcID, ProcBase, Req, Slot, Res, Opts)
                       end
             end
+    end.
+
+%% @doc Compute a slot that is not in the cache.
+%%
+%% With a live state in hand, `compute_from/5' decides where to start. Without
+%% one -- a cold worker after a restart, or a state read back from the cache --
+%% `ensure_loaded/3' would restore the newest checkpoint at or below the target
+%% or, with none, initialize the process. For a target below every retained
+%% checkpoint of a process that has run past it, that is a replay from slot 0:
+%% `process-historical-replay-limit' only guarded a worker already ahead of the
+%% target. In production a cold worker asked for slot 43,827 of a process at
+%% 50,737 (retention kept checkpoints near 49,000 and 50,000) replayed from 0 at
+%% ~400 slots/min, with every live request for the process queued behind it.
+%%
+%% Such a target is a historical read, so it goes to `compute_historical/5',
+%% which answers it off to the side within the limit or with a 503 without
+%% doing any work, and leaves the worker cold: its next live request restores
+%% the newest checkpoint. A process with no checkpoint above the target is not
+%% past it, so its first compute, or a catch-up from its newest checkpoint, is
+%% still computed from there, however far.
+compute_miss(ProcID, ProcBase, Req, Slot, Miss, Opts) ->
+    case is_live_state(ProcBase, Opts) orelse
+            not checkpoint_after(ProcID, Slot, Opts) of
+        false ->
+            compute_historical(ProcID, ProcBase, Req, Slot, Opts);
+        true ->
+            {ok, Loaded} = ensure_loaded(ProcBase, Req, Opts),
+            ?event(compute,
+                {recomputing_uncached_slot,
+                    {process_id, ProcID},
+                    {to_slot, Slot},
+                    {cache_said, Miss}},
+                Opts
+            ),
+            compute_from(ProcID, Loaded, Req, Slot, Opts)
+    end.
+
+%% @doc Whether `ensure_loaded/3' would use `Base' as it is, rather than
+%% restoring a state from the cache.
+is_live_state(Base, Opts) ->
+    not is_cached_state(Base) andalso
+        hb_ao:get(<<"initialized">>, Base, Opts) == <<"true">>.
+
+%% @doc Whether the process has a checkpoint above `Slot'.
+checkpoint_after(ProcID, Slot, Opts) ->
+    case catch dev_process_cache:newest_slot_after(
+            ProcID, [<<"snapshot+link">>], Slot, Opts) of
+        {ok, _} -> true;
+        _ -> false
     end.
 
 %% @doc Compute `Slot' from the loaded state, choosing where to start.
@@ -346,8 +386,8 @@ newer_checkpoint(ProcID, Loaded, Current, Req, Slot, Opts) ->
 %% @doc The newest slot at or below `Slot' that holds a full checkpoint, or -1
 %% (the initialized state) when there is none.
 checkpoint_slot(ProcID, Slot, Opts) ->
-    case catch dev_process_cache:latest(ProcID, [<<"snapshot+link">>], Slot, Opts) of
-        {ok, Found, _} -> hb_util:int(hb_cache:ensure_all_loaded(Found, Opts));
+    case catch dev_process_cache:latest_slot(ProcID, [<<"snapshot+link">>], Slot, Opts) of
+        {ok, Found} -> Found;
         _ -> -1
     end.
 
