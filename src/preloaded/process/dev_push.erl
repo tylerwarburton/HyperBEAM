@@ -298,9 +298,17 @@ do_push(PrimaryProcess, Assignment, Opts) ->
                 }
         end,
     % Determine if we should include the full compute result in our response.
+    % The response is a new message: the result's keys plus `slot', `process'
+    % and one delivery report per outbox entry. The result's own commitments
+    % cover only its keys, so they must not be carried over: a cache write of
+    % the response (`cache-control: always') keeps only committed keys and
+    % drops the delivery reports, while the node's signature on the response
+    % links them by ID -- and the HTTP encoder then fails to load them.
     IncludeDepth = hb_ao:get(<<"result-depth">>, Assignment, 1, Opts),
     AdditionalRes =
         case IncludeDepth of
+            X when X > 0 andalso is_map(Result) ->
+                hb_message:uncommitted(Result, Opts);
             X when X > 0 -> Result;
             _ -> #{}
         end,
@@ -3633,3 +3641,120 @@ test_push_durable_resume_from_journal() ->
     ),
     {ok, R1} = hb_ao:resolve(Receiver, #{ <<"path">> => <<"slot/current">> }, Opts),
     ?assertEqual(R0 + 1, R1).
+
+%% @doc A pushed slot whose outbox was delivered is answered over HTTP like any
+%% other: every message the reply names can be loaded, under the node's
+%% production options (process workers, async checkpoints, durable push).
+push_reply_with_outbox_encodes_over_http_test_() ->
+    {timeout, 300, fun test_push_reply_with_outbox_encodes_over_http/0}.
+
+test_push_reply_with_outbox_encodes_over_http() ->
+    lists:foreach(
+        fun({Device, Async}) ->
+            push_reply_over_http(Device, Async)
+        end,
+        [{<<"lua@5.3b">>, true}, {<<"lua@5.3b">>, false}, {<<"lua@5.3a">>, false}]
+    ).
+
+push_reply_over_http(Device, Async) ->
+    hb_process_test_vectors:init(),
+    Wallet = ar_wallet:new(),
+    Opts =
+        #{
+            <<"priv-wallet">> => Wallet,
+            <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)],
+            <<"process-workers">> => true,
+            <<"spawn-worker">> => true,
+            <<"push-durable">> => true,
+            <<"process-async-checkpoints">> => Async,
+            <<"process-now-from-cache">> => true,
+            <<"process-hot-cache-slots">> => 512,
+            <<"process-delta-checkpoint-slots">> => 1000,
+            <<"http-extra-opts">> =>
+                #{
+                    <<"cache-control">> => [<<"always">>],
+                    <<"force-message">> => true
+                }
+        },
+    Node = hb_http_server:start_node(Opts),
+    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Proc =
+        fun(Script) ->
+            P = hb_message:commit(
+                #{
+                    <<"device">> => <<"process@1.0">>,
+                    <<"type">> => <<"Process">>,
+                    <<"scheduler-device">> => <<"scheduler@1.0">>,
+                    <<"execution-device">> => Device,
+                    <<"module">> =>
+                        #{
+                            <<"content-type">> => <<"application/lua">>,
+                            <<"body">> => Script
+                        },
+                    <<"scheduler">> => Address,
+                    <<"scheduler-location">> => Address,
+                    <<"authority">> => Address,
+                    <<"test-random-seed">> => rand:uniform(1 bsl 30)
+                },
+                Opts
+            ),
+            {ok, _} = hb_cache:write(P, Opts),
+            {ok, _} = schedule_body(P, P, Opts),
+            P
+        end,
+    {RecvScript, SendScript} =
+        case Device of
+            <<"lua@5.3b">> ->
+                {
+                    <<"function compute(req)\n"
+                      "  return { patches = {}, results = { output = { data = 'pong' } } }\n"
+                      "end\n">>,
+                    fun(RecvID) ->
+                        <<"N = N or 0\n"
+                          "function compute(req)\n"
+                          "  N = N + 1\n"
+                          "  return { patches = {{ path = '/n', value = tostring(N) }},\n"
+                          "    results = { output = { data = tostring(N) },\n"
+                          "      outbox = { ['peers-a'] = { target = '", RecvID/binary, "',\n"
+                          "        action = 'Ping', peers = { a = '1', b = { c = '2' } } } } } }\n"
+                          "end\n">>
+                    end
+                };
+            _ ->
+                {receiver_module(), fun simple_sender_module/1}
+        end,
+    Receiver = Proc(RecvScript),
+    RecvID = hb_message:id(Receiver, all, Opts),
+    Sender = Proc(SendScript(RecvID)),
+    SenderID = hb_util:human_id(hb_message:id(Sender, all, Opts)),
+    lists:foreach(
+        fun(N) ->
+            {ok, Sched} =
+                schedule_body(Sender,
+                    hb_message:commit(
+                        #{
+                            <<"target">> => SenderID,
+                            <<"type">> => <<"Message">>,
+                            <<"action">> => <<"Fire">>,
+                            <<"n">> => N
+                        },
+                        Opts
+                    ),
+                    Opts
+                ),
+            {ok, Slot} = hb_ao:resolve(Sched, #{ <<"path">> => <<"slot">> }, Opts),
+            Res =
+                hb_http:get(
+                    Node,
+                    <<"/", SenderID/binary, "~process@1.0/push&slot=",
+                        (hb_util:bin(Slot))/binary>>,
+                    Opts
+                ),
+            ?event(debug_test, {push_reply, Device, Async, Slot, Res}),
+            ?assertMatch({{ok, _}, _, _, _}, {Res, Device, Async, Slot})
+        end,
+        lists:seq(1, 12)
+    ),
+    {ok, RecvSlot} =
+        hb_ao:resolve(Receiver, #{ <<"path">> => <<"slot/current">> }, Opts),
+    ?assertEqual({Device, Async, 12}, {Device, Async, RecvSlot}).
