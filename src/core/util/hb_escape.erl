@@ -32,17 +32,73 @@ decode(<<$%, _/binary>>, Original) ->
 decode(<<_C, Rest/binary>>, Original) ->
     decode(Rest, Original).
 
-encode_header(<<>>) -> <<>>;
-encode_header(<<$\\, Rest/binary>>) -> <<"\\\\", (encode_header(Rest))/binary>>;
-encode_header(<<$\r, Rest/binary>>) -> <<"\\r", (encode_header(Rest))/binary>>;
-encode_header(<<$\n, Rest/binary>>) -> <<"\\n", (encode_header(Rest))/binary>>;
-encode_header(<<C, Rest/binary>>) -> <<C, (encode_header(Rest))/binary>>.
+%% @doc Escape `\\', CR and LF for a header value: `\\' -> `\\\\',
+%% CR -> `\\r', LF -> `\\n'; every other byte is copied.
+%%
+%% Linear in the value: the escapable bytes are found by `binary:matches/2' and
+%% the untouched runs between them are sub-binaries of the input, joined once.
+%% (The first version rebuilt the whole tail at every byte -- quadratic, and a
+%% non-tail call per byte -- which for a multi-megabyte value was seconds.) A
+%% value with nothing to escape is returned as is.
+encode_header(Bin) when is_binary(Bin) ->
+    case binary:matches(Bin, header_escapes()) of
+        [] -> Bin;
+        Found -> iolist_to_binary(encode_header_runs(Bin, 0, Found))
+    end.
 
-decode_header(<<>>) -> <<>>;
-decode_header(<<$\\, $\\, Rest/binary>>) -> <<$\\, (decode_header(Rest))/binary>>;
-decode_header(<<$\\, $r, Rest/binary>>) -> <<$\r, (decode_header(Rest))/binary>>;
-decode_header(<<$\\, $n, Rest/binary>>) -> <<$\n, (decode_header(Rest))/binary>>;
-decode_header(<<C, Rest/binary>>) -> <<C, (decode_header(Rest))/binary>>.
+encode_header_runs(Bin, Pos, []) ->
+    [binary:part(Bin, Pos, byte_size(Bin) - Pos)];
+encode_header_runs(Bin, Pos, [{At, 1} | Rest]) ->
+    [binary:part(Bin, Pos, At - Pos), header_escape(binary:at(Bin, At))
+    | encode_header_runs(Bin, At + 1, Rest)].
+
+header_escape($\\) -> <<"\\\\">>;
+header_escape($\r) -> <<"\\r">>;
+header_escape($\n) -> <<"\\n">>.
+
+header_escapes() ->
+    case persistent_term:get({?MODULE, header_escapes}, undefined) of
+        undefined ->
+            CP = binary:compile_pattern([<<"\\">>, <<"\r">>, <<"\n">>]),
+            persistent_term:put({?MODULE, header_escapes}, CP),
+            CP;
+        CP -> CP
+    end.
+
+%% @doc The inverse of `encode_header/1': `\\\\' -> `\\', `\\r' -> CR,
+%% `\\n' -> LF. A backslash followed by anything else (or by nothing) is
+%% kept, and the byte after it is read as an ordinary byte. Linear, as
+%% `encode_header/1'.
+decode_header(Bin) when is_binary(Bin) ->
+    case binary:match(Bin, <<"\\">>) of
+        nomatch -> Bin;
+        {At, 1} -> iolist_to_binary(decode_header_runs(Bin, 0, At))
+    end.
+
+decode_header_runs(Bin, Pos, nomatch) ->
+    [binary:part(Bin, Pos, byte_size(Bin) - Pos)];
+decode_header_runs(Bin, Pos, At) ->
+    Size = byte_size(Bin),
+    Run = binary:part(Bin, Pos, At - Pos),
+    {Out, Next} =
+        case At + 1 < Size of
+            false -> {<<"\\">>, At + 1};
+            true ->
+                case binary:at(Bin, At + 1) of
+                    $\\ -> {<<"\\">>, At + 2};
+                    $r -> {<<"\r">>, At + 2};
+                    $n -> {<<"\n">>, At + 2};
+                    _ -> {<<"\\">>, At + 1}
+                end
+        end,
+    [Run, Out | decode_header_runs(Bin, Next, next_backslash(Bin, Next))].
+
+next_backslash(Bin, Pos) when Pos >= byte_size(Bin) -> nomatch;
+next_backslash(Bin, Pos) ->
+    case binary:match(Bin, <<"\\">>, [{scope, {Pos, byte_size(Bin) - Pos}}]) of
+        nomatch -> nomatch;
+        {At, 1} -> At
+    end.
 
 %% @doc Encode a string with escaped quotes.
 encode_quotes(String) when is_binary(String) ->
@@ -190,3 +246,69 @@ escape_unescape_special_chars_test() ->
     ],
     TestString = list_to_binary(SpecialChars),
     ?assertEqual(TestString, decode(encode(TestString))).
+
+%%% Header escaping: the linear implementations against the original
+%%% byte-at-a-time definitions, kept here as the reference.
+
+ref_encode_header(<<>>) -> <<>>;
+ref_encode_header(<<$\\, Rest/binary>>) -> <<"\\\\", (ref_encode_header(Rest))/binary>>;
+ref_encode_header(<<$\r, Rest/binary>>) -> <<"\\r", (ref_encode_header(Rest))/binary>>;
+ref_encode_header(<<$\n, Rest/binary>>) -> <<"\\n", (ref_encode_header(Rest))/binary>>;
+ref_encode_header(<<C, Rest/binary>>) -> <<C, (ref_encode_header(Rest))/binary>>.
+
+ref_decode_header(<<>>) -> <<>>;
+ref_decode_header(<<$\\, $\\, Rest/binary>>) -> <<$\\, (ref_decode_header(Rest))/binary>>;
+ref_decode_header(<<$\\, $r, Rest/binary>>) -> <<$\r, (ref_decode_header(Rest))/binary>>;
+ref_decode_header(<<$\\, $n, Rest/binary>>) -> <<$\n, (ref_decode_header(Rest))/binary>>;
+ref_decode_header(<<C, Rest/binary>>) -> <<C, (ref_decode_header(Rest))/binary>>.
+
+%% A random binary of `Len' bytes, drawn either from every byte value or
+%% from an alphabet dense in the bytes the escaping cares about.
+header_random(Len) ->
+    Alphabet = <<"\\\r\nrnab\"%">>,
+    case rand:uniform(2) of
+        1 -> crypto:strong_rand_bytes(Len);
+        2 ->
+            << <<(binary:at(Alphabet, rand:uniform(byte_size(Alphabet)) - 1))>>
+            || _ <- lists:seq(1, Len) >>
+    end.
+
+header_escape_edge_cases_test() ->
+    Cases = [<<>>, <<"\\">>, <<"\r">>, <<"\n">>, <<"\\\\">>, <<"\\r">>,
+             <<"\\n">>, <<"\\x">>, <<"x\\">>, <<"\\\\\\">>, <<"\r\n">>,
+             <<"abc">>, << <<B>> || B <- lists:seq(0, 255) >>],
+    lists:foreach(
+        fun(C) ->
+            ?assertEqual(ref_encode_header(C), encode_header(C)),
+            ?assertEqual(ref_decode_header(C), decode_header(C)),
+            ?assertEqual(C, decode_header(encode_header(C)))
+        end,
+        Cases).
+
+header_escape_matches_reference_test_() ->
+    {timeout, 120, fun() ->
+        Lens = [ rand:uniform(64) - 1 || _ <- lists:seq(1, 3000) ] ++
+               [ rand:uniform(4096) || _ <- lists:seq(1, 300) ] ++
+               [ 20000 + rand:uniform(20000) || _ <- lists:seq(1, 6) ],
+        lists:foreach(
+            fun(Len) ->
+                B = header_random(Len),
+                E = encode_header(B),
+                ?assertEqual(ref_encode_header(B), E),
+                ?assertEqual(ref_decode_header(B), decode_header(B)),
+                ?assertEqual(ref_decode_header(E), decode_header(E)),
+                ?assertEqual(B, decode_header(E))
+            end,
+            Lens)
+    end}.
+
+%% A long value is linear: 4 MB with escapes throughout encodes and decodes
+%% in well under a second (the reference took minutes at this size).
+header_escape_long_value_test_() ->
+    {timeout, 60, fun() ->
+        B = header_random(4 * 1024 * 1024),
+        {T1, E} = timer:tc(fun() -> encode_header(B) end),
+        {T2, D} = timer:tc(fun() -> decode_header(E) end),
+        ?assertEqual(B, D),
+        ?assert(T1 + T2 < 5000000)
+    end}.
