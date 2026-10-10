@@ -324,7 +324,7 @@ start_worker(GroupName, Msg, Opts) ->
     ?event(worker_spawns,
         {starting_worker, {group, GroupName}, {msg, Msg}, {opts, Opts}}
     ),
-    WorkerPID = spawn(
+    WorkerPID = spawn_opt(
         fun() ->
             % If the device's info contains a `worker' function we
             % use that instead of the default implementation.
@@ -363,7 +363,8 @@ start_worker(GroupName, Msg, Opts) ->
                     ]
                 )
             )
-        end
+        end,
+        worker_spawn_opts(Opts)
     ),
     case hb_name:lookup(GroupName) of
         Parent when not is_atom(GroupName) ->
@@ -371,6 +372,50 @@ start_worker(GroupName, Msg, Opts) ->
         _ -> ok
     end,
     WorkerPID.
+
+%% @doc Garbage-collection options for a persistent worker's process.
+%%
+%% A process worker holds its process's whole state (for `lua@5.3b', a Lua VM
+%% of tens of MB of live heap) for as long as it lives, and nearly all of it
+%% survives every minor collection. With the VM default (`fullsweep_after'
+%% 65535) that state is promoted to the old heap once and then copied by
+%% nothing but the occasional major collection the old heap's growth forces,
+%% while every minor collection still scans the ever-larger young heap the
+%% survivors keep it at: measured on a live game snapshot, a slot took 40 ms
+%% with the default against 21 ms with `{fullsweep_after, 0}', flat as the
+%% state grew 2-5x. The cost is a larger peak heap.
+%%
+%% All three keys are unset by default, which spawns the worker exactly as
+%% before (`spawn/1' defaults):
+%% <ul>
+%%   <li>`process-worker-fullsweep-after': `fullsweep_after' (0 = every
+%%       collection is a full sweep);</li>
+%%   <li>`process-worker-min-heap-size': `min_heap_size', in words;</li>
+%%   <li>`process-worker-min-bin-vheap-size': `min_bin_vheap_size', in
+%%       words.</li>
+%% </ul>
+%% An unparseable or negative value is ignored rather than failing the spawn.
+worker_spawn_opts(Opts) ->
+    lists:flatmap(
+        fun({Key, Flag}) ->
+            case spawn_opt_int(hb_opts:get(Key, undefined, Opts)) of
+                undefined -> [];
+                N -> [{Flag, N}]
+            end
+        end,
+        [
+            {<<"process-worker-fullsweep-after">>, fullsweep_after},
+            {<<"process-worker-min-heap-size">>, min_heap_size},
+            {<<"process-worker-min-bin-vheap-size">>, min_bin_vheap_size}
+        ]
+    ).
+
+spawn_opt_int(N) when is_integer(N), N >= 0 -> N;
+spawn_opt_int(B) when is_binary(B) ->
+    try spawn_opt_int(binary_to_integer(B)) catch _:_ -> undefined end;
+spawn_opt_int(L) when is_list(L) ->
+    try spawn_opt_int(list_to_integer(L)) catch _:_ -> undefined end;
+spawn_opt_int(_) -> undefined.
 
 %% @doc A server function for handling persistent executions. 
 default_worker(GroupName, Base, Opts) ->
@@ -611,6 +656,56 @@ spawn_worker_outlives_resolution_test() ->
     ?assert(is_pid(Worker)),
     ?assert(erlang:is_process_alive(Worker)),
     exit(Worker, normal).
+
+%% @doc The worker GC options: unset spawns with the VM defaults; set, the
+%% worker process carries them. Garbage is ignored rather than failing.
+worker_spawn_opts_test() ->
+    ?assertEqual([], worker_spawn_opts(#{})),
+    ?assertEqual(
+        [{fullsweep_after, 0}, {min_heap_size, 1000}, {min_bin_vheap_size, 2000}],
+        worker_spawn_opts(#{
+            <<"process-worker-fullsweep-after">> => 0,
+            <<"process-worker-min-heap-size">> => <<"1000">>,
+            <<"process-worker-min-bin-vheap-size">> => 2000
+        })
+    ),
+    ?assertEqual([],
+        worker_spawn_opts(#{
+            <<"process-worker-fullsweep-after">> => <<"x">>,
+            <<"process-worker-min-heap-size">> => -1,
+            <<"process-worker-min-bin-vheap-size">> => false
+        })).
+
+worker_carries_gc_opts_test() ->
+    start(),
+    Spawn =
+        fun(Extra) ->
+            % A distinct base per case, so each case gets its own worker.
+            Base = #{ <<"device">> => test_device(),
+                      <<"gc-case">> => maps:size(Extra) },
+            Req = #{ <<"path">> => <<"slow_key">>, <<"wait">> => 10 },
+            Opts =
+                Extra#{
+                    <<"spawn-worker">> => true,
+                    <<"static-worker">> => true,
+                    <<"hashpath">> => ignore
+                },
+            GroupName = group(Base, Req, Opts),
+            {ok, _} = hb_ao:resolve(Base, Req, Opts),
+            Worker = await_registration(GroupName, 100),
+            ?assert(is_pid(Worker)),
+            {garbage_collection, GC} =
+                erlang:process_info(Worker, garbage_collection),
+            exit(Worker, normal),
+            GC
+        end,
+    Default = Spawn(#{}),
+    ?assertEqual(
+        proplists:get_value(fullsweep_after,
+            element(2, erlang:process_info(self(), garbage_collection))),
+        proplists:get_value(fullsweep_after, Default)),
+    Tuned = Spawn(#{ <<"process-worker-fullsweep-after">> => 0 }),
+    ?assertEqual(0, proplists:get_value(fullsweep_after, Tuned)).
 
 %% @doc An execution whose group name is the `ungrouped_exec' sentinel was
 %% never registered under a name, so there is nothing for a later resolution to
