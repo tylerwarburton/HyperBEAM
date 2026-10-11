@@ -13,7 +13,13 @@ Opt-in node option, default `false`: compute each slot this node assigns in the
 background instead of waiting for a `compute`/`push` (a schedule-only client
 left a game process at computed slot 4 with 2,004 assignments). To enable, set
 `"process-compute-on-schedule": true` (or a list of process IDs) in
-`node-config.json`; to undo, remove it and restart. Not on prod yet.
+`node-config.json`; to undo, remove it and restart. With no live worker the
+catch-up replays from the newest checkpoint up to
+`process-compute-on-schedule-replay-limit` slots (default 2 x
+`process-snapshot-slots` = 2000 with the saved config; `infinity` for none),
+independent of `process-historical-replay-limit` (64). `ops/prod/node-config.json`
+in the repo now sets the option to `true`; the live config on the host is
+unchanged. Not on prod yet.
 
 ---
 

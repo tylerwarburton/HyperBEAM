@@ -43,9 +43,7 @@
 %%%                      The most slots a read of a slot behind the state it
 %%%                      is computed from may replay from the newest
 %%%                      checkpoint at or below it (default 1000; `infinity'
-%%%                      for no bound). Beyond it the read is a 503. Also
-%%%                      bounds the cold catch-up a
-%%%                      `process-compute-on-schedule' wake may start.
+%%%                      for no bound). Beyond it the read is a 503.
 %%%     process-checkpoint-resume-gap:
 %%%                      The gap, in slots, from the loaded state to the target
 %%%                      at which computation resumes from a newer checkpoint
@@ -55,12 +53,17 @@
 %%%                      background after each assignment, instead of waiting
 %%%                      for a read to ask (default false; `true', or a list of
 %%%                      process IDs). See `dev_process_worker:compute_on_schedule/4'.
+%%%     process-compute-on-schedule-replay-limit:
+%%%                      The most slots such a catch-up may replay from the
+%%%                      newest checkpoint when no worker holds the live state
+%%%                      (default twice `process-snapshot-slots' if that is an
+%%%                      integer, else 2000; `infinity' for no bound).
 -module(dev_process).
 -device_libraries([lib_process]).
 %%% Public API
 -export([info/1, as/3, compute/3, schedule/3, slot/3, now/3, push/3, snapshot/3]).
 -export([target_slot/2, request_slot/2, is_cached_state/1]).
--export([cold_replay_bound/3, compute_on_schedule/4]).
+-export([cold_replay_bound/4, compute_on_schedule/4]).
 -export([default_device/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("include/hb.hrl").
@@ -471,19 +474,13 @@ compute_historical(ProcID, Loaded, Req, Slot, Opts) ->
 
 %% @doc Whether a cold start -- no live state, so a restore from the newest
 %% checkpoint at or below `Slot' and a replay from there -- would replay no more
-%% than `process-historical-replay-limit' slots to reach `Slot'. Returns
-%% `{true | false, Checkpoint, Limit}'. Used by the background catch-up of
-%% `process-compute-on-schedule', which must never start a long cold replay that
-%% nobody asked for.
-cold_replay_bound(ProcID, Slot, Opts) ->
+%% than `Limit' slots (`infinity' for no bound) to reach `Slot'. Returns
+%% `{true | false, Checkpoint}'. Used by the background catch-up of
+%% `process-compute-on-schedule', which must never start a replay from slot 0,
+%% or from far below the retained checkpoints, that nobody asked for.
+cold_replay_bound(ProcID, Slot, Limit, Opts) ->
     From = checkpoint_slot(ProcID, Slot, Opts),
-    Limit =
-        hb_opts:get(
-            <<"process-historical-replay-limit">>,
-            ?DEFAULT_HISTORICAL_REPLAY_LIMIT,
-            Opts
-        ),
-    {within_replay_limit(Slot - From, Limit), From, Limit}.
+    {within_replay_limit(Slot - From, Limit), From}.
 
 within_replay_limit(_Distance, Limit)
         when Limit == infinity; Limit == <<"infinity">>; Limit == false ->

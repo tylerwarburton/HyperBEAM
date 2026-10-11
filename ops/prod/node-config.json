@@ -134,5 +134,6 @@
   },
   "essentials-retention-days": 7,
   "essentials-retention-dry-run": false,
-  "process-async-checkpoints": true
+  "process-async-checkpoints": true,
+  "process-compute-on-schedule": true
 }

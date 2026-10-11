@@ -52,8 +52,11 @@ beside the originals and has a `rollback <STAMP>` mode.
   of process IDs): then every slot this node assigns is computed in the
   background, coalesced to one catch-up per process, through the process worker
   (same checkpoints and cache as a read; nothing is pushed). With no live worker
-  a catch-up that would replay more than `process-historical-replay-limit`
-  slots from the newest checkpoint is skipped and left to the next read.
+  (idle-out, restart) a catch-up replays from the newest checkpoint, up to
+  `process-compute-on-schedule-replay-limit` slots (default 2 x
+  `process-snapshot-slots`, so 2000 here; `infinity` for none); further than
+  that it is skipped and left to the next read. `process-historical-replay-limit`
+  does not apply to it.
 - Long `hb eval` calls hit an "Alarm clock" timeout: spawn the work inside the
   node and have it write a result file instead.
 - The node still looks up unknown push targets (wallets, deleted processes) in

@@ -543,14 +543,15 @@ catch_up_to(ProcID, Process, Target, Opts) ->
 
 %% @doc A live worker computes forward from the state it holds. Without one,
 %% the compute restores the newest checkpoint at or below `Target' and replays
-%% from there, which is allowed only within the replay limit.
+%% from there, which is allowed only within `catch_up_replay_limit/1'.
 catch_up_allowed(ProcID, Target, Opts) ->
     case hb_name:lookup(ProcID) of
         Pid when is_pid(Pid) -> true;
         undefined ->
-            case dev_process:cold_replay_bound(ProcID, Target, Opts) of
-                {true, _, _} -> true;
-                {false, From, Limit} ->
+            Limit = catch_up_replay_limit(Opts),
+            case dev_process:cold_replay_bound(ProcID, Target, Limit, Opts) of
+                {true, _} -> true;
+                {false, From} ->
                     ?event(compute_on_schedule,
                         {skipped_cold_replay,
                             {proc_id, ProcID},
@@ -562,6 +563,27 @@ catch_up_allowed(ProcID, Target, Opts) ->
                     ),
                     false
             end
+    end.
+
+%% @doc The most slots a cold catch-up may replay from the newest checkpoint:
+%% `process-compute-on-schedule-replay-limit', by default twice the snapshot
+%% cadence (`process-snapshot-slots', when it is an integer), else 2000.
+%%
+%% It is not `process-historical-replay-limit': that bounds reads of old slots,
+%% and is set well below the snapshot cadence (64 against 1000 on prod), so a
+%% catch-up bounded by it was skipped almost every time the worker was gone.
+%% Replaying from the newest checkpoint to the head is what any read or push of
+%% a cold process does anyway; the bound only has to stop a replay from slot 0,
+%% or from far below the retained checkpoints, that nobody asked for.
+catch_up_replay_limit(Opts) ->
+    LimitOpt = <<"process-compute-on-schedule-replay-limit">>,
+    case hb_opts:get(LimitOpt, undefined, Opts) of
+        undefined ->
+            case hb_opts:get(<<"process-snapshot-slots">>, undefined, Opts) of
+                Slots when is_integer(Slots), Slots > 0 -> 2 * Slots;
+                _ -> 2000
+            end;
+        Limit -> Limit
     end.
 
 %%% Tests
@@ -1527,8 +1549,9 @@ compute_on_schedule_matches_lazy_test_() ->
     end}.
 
 %% @doc With no live worker, a wake whose target is further from the newest
-%% checkpoint than `process-historical-replay-limit' is skipped without
-%% computing; within the limit, the same wake computes.
+%% checkpoint than `process-compute-on-schedule-replay-limit' is skipped without
+%% computing; within the limit, the same wake computes. The historical read
+%% limit plays no part.
 compute_on_schedule_respects_cold_bound_test_() ->
     {timeout, 120, fun() ->
         Ref = make_ref(),
@@ -1544,7 +1567,8 @@ compute_on_schedule_respects_cold_bound_test_() ->
         Bounded =
             Opts#{
                 <<"process-compute-on-schedule">> => true,
-                <<"process-historical-replay-limit">> => 2
+                <<"process-compute-on-schedule-replay-limit">> => 2,
+                <<"process-historical-replay-limit">> => infinity
             },
         cos_schedule(Process, ProcID, [6], Bounded),
         cos_catch_up_idle(ProcID),
@@ -1555,8 +1579,46 @@ compute_on_schedule_respects_cold_bound_test_() ->
             Process,
             ProcID,
             [7],
-            Bounded#{ <<"process-historical-replay-limit">> => infinity }
+            Bounded#{
+                <<"process-compute-on-schedule-replay-limit">> => infinity,
+                <<"process-historical-replay-limit">> => 2
+            }
         ),
         cos_await_latest(ProcID, 6, Opts),
         ?assertEqual([6], cos_computes(Ref))
     end}.
+
+%% @doc The catch-up's replay limit defaults to twice the snapshot cadence, or
+%% 2000 without an integer one, and an explicit setting wins.
+compute_on_schedule_replay_limit_default_test() ->
+    ?assertEqual(2000, catch_up_replay_limit(#{})),
+    ?assertEqual(
+        2000,
+        catch_up_replay_limit(#{ <<"process-snapshot-slots">> => <<"x">> })
+    ),
+    ?assertEqual(
+        2000,
+        catch_up_replay_limit(#{ <<"process-historical-replay-limit">> => 64 })
+    ),
+    ?assertEqual(
+        2000,
+        catch_up_replay_limit(#{ <<"process-snapshot-slots">> => 1000 })
+    ),
+    ?assertEqual(
+        100,
+        catch_up_replay_limit(#{ <<"process-snapshot-slots">> => 50 })
+    ),
+    ?assertEqual(
+        infinity,
+        catch_up_replay_limit(#{
+            <<"process-snapshot-slots">> => 1000,
+            <<"process-compute-on-schedule-replay-limit">> => infinity
+        })
+    ),
+    ?assertEqual(
+        10,
+        catch_up_replay_limit(#{
+            <<"process-snapshot-slots">> => 1000,
+            <<"process-compute-on-schedule-replay-limit">> => 10
+        })
+    ).
