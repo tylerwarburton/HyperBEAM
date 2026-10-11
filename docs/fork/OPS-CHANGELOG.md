@@ -7,6 +7,63 @@ Node: `hyperbeam-prod` on Box A · `hyperbeam.tylerw.ai` · store `/opt/runereal
 
 ---
 
+## Pending - not deployed: worker GC policy and low-garbage Luerl collect
+
+Two changes, both in source only; `ops/prod/node-config.json` already carries
+the new keys, so it is ahead of the live config until this ships.
+
+1. `process-worker-gc` (default `checkpoint+idle`; also `off`, `checkpoint`,
+   `idle`) and `process-worker-gc-idle-ms` (default 5000). A process worker
+   runs one full collection plus one minor (which promotes the state at the
+   quiet point instead of inside the next request) after the request that
+   handed off a checkpoint has been answered, and once after it has been idle
+   for the delay; never inside the per-slot path, never repeatedly while idle.
+   A compute-on-schedule catch-up that computed as leader drops its dead copy
+   of the state. `process-worker-fullsweep-after` stays available but unset.
+2. `patches/luerl-incremental-gc.patch`: a full `collectgarbage("collect")`
+   (which the game runs at the end of every message) no longer rebuilds the
+   VM's table/env/function stores, keeps its seen-sets off-heap (atomics), and
+   marks without listing every table entry. Same stores, same free lists, same
+   table indices as before: checked term-for-term in lockstep
+   (`scripts/luerl_gc_detcheck.erl`), and the Lua/process suites pass.
+
+Measured with `scripts/luerl_gc_bench.erl` (1 CPU, 286 MB live Lua state,
+900k tables, an allocation-heavy action per message):
+
+```
+collect per message       msg p50   majors/msg  minor GC total  heap mean
+old luerl, default        3980 ms      4.47         36.3 s       526 MB
+old luerl, fullsweep 0    4014 ms      1.70           -         1040 MB
+new luerl, default        1020 ms      0.47          2.2 s       492 MB
+no collect, default         28 ms      0.03          0.3 s       543 MB
+no collect, fullsweep 0     29 ms      0.05           -          411 MB
+no collect, GC every 10     28 ms      0.13          0.9 s       433 MB
+```
+
+The forced collection costs ~250-290 ms on this state, once per checkpoint
+interval (1000 slots on prod) and once per idle period. On prod a 1-2.5 s
+phase would be several majors or a heap of GBs: measure the game worker's
+`process_info(Pid, [total_heap_size, garbage_collection])` before and after.
+
+Undo: redeploy the previous image; to keep the image and stop the forced
+collections only, set `process-worker-gc: off`.
+
+---
+
+## 2026-10-11 18:35Z - removed `process-worker-fullsweep-after: 0` from live config
+
+With `{fullsweep_after, 0}` every minor collection of a process worker is a
+full copy of its heap. That cut the node's anonymous RSS from ~12 GB to
+~3.8 GB, but under a heavy swarm the game worker (one large Lua state, hundreds
+of MB) slowed 10-50x: per-action execution ~20 ms -> 300-1000 ms, store time
+~10 -> ~400 ms, compute below 1 msg/s, schedule replies to the game 5-15 s.
+Without the option (VM default `fullsweep_after`) it is back to ~5 msg/s and
+~100 ms per action. Config only, one restart; no image change.
+
+Undo: `fullsweep-off.sh rollback 20261011T183527Z`.
+
+---
+
 ## 2026-10-11 19:42Z - `hyperbeam:upgrades-o` (d9925e2d9a44, source 6c78128f8)
 
 Fixes the compute-on-schedule catch-up shipped in upgrades-n. It ran without
