@@ -7,6 +7,20 @@ Node: `hyperbeam-prod` on Box A · `hyperbeam.tylerw.ai` · store `/opt/runereal
 
 ---
 
+## 2026-10-11 19:42Z - `hyperbeam:upgrades-o` (d9925e2d9a44, source 6c78128f8)
+
+Fixes the compute-on-schedule catch-up shipped in upgrades-n. It ran without
+`spawn-worker` (hb_ao strips it from device-call opts), so it computed each wake
+itself from the newest checkpoint and never left a live worker: every new message
+to a hunt or vault replayed it from slot 0 (~500 slots), 5-7 cores under swarm
+load, starving the game into a backlog spiral. It also crashed with `undef` at the
+end of every catch-up (~2,163/h). After deploy: 0 resets, hunts compute only new
+slots, CPU 5.4 -> 1.2 cores, 0 crashes. Config unchanged.
+
+Undo: `bash deploy-o.sh rollback 20261011T194042Z`.
+
+---
+
 ## 2026-10-11 16:51Z - `hyperbeam:upgrades-n` (61196afbbbc8, source 852c669d4)
 
 Prod was `runerealm-hb:bridge-v2` (2b3f18fe, source 014bb536a). Added on top:
