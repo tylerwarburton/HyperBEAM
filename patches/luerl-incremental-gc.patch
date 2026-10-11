@@ -61,7 +61,7 @@ index 6e26f6b..38df4e7 100644
  methodcall(Obj, Meth, Args, St0) ->
      %% Get the function to call from object and method.
 diff --git a/src/luerl_heap.erl b/src/luerl_heap.erl
-index 93449c5..825a73c 100644
+index 93449c5..5fd58c2 100644
 --- a/src/luerl_heap.erl
 +++ b/src/luerl_heap.erl
 @@ -24,11 +24,13 @@
@@ -89,7 +89,7 @@ index 93449c5..825a73c 100644
  %% init() -> State
  %%
  %% Initialise the heap section of the state and return the state.
-@@ -589,20 +594,210 @@ set_env_var(#eref{i=N}, Index, Val, #luerl{envs=Est0}=St) ->
+@@ -589,20 +594,218 @@ set_env_var(#eref{i=N}, Index, Val, #luerl{envs=Est0}=St) ->
  
  -record(gct, {t,s}).                            %Gc table info table, seen
  
@@ -293,24 +293,33 @@ index 93449c5..825a73c 100644
 -    %% The root set consisting of global table and stack.
 -    Root = [Meta#meta.nil,Meta#meta.boolean,Meta#meta.number,Meta#meta.string,
 -            G|Stk],
-+          fncs=#tstruct{data=Ft0,free=Ff0}=Fnc0}=St) ->
-+    %% The root set consisting of global table, stacks and frames.
-+    Root = root_set(St),
-     %% Mark all seen tables and frames, i.e. return them.
+-    %% Mark all seen tables and frames, i.e. return them.
 -    GcT = #gct{t=Tt0,s=[]},
 -    GcE = #gct{t=Et0,s=[]},
 -    GcU = #gct{t=Ut0,s=[]},
 -    GcF = #gct{t=Ft0,s=[]},
 -    {SeenT,SeenE,SeenU,SeenF} = mark(Root, [Cs], GcT, GcE, GcU, GcF),
-+    GcT = #gct{t=Tt0,s=#{}},
-+    GcE = #gct{t=Et0,s=#{}},
-+    GcU = #gct{t=Ut0,s=#{}},
-+    GcF = #gct{t=Ft0,s=#{}},
++          fncs=#tstruct{data=Ft0,free=Ff0}=Fnc0}=St) ->
++    %% The root set consisting of global table, stacks and frames.
++    Root = root_set(St),
++    %% Mark all seen tables and frames, i.e. return them. A full collection
++    %% runs on every message of a contract that ends each with
++    %% collectgarbage("collect"), so it must leave little behind on the Erlang
++    %% heap: seen-sets are off-heap atomics, marking pushes only references
++    %% rather than listing every table entry, and the sweep deletes the dead
++    %% keys from the stores instead of rebuilding them (a rebuilt store is a
++    %% new live copy that survives into the old heap, forcing a major Erlang
++    %% collection of the whole VM every message or two). The result -- live
++    %% stores and free lists -- is identical, term for term.
++    GcT = #gct{t=Tt0,s=seen_new(Tab0)},
++    GcE = #gct{t=Et0,s=seen_new(Env0)},
++    GcU = #gct{t=Ut0,s=seen_new(Usd0)},
++    GcF = #gct{t=Ft0,s=seen_new(Fnc0)},
 +    {SeenT,SeenE,SeenU,SeenF} = mark(Root, [], GcT, GcE, GcU, GcF),
      %% io:format("gc: ~p\n", [{SeenT,SeenF,SeenU}]),
      %% Free unseen tables and add freed to free list.
      {Tf1,Tt1} = filter_tables(SeenT, Tf0, Tt0),
-@@ -614,7 +809,15 @@ gc(#luerl{tabs=#tstruct{data=Tt0,free=Tf0}=Tab0,
+@@ -614,7 +817,15 @@ gc(#luerl{tabs=#tstruct{data=Tt0,free=Tf0}=Tab0,
      Env1 = Env0#tstruct{data=Et1,free=Ef1},
      Usd1 = Usd0#tstruct{data=Ut1,free=Uf1},
      Fnc1 = Fnc0#tstruct{data=Ft1,free=Ff1},
@@ -327,62 +336,72 @@ index 93449c5..825a73c 100644
  
  %% mark(ToDo, MoreTodo, GcTabs, GcEnv, GcUserdata, GcFuncdefs) ->
  %%     {SeenTabs,SeenFrames,SeenUserdata,SeenFuncdefs}.
-@@ -625,11 +828,11 @@ mark([{in_table,_}=_T|Todo], More, GcT, GcE, GcU, GcF) ->
+@@ -625,37 +836,39 @@ mark([{in_table,_}=_T|Todo], More, GcT, GcE, GcU, GcF) ->
      %%io:format("gc: ~p\n", [_T]),
      mark(Todo, More, GcT, GcE, GcU, GcF);
  mark([#tref{i=T}|Todo], More, #gct{t=Tt,s=Ts0}=GcT, GcE, GcU, GcF) ->
 -    case ordsets:is_element(T, Ts0) of
-+    case maps:is_key(T, Ts0) of
++    case seen(T, Ts0) of
          true ->                                 %Already done
              mark(Todo, More, GcT, GcE, GcU, GcF);
          false ->                                %Mark it and add to todo
 -            Ts1 = ordsets:add_element(T, Ts0),
-+            Ts1 = Ts0#{ T => true },
++            Ts1 = seen_set(T, Ts0),
              #table{a=Arr,d=Dict,meta=Meta} = ?GET_TABLE(T, Tt),
              %% Have to be careful when adding Tab and Meta as Tab is
              %% [{Key,Val}], Arr is array and Meta is
-@@ -641,21 +844,21 @@ mark([#tref{i=T}|Todo], More, #gct{t=Tt,s=Ts0}=GcT, GcE, GcU, GcF) ->
+             %% nil|#tref{i=M}. We want lists.
+-            Aes = array:sparse_to_list(Arr),
+-            Des = ttdict:to_list(Dict),
+-            mark([Meta|Todo], [[{in_table,T}],Des,Aes,[{in_table,-T}]|More],
+-                 GcT#gct{s=Ts1}, GcE, GcU, GcF)
++            Refs0 = array:sparse_foldl(fun (_, V, Acc) -> push_ref(V, Acc) end,
++                                       [], Arr),
++            Refs1 = ttdict:fold(fun (K, V, Acc) ->
++                                        push_ref(V, push_ref(K, Acc))
++                                end, Refs0, Dict),
++            mark([Meta|Todo], [Refs1|More], GcT#gct{s=Ts1}, GcE, GcU, GcF)
      end;
  mark([#eref{i=F}|Todo], More, GcT, #gct{t=Et,s=Es0}=GcE, GcU, GcF) ->
      %% io:format("eref0: ~p\ ~p ~pn", [F,Et,Es0]),
 -    case ordsets:is_element(F, Es0) of
-+    case maps:is_key(F, Es0) of
++    case seen(F, Es0) of
          true ->                                 %Already done
              mark(Todo, More, GcT, GcE, GcU, GcF);
          false ->                                %Mark it and add to todo
 -            Es1 = ordsets:add_element(F, Es0),
-+            Es1 = Es0#{ F => true },
++            Es1 = seen_set(F, Es0),
              Ses = tuple_to_list(?GET_TABLE(F, Et)),
              %% io:format("eref1: ~p ~p\n", [Et,Es1]),
              mark(Todo, [Ses|More], GcT, GcE#gct{s=Es1}, GcU, GcF)
      end;
  mark([#usdref{i=U}|Todo], More, GcT, GcE, #gct{s=Us0}=GcU, GcF) ->
 -    case ordsets:is_element(U, Us0) of
-+    case maps:is_key(U, Us0) of
++    case seen(U, Us0) of
         true ->                                 %Already done
             mark(Todo, More, GcT, GcE, GcU, GcF);
         false ->
 -           Us1 = ordsets:add_element(U, Us0),
-+           Us1 = Us0#{ U => true },
++           Us1 = seen_set(U, Us0),
             mark(Todo, More, GcT, GcE, GcU#gct{s=Us1}, GcF)
      end;
  mark([#funref{i=F,env=Erefs}|ToDo], More, GcT, GcE, GcU,
-@@ -663,12 +866,12 @@ mark([#funref{i=F,env=Erefs}|ToDo], More, GcT, GcE, GcU,
+@@ -663,12 +876,12 @@ mark([#funref{i=F,env=Erefs}|ToDo], More, GcT, GcE, GcU,
      %% io:format("funref0: ~p ~p ~p\n", [F,Fs0,Erefs]),
      %% Each funref has its own environments but we only need to add
      %% the function definition once.
 -    case ordsets:is_element(F, Fs0) of
-+    case maps:is_key(F, Fs0) of
++    case seen(F, Fs0) of
          true ->
              mark(ToDo, [Erefs|More], GcT, GcE, GcU, GcF);
          false ->
              %% And mark the function definition.
 -            Fs1 = ordsets:add_element(F, Fs0),
-+            Fs1 = Fs0#{ F => true },
++            Fs1 = seen_set(F, Fs0),
              Fdef = ?GET_TABLE(F, Ft0),
              %% io:format("funref1: ~p ~p ~p\n", [F,Fs1,Erefs]),
              mark([Fdef|ToDo], [Erefs|More], GcT, GcE, GcU, GcF#gct{s=Fs1})
-@@ -697,6 +900,9 @@ mark([#userdata{meta=Meta}|Todo], More, GcT, GcE, GcU, GcF) ->
+@@ -697,6 +910,9 @@ mark([#userdata{meta=Meta}|Todo], More, GcT, GcE, GcU, GcF) ->
  mark([{K,V}|Todo], More, GcT, GcE, GcU, GcF) -> %Table key-value pair
      %% io:format("mt: ~p\n", [{K,V}]),
      mark([K,V|Todo], More, GcT, GcE, GcU, GcF);
@@ -392,7 +411,7 @@ index 93449c5..825a73c 100644
  mark([_|Todo], More, GcT, GcE, GcU, GcF) ->
      %% Can ignore everything else.
      mark(Todo, More, GcT, GcE, GcU, GcF);
-@@ -705,6 +911,151 @@ mark([], [M|More], GcT, GcE, GcU, GcF) ->
+@@ -705,6 +921,151 @@ mark([], [M|More], GcT, GcE, GcU, GcF) ->
  mark([], [], #gct{s=St}, #gct{s=Se}, #gct{s=Su}, #gct{s=Sf}) ->
      {St,Se,Su,Sf}.
  
@@ -544,61 +563,83 @@ index 93449c5..825a73c 100644
  %% filter_tables(Seen, Free, Tables) -> {Free,Tables}.
  %% filter_environment(Seen, Free, Frames) -> {Free,Frames}.
  %% filter_userdata(Seen, Free, Frames) -> {Free,Frames}.
-@@ -715,46 +1066,46 @@ mark([], [], #gct{s=St}, #gct{s=Se}, #gct{s=Su}, #gct{s=Sf}) ->
- filter_tables(Seen, Tf0, Tt0) ->
-     %% Update the free list.
-     Tf1 = ?FOLD_TABLES(fun (K, _, Free) ->
+@@ -712,49 +1073,31 @@ mark([], [], #gct{s=St}, #gct{s=Se}, #gct{s=Su}, #gct{s=Sf}) ->
+ %%  Filter tables/frames/userdata/funcdefs and return updated free
+ %%  lists and tables/frames.
+ 
+-filter_tables(Seen, Tf0, Tt0) ->
+-    %% Update the free list.
+-    Tf1 = ?FOLD_TABLES(fun (K, _, Free) ->
 -                               case ordsets:is_element(K, Seen) of
-+                               case maps:is_key(K, Seen) of
-                                    true -> Free;
-                                    false -> [K|Free]
-                                end
-                        end, Tf0, Tt0),
+-                                   true -> Free;
+-                                   false -> [K|Free]
+-                               end
+-                       end, Tf0, Tt0),
 -    Tt1 = ?FILTER_TABLES(fun (K, _) -> ordsets:is_element(K, Seen) end, Tt0),
-+    Tt1 = ?FILTER_TABLES(fun (K, _) -> maps:is_key(K, Seen) end, Tt0),
-     {Tf1,Tt1}.
- 
- filter_environment(Seen, Ef0, Et0) ->
-     %% io:format("env0: ~p ~p ~p\n", [Seen,Ef0,Et0]),
-     %% Update the free list.
-     Ef1 = ?FOLD_TABLES(fun (K, _, Free) ->
+-    {Tf1,Tt1}.
+-
+-filter_environment(Seen, Ef0, Et0) ->
+-    %% io:format("env0: ~p ~p ~p\n", [Seen,Ef0,Et0]),
+-    %% Update the free list.
+-    Ef1 = ?FOLD_TABLES(fun (K, _, Free) ->
 -                               case ordsets:is_element(K, Seen) of
-+                               case maps:is_key(K, Seen) of
-                                    true -> Free;
-                                    false -> [K|Free]
-                                end
-                        end, Ef0, Et0),
+-                                   true -> Free;
+-                                   false -> [K|Free]
+-                               end
+-                       end, Ef0, Et0),
 -    Et1 = ?FILTER_TABLES(fun (K, _) -> ordsets:is_element(K, Seen) end, Et0),
-+    Et1 = ?FILTER_TABLES(fun (K, _) -> maps:is_key(K, Seen) end, Et0),
-     %% io:format("env1: ~p ~p\n", [Ef1,Et1]),
-     {Ef1,Et1}.
- 
- filter_userdata(Seen, Uf0, Ut0) ->
-     %% Update the free list.
-     Uf1 = ?FOLD_TABLES(fun (K, _, Free) ->
+-    %% io:format("env1: ~p ~p\n", [Ef1,Et1]),
+-    {Ef1,Et1}.
+-
+-filter_userdata(Seen, Uf0, Ut0) ->
+-    %% Update the free list.
+-    Uf1 = ?FOLD_TABLES(fun (K, _, Free) ->
 -                              case ordsets:is_element(K, Seen) of
-+                              case maps:is_key(K, Seen) of
-                                   true -> Free;
-                                   false -> [K|Free]
-                               end
-                       end, Uf0, Ut0),
-     %% Reclaim free table slots.
+-                                  true -> Free;
+-                                  false -> [K|Free]
+-                              end
+-                      end, Uf0, Ut0),
+-    %% Reclaim free table slots.
 -    Ut1 = ?FILTER_TABLES(fun (K, _) -> ordsets:is_element(K, Seen) end, Ut0),
-+    Ut1 = ?FILTER_TABLES(fun (K, _) -> maps:is_key(K, Seen) end, Ut0),
-     {Uf1,Ut1}.
- 
- filter_funcdefs(Seen, Ff0, Ft0) ->
-     %% Update the free list.
-     Ff1 = ?FOLD_TABLES(fun (K, _, Free) ->
+-    {Uf1,Ut1}.
+-
+-filter_funcdefs(Seen, Ff0, Ft0) ->
+-    %% Update the free list.
+-    Ff1 = ?FOLD_TABLES(fun (K, _, Free) ->
 -                                case ordsets:is_element(K, Seen) of
-+                                case maps:is_key(K, Seen) of
-                                     true -> Free;
-                                     false -> [K|Free]
+-                                    true -> Free;
+-                                    false -> [K|Free]
++filter_tables(Seen, Tf0, Tt0) -> sweep_unseen(Seen, Tf0, Tt0).
++filter_environment(Seen, Ef0, Et0) -> sweep_unseen(Seen, Ef0, Et0).
++filter_userdata(Seen, Uf0, Ut0) -> sweep_unseen(Seen, Uf0, Ut0).
++filter_funcdefs(Seen, Ff0, Ft0) -> sweep_unseen(Seen, Ff0, Ft0).
++
++%% The free list gains the dead keys in the store's fold order, exactly as the
++%% filter it replaces built it: table indices are visible to Lua (tostring,
++%% and the order of table keys), so their reuse order must not change.
++sweep_unseen(Seen, Free0, Data0) ->
++    Dead = ?FOLD_TABLES(fun (K, _, Acc) ->
++                                case seen(K, Seen) of
++                                    true -> Acc;
++                                    false -> [K|Acc]
                                  end
-                         end, Ff0, Ft0),
+-                        end, Ff0, Ft0),
 -    Ft1 = ?FILTER_TABLES(fun (K, _) -> ordsets:is_element(K, Seen) end, Ft0),
-+    Ft1 = ?FILTER_TABLES(fun (K, _) -> maps:is_key(K, Seen) end, Ft0),
-     {Ff1,Ft1}.
+-    {Ff1,Ft1}.
++                        end, [], Data0),
++    {Dead ++ Free0,
++     lists:foldl(fun (K, D) -> ?DEL_TABLE(K, D) end, Data0, Dead)}.
++
++%% Seen-sets for a full collection: one off-heap atomic per index, so marking
++%% allocates nothing on the process heap for them.
++seen_new(#tstruct{next=Next}) -> atomics:new(max(Next, 1) + 1, [{signed,false}]).
++seen(K, A) -> atomics:get(A, K + 1) =:= 1.
++seen_set(K, A) -> atomics:put(A, K + 1, 1), A.
++
++%% Only values that can lead to heap objects need marking: numbers, strings,
++%% booleans and nil are skipped instead of being copied into a work list.
++push_ref(V, Acc) when is_tuple(V); is_list(V) -> [V|Acc];
++push_ref(_, Acc) -> Acc.
 diff --git a/src/luerl_lib_basic.erl b/src/luerl_lib_basic.erl
 index 6b52b62..b0f19ff 100644
 --- a/src/luerl_lib_basic.erl
