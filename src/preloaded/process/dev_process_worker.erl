@@ -739,10 +739,40 @@ catch_up_to(ProcID, Process, Target, Opts) ->
 %% checkpoint but slot 0) replayed every slot from 1 on every wake, ~400 slots
 %% per few new assignments. With process workers on, the catch-up delegates to
 %% a worker as a request does, and every later catch-up finds that worker live.
+%%
+%% The options are the ones an HTTP request to this node resolves under
+%% (`request_opts/1'), never the scheduler call's own. A worker computes every
+%% slot of its process for as long as it lives (`process-worker-max-idle', a
+%% day on prod) under the options it was spawned with, and they override each
+%% request's (`server/4'). The scheduler call's options are whatever woke the
+%% catch-up: the HTTP request with `hb_ao''s temporary options stripped, or a
+%% push's (`push-in-worker', `push-max-depth', ...), or -- from inside another
+%% worker -- `process-workers' and `await-inprogress' off, which made the
+%% catch-up compute in its own process instead of delegating. A worker the
+%% catch-up spawns must be the worker a request would have spawned.
 catch_up_opts(Opts) ->
-    case hb_opts:get(<<"process-workers">>, false, Opts) of
-        false -> Opts;
-        _ -> Opts#{ <<"spawn-worker">> => true }
+    ReqOpts = request_opts(Opts),
+    case hb_opts:get(<<"process-workers">>, false, ReqOpts) of
+        false -> ReqOpts;
+        _ -> ReqOpts#{ <<"spawn-worker">> => true }
+    end.
+
+%% @doc The options an HTTP request to this node resolves under: the node
+%% message, as `hb_http_server' holds it now, with `http-extra-opts' and
+%% `force-message' applied as `dev_meta' applies them. Without an HTTP server
+%% (a node used as a library, or most tests), `Opts' unchanged.
+request_opts(Opts) ->
+    case hb_opts:get(<<"http-server">>, no_server_ref, Opts) of
+        no_server_ref -> Opts;
+        _ ->
+            case hb_http_server:get_opts(Opts) of
+                NodeMsg when is_map(NodeMsg) ->
+                    Extra = hb_opts:get(<<"http-extra-opts">>, #{}, NodeMsg),
+                    (hb_maps:merge(NodeMsg, Extra, NodeMsg))#{
+                        <<"force-message">> => true
+                    };
+                _ -> Opts
+            end
     end.
 
 %% @doc A live worker computes forward from the state it holds. Without one,
@@ -1937,6 +1967,215 @@ worker_keeps_live_state_under_traffic_test_() ->
         ),
         ?assertEqual(Worker, hb_name:lookup(ProcID))
     end}.
+
+%% @doc Regression: a worker the compute-on-schedule catch-up spawns is the
+%% worker an HTTP request would have spawned. The catch-up resolved under the
+%% scheduler call's options -- `hb_ao''s temporary options stripped, plus the
+%% keys of whatever woke it -- and a worker keeps the options it was spawned
+%% with for every slot it computes, for up to `process-worker-max-idle'. Over a
+%% real HTTP node, process A is computed on schedule (its worker spawned by the
+%% catch-up) and process B by HTTP `compute' requests (its worker spawned by
+%% the first one). The two spawns' options must be the same, and so must each
+%% worker's store traffic per slot: writes, bytes written, links and reads.
+catch_up_spawns_request_worker_test_() ->
+    {timeout, 300, fun() ->
+        test_init(),
+        Store = hb_test_utils:test_store(hb_store_lmdb),
+        Base =
+            #{
+                <<"store">> => Store,
+                <<"priv-wallet">> => ar_wallet:new(),
+                <<"spawn-worker">> => true,
+                <<"process-workers">> => true,
+                <<"await-inprogress">> => named,
+                <<"process-async-checkpoints">> => true,
+                <<"process-now-from-cache">> => true,
+                <<"process-historical-replay-limit">> => 64,
+                <<"process-snapshot-slots">> => 1000,
+                <<"process-delta-checkpoint-slots">> => 1000
+            },
+        {ProcA, IDA} = cos_process(Base),
+        {ProcB, IDB} = cos_process(Base),
+        Node =
+            hb_http_server:start_node(
+                Base#{ <<"process-compute-on-schedule">> => [IDA] }
+            ),
+        Client = #{ <<"priv-wallet">> => ar_wallet:new(), <<"store">> => Store },
+        Tracer = spawn(fun() -> trace_collector([]) end),
+        StartWorker = {hb_persistent, start_worker, 3},
+        Spawns =
+            try
+                erlang:trace_pattern(StartWorker, true, [global]),
+                erlang:trace(new_processes, true, [call, {tracer, Tracer}]),
+                {ok, _} = hb_http:post(Node, <<"/schedule">>, ProcA, Client),
+                {ok, _} = hb_http:post(Node, <<"/schedule">>, ProcB, Client),
+                lists:foreach(
+                    fun(N) ->
+                        http_schedule(Node, IDA, N, Client),
+                        http_schedule(Node, IDB, N, Client)
+                    end,
+                    lists:seq(1, 3)
+                ),
+                cos_await_latest(IDA, 3, Base),
+                cos_catch_up_idle(IDA),
+                {ok, _} = http_compute(Node, IDB, 3, Client),
+                trace_collected(Tracer)
+            after
+                erlang:trace(new_processes, false, [call]),
+                erlang:trace(all, false, [call]),
+                erlang:trace_pattern(StartWorker, false, [global]),
+                exit(Tracer, kill)
+            end,
+        SpawnOpts =
+            fun(ID) ->
+                [Opts] =
+                    [ O || {_, {hb_persistent, start_worker, [G, _, O]}} <- Spawns,
+                           G == ID ],
+                Opts
+            end,
+        OptsA = SpawnOpts(IDA),
+        OptsB = SpawnOpts(IDB),
+        ?assertEqual(<<"true">>, hb_util:bin(maps:get(<<"spawn-worker">>, OptsA))),
+        WorkerA = await_worker(IDA, 50),
+        WorkerB = await_worker(IDB, 50),
+        ?assert(is_pid(WorkerA)),
+        ?assert(is_pid(WorkerB)),
+        % Store traffic of each worker, one slot at a time: A's slot is
+        % computed by the catch-up its schedule wakes, B's by an HTTP compute.
+        PerSlot =
+            [
+                {
+                    Slot,
+                    worker_store_traffic(
+                        WorkerA,
+                        fun() ->
+                            http_schedule(Node, IDA, Slot, Client),
+                            cos_await_latest(IDA, Slot, Base),
+                            cos_catch_up_idle(IDA)
+                        end
+                    ),
+                    worker_store_traffic(
+                        WorkerB,
+                        fun() ->
+                            http_schedule(Node, IDB, Slot, Client),
+                            {ok, _} = http_compute(Node, IDB, Slot, Client)
+                        end
+                    )
+                }
+            ||
+                Slot <- lists:seq(4, 8)
+            ],
+        ?event(debug_test, {per_slot_store_traffic, PerSlot}),
+        lists:foreach(
+            fun({Slot, A, B}) ->
+                ?assertMatch(#{ write := {W, _} } when W > 0, A),
+                ?assertEqual({Slot, B}, {Slot, A})
+            end,
+            PerSlot
+        ),
+        ?assertEqual(
+            [],
+            [ {K, maps:get(K, OptsA, absent), maps:get(K, OptsB, absent)}
+            ||
+                K <- lists:usort(maps:keys(OptsA) ++ maps:keys(OptsB)),
+                maps:get(K, OptsA, absent) =/= maps:get(K, OptsB, absent)
+            ]
+        ),
+        % Each worker kept its live state throughout.
+        ?assertEqual(WorkerA, hb_name:lookup(IDA)),
+        ?assertEqual(WorkerB, hb_name:lookup(IDB)),
+        ?assertEqual({8, <<"9">>, <<"45">>, <<"9">>}, cos_public(IDA, 8, Base)),
+        ?assertEqual(cos_public(IDA, 8, Base), cos_public(IDB, 8, Base))
+    end}.
+
+%% @doc Without an HTTP server the catch-up keeps the options it was given,
+%% adding `spawn-worker' only when process workers are on.
+catch_up_opts_without_http_server_test() ->
+    Off = #{ <<"process-workers">> => false },
+    ?assertEqual(Off, catch_up_opts(Off)),
+    On = #{ <<"process-workers">> => true },
+    ?assertEqual(On#{ <<"spawn-worker">> => true }, catch_up_opts(On)).
+
+http_schedule(Node, ProcID, N, Client) ->
+    {ok, _} =
+        hb_http:post(
+            Node,
+            <<ProcID/binary, "~process@1.0/schedule">>,
+            hb_message:commit(
+                #{
+                    <<"target">> => ProcID,
+                    <<"type">> => <<"Message">>,
+                    <<"number">> => N
+                },
+                Client
+            ),
+            Client
+        ).
+
+http_compute(Node, ProcID, Slot, Client) ->
+    hb_http:get(
+        Node,
+        <<ProcID/binary, "~process@1.0/compute&slot=",
+            (hb_util:bin(Slot))/binary>>,
+        Client
+    ).
+
+%% A trace receiver that keeps every call it is sent, in order.
+trace_collector(Acc) ->
+    receive
+        {trace, _Pid, call, MFA} -> trace_collector([MFA | Acc]);
+        {collect, From, Ref} ->
+            From ! {Ref, lists:reverse(Acc)},
+            trace_collector([])
+    end.
+
+%% The calls collected so far, once every trace message sent before this
+%% call has been delivered.
+trace_collected(Tracer) ->
+    Ref = erlang:trace_delivered(all),
+    receive {trace_delivered, all, Ref} -> ok after 10000 -> ok end,
+    Tracer ! {collect, self(), CRef = make_ref()},
+    receive {CRef, Calls} -> [ {Tracer, C} || C <- Calls ]
+    after 10000 -> []
+    end.
+
+%% The store calls `Worker' makes while `Fun' runs: for each of `write',
+%% `link' and `read', the number of calls and the bytes of binary values
+%% written.
+worker_store_traffic(Worker, Fun) ->
+    Tracer = spawn(fun() -> trace_collector([]) end),
+    MFAs = [ {hb_store, F, 3} || F <- [write, link, read] ],
+    Calls =
+        try
+            [ erlang:trace_pattern(MFA, true, [global]) || MFA <- MFAs ],
+            erlang:trace(Worker, true, [call, {tracer, Tracer}]),
+            Fun(),
+            erlang:trace(Worker, false, [call]),
+            trace_collected(Tracer)
+        after
+            [ erlang:trace_pattern(MFA, false, [global]) || MFA <- MFAs ],
+            exit(Tracer, kill)
+        end,
+    lists:foldl(
+        fun({_, {hb_store, F, [_, Req, _]}}, Acc) ->
+            Bytes =
+                case {F, Req} of
+                    {write, #{}} ->
+                        lists:sum(
+                            [ byte_size(V) || V <- maps:values(Req), is_binary(V) ]
+                        );
+                    _ -> 0
+                end,
+            maps:update_with(
+                F,
+                fun({N, B}) -> {N + 1, B + Bytes} end,
+                {1, Bytes},
+                Acc
+            )
+        end,
+        #{},
+        Calls
+    ).
 
 %% @doc Regression: the catch-up's last look at the scheduler named
 %% `dev_scheduler_server', which is loaded under a package-specific name, and

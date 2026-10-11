@@ -62,6 +62,79 @@ redeploy the previous image.
 
 ---
 
+## Pending - not deployed - compute-on-schedule catch-up spawns workers with the node's request options (branch `fix/catch-up-worker-opts`)
+
+**Live state now:** prod runs with `process-compute-on-schedule: false` since
+2026-10-11 22:09Z (config flag + restart only, image unchanged `upgrades-p`).
+Undo of that: `cos-off.sh rollback 20261011T220823Z`.
+
+The regression (A/B under the same swarm load, `upgrades-p`, 2026-10-11/12):
+with `process-compute-on-schedule: true`, per-slot `store_ms` (the
+`computed_slot ... store_ms` line) averaged 117-183 ms on every process and
+every action (e.g. Lootbox.Open 10 ms -> 143 ms), `execution_ms` rose too, the
+game fell behind at ~2 slots/s and the disk did ~2,300 reads/s. With it false:
+store p50 6 ms, p90 17 ms, exec p50 11 ms, game live. Before `upgrades-o`
+(6c78128f8, "catch-up hands its state to a worker") store was 7-40 ms.
+
+Re-read of the prod logs (20:40Z-22:09Z on, 22:12Z- off): the averages are a
+tail, not a uniform per-slot cost. On: store p50 9 ms, p75 17, **p90 531**;
+~12% of slots stall 400-1300 ms (mode 550-600 ms), several processes in the
+same instant, in `execution_ms` as well as `store_ms`. Off: p50 7, p75 11,
+p90 20. No slot was computed twice in either window (two computes per slot
+appear only across the 22:09 restart, as the cold replay from checkpoint 1000).
+The sampler shows the queue and p99 rising from ~21:39Z as the swarm's request
+rate rose; RSS stayed 3-4.5 GB, so not memory pressure.
+
+What the branch changes: `catch_up_opts/1` (`dev_process_worker`) set
+`spawn-worker` on the *scheduler call's* options, and a worker keeps its spawn
+options for every slot it computes (they override each request's in
+`server/4`), for up to `process-worker-max-idle` (24 h). Those options were
+the waking HTTP request's with `hb_ao`'s temporary options stripped, or a
+push's. The catch-up now resolves under the node's request options
+(`hb_http_server:get_opts/1` + `http-extra-opts` + `force-message`, as
+`dev_meta` does), so a worker it spawns is the worker an HTTP request would
+spawn; with a live worker it just queues on it. A catch-up woken from inside a
+worker (`process-workers`/`await-inprogress` off, reachable only via a
+`compute&push=...` request) now delegates too instead of computing in its own
+process (by construction; no test drives that path). Without an HTTP server
+nothing changes.
+
+Measured (`catch_up_spawns_request_worker_test_`, real HTTP node, A computed on
+schedule, B by HTTP `compute`), spawn-option differences catch-up vs request:
+
+```
+before: cache-control  absent vs [always]   (worker overrides it to no-store/no-cache)
+        force-message  absent vs true
+        only           absent vs local      (same values: the node message carries every default)
+  (catch-up woken by a push also adds push-in-worker=true, push-max-depth=16,
+   push-depth-implicit=true)
+after:  none
+```
+
+Per-slot store traffic of the worker (hb_store write/link/read calls, bytes of
+values written), slots 4-8, A vs B:
+
+```
+before: write 20 / 1112 B, link 15, read 19   =   write 20 / 1112 B, link 15, read 19
+after:  write 20 / 1112 B, link 15, read 19   =   write 20 / 1112 B, link 15, read 19
+```
+
+**So the option drift is real but is NOT what drives the prod store cost**:
+in the harness neither the request-path differences nor the push-path ones
+change a worker's per-slot store work (also checked with all hb_store calls,
+and for a worker spawned by a push-woken catch-up: identical). This branch
+removes the drift; it is not expected to fix the regression, and
+`process-compute-on-schedule` should stay false until the 400-1300 ms stalls
+are explained. Next places to look: what else runs only with cos on and
+contends with the workers' writes (the catch-up processes themselves -- each
+wake re-reads the process from the store, and each target copies the full
+public state back from the worker; `scheduler-durable-confirm: commit` syncs
+racing the workers' LMDB writes), measured on stage under swarm load.
+
+Tests: see the commit message. Undo: do not deploy; nothing live changed.
+
+---
+
 ## 2026-10-11 20:42Z - `hyperbeam:upgrades-p` (b2f84873fa82, source 3fa4ff1a6): worker GC policy and low-garbage Luerl collect
 
 Deployed with config `process-worker-gc: checkpoint+idle`, `process-worker-gc-idle-ms: 5000`
