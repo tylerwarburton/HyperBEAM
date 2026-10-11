@@ -7,7 +7,15 @@ Node: `hyperbeam-prod` on Box A · `hyperbeam.tylerw.ai` · store `/opt/runereal
 
 ---
 
-## Pending - not deployed: worker GC policy and low-garbage Luerl collect
+## 2026-10-11 20:42Z - `hyperbeam:upgrades-p` (b2f84873fa82, source 3fa4ff1a6): worker GC policy and low-garbage Luerl collect
+
+Deployed with config `process-worker-gc: checkpoint+idle`, `process-worker-gc-idle-ms: 5000`
+(and `process-worker-fullsweep-after` absent). Game under light swarm load, before -> after:
+exec avg ~1000 ms -> ~100-230 ms (p50 35 ms), store ~900 ms -> ~30-110 ms per slot; game
+level with its schedule, 0 replay resets, 0 crash reports. Remaining tail: p90 ~750 ms.
+Undo: `bash deploy-p.sh rollback 20261011T204101Z`.
+
+What was deployed:
 
 Two changes, both in source only; `ops/prod/node-config.json` already carries
 the new keys, so it is ahead of the live config until this ships.
@@ -50,20 +58,6 @@ collections only, set `process-worker-gc: off`.
 
 ---
 
-## 2026-10-11 18:35Z - removed `process-worker-fullsweep-after: 0` from live config
-
-With `{fullsweep_after, 0}` every minor collection of a process worker is a
-full copy of its heap. That cut the node's anonymous RSS from ~12 GB to
-~3.8 GB, but under a heavy swarm the game worker (one large Lua state, hundreds
-of MB) slowed 10-50x: per-action execution ~20 ms -> 300-1000 ms, store time
-~10 -> ~400 ms, compute below 1 msg/s, schedule replies to the game 5-15 s.
-Without the option (VM default `fullsweep_after`) it is back to ~5 msg/s and
-~100 ms per action. Config only, one restart; no image change.
-
-Undo: `fullsweep-off.sh rollback 20261011T183527Z`.
-
----
-
 ## 2026-10-11 19:42Z - `hyperbeam:upgrades-o` (d9925e2d9a44, source 6c78128f8)
 
 Fixes the compute-on-schedule catch-up shipped in upgrades-n. It ran without
@@ -75,6 +69,20 @@ end of every catch-up (~2,163/h). After deploy: 0 resets, hunts compute only new
 slots, CPU 5.4 -> 1.2 cores, 0 crashes. Config unchanged.
 
 Undo: `bash deploy-o.sh rollback 20261011T194042Z`.
+
+---
+
+## 2026-10-11 18:35Z - removed `process-worker-fullsweep-after: 0` from live config
+
+With `{fullsweep_after, 0}` every minor collection of a process worker is a
+full copy of its heap. That cut the node's anonymous RSS from ~12 GB to
+~3.8 GB, but under a heavy swarm the game worker (one large Lua state, hundreds
+of MB) slowed 10-50x: per-action execution ~20 ms -> 300-1000 ms, store time
+~10 -> ~400 ms, compute below 1 msg/s, schedule replies to the game 5-15 s.
+Without the option (VM default `fullsweep_after`) it is back to ~5 msg/s and
+~100 ms per action. Config only, one restart; no image change.
+
+Undo: `fullsweep-off.sh rollback 20261011T183527Z`.
 
 ---
 
