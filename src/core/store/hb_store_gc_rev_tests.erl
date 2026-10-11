@@ -28,7 +28,9 @@ node_opts(Extra) ->
             <<"store-retention-checkpoints">> => 2,
             <<"store-retention-grace-ms">> => 0,
             <<"store-retention-max-deletes-per-sec">> => 0,
-            <<"store-retention-scan-rows">> => 5000
+            <<"store-retention-scan-rows">> => 5000,
+            % Unthrottled: the CPU budget has its own test.
+            <<"store-retention-max-cpu-pct">> => 0
         },
         Extra
     ).

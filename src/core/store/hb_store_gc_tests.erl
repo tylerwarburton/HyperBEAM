@@ -31,7 +31,9 @@ node_opts(Extra) ->
             <<"store-retention-checkpoints">> => 2,
             <<"store-retention-grace-ms">> => 0,
             <<"store-retention-max-deletes-per-sec">> => 0,
-            <<"store-retention-scan-rows">> => 5000
+            <<"store-retention-scan-rows">> => 5000,
+            % Unthrottled: the CPU budget has its own test.
+            <<"store-retention-max-cpu-pct">> => 0
         },
         Extra
     ).
@@ -354,18 +356,30 @@ executed_slots(Fun) ->
         erlang:trace_pattern(MFA, false, [local, call_count])
     end.
 
-%% @doc A run sleeps the grace period once, however many chunks it sweeps, and
-%% in steady state sweeps everything in one chunk (one protection scan).
-%% `store-retention-max-candidates' bounds a chunk's memory.
-retention_one_grace_per_run_test_() ->
+%% @doc A run makes ONE protection pass and sleeps the grace period once,
+%% however large the backlog: `store-retention-max-candidates' bounds what it
+%% takes, and the rest is left whole for the next runs, which converge. Every
+%% kept and every deferred slot reads back throughout.
+retention_bounded_runs_converge_test_() ->
     {timeout, 300, fun() ->
         Opts = node_opts(#{ <<"store-retention-grace-ms">> => 300 }),
         Process = new_process(Opts),
         Next = run_slots(Process, 0, 42, Opts),
-        R = hb_store_gc:retain(Opts#{ <<"store-retention-max-candidates">> => 200 }),
-        ?assert(maps:get(chunks, R) >= 3),
+        Bounded = Opts#{ <<"store-retention-max-candidates">> => 200 },
+        R = hb_store_gc:retain(Bounded),
+        ?assertEqual(1, maps:get(chunks, R)),
+        ?assertEqual(1, maps:get(scans, R)),
         ?assertEqual(1, maps:get(graces, R)),
+        ?assert(maps:get(deferred_slots, R) > 0),
+        ?assert(maps:get(deleted_keys, R) > 0),
         ?assert(maps:get(duration_ms, R) < 300 * 2 + 5000),
+        % Deferred slots are untouched: every slot still listed reads back.
+        clear_process_caches(),
+        [ ?assertEqual(integer_to_binary(S + 1), element(1, state_digest(Process, S, Opts)))
+        || S <- computed_slots(Process, Opts) ],
+        Rs = converge(Bounded, 40),
+        ?assert(lists:all(fun(X) -> maps:get(scans, X) =< 1 end, Rs)),
+        ?assertEqual(0, maps:get(deferred_slots, lists:last(Rs))),
         clear_process_caches(),
         ?assertEqual(integer_to_binary(Next), count_at(Process, Next - 1, Opts)),
         Next2 = run_slots(Process, Next, 12, Opts),
@@ -376,6 +390,124 @@ retention_one_grace_per_run_test_() ->
         [ ?assertEqual(integer_to_binary(S + 1), element(1, state_digest(Process, S, Opts)))
         || S <- computed_slots(Process, Opts) ],
         ?assertEqual(integer_to_binary(Next2), count_at(Process, Next2 - 1, Opts))
+    end}.
+
+%% Run until nothing is deferred (at most `N' runs); return the reports.
+converge(Opts, N) -> converge(Opts, N, []).
+converge(_Opts, 0, _Acc) -> erlang:error(retention_did_not_converge);
+converge(Opts, N, Acc) ->
+    R = hb_store_gc:retain(Opts),
+    case maps:get(deferred_slots, R) of
+        0 -> lists:reverse([R | Acc]);
+        _ -> converge(Opts, N - 1, [R | Acc])
+    end.
+
+%% Every row of a store, sorted.
+all_store_rows(DB) ->
+    ok = elmdb:flush(DB),
+    Loop =
+        fun L(From, Acc) ->
+            case elmdb:scan_rows(DB, From, 50000) of
+                {ok, Rows, _, done} -> Rows ++ Acc;
+                {ok, Rows, _, Next} -> L(Next, Rows ++ Acc)
+            end
+        end,
+    lists:sort(Loop(<<>>, [])).
+
+%% A second store holding exactly the rows of the first.
+clone_store(Opts) ->
+    Rows = all_store_rows(main_db(Opts)),
+    Store = hb_test_utils:test_store(hb_store_lmdb),
+    ok = hb_store:start([Store], #{}, #{}),
+    #{ <<"db">> := DB } = hb_store:find(Store),
+    [ ok = elmdb:put(DB, K, V) || {K, V} <- Rows ],
+    ok = elmdb:flush(DB),
+    ?assertEqual(Rows, all_store_rows(DB)),
+    Opts#{ <<"store">> => [Store] }.
+
+%% @doc Bounded runs -- the first one killed after deleting its aliases, so
+%% the next recovers its journal -- delete exactly the rows one unbounded run
+%% deletes on an identical copy of the store.
+retention_bounded_runs_delete_what_one_run_deletes_test_() ->
+    {timeout, 600, fun() ->
+        Opts = node_opts(#{}),
+        Procs = [ new_process(Opts) || _ <- lists:seq(1, 3) ],
+        [ run_slots(P, 0, 30 + 7 * I, Opts)
+        || {I, P} <- lists:zip(lists:seq(1, 3), Procs) ],
+        Copy = clone_store(Opts),
+        Before = all_store_rows(main_db(Opts)),
+        % The reference: one run, unbounded.
+        Full = hb_store_gc:retain(Copy#{ <<"store-retention-max-candidates">> => 100000000 }),
+        ?assertEqual(0, maps:get(deferred_slots, Full)),
+        ?assertEqual(1, maps:get(chunks, Full)),
+        Expected = all_store_rows(main_db(Copy)),
+        ?assert(length(Expected) < length(Before)),
+        % Bounded, killed mid-run, then resumed until it converges.
+        Bounded = Opts#{ <<"store-retention-max-candidates">> => 150 },
+        Kill = fun(aliases_deleted) -> exit(simulated_crash); (_) -> ok end,
+        ?assertExit(simulated_crash,
+            hb_store_gc:retain(Bounded#{ <<"store-retention-test-hook">> => Kill })),
+        [R1 | _] = Rs = converge(Bounded, 60),
+        ?assert(maps:get(recovered_journal, R1)),
+        ?assert(length(Rs) > 1),
+        Got = all_store_rows(main_db(Opts)),
+        ?assertEqual(length(Expected), length(Got)),
+        ?assertEqual([], [ K || {K, _} <- Got -- Expected ]),
+        ?assertEqual(Expected, Got),
+        clear_process_caches(),
+        lists:foreach(
+            fun(P) ->
+                [ ?assertEqual(integer_to_binary(S + 1), element(1, state_digest(P, S, Opts)))
+                || S <- computed_slots(P, Opts) ]
+            end,
+            Procs)
+    end}.
+
+%% @doc Runs never overlap: a run started while one is in progress returns at
+%% once without touching the store, and the lock goes with the run.
+retention_runs_never_overlap_test_() ->
+    {timeout, 300, fun() ->
+        Opts = node_opts(#{}),
+        Process = new_process(Opts),
+        _ = run_slots(Process, 0, 22, Opts),
+        Self = self(),
+        Hook =
+            fun(journal_written) ->
+                    ?assert(hb_store_gc:retention_running()),
+                    Self ! {inner, hb_store_gc:retain(Opts)};
+               (_) -> ok
+            end,
+        R = hb_store_gc:retain(Opts#{ <<"store-retention-test-hook">> => Hook }),
+        ?assert(maps:get(deleted_keys, R) > 0),
+        receive {inner, Inner} -> ?assertEqual(#{ status => already_running }, Inner)
+        after 1000 -> erlang:error(no_inner_run)
+        end,
+        ?assertNot(hb_store_gc:retention_running()),
+        % A run that dies releases the lock with it.
+        Kill = fun(aliases_deleted) -> exit(simulated_crash); (_) -> ok end,
+        _ = run_slots(Process, 22, 8, Opts),
+        ?assertExit(simulated_crash,
+            hb_store_gc:retain(Opts#{ <<"store-retention-test-hook">> => Kill })),
+        ?assertNot(hb_store_gc:retention_running()),
+        ?assertMatch(#{ recovered_journal := true }, hb_store_gc:retain(Opts))
+    end}.
+
+%% @doc `store-retention-max-cpu-pct' holds a run's busy time to its share:
+%% at 25% a run sleeps about three times what it works.
+retention_cpu_budget_test_() ->
+    {timeout, 300, fun() ->
+        Opts = node_opts(#{ <<"store-retention-scan-rows">> => 200 }),
+        Process = new_process(Opts),
+        _ = run_slots(Process, 0, 40, Opts),
+        R = hb_store_gc:retain(Opts#{ <<"store-retention-max-cpu-pct">> => 25 }),
+        ?assert(maps:get(deleted_keys, R) > 0),
+        Work = maps:get(work_ms, R),
+        Slept = maps:get(throttle_ms, R),
+        ?event(debug_retention, {budget, Work, Slept, maps:get(duration_ms, R)}),
+        ?assert(Work > 0),
+        % Sub-2 ms debts are carried, so allow some slack under 3x.
+        ?assert(Slept >= 2 * Work),
+        ?assert(maps:get(duration_ms, R) >= Work + Slept - 50)
     end}.
 
 %% @doc A slot computed after the run planned, whose state has the same root
@@ -423,8 +555,18 @@ retention_cold_resume_test_() ->
 %% continuously: no compute fails, no read finds a missing link, and every
 %% kept slot reads back afterwards.
 retention_under_concurrent_load_test_() ->
+    {timeout, 600, fun() -> concurrent_load(#{}) end}.
+
+%% The same with runs that each take only part of the backlog, so slots are
+%% deferred while the loader writes and reads.
+retention_bounded_under_concurrent_load_test_() ->
     {timeout, 600, fun() ->
-        Opts = node_opts(#{ <<"store-retention-delete-batch">> => 50 }),
+        concurrent_load(#{ <<"store-retention-max-candidates">> => 150 })
+    end}.
+
+concurrent_load(Extra) ->
+    begin
+        Opts = node_opts(Extra#{ <<"store-retention-delete-batch">> => 50 }),
         Process = new_process(Opts),
         Start = run_slots(Process, 0, 12, Opts),
         Parent = self(),
@@ -451,12 +593,19 @@ retention_under_concurrent_load_test_() ->
         ?assert(Last > Start + 10),
         ?assert(lists:sum([ maps:get(deleted_keys, R) || R <- Reports ]) > 0),
         clear_process_caches(),
+        % Every slot still listed -- kept, or deferred by a bounded run --
+        % reads back.
+        [ ?assertEqual(integer_to_binary(S + 1), element(1, state_digest(Process, S, Opts)))
+        || S <- computed_slots(Process, Opts) ],
+        % Once the backlog is gone, what is left is one contiguous window.
+        _ = converge(Opts, 40),
+        clear_process_caches(),
         Kept = computed_slots(Process, Opts),
         ?assertEqual(Last, lists:max(Kept)),
         ?assertEqual(lists:seq(lists:min(Kept), Last), Kept),
         [ ?assertEqual(integer_to_binary(S + 1), element(1, state_digest(Process, S, Opts)))
         || S <- Kept ]
-    end}.
+    end.
 
 %% @doc A run killed after its aliases are gone, or in the middle of deleting
 %% candidates, leaves a journal; the next run finishes it, and the process

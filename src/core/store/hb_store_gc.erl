@@ -69,7 +69,7 @@
 -export([assignment_timestamp_probe/3]).
 -export([retain_essentials/2]).
 -export([retain/1, maybe_start_retention/1, start_retention/1, stop_retention/0,
-         run_retention/1, retention_status/0, retain_plan/3,
+         run_retention/1, retention_status/0, retention_running/0, retain_plan/3,
          copy_essential_namespaces/3, forget_process_cache/3,
          restore_checkpoint/2, closure_rows/2]).
 -include("include/hb.hrl").
@@ -1385,6 +1385,11 @@ report(Acc, Plans, Policy, SrcStore, DstStore) ->
 -define(RET_DEFAULT_RATE, 20000).
 -define(RET_DEFAULT_SCAN_ROWS, 20000).
 -define(RET_DEFAULT_GRACE, 120000).
+%% Share of one scheduler a run may keep busy, in percent (see `duty/1').
+-define(RET_DEFAULT_MAX_CPU_PCT, 25).
+-define(RET_LOCK, hb_store_gc_retention_running).
+%% Roots whose class `classify_slot_cached/3' remembers across runs.
+-define(CLASS_CACHE_MAX, 2000000).
 -define(RET_JOURNAL, "retention-pending.bin").
 -define(ESS_JOURNAL, "essentials-retention-pending.bin").
 -define(ESS_DEFAULT_MAX_SLOTS, 100000).
@@ -1454,7 +1459,7 @@ retain_safely(Opts) ->
 
 %% @doc The last run's report and running totals.
 retention_status() ->
-    persistent_term:get(?RET_STATUS, #{}).
+    (persistent_term:get(?RET_STATUS, #{}))#{ running => retention_running() }.
 
 ret_opt(Key, Default, Opts) ->
     case hb_opts:get(Key, Default, Opts) of
@@ -1476,6 +1481,8 @@ retention_policy(Opts) ->
         scan_rows => ret_opt(<<"store-retention-scan-rows">>, ?RET_DEFAULT_SCAN_ROWS, Opts),
         scan_pause => ret_opt(<<"store-retention-scan-pause-ms">>, 0, Opts),
         grace => ret_opt(<<"store-retention-grace-ms">>, ?RET_DEFAULT_GRACE, Opts),
+        max_cpu_pct =>
+            ret_opt(<<"store-retention-max-cpu-pct">>, ?RET_DEFAULT_MAX_CPU_PCT, Opts),
         dry_run => hb_util:atom(hb_opts:get(<<"store-retention-dry-run">>, false, Opts)) == true,
         %% Fields `window_start/4' and `lower_to_full_state/4' read.
         base_search => ?DEFAULT_BASE_SEARCH,
@@ -1505,15 +1512,50 @@ main_store(Opts) ->
         [] -> erlang:error(store_retention_needs_a_writable_lmdb_store)
     end.
 
-%% @doc One retention run over the main store. Returns a report.
+%% @doc One retention run over the main store. Returns a report, or
+%% `#{ status => already_running }' when another run is in progress: runs never
+%% overlap, whoever starts them (the background server, `run_retention/1', or
+%% a direct call).
 retain(Opts) ->
+    case run_lock() of
+        false ->
+            ?event(store_retention, {retention_skipped, already_running}),
+            #{ status => already_running };
+        true ->
+            try
+                duty_start(),
+                retain_locked(Opts)
+            after
+                run_unlock()
+            end
+    end.
+
+%% The run lock is a named ETS table owned by the running process: creating it
+%% fails while it exists, and it vanishes with its owner, so a run that is
+%% killed never leaves the lock behind.
+run_lock() ->
+    try ets:new(?RET_LOCK, [named_table, public]), true
+    catch error:badarg -> false
+    end.
+
+run_unlock() ->
+    catch ets:delete(?RET_LOCK),
+    ok.
+
+%% @doc Is a run in progress?
+retention_running() ->
+    ets:info(?RET_LOCK, owner) =/= undefined.
+
+retain_locked(Opts) ->
     Start = erlang:monotonic_time(millisecond),
     Store = main_store(Opts),
     ok = hb_store:start([Store], #{}, Opts),
     DB = store_db(Store),
     Policy = retention_policy(Opts),
     Seen = ets:new(hb_store_gc_ret_seen, [set, private]),
+    SlotRoots = ets:new(hb_store_gc_slot_roots, [set, private]),
     Ctx = #{
+        slot_roots => SlotRoots,
         src_db => DB,
         src_store => Store,
         src_opts => Opts#{ <<"store">> => [Store] },
@@ -1530,18 +1572,24 @@ retain(Opts) ->
     try
         Acc1 = ret_acc(),
         Procs = computed_processes(Ctx),
-        {Plans, Acc1b} =
+        T0 = erlang:monotonic_time(millisecond),
+        {Plans, Acc1b0} =
             lists:foldl(
                 fun(P, {Ps, A}) ->
                     {Plan, A1} = retain_plan(Ctx, P, A),
+                    duty(Ctx),
                     {[{P, Plan} | Ps], A1}
                 end,
                 {[], Acc1},
                 Procs
             ),
+        Acc1b = Acc1b0#{ plan_ms => erlang:monotonic_time(millisecond) - T0 },
+        % Highest slot first within a process: when a run takes only part of
+        % the backlog, what it leaves are the lowest slots, whose backward
+        % delta chains are untouched.
         Drops =
-            [ {P, S, R} || {P, #{ drop := D, keep_roots := _ }} <- lists:reverse(Plans),
-                           {S, R} <- D ],
+            [ [ {P, S, R} || {S, R} <- lists:reverse(D) ]
+            || {P, #{ drop := D, keep_roots := _ }} <- lists:reverse(Plans) ],
         Keep =
             sets:from_list(
                 lists:append([ maps:get(keep_roots, Pl) || {_, Pl} <- Plans ]),
@@ -1559,10 +1607,13 @@ retain(Opts) ->
         Needs = maps:from_list(
             [ {P, C} || {P, #{ oldest_checkpoint := C }} <- Plans, is_integer(C) ]),
         EssReport = retain_essentials(Opts, Needs),
+        {DutyWork, DutySleep} = duty_totals(),
         Report = Acc3#{
             essentials => EssReport,
             started_at => os:system_time(second),
             duration_ms => erlang:monotonic_time(millisecond) - Start,
+            work_ms => DutyWork,
+            throttle_ms => DutySleep,
             processes => length(Procs),
             store => maps:get(<<"name">>, Store),
             policy => maps:without([hook], Policy)
@@ -1582,7 +1633,8 @@ retain(Opts) ->
     after
         catch elmdb:track_watch(DB, clear),
         catch elmdb:track(DB, false),
-        ets:delete(Seen)
+        ets:delete(Seen),
+        ets:delete(maps:get(slot_roots, Ctx))
     end.
 
 %%% Essentials retention (`essentials-retention-days', unset = keep forever).
@@ -1701,18 +1753,24 @@ retain_essentials(Opts, Needs, Inner, Exported, DaysMs, Start) ->
                     % scheduler publishes remotely -- what it has uploaded.
                     Mark = min(maps:get(P, Exported, -1), upload_limit(Ctx, P, Opts)),
                     {PD, Why} = ess_plan(Ctx, P, maps:get(P, Needs, none), Mark, Cutoff, B),
-                    {PD ++ D, maps:update_with(Why, fun(X) -> X + 1 end, 1, H), B - length(PD)}
+                    duty(Ctx),
+                    {[PD | D], maps:update_with(Why, fun(X) -> X + 1 end, 1, H), B - length(PD)}
                 end,
                 {[], #{}, Budget},
                 Procs),
         Empty = sets:new([{version, 2}]),
         Acc0 = recover_journal(Ctx, Empty, ret_acc()),
+        % Oldest first within a process: what a partial run leaves is the
+        % newer end, so each process's pruned assignments stay a prefix.
         Acc = sweep_run(Ctx, lists:reverse(Drops), Empty, Acc0),
         Report = maps:with([deleted_keys, deleted_bytes, alias_keys, candidate_keys,
                             protected_keys, protected_by_scan, protected_by_writes,
-                            conflicts, recovered_journal, chunks], Acc),
+                            conflicts, recovered_journal, chunks, deferred_slots,
+                            scan_ms, alias_scan_ms, closure_ms, protect_ms,
+                            sweep_ms, scanned_rows], Acc),
         Report#{ status => case maps:get(dry_run, Policy) of true -> dry_run; false -> ok end,
-                 pruned_assignments => length(Drops),
+                 pruned_assignments => length(lists:append(Drops)) -
+                     maps:get(deferred_slots, Acc, 0),
                  processes => length(Procs),
                  stopped_by => Held,
                  dry_run => EssDry,
@@ -1791,7 +1849,8 @@ ret_acc() ->
        protected_keys => 0, protected_by_scan => 0, protected_by_writes => 0,
        deleted_keys => 0, deleted_bytes => 0, alias_keys => 0, conflicts => 0,
        scans => 0, scanned_rows => 0, recovered_journal => false,
-       skipped_processes => 0 }.
+       skipped_processes => 0, deferred_slots => 0, closure_ms => 0,
+       alias_scan_ms => 0, protect_ms => 0, sweep_ms => 0 }.
 
 %% @doc Explicit roots: every process ID (the definitions, R1b), every trusted
 %% device, and any configured pin. Never entered as candidates.
@@ -1812,7 +1871,10 @@ pins(DB, Opts) ->
     sets:from_list([ hb_util:bin(X) || X <- Procs ++ Devices ++ Extra ], [{version, 2}]).
 
 list_children(DB, Prefix) ->
-    case elmdb:list(DB, <<Prefix/binary, "/">>) of
+    %% `list/3' seeks past each child's subtree; `list/2' walked every key
+    %% below the prefix (every slot alias of every process, 2 s a call on a
+    %% 7.7M-row store).
+    case elmdb:list(DB, <<Prefix/binary, "/">>, []) of
         {ok, L} -> [ C || C <- L, is_binary(C) ];
         _ -> []
     end.
@@ -1831,7 +1893,7 @@ retain_plan(Ctx, P, Acc) ->
         [] -> {#{ drop => [], keep_roots => [] }, Acc};
         _ ->
             Head = lists:last(Slots),
-            Classify = fun(S) -> classify_slot(Ctx, P, S) end,
+            Classify = fun(S) -> classify_slot_cached(Ctx, P, S) end,
             Desc = lists:reverse(Slots),
             K = maps:get(checkpoints, Policy),
             Ckpts = newest_checkpoints(Desc, Classify, K),
@@ -1857,12 +1919,15 @@ retain_plan(Ctx, P, Acc) ->
                     % Sparse checkpoints may instead go to the archive: kept
                     % locally only until archiving succeeds.
                     NotArchived = archive_checkpoints(Ctx, P, Below, Classify),
-                    Drop = [ S || S <- Below, not lists:member(S, Sparse),
-                                  not lists:member(S, NotArchived) ],
-                    KeepSlots = (Slots -- Drop),
-                    KeepRoots = [ R || S <- KeepSlots, R <- [deref(Ctx, computed_path(P, S))],
+                    % Sets, not list subtraction: a backlog of dropped slots
+                    % made `--' and `member' quadratic in it.
+                    Held = sets:from_list(Sparse ++ NotArchived, [{version, 2}]),
+                    Drop = [ S || S <- Below, not sets:is_element(S, Held) ],
+                    DropSet = sets:from_list(Drop, [{version, 2}]),
+                    KeepSlots = [ S || S <- Slots, not sets:is_element(S, DropSet) ],
+                    KeepRoots = [ R || S <- KeepSlots, R <- [slot_root(Ctx, P, S)],
                                        R =/= not_found ],
-                    DropRoots = [ {S, deref(Ctx, computed_path(P, S))} || S <- Drop ],
+                    DropRoots = [ {S, slot_root(Ctx, P, S)} || S <- Drop ],
                     Oldest = first_checkpoint(lists:sort(KeepSlots), Classify),
                     {#{ drop => DropRoots, keep_roots => KeepRoots, window_start => W,
                         oldest_checkpoint => Oldest },
@@ -1872,6 +1937,55 @@ retain_plan(Ctx, P, Acc) ->
 
 newest_checkpoints(Desc, Classify, K) ->
     newest_checkpoints(Desc, Classify, K, []).
+
+%% @doc The root a slot's alias names, read once per run: planning asks for
+%% the same slot up to four times (the checkpoint walk, the window's lower
+%% edge, the kept and dropped roots). Without a run memo, as `deref/2'.
+slot_root(Ctx = #{ slot_roots := Memo }, P, S) ->
+    case ets:lookup(Memo, {P, S}) of
+        [{_, R}] -> R;
+        [] ->
+            R = deref(Ctx, computed_path(P, S)),
+            ets:insert(Memo, {{P, S}, R}),
+            R
+    end;
+slot_root(Ctx, P, S) -> deref(Ctx, computed_path(P, S)).
+
+%% @doc `classify_slot/3', remembering each root's class across runs. A
+%% root is a content-addressed unit, so its class (which rows it carries)
+%% cannot change while it exists; the slot-to-root step is read fresh every
+%% run. The cache lives in the process that runs retention and is cleared
+%% when it grows past `?CLASS_CACHE_MAX' roots.
+classify_slot_cached(Ctx, P, S) ->
+    case slot_root(Ctx, P, S) of
+        not_found -> unknown;
+        Root ->
+            Cache = class_cache(),
+            case ets:lookup(Cache, Root) of
+                [{_, Class}] -> Class;
+                [] ->
+                    Class = classify_root(Ctx, Root),
+                    case Class of
+                        unknown -> ok;
+                        _ -> ets:insert(Cache, {Root, Class})
+                    end,
+                    Class
+            end
+    end.
+
+class_cache() ->
+    case get(hb_store_gc_class_cache) of
+        undefined ->
+            T = ets:new(hb_store_gc_class_cache, [set, private]),
+            put(hb_store_gc_class_cache, T),
+            T;
+        T ->
+            case ets:info(T, size) > ?CLASS_CACHE_MAX of
+                true -> ets:delete_all_objects(T);
+                false -> ok
+            end,
+            T
+    end.
 
 %% The lowest kept slot holding a checkpoint, or `none'.
 first_checkpoint([], _Classify) -> none;
@@ -2091,44 +2205,168 @@ restore_checkpoint(File, Opts) ->
 %%% The sweep of a run.
 %%%
 %%% One generation for the whole run: tracking began before planning, so every
-%%% write since is recorded or (flushed) visible to the scans. The run's alias
-%%% rows go first, all of them, guarded, followed by ONE grace period for
-%%% readers that resolved an alias just before -- the first version slept the
-%%% grace once per batch of 1000 slots, which was 960 of the 1,104 s a live
-%%% run took. Then the dropped roots are swept in chunks, each as large as
-%%% `store-retention-max-candidates' allows (in steady state, the whole run in
-%%% one chunk): one protection scan per chunk.
+%%% write since is recorded or (flushed) visible to the scans.
+%%%
+%%% A run makes exactly ONE protection pass (plus one alias pass when the
+%%% candidates have alias rows), whatever the backlog. It closes over the
+%%% dropped roots until the candidate set reaches
+%%% `store-retention-max-candidates', taking the processes' drops round-robin,
+%%% and leaves the rest -- untouched, aliases and all -- for the next run,
+%%% which plans them again. The first version instead swept every dropped root
+%%% in the run, one full pass over the store per `max-candidates' rows: a run
+%%% that fell behind dropped more slots the next time, so made more passes,
+%%% and ran longer again (12 -> 20 -> 35 -> 61 minutes on a 37 GB store).
+%%% Now a run's passes are a constant, and its cost is bounded by
+%%% `store-retention-max-cpu-pct' (`duty/1').
+%%%
+%%% Order: close over the taken roots and watch the candidates and the taken
+%%% slots' aliases; journal; delete the aliases, guarded; ONE grace period for
+%%% readers that resolved an alias just before (the first version slept the
+%%% grace once per batch of 1000 slots, which was 960 of the 1,104 s a live run
+%%% took); then flush, scan, protect and sweep. A deferred slot's alias still
+%%% names its root, which the scan sees, so content a taken slot shares with a
+%%% deferred one is protected like anything else referenced from outside.
 
-sweep_run(_Ctx, [], _Keep, Acc) -> Acc;
-sweep_run(Ctx, Drops, Keep, Acc) ->
+sweep_run(Ctx, PerProc, Keep, Acc) ->
+    case lists:all(fun(L) -> L == [] end, PerProc) of
+        true -> Acc;
+        false -> sweep_run1(Ctx, PerProc, Keep, Acc)
+    end.
+
+sweep_run1(Ctx, PerProc, Keep, Acc) ->
     Policy = maps:get(policy, Ctx),
     DB = maps:get(src_db, Ctx),
     AliasesOf = maps:get(aliases_of, Ctx, fun slot_aliases/4),
-    Aliases = lists:append([ AliasesOf(P, S, R, Keep) || {P, S, R} <- Drops ]),
-    Roots = lists:usort([ R || {_P, _S, R} <- Drops, R =/= not_found ]),
-    Procs = lists:foldl(fun({P, S, _}, M) -> maps:update_with(P, fun(X) -> max(X, S) end, S, M) end,
-                        #{}, Drops),
-    %% Watch the aliases from here: a slot rewritten before its alias is
-    %% deleted (a historical replay, or a new slot whose state has the same
+    AllDrops = lists:append(PerProc),
+    %% Watch every planned alias from here: a slot rewritten before its alias
+    %% is deleted (a historical replay, or a new slot whose state has the same
     %% root as a dropped one) vetoes that delete and keeps its root.
-    ok = elmdb:track_watch(DB, Aliases),
-    case maps:get(dry_run, Policy) of
-        true ->
-            sweep_roots(Ctx, Roots, Keep, [], Aliases, Acc#{ dry_run => true });
-        false ->
-            ok = write_journal(Ctx, Aliases, Roots),
-            hook(Ctx, journal_written),
-            {Acc1, Revived} = delete_aliases(Ctx, Aliases, Acc),
-            forget(Ctx, Procs),
-            hook(Ctx, aliases_deleted),
-            timer:sleep(maps:get(grace, Policy)),
-            forget(Ctx, Procs),
-            Acc2 = sweep_roots(Ctx, Roots, Keep, Revived, Aliases, bump(graces, 1, Acc1)),
-            ok = clear_journal(Ctx),
-            Acc2
+    ok = elmdb:track_watch(DB,
+            lists:append([ AliasesOf(P, S, R, Keep) || {P, S, R} <- AllDrops ])),
+    T0 = erlang:monotonic_time(millisecond),
+    Cand = new_cand(),
+    Stop = sets:union(maps:get(pins, Ctx), Keep),
+    {Taken, Deferred} =
+        take_drops(Ctx, Cand, round_robin_lists(PerProc), Stop,
+                   maps:get(max_candidates, Policy), []),
+    Aliases = lists:append([ AliasesOf(P, S, R, Keep) || {P, S, R} <- Taken ]),
+    Procs = lists:foldl(fun({P, S, _}, M) -> maps:update_with(P, fun(X) -> max(X, S) end, S, M) end,
+                        #{}, Taken),
+    ok = elmdb:track_watch(DB, cand_keys(Cand) ++ Aliases),
+    Acc1 = bump(candidate_keys, cand_size(Cand),
+             bump(chunks, 1,
+               bump(deferred_slots, length(Deferred),
+                 bump(closure_ms, erlang:monotonic_time(millisecond) - T0, Acc)))),
+    try
+        case maps:get(dry_run, Policy) of
+            true ->
+                protect_and_sweep(Ctx, Cand, [], Aliases, Acc1#{ dry_run => true });
+            false ->
+                ok = write_journal(Ctx, Aliases, [],
+                        [ {K, B} || {K, _O, B, _} <- ets:tab2list(maps:get(tab, Cand)) ]),
+                hook(Ctx, journal_written),
+                {Acc2, Revived} = delete_aliases(Ctx, Aliases, Acc1),
+                forget(Ctx, Procs),
+                hook(Ctx, aliases_deleted),
+                duty_sleep(Ctx, maps:get(grace, Policy)),
+                forget(Ctx, Procs),
+                Acc3 = protect_and_sweep(Ctx, Cand, Revived, Aliases, bump(graces, 1, Acc2)),
+                ok = clear_journal(Ctx),
+                Acc3
+        end
+    after
+        free_cand(Cand)
     end.
 
-%% Sweep the dropped roots in chunks bounded by `max_candidates'.
+%% Close over the drops in order until the candidate set reaches `Max'. The
+%% first drop is always taken, so a run always progresses. Returns the drops
+%% taken and those left for a later run.
+take_drops(_Ctx, _Cand, [], _Stop, _Max, Taken) -> {lists:reverse(Taken), []};
+take_drops(Ctx, Cand, [D = {_P, _S, R} | Rest], Stop, Max, Taken) ->
+    case Taken =/= [] andalso cand_size(Cand) >= Max of
+        true -> {lists:reverse(Taken), [D | Rest]};
+        false ->
+            case R of
+                not_found -> ok;
+                _ -> closure(Ctx, Cand, R, Stop)
+            end,
+            duty(Ctx),
+            take_drops(Ctx, Cand, Rest, Stop, Max, [D | Taken])
+    end.
+
+%% Interleave per-process lists: the first of each, then the second of each...
+round_robin_lists(Lists) -> round_robin_lists([ L || L <- Lists, L =/= [] ], []).
+round_robin_lists([], Acc) -> lists:reverse(Acc);
+round_robin_lists(Lists, Acc) ->
+    Heads = [ H || [H | _] <- Lists ],
+    Tails = [ T || [_ | T] <- Lists, T =/= [] ],
+    round_robin_lists(Tails, lists:reverse(Heads, Acc)).
+
+%%% CPU budget.
+%%%
+%%% A run may keep its process busy at most `store-retention-max-cpu-pct' of
+%%% the time (default 25, i.e. a quarter of one scheduler; 0 or 100 and above
+%%% disable it). After each bounded step -- a scan batch, one dropped root's
+%%% closure, one process's plan, a delete batch -- `duty/1' sleeps long enough
+%%% that work / (work + sleep) stays at the budget. Work is measured as wall
+%%% time, which also covers the dirty NIF scans the process's own CPU counters
+%%% do not see; time blocked on I/O counts as work, so the bound errs low.
+%%% Sleeps shorter than a millisecond accumulate until they are worth taking.
+
+duty_start() ->
+    put(hb_store_gc_duty, {erlang:monotonic_time(microsecond), 0, 0}).
+
+%% Sleep `Ms' (a grace period, delete pacing), counting it towards what the
+%% work so far owes the budget: sleep the larger of the two.
+duty_sleep(Ctx, Ms) ->
+    Pct = maps:get(max_cpu_pct, maps:get(policy, Ctx), 0),
+    case get(hb_store_gc_duty) of
+        {Since, W, Sl} ->
+            Now = erlang:monotonic_time(microsecond),
+            Worked = Now - Since,
+            Owed =
+                case is_integer(Pct) andalso Pct > 0 andalso Pct < 100 of
+                    true -> Worked * (100 - Pct) div Pct;
+                    false -> 0
+                end,
+            SleepUs = max(Ms * 1000, Owed),
+            timer:sleep(SleepUs div 1000),
+            put(hb_store_gc_duty,
+                {erlang:monotonic_time(microsecond), W + Worked, Sl + SleepUs});
+        _ ->
+            timer:sleep(Ms),
+            duty_start()
+    end.
+
+duty(Ctx) ->
+    Pct = maps:get(max_cpu_pct, maps:get(policy, Ctx), 0),
+    case get(hb_store_gc_duty) of
+        {Since, W, Sl} when is_integer(Pct), Pct > 0, Pct < 100 ->
+            Now = erlang:monotonic_time(microsecond),
+            Worked = Now - Since,
+            Owed = Worked * (100 - Pct) div Pct,
+            case Owed >= 2000 of
+                true ->
+                    timer:sleep(Owed div 1000),
+                    put(hb_store_gc_duty,
+                        {erlang:monotonic_time(microsecond), W + Worked, Sl + Owed});
+                false -> ok
+            end;
+        undefined -> duty_start();
+        _ -> ok
+    end.
+
+%% Milliseconds worked and slept under the budget so far in this run.
+duty_totals() ->
+    case get(hb_store_gc_duty) of
+        {Since, W, Sl} ->
+            {(W + erlang:monotonic_time(microsecond) - Since) div 1000, Sl div 1000};
+        _ -> {0, 0}
+    end.
+
+%% Sweep dropped roots in chunks bounded by `max_candidates', one protection
+%% pass each. Only for a journal written by an earlier version, which recorded
+%% the roots a run had not reached yet; a run now journals only its candidates.
 sweep_roots(_Ctx, [], _Keep, _Revived, _Aliases, Acc) -> Acc;
 sweep_roots(Ctx, Roots, Keep, Revived, Aliases, Acc) ->
     Max = maps:get(max_candidates, maps:get(policy, Ctx)),
@@ -2152,6 +2390,7 @@ sweep_roots(Ctx, Roots, Keep, Revived, Aliases, Acc) ->
 closure_until(_Ctx, _Cand, [], _Stop, _Max) -> [];
 closure_until(Ctx, Cand, [R | Rest], Stop, Max) ->
     closure(Ctx, Cand, R, Stop),
+    duty(Ctx),
     case cand_size(Cand) >= Max of
         true -> Rest;
         false -> closure_until(Ctx, Cand, Rest, Stop, Max)
@@ -2235,15 +2474,21 @@ guarded_batch(Ctx, Batch) ->
     end.
 
 chunks([], _N) -> [];
-chunks(L, N) when length(L) =< N -> [L];
-chunks(L, N) -> {A, B} = lists:split(N, L), [A | chunks(B, N)].
+chunks(L, N) -> {A, B} = take(N, L), [A | chunks(B, N)].
+
+%% The first `N' elements and the rest, in O(N) (not `lists:split/2' after a
+%% `length/1' of the whole list, which made batching quadratic).
+take(N, L) -> take(N, L, []).
+take(0, L, Acc) -> {lists:reverse(Acc), L};
+take(_, [], Acc) -> {lists:reverse(Acc), []};
+take(N, [H | T], Acc) -> take(N - 1, T, [H | Acc]).
 
 %% Bound the delete rate: sleep long enough that `Count' deletes take at least
 %% Count / rate seconds.
 pace(Ctx, Count) ->
     case maps:get(rate, maps:get(policy, Ctx)) of
-        R when is_integer(R), R > 0 -> timer:sleep((Count * 1000) div R);
-        _ -> ok
+        R when is_integer(R), R > 0 -> duty_sleep(Ctx, (Count * 1000) div R);
+        _ -> duty(Ctx)
     end.
 
 %%% Candidate set: an ETS table of {Key, Order, Bytes, Protected}, plus the
@@ -2252,8 +2497,12 @@ pace(Ctx, Count) ->
 new_cand() ->
     #{ tab => ets:new(hb_store_gc_cand, [set, private]),
        alias_of => ets:new(hb_store_gc_alias, [set, private]),
+       %% `{Order, Key}' in sweep order, so a sweep walks the candidates
+       %% without copying and sorting the whole table.
+       order => ets:new(hb_store_gc_order, [ordered_set, private]),
        counter => counters:new(1, []) }.
-free_cand(#{ tab := T, alias_of := A }) -> ets:delete(T), ets:delete(A).
+free_cand(#{ tab := T, alias_of := A, order := O }) ->
+    ets:delete(T), ets:delete(A), ets:delete(O).
 
 cand_keys(#{ tab := T }) -> ets:select(T, [{{'$1', '_', '_', '_'}, [], ['$1']}]).
 
@@ -2261,11 +2510,14 @@ is_alias(#{ alias_of := A }, K) -> ets:member(A, K).
 
 %% An alias row of a candidate unit: a candidate ordered just before its unit,
 %% so a reader holding the alias never outlives the unit by a batch.
-add_alias(Cand = #{ tab := T, alias_of := A }, AliasKey, Unit) ->
+add_alias(Cand = #{ tab := T, alias_of := A, order := Ord }, AliasKey, Unit) ->
     case ets:lookup(T, Unit) of
         [{_, O, _, Protected}] ->
             ets:insert(A, {AliasKey, Unit}),
-            ets:insert_new(T, {AliasKey, O - 0.5, byte_size(AliasKey) + 48, Protected});
+            case ets:insert_new(T, {AliasKey, O - 0.5, byte_size(AliasKey) + 48, Protected}) of
+                true -> ets:insert(Ord, {{O - 0.5, AliasKey}});
+                false -> ok
+            end;
         [] -> ok
     end,
     _ = Cand,
@@ -2273,9 +2525,13 @@ add_alias(Cand = #{ tab := T, alias_of := A }, AliasKey, Unit) ->
 cand_size(#{ tab := T }) -> ets:info(T, size).
 is_cand(#{ tab := T }, K) -> ets:member(T, K).
 
-add_cand(#{ tab := T, counter := C }, K, Bytes) ->
+add_cand(#{ tab := T, counter := C, order := Ord }, K, Bytes) ->
     counters:add(C, 1, 1),
-    ets:insert_new(T, {K, counters:get(C, 1), Bytes, false}).
+    N = counters:get(C, 1),
+    case ets:insert_new(T, {K, N, Bytes, false}) of
+        true -> ets:insert(Ord, {{N, K}}), true;
+        false -> false
+    end.
 
 %% @doc Is `Key' in a unit retention may delete: a top-level 43-byte ID
 %% (a message, a message alias, a commitments group) or `data/'.
@@ -2359,11 +2615,13 @@ protect_and_sweep(Ctx, Cand, Seeds0, SlotAliases, Acc) ->
     AliasKeys = [ A || {A, _} <- Aliases ],
     ok = elmdb:track_watch(DB, cand_keys(Cand) ++ SlotAliases ++ AliasKeys),
     ok = elmdb:flush(DB),
+    TA = erlang:monotonic_time(millisecond),
     AliasSeeds =
         case Aliases of
             [] -> [];
             _ -> alias_scan(Ctx, Cand, Aliases)
         end,
+    TP = erlang:monotonic_time(millisecond),
     %% An alias row goes with its unit: it is a candidate, ordered just before
     %% the unit, and dropped from the sweep whenever the unit is protected.
     lists:foreach(
@@ -2372,12 +2630,14 @@ protect_and_sweep(Ctx, Cand, Seeds0, SlotAliases, Acc) ->
     {ok, Tracked} = elmdb:track_take(DB),
     WriteSeeds = [ K || K <- Tracked, is_cand(Cand, K) orelse is_alias(Cand, K) ],
     Seeds = Seeds0 ++ PinSeeds ++ ScanSeeds ++ AliasSeeds ++ WriteSeeds,
-    lists:foreach(fun(S) -> protect(Ctx, Cand, S) end, Seeds),
-    Acc2 = Acc1#{
+    lists:foreach(fun(S) -> protect(Ctx, Cand, S), duty(Ctx) end, Seeds),
+    TS = erlang:monotonic_time(millisecond),
+    Acc2 = (bump(alias_scan_ms, TP - TA, bump(protect_ms, TS - TP, Acc1)))#{
         protected_by_scan => maps:get(protected_by_scan, Acc1) + length(ScanSeeds ++ AliasSeeds),
         protected_by_writes => maps:get(protected_by_writes, Acc1) + length(WriteSeeds)
     },
-    sweep(Ctx, Cand, Acc2).
+    Acc3 = sweep(Ctx, Cand, Acc2),
+    bump(sweep_ms, erlang:monotonic_time(millisecond) - TS, Acc3).
 
 %% @doc One pass over every reference row in the store. A row that is not a
 %% candidate and names a candidate protects it. A top-level ID row linking to a
@@ -2407,6 +2667,7 @@ protection_scan(Ctx, Cand, Acc) ->
                         done -> {Seeds1, Aliases1, Rows + N};
                         _ ->
                             case Pause of 0 -> ok; _ -> timer:sleep(Pause) end,
+                            duty(Ctx),
                             L(Next, Seeds1, Aliases1, Rows + N)
                     end;
                 {error, T, D} -> erlang:error({store_retention_scan_failed, T, D})
@@ -2450,7 +2711,7 @@ alias_scan(Ctx, Cand, Aliases) ->
                     end,
                     Seeds,
                     Refs),
-            case Next of done -> Seeds1; _ -> L(Next, Seeds1) end
+            case Next of done -> Seeds1; _ -> duty(Ctx), L(Next, Seeds1) end
         end,
     Loop(<<>>, []).
 
@@ -2508,10 +2769,17 @@ protect_row(Ctx, Cand = #{ tab := T }, {K, V}) ->
 %% @doc Delete every unprotected candidate, top-down, in guarded batches. A
 %% vetoed key -- written or referenced since the last check -- is protected
 %% with everything it reaches, and the remaining batches are recomputed.
-sweep(Ctx, Cand = #{ tab := T }, Acc) ->
+sweep(Ctx, Cand = #{ tab := T, order := Ord }, Acc) ->
     Ordered =
-        [ {K, B} || {K, _O, B, false} <- lists:keysort(2, ets:tab2list(T)),
-                    deletable(Cand, K) ],
+        ets:foldr(
+            fun({{_, K}}, L) ->
+                case deletable(Cand, K) of
+                    true -> [{K, ets:lookup_element(T, K, 3)} | L];
+                    false -> L
+                end
+            end,
+            [],
+            Ord),
     Protected = ets:select_count(T, [{{'_', '_', '_', true}, [], [true]}]),
     Acc1 = Acc#{ protected_keys => maps:get(protected_keys, Acc) + Protected },
     case maps:get(dry_run, Acc1, false) of
@@ -2539,7 +2807,7 @@ deletable(#{ tab := T, alias_of := A }, K) ->
 sweep_batches(_Ctx, _Cand, [], Acc) -> Acc;
 sweep_batches(Ctx, Cand = #{ tab := T }, Ordered, Acc) ->
     N = maps:get(delete_batch, maps:get(policy, Ctx)),
-    {Batch, Rest} = lists:split(min(N, length(Ordered)), Ordered),
+    {Batch, Rest} = take(N, Ordered),
     %% Fold in what was written since the last check before deciding.
     {ok, Tracked} = elmdb:track_take(maps:get(src_db, Ctx)),
     [ protect(Ctx, Cand, K) || K <- Tracked, is_cand(Cand, K) orelse is_alias(Cand, K) ],
@@ -2708,7 +2976,7 @@ orphan_chunk(Ctx, Units, Prev, Marks, Acc) ->
                         ),
                     case Next of
                         done -> {Seeds1, Edges1};
-                        _ -> S(Next, Seeds1, Edges1)
+                        _ -> duty(Ctx), S(Next, Seeds1, Edges1)
                     end;
                 {error, T, D} -> erlang:error({store_retention_scan_failed, T, D})
             end
