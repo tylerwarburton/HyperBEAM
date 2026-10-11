@@ -7,6 +7,15 @@ Node: `hyperbeam-prod` on Box A · `hyperbeam.tylerw.ai` · store `/opt/runereal
 
 ---
 
+## 2026-10-11 23:17Z - fresh reset onto `hyperbeam:upgrades-q` (178df0187e31, source 2228804c1)
+
+Empty store (old store/export moved aside, stamp 20261011T231755Z) for a fresh contract
+respawn (paralith-mono deploy/fresh-20261009 @ e6948d5). upgrades-p plus the `now/<key>`
+read path (`process-now-key-reads: true`) and the catch-up option fix (inactive:
+`process-compute-on-schedule: false`). Undo: `fresh-reset-q.sh rollback 20261011T231755Z`.
+
+---
+
 ## Pending - not deployed: `now/<key>` reads cost the key, not the state (`process-now-key-reads`)
 
 Source only (branch `perf/now-read-cache`); `ops/prod/node-config.json`
