@@ -136,6 +136,7 @@
   "essentials-retention-dry-run": false,
   "process-async-checkpoints": true,
   "process-compute-on-schedule": true,
-  "process-worker-fullsweep-after": 0,
+  "process-worker-gc": "checkpoint+idle",
+  "process-worker-gc-idle-ms": 5000,
   "store-retention-max-cpu-pct": 25
 }

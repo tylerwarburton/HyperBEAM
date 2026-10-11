@@ -395,6 +395,14 @@ start_worker(GroupName, Msg, Opts) ->
 %%       words.</li>
 %% </ul>
 %% An unparseable or negative value is ignored rather than failing the spawn.
+%%
+%% `process-worker-fullsweep-after: 0' is harmful for a worker with a large
+%% state under load: every collection, including each of the many an
+%% allocation-heavy slot triggers, then copies the whole live heap. On prod
+%% (2026-10-11) the game worker's slots went from ~20 ms to 300-1000 ms and
+%% compute fell below 1 msg/s; removing the option restored ~5 msg/s. Keep it
+%% unset and use `process-worker-gc' (`dev_process_worker') to compact
+%% workers at checkpoints and when idle instead.
 worker_spawn_opts(Opts) ->
     lists:flatmap(
         fun({Key, Flag}) ->

@@ -1003,6 +1003,8 @@ store_result_sync(ForceSnapshot, ProcID, Slot, Res, Req, Opts) ->
                         {snapshot, WithLastSnapshot}
                     }
                 ),
+                % A quiet point for the process worker to collect at.
+                dev_process_worker:checkpoint_taken(),
                 WithLastSnapshot
     end,
     ?event(compute, {caching_result, {proc_id, ProcID}, {slot, Slot}}, Opts),
@@ -1051,7 +1053,11 @@ store_result_async(ProcID, Slot, Res, Req, Opts) ->
             false -> Res;
             true ->
                 case start_checkpoint_writer(ProcID, Slot, Res, Req, Opts) of
-                    started -> set_checkpoint_overdue(Res, false);
+                    started ->
+                        % The writer has its copy: a quiet point for the
+                        % process worker to collect at.
+                        dev_process_worker:checkpoint_taken(),
+                        set_checkpoint_overdue(Res, false);
                     busy ->
                         ?event(compute_short,
                             {checkpoint_deferred,

@@ -44,6 +44,11 @@ beside the originals and has a `rollback <STAMP>` mode.
   fine and then the store is silently write-dead (MDB_MAP_FULL).
 - **`hb-prod.sh`'s `HB_IMAGE` default must match the running image**, or
   `recreate` silently downgrades prod (the deploy scripts update it).
+- **`process-worker-fullsweep-after` must stay unset**: `0` makes every
+  collection of a process worker a full copy of its heap, and slowed the game
+  worker 10-50x under the swarm (removed 2026-10-11). Workers are compacted at
+  quiet points by `process-worker-gc` (`checkpoint+idle`: after each
+  checkpoint hand-off, and once after `process-worker-gc-idle-ms` idle).
 - **`push-max-depth` must stay unset**: an explicit depth brings back the silent
   skip past 16 hops; the implicit bound defers instead.
 - `process-now-from-cache: true` means `/now` serves the last computed state;

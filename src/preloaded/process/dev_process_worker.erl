@@ -5,8 +5,20 @@
 -module(dev_process_worker).
 -export([server/3, stop/1, group/3, await/5, notify_compute/4]).
 -export([compute_on_schedule/4]).
+-export([checkpoint_taken/0]).
 -include_lib("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
+
+%% Forced collections of a worker's heap, at quiet points only: after the
+%% request that handed off a checkpoint has been answered, and once when the
+%% worker has then been idle for `process-worker-gc-idle-ms'. See `force_gc/2'.
+-define(DEFAULT_GC_POLICY, <<"checkpoint+idle">>).
+-define(DEFAULT_GC_IDLE_MS, 5000).
+-define(GC_CHECKPOINT_DUE, {?MODULE, gc_checkpoint_due}).
+%% A compute-on-schedule catch-up that has itself computed (as the leader for
+%% a process with no worker) holds a dead copy of the state; above this many
+%% words of heap it is collected before it waits for the next target.
+-define(CATCH_UP_GC_WORDS, 1_000_000).
 
 %% Request keys a delegated `compute' carries to the worker's resolution.
 -define(CARRIED_KEYS,
@@ -86,7 +98,13 @@ process_to_group_name(Base, Opts) ->
 %% @doc Spawn a new worker process. This is called after the end of the first
 %% execution of `hb_ao:resolve/3', so the state we are given is the
 %% already current.
+%%
+%% The state arrives as the spawn's copy, compact, so no idle collection is
+%% due until the worker has computed something (`gc_policy/1').
 server(GroupName, RawBase, Opts) ->
+    server(GroupName, RawBase, Opts, false).
+
+server(GroupName, RawBase, Opts, IdleGCDue) ->
     Base = live_base(RawBase),
     ServerOpts = Opts#{
         <<"await-inprogress">> => false,
@@ -104,7 +122,7 @@ server(GroupName, RawBase, Opts) ->
     % checking the cache for a snapshot. Default: 5 minutes.
     Timeout = hb_opts:get(process_worker_max_idle, 300_000, Opts),
     ?event(worker, {waiting_for_req, {group, GroupName}}),
-    receive
+    case next_request(GroupName, Timeout, IdleGCDue, Opts) of
         {resolve, Listener, GroupName, Req, ListenerOpts} ->
             TargetSlot = read_slot(Req, not_found, Opts),
             ?event(worker,
@@ -123,21 +141,158 @@ server(GroupName, RawBase, Opts) ->
                 ),
             ?event(worker, {work_done, {group, GroupName}, {req, Req}, {res, Res}}),
             send_notification(Listener, GroupName, TargetSlot, Res),
-            server(GroupName, next_base(Base, Res), Opts);
+            % The listener has its answer: a quiet point. A forced collection
+            % after a checkpoint leaves nothing for the idle one to do until
+            % the worker computes again.
+            Collected = checkpoint_gc(Opts),
+            server(GroupName, next_base(Base, Res), Opts, not Collected);
         stop ->
             ?event(worker, {stopping, {group, GroupName}, {base, Base}}),
-            exit(normal)
-    after Timeout ->
-        % We have hit the in-memory persistence timeout. Generate a snapshot
-        % of the current process state and ensure it is cached.
-        hb_ao:resolve(
-            Base,
-            <<"snapshot">>,
-            ServerOpts#{ <<"cache-control">> => [<<"store">>] }
-        ),
-        % Return the current process state.
-        {ok, Base}
+            exit(normal);
+        timeout ->
+            % We have hit the in-memory persistence timeout. Generate a snapshot
+            % of the current process state and ensure it is cached.
+            hb_ao:resolve(
+                Base,
+                <<"snapshot">>,
+                ServerOpts#{ <<"cache-control">> => [<<"store">>] }
+            ),
+            % Return the current process state.
+            {ok, Base}
     end.
+
+%% @doc Wait up to `Timeout' for the next request or `stop', and return it, or
+%% `timeout'. With an idle collection due, a wait that outlasts
+%% `process-worker-gc-idle-ms' runs it once and waits out the rest of
+%% `Timeout' without it: a worker that stays idle is collected once, not once
+%% per interval.
+next_request(GroupName, Timeout, IdleGCDue, Opts) ->
+    IdleMs =
+        case IdleGCDue andalso idle_gc_ms(Opts) of
+            Ms when is_integer(Ms), Ms < Timeout -> Ms;
+            _ -> none
+        end,
+    receive
+        {resolve, _Listener, GroupName, _Req, _ListenerOpts} = Msg -> Msg;
+        stop -> stop
+    after wait_ms(IdleMs, Timeout) ->
+        case IdleMs of
+            none -> timeout;
+            _ ->
+                force_gc(idle, Opts),
+                next_request(GroupName, remaining(Timeout, IdleMs), false, Opts)
+        end
+    end.
+
+wait_ms(none, Timeout) -> Timeout;
+wait_ms(IdleMs, _Timeout) -> IdleMs.
+
+remaining(infinity, _) -> infinity;
+remaining(Timeout, Elapsed) -> max(0, Timeout - Elapsed).
+
+%%% Forced collections of the worker's heap (`process-worker-gc').
+
+%% @doc Note that the process running this call has just handed a checkpoint
+%% to the store, or to its asynchronous writer. Called from `dev_process' on
+%% the compute path, so it only sets a flag: the collection itself waits for
+%% the worker's next quiet point (`checkpoint_gc/1'). In any process other
+%% than a worker the flag is never read.
+checkpoint_taken() ->
+    put(?GC_CHECKPOINT_DUE, true),
+    ok.
+
+%% @doc After a request has been answered: run the checkpoint collection if
+%% the request handed off a checkpoint and the policy asks for one. A request
+%% that crosses several checkpoints (a long catch-up) is collected once.
+%% Returns whether a collection ran.
+checkpoint_gc(Opts) ->
+    case erase(?GC_CHECKPOINT_DUE) of
+        true ->
+            case gc_policy(Opts) of
+                #{ checkpoint := true } ->
+                    force_gc(checkpoint, Opts),
+                    true;
+                _ -> false
+            end;
+        _ -> false
+    end.
+
+%% @doc The idle delay, or `false' when the policy has no idle collection.
+idle_gc_ms(Opts) ->
+    case gc_policy(Opts) of
+        #{ idle := true } ->
+            case hb_opts:get(<<"process-worker-gc-idle-ms">>, ?DEFAULT_GC_IDLE_MS, Opts) of
+                Ms when is_integer(Ms), Ms >= 0 -> Ms;
+                Bin when is_binary(Bin) ->
+                    try binary_to_integer(Bin)
+                    catch _:_ -> ?DEFAULT_GC_IDLE_MS
+                    end;
+                _ -> ?DEFAULT_GC_IDLE_MS
+            end;
+        _ -> false
+    end.
+
+%% @doc Parse `process-worker-gc': `off', `checkpoint', `idle' or
+%% `checkpoint+idle' (an atom or binary), or a list of `checkpoint' and
+%% `idle'. Anything else is the default.
+gc_policy(Opts) ->
+    parse_gc_policy(hb_opts:get(<<"process-worker-gc">>, ?DEFAULT_GC_POLICY, Opts)).
+
+parse_gc_policy(L) when is_list(L), L =/= [] ->
+    case lists:all(fun(X) -> is_binary(X) orelse is_atom(X) end, L) of
+        true ->
+            lists:foldl(
+                fun(Mode, Acc) ->
+                    maps:merge_with(
+                        fun(_, A, B) -> A orelse B end,
+                        Acc,
+                        parse_gc_policy(Mode)
+                    )
+                end,
+                #{ checkpoint => false, idle => false },
+                L
+            );
+        false -> parse_gc_policy(list_to_binary(L))
+    end;
+parse_gc_policy(A) when is_atom(A) -> parse_gc_policy(atom_to_binary(A));
+parse_gc_policy(<<"off">>) -> #{ checkpoint => false, idle => false };
+parse_gc_policy(<<"false">>) -> #{ checkpoint => false, idle => false };
+parse_gc_policy(<<"checkpoint">>) -> #{ checkpoint => true, idle => false };
+parse_gc_policy(<<"idle">>) -> #{ checkpoint => false, idle => true };
+parse_gc_policy(<<"checkpoint+idle">>) -> #{ checkpoint => true, idle => true };
+parse_gc_policy(_) -> parse_gc_policy(?DEFAULT_GC_POLICY).
+
+%% @doc One full collection of the calling worker, then one minor collection.
+%% The full sweep leaves every live word in a young heap sized to fit it, with
+%% the high-water mark at its top, so the next minor collection -- otherwise
+%% the first one inside the next request -- would copy the whole state again
+%% to promote it. Running that minor here moves the state to the old heap at
+%% the quiet point and leaves a small young heap behind.
+%%
+%% Not `erlang:hibernate/3': it compacts no further than this for a worker
+%% whose state is nearly all live, but the request that wakes it pays to grow
+%% the heap back and promote the state, on the latency path; and the worker
+%% loop would have to be restarted from a continuation.
+force_gc(Reason, Opts) ->
+    case hb_opts:get(<<"process-worker-gc-hook">>, undefined, Opts) of
+        Hook when is_function(Hook, 1) -> Hook(Reason);
+        _ -> ok
+    end,
+    {memory, Before} = erlang:process_info(self(), memory),
+    Start = erlang:monotonic_time(microsecond),
+    erlang:garbage_collect(),
+    erlang:garbage_collect(self(), [{type, minor}]),
+    Done = erlang:monotonic_time(microsecond),
+    {memory, After} = erlang:process_info(self(), memory),
+    ?event(worker_gc,
+        {forced_gc,
+            {reason, Reason},
+            {ms, (Done - Start) div 1000},
+            {memory_before, Before},
+            {memory_after, After}
+        }
+    ),
+    ok.
 
 %% @doc Execute one request against the worker's live state.
 %%
@@ -454,7 +609,22 @@ catch_up(Name, ProcID, SchedPID, Target, Done, Process, Opts) ->
             finish_catch_up(Name, ProcID, SchedPID, Done, Opts);
         Next ->
             NextProcess = catch_up_to(ProcID, Process, Next, Opts),
+            shed_dead_state(),
             catch_up(Name, ProcID, SchedPID, Next, Next, NextProcess, Opts)
+    end.
+
+%% @doc A catch-up that found no worker became the leader of its compute: it
+%% computed the state itself and handed it to the worker it spawned, keeping
+%% a dead copy (hundreds of MB for a large process). Under steady scheduling a
+%% catch-up never runs dry, so that copy would otherwise wait for a collection
+%% its small live set rarely triggers. A full sweep costs only the live data,
+%% which is small here.
+shed_dead_state() ->
+    erase(?GC_CHECKPOINT_DUE),
+    case erlang:process_info(self(), total_heap_size) of
+        {total_heap_size, Words} when Words > ?CATCH_UP_GC_WORDS ->
+            erlang:garbage_collect();
+        _ -> ok
     end.
 
 %% @doc The highest target among `Slot' and the wakes waiting in the mailbox.
@@ -1622,3 +1792,190 @@ compute_on_schedule_replay_limit_default_test() ->
             <<"process-compute-on-schedule-replay-limit">> => 10
         })
     ).
+
+%%% Forced worker collections (`process-worker-gc').
+
+%% @doc Every spelling of the policy, and the fallbacks.
+gc_policy_parse_test() ->
+    Both = #{ checkpoint => true, idle => true },
+    None = #{ checkpoint => false, idle => false },
+    ?assertEqual(Both, gc_policy(#{})),
+    ?assertEqual(None, gc_policy(#{ <<"process-worker-gc">> => <<"off">> })),
+    ?assertEqual(None, gc_policy(#{ <<"process-worker-gc">> => false })),
+    ?assertEqual(
+        #{ checkpoint => true, idle => false },
+        gc_policy(#{ <<"process-worker-gc">> => checkpoint })
+    ),
+    ?assertEqual(
+        #{ checkpoint => false, idle => true },
+        gc_policy(#{ <<"process-worker-gc">> => <<"idle">> })
+    ),
+    ?assertEqual(
+        Both,
+        gc_policy(#{ <<"process-worker-gc">> => [<<"idle">>, <<"checkpoint">>] })
+    ),
+    ?assertEqual(Both, gc_policy(#{ <<"process-worker-gc">> => "checkpoint+idle" })),
+    ?assertEqual(Both, gc_policy(#{ <<"process-worker-gc">> => <<"bogus">> })),
+    ?assertEqual(5000, idle_gc_ms(#{})),
+    ?assertEqual(
+        250,
+        idle_gc_ms(#{ <<"process-worker-gc-idle-ms">> => <<"250">> })
+    ),
+    ?assertEqual(
+        false,
+        idle_gc_ms(#{
+            <<"process-worker-gc">> => <<"checkpoint">>,
+            <<"process-worker-gc-idle-ms">> => 250
+        })
+    ).
+
+%% A counter process (checkpoints every 10 slots) whose worker reports every
+%% forced collection to the test. Slot 0 is computed by the requester, which
+%% then hands the state to a new worker; every later slot is the worker's.
+gc_counter(Count, Extra) ->
+    Test = self(),
+    Ref = make_ref(),
+    {Process, Opts} =
+        counter_process(
+            Count,
+            Extra#{
+                <<"spawn-worker">> => true,
+                <<"process-workers">> => true,
+                <<"await-inprogress">> => named,
+                <<"process-worker-gc-hook">> =>
+                    fun(Reason) -> Test ! {worker_gc, Ref, Reason} end
+            }
+        ),
+    {ok, _} = gc_compute(Process, 0, Opts),
+    Group = hb_util:human_id(hb_message:id(Process, all, Opts)),
+    ?assert(is_pid(await_worker(Group, 50))),
+    % The new worker may also be handed the request that elected it, which
+    % re-stores slot 0 (a checkpoint); let it settle, then start counting.
+    timer:sleep(1000),
+    gc_events(Ref),
+    {Process, Ref, Opts}.
+
+gc_compute(Process, Slot, Opts) ->
+    bounded_resolve(
+        Process,
+        #{ <<"path">> => <<"compute">>, <<"slot">> => Slot },
+        Opts
+    ).
+
+%% Slots `From'..`To' one request each, as the swarm drives a game process,
+%% returning each slot's public state.
+gc_compute_each(Process, Slots, Opts) ->
+    [
+        begin
+            {ok, S} = gc_compute(Process, Slot, Opts),
+            {
+                hb_ao:get(<<"at-slot">>, S, Opts),
+                hb_ao:get(<<"count">>, S, Opts),
+                hb_ao:get(<<"results/output/data">>, S, Opts)
+            }
+        end
+    ||
+        Slot <- Slots
+    ].
+
+%% The forced collections reported so far, in order. A collection runs just
+%% after the worker answers, so give the last one a moment to report.
+gc_events(Ref) ->
+    timer:sleep(300),
+    gc_reported(Ref).
+
+gc_reported(Ref) ->
+    receive {worker_gc, Ref, Reason} -> [Reason | gc_reported(Ref)]
+    after 0 -> []
+    end.
+
+%% @doc Off: no forced collection, however many checkpoints or idle waits.
+worker_gc_off_test_() ->
+    {timeout, 180, fun() ->
+        {Process, Ref, Opts} =
+            gc_counter(26, #{
+                <<"process-worker-gc">> => <<"off">>,
+                <<"process-worker-gc-idle-ms">> => 0
+            }),
+        gc_compute_each(Process, lists:seq(1, 25), Opts),
+        timer:sleep(500),
+        ?assertEqual([], gc_events(Ref))
+    end}.
+
+%% @doc Checkpoint mode: exactly one collection per checkpoint the worker
+%% hands off (slots 10 and 20), synchronous or asynchronous.
+worker_gc_per_checkpoint_test_() ->
+    {timeout, 300, fun() ->
+        lists:foreach(
+            fun(Async) ->
+                {Process, Ref, Opts} =
+                    gc_counter(26, #{
+                        <<"process-worker-gc">> => <<"checkpoint">>,
+                        <<"process-async-checkpoints">> => Async
+                    }),
+                gc_compute_each(Process, lists:seq(1, 9), Opts),
+                ?assertEqual([], gc_events(Ref)),
+                gc_compute_each(Process, [10], Opts),
+                ?assertEqual([checkpoint], gc_events(Ref)),
+                gc_compute_each(Process, lists:seq(11, 25), Opts),
+                ?assertEqual([checkpoint], gc_events(Ref))
+            end,
+            [false, true]
+        )
+    end}.
+
+%% @doc Idle mode: one collection once the worker has been idle, none more
+%% while it stays idle, and one again after it next works and goes idle.
+worker_gc_once_per_idle_period_test_() ->
+    {timeout, 180, fun() ->
+        {Process, Ref, Opts} =
+            gc_counter(26, #{
+                <<"process-worker-gc">> => <<"idle">>,
+                <<"process-worker-gc-idle-ms">> => 200
+            }),
+        gc_compute_each(Process, [1], Opts),
+        timer:sleep(1000),
+        ?assertEqual([idle], gc_events(Ref)),
+        timer:sleep(1000),
+        ?assertEqual([], gc_events(Ref)),
+        % Checkpoints (slot 10) collect nothing in idle mode.
+        gc_compute_each(Process, lists:seq(2, 12), Opts),
+        timer:sleep(1000),
+        ?assertEqual([idle], gc_events(Ref))
+    end}.
+
+%% @doc Both: a checkpoint's collection leaves nothing for the idle one until
+%% the worker computes again.
+worker_gc_checkpoint_then_idle_test_() ->
+    {timeout, 180, fun() ->
+        {Process, Ref, Opts} =
+            gc_counter(26, #{
+                <<"process-worker-gc">> => <<"checkpoint+idle">>,
+                <<"process-worker-gc-idle-ms">> => 200
+            }),
+        gc_compute_each(Process, lists:seq(1, 10), Opts),
+        timer:sleep(1000),
+        ?assertEqual([checkpoint], gc_events(Ref)),
+        gc_compute_each(Process, [11], Opts),
+        timer:sleep(1000),
+        ?assertEqual([idle], gc_events(Ref))
+    end}.
+
+%% @doc The policy never changes a result: the same slots give the same public
+%% states with forced collections off and as often as they can run.
+worker_gc_results_unchanged_test_() ->
+    {timeout, 300, fun() ->
+        Run =
+            fun(Policy) ->
+                {Process, _Ref, Opts} =
+                    gc_counter(26, #{
+                        <<"process-worker-gc">> => Policy,
+                        <<"process-worker-gc-idle-ms">> => 0,
+                        <<"process-async-checkpoints">> => true
+                    }),
+                gc_compute_each(Process, lists:seq(1, 25), Opts)
+            end,
+        Off = Run(<<"off">>),
+        ?assertEqual(Off, Run(<<"checkpoint+idle">>)),
+        ?assertEqual({25, <<"26">>, <<"26">>}, lists:last(Off))
+    end}.
