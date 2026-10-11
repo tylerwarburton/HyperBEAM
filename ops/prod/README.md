@@ -62,6 +62,16 @@ beside the originals and has a `rollback <STAMP>` mode.
   `process-snapshot-slots`, so 2000 here; `infinity` for none); further than
   that it is skipped and left to the next read. `process-historical-replay-limit`
   does not apply to it.
+- `process-now-key-reads: true` (default `false`; needs
+  `process-now-from-cache`) answers `GET /<pid>~process@1.0/now/<key>` with
+  that key alone, matched out of the in-memory hot cache, instead of copying
+  the whole latest state into the request and walking all of its keys (on the
+  game process: tens of MB and 30-350 ms per read, growing with the state).
+  Same bodies and status codes, 404 included; it holds no memory of its own
+  (it reads the hot cache entry `process-hot-cache-*` already bounds). Keys
+  a device exports (`now/compute`, `now/snapshot`, `now/keys`, ...), a bare
+  `now`, and a process not in the hot cache take the old path. Turn it off to
+  get the old behaviour back exactly.
 - Long `hb eval` calls hit an "Alarm clock" timeout: spawn the work inside the
   node and have it write a result file instead.
 - The node still looks up unknown push targets (wallets, deleted processes) in

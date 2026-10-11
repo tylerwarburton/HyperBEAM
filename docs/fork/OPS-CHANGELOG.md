@@ -7,6 +7,61 @@ Node: `hyperbeam-prod` on Box A · `hyperbeam.tylerw.ai` · store `/opt/runereal
 
 ---
 
+## Pending - not deployed: `now/<key>` reads cost the key, not the state (`process-now-key-reads`)
+
+Source only (branch `perf/now-read-cache`); `ops/prod/node-config.json`
+already carries `process-now-key-reads: true`, so it is ahead of the live
+config until this ships. An image without the code ignores the key.
+
+Why: on 2026-10-11 21:31-21:39Z the game process's `now/player-<addr>` reads
+(~5 KB answers) took 50-350 ms each (avg 345 ms, max 3 s), and every other
+process's `now/` reads slowed with them (all `now/` reads, 4 min: p50 26 ms,
+p90 929 ms, max 9.2 s). Each read copied the newest state whole out of the hot
+cache ETS table into the HTTP request process
+(`dev_process_cache:hot_newest/2`, `ets:lookup`), then walked every key of it
+again: `without_snapshot/2` (`hb_ao:set`) and AO-Core's key normalization on
+the `now` result, and for a missing key `dev_message`'s case-insensitive
+fallback normalizes the whole state once more. 1,072 reads/min on a state of
+tens of MB is GBs/min of copying and garbage beside the game worker.
+
+What changes, with the option on:
+
+1. `hb_ao` names the next key in a `now` request's private `ao-next-key` when
+   the next step is a single plain key (private keys are in no ID or hashpath).
+2. `dev_process:now/3` then answers with a state holding only that key (plus
+   `device`, `cache-control`, `hashpath-alg` if set), matched out of the hot
+   cache entry by a match specification that copies only the value
+   (`dev_process_cache:latest_fields/3`). AO-Core resolves the key on it as on
+   the full state: same value, hashpath, status, 404. It falls back to the old
+   path for a key a device exports (`now/compute`, `now/keys`, ...), a private
+   key, a process with no hot cache entry, and a reader with messages queued
+   (`notify_compute/4` sends listeners the whole state). Key reads run
+   ungrouped. No new memory: it reads the entry the hot cache already holds.
+
+Measured (`dev_process_now_tests`, `HB_NOW_BENCH=1:50`, 2 CPUs), per read p50:
+
+```
+state          in-process  old -> new     HTTP  old -> new
+1 MB              0.51 ms -> 0.44 ms        5.1 ms -> 3.3 ms
+49 MB (23,500     31.5 ms -> 0.25 ms       36.6 ms -> 3.1 ms
+  players)
+```
+
+With 4 readers at ~20 reads/s on the 49 MB state, a worker-like allocation loop
+went from p99 22 ms alone to 48 ms (old reads, read p50 57 ms) and to 13 ms
+(new, read p50 0.6 ms). 50 reads of a 5,000-player (11 MB) state left 590 MB
+of garbage before, 6 MB after.
+
+Same responses: HTTP byte for byte (status, headers but `date`, body) and
+in-process term for term, on a Lua process, for found keys, nested paths,
+`at-slot`, missing keys, case-insensitive fallback, exported keys, and after
+the process advances.
+
+Undo: set `process-now-key-reads: false` (or remove it) and restart; or
+redeploy the previous image.
+
+---
+
 ## 2026-10-11 20:42Z - `hyperbeam:upgrades-p` (b2f84873fa82, source 3fa4ff1a6): worker GC policy and low-garbage Luerl collect
 
 Deployed with config `process-worker-gc: checkpoint+idle`, `process-worker-gc-idle-ms: 5000`

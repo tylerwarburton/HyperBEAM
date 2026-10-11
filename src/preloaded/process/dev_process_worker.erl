@@ -27,7 +27,11 @@
 
 %% @doc Return a group name for a request. Cached compute reads run
 %% ungrouped; uncached compute work groups by process ID; everything
-%% else uses the default grouper.
+%% else uses the default grouper, except a `now/<key>' key read
+%% (`dev_process:now_key_read/2'): it is cheap, and its result holds only its
+%% own key, so it must not be shared with a reader of another key -- which the
+%% default grouper, blind to the private key it is named by, would do under
+%% `await-inprogress: true'.
 group(Base, undefined, Opts) ->
     hb_persistent:default_grouper(Base, undefined, Opts);
 group(Base, Req, Opts) ->
@@ -37,7 +41,10 @@ group(Base, Req, Opts) ->
         true ->
             compute_group(Base, Req, Opts);
         false ->
-            hb_persistent:default_grouper(Base, Req, Opts)
+            case dev_process:now_key_read(Req, Opts) of
+                {true, _} -> ungrouped_exec;
+                false -> hb_persistent:default_grouper(Base, Req, Opts)
+            end
     end.
 
 %% @doc Decide which group to enrol a `compute' request into. Cache-hit

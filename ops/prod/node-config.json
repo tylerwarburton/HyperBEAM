@@ -4,6 +4,7 @@
   "process-snapshot-time": 900,
   "process-snapshot-slots": 1000,
   "process-now-from-cache": true,
+  "process-now-key-reads": true,
   "spawn-worker": true,
   "process-worker-max-idle": 86400000,
   "idle-timeout": 900000,

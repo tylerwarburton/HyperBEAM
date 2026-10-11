@@ -5,6 +5,7 @@
 -module(dev_process_cache).
 -export([latest/2, latest/3, latest/4, read/2, read/3, write/4]).
 -export([write_checkpoint/5, latest_slot/4, newest_slot_after/4]).
+-export([latest_fields/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 
@@ -703,6 +704,50 @@ hot_newest(ProcID, Opts) ->
         [{Key, Slot, Msg}] -> {ok, Slot, Msg};
         [] -> not_found
     catch error:badarg -> not_found
+    end.
+
+%% @doc The fields `Fields' of the newest state `latest/2' would return, read
+%% out of the hot cache without the rest of the state: `{ok, Slot, Map}', where
+%% `Map' holds each of `Fields' that the state has, or `not_found' when the hot
+%% cache holds no state for the process (`latest/2' would go to the store).
+%%
+%% `latest/2' copies the whole state out of the table: on a game process with a
+%% few thousand players, tens of MB into the reader's heap for every
+%% `now/<key>' read, which then walks all of it again. Here each field is
+%% matched out by a match specification whose head binds just that field's
+%% value, so only the value is copied. (A body expression such as `map_get'
+%% would copy the whole state onto the heap first: measured 5 ms against 1 us
+%% for the head pattern on a 20,000-key state.) Every select is bound to the
+%% slot first seen, so a newer slot written in between is retried rather than
+%% mixed with the old one.
+latest_fields(ProcID, Fields, Opts) ->
+    ensure_hot_cache(),
+    latest_fields(hot_key(ProcID, Opts), Fields, Opts, 3).
+latest_fields(_Key, _Fields, _Opts, 0) ->
+    not_found;
+latest_fields(Key, Fields, Opts, Tries) ->
+    try ets:lookup_element(?HOT_CACHE, Key, 2, not_found) of
+        not_found -> not_found;
+        Slot ->
+            case hot_fields(Key, Slot, Fields, #{}) of
+                {ok, Found} -> {ok, Slot, Found};
+                moved -> latest_fields(Key, Fields, Opts, Tries - 1)
+            end
+    catch error:badarg -> not_found
+    end.
+
+hot_fields(_Key, _Slot, [], Acc) ->
+    {ok, Acc};
+hot_fields(Key, Slot, [Field | Rest], Acc) ->
+    Spec =
+        [
+            {{Key, Slot, #{ Field => '$1' }}, [], [{{ok, '$1'}}]},
+            {{Key, Slot, '_'}, [], [absent]}
+        ],
+    case ets:select(?HOT_CACHE, Spec) of
+        [{ok, Value}] -> hot_fields(Key, Slot, Rest, Acc#{ Field => Value });
+        [absent] -> hot_fields(Key, Slot, Rest, Acc);
+        [] -> moved
     end.
 
 latest_from_store(ProcID, RawRequiredPath, Limit, RawOpts) ->

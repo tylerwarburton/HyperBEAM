@@ -58,11 +58,16 @@
 %%%                      newest checkpoint when no worker holds the live state
 %%%                      (default twice `process-snapshot-slots' if that is an
 %%%                      integer, else 2000; `infinity' for no bound).
+%%%     process-now-key-reads:
+%%%                      With `process-now-from-cache', answer `now/<key>' from
+%%%                      the hot cache with that key alone, instead of copying
+%%%                      and walking the whole latest state (default false).
+%%%                      Same responses. See `latest_key/3'.
 -module(dev_process).
 -device_libraries([lib_process]).
 %%% Public API
 -export([info/1, as/3, compute/3, schedule/3, slot/3, now/3, push/3, snapshot/3]).
--export([target_slot/2, request_slot/2, is_cached_state/1]).
+-export([target_slot/2, request_slot/2, is_cached_state/1, now_key_read/2]).
 -export([cold_replay_bound/4, compute_on_schedule/4]).
 -export([default_device/3]).
 -include_lib("eunit/include/eunit.hrl").
@@ -86,6 +91,14 @@
 %% newest checkpoint is looked up to resume from instead. Overridden with the
 %% `process-checkpoint-resume-gap' option.
 -define(DEFAULT_CHECKPOINT_RESUME_GAP, 32).
+
+%% The fields of a state, besides the key itself, that decide how a key read on
+%% it resolves: its device (`hb_device:message_to_fun/3'), its cache settings
+%% (`hb_cache_control') and its hashpath algorithm (`hb_path:hashpath/3').
+%% A `now/<key>' read copies only these out of the hot cache. See `latest_key/3'.
+-define(KEY_READ_FIELDS, [<<"device">>, <<"cache-control">>, <<"hashpath-alg">>]).
+%% A key no device exports, so it resolves as a plain read of the message.
+-define(PLAIN_KEY_PROBE, <<"process-now-plain-key-probe">>).
 
 %% @doc When the info key is called, we should return the process exports.
 info(_Base) ->
@@ -1270,46 +1283,137 @@ now(RawBase, Req, Opts) ->
                 Opts
             );
         CacheParam ->
-            % We are serving the latest known state from the cache, rather
-            % than computing it.
-            LatestKnown = dev_process_cache:latest(ProcessID, [], Opts),
-            case LatestKnown of
-                {ok, LatestSlot, RawLatestMsg} ->
-                    % Marked as a cache hit: it is public state only (never a
-                    % base to compute from), and the store already holds it,
-                    % so result caching must not write it back on every read.
-                    LatestMsg =
-                        mark_cached_state(
-                            without_snapshot(RawLatestMsg, Opts),
-                            Opts
-                        ),
-                    ?event(compute_cache,
-                        {serving_latest_cached_state,
-                            {proc_id, ProcessID},
-                            {slot, LatestSlot}
-                        },
-                        Opts
-                    ),
-                    dev_process_worker:notify_compute(
-                        ProcessID,
-                        LatestSlot,
-                        {ok, LatestMsg},
-                        Opts
-                    ),
-                    {ok, LatestMsg};
-                _ ->
-                    if CacheParam =/= always ->
-                        % The node is configured to use the cache if possible,
-                        % but forcing computation is also admissible. Subsequently,
-                        % as no other option is available, we compute the state.
-                        now(Base, Req, Opts#{ <<"process-now-from-cache">> => false });
-                    true ->
-                        % The node is configured to only serve the latest known
-                        % state from the cache, so we return the latest slot.
-                        {failure, <<"No cached state available.">>}
-                    end
+            case latest_key(ProcessID, Req, Opts) of
+                {ok, KeyState} -> {ok, KeyState};
+                miss -> now_from_cache(Base, Req, ProcessID, CacheParam, Opts)
             end
     end.
+
+%% @doc Serve the latest known state of a process from the process cache.
+now_from_cache(Base, Req, ProcessID, CacheParam, Opts) ->
+    % We are serving the latest known state from the cache, rather
+    % than computing it.
+    LatestKnown = dev_process_cache:latest(ProcessID, [], Opts),
+    case LatestKnown of
+        {ok, LatestSlot, RawLatestMsg} ->
+            % Marked as a cache hit: it is public state only (never a
+            % base to compute from), and the store already holds it,
+            % so result caching must not write it back on every read.
+            LatestMsg =
+                mark_cached_state(
+                    without_snapshot(RawLatestMsg, Opts),
+                    Opts
+                ),
+            ?event(compute_cache,
+                {serving_latest_cached_state,
+                    {proc_id, ProcessID},
+                    {slot, LatestSlot}
+                },
+                Opts
+            ),
+            dev_process_worker:notify_compute(
+                ProcessID,
+                LatestSlot,
+                {ok, LatestMsg},
+                Opts
+            ),
+            {ok, LatestMsg};
+        _ ->
+            if CacheParam =/= always ->
+                % The node is configured to use the cache if possible,
+                % but forcing computation is also admissible. Subsequently,
+                % as no other option is available, we compute the state.
+                now(Base, Req, Opts#{ <<"process-now-from-cache">> => false });
+            true ->
+                % The node is configured to only serve the latest known
+                % state from the cache, so we return the latest slot.
+                {failure, <<"No cached state available.">>}
+            end
+    end.
+
+%% @doc A `now/<key>' read with `process-now-key-reads': answer the `now' step
+%% with a state that holds only `<key>' (and the fields that decide how a key
+%% read resolves), copied out of the hot cache by `dev_process_cache:
+%% latest_fields/3'. AO-Core then resolves `<key>' on it exactly as on the full
+%% state: same value, same hashpath (it depends on the `now' request, not on
+%% the result), same 404 when the key is absent.
+%%
+%% Without it, every such read copied the newest state whole out of the hot
+%% cache into the reader (tens of MB for a game process with a few thousand
+%% players) and then walked every key of it again -- once to drop `snapshot',
+%% and in each AO-Core stage that normalizes a message's keys -- to return a
+%% few KB. The work grew with the state, not the answer, and readers in
+%% parallel churned hundreds of MB/s of heap next to the process worker.
+%%
+%% AO-Core names the next key (`hb_ao' adds it to a `now' request's private
+%% `ao-next-key'). Anything that would not resolve as a plain read of the state
+%% takes the full path: a key a device exports (`now/compute',
+%% `now/snapshot', `now/keys', ...), a private key, a process with no state in
+%% the hot cache, or a reader with listeners in its mailbox, which
+%% `notify_compute/4' would have to send the whole state.
+latest_key(ProcessID, Req, Opts) ->
+    case now_key_read(Req, Opts) of
+        false -> miss;
+        {true, Key} ->
+            case erlang:process_info(self(), message_queue_len) of
+                {message_queue_len, 0} -> latest_key_read(ProcessID, Key, Opts);
+                _ -> miss
+            end
+    end.
+
+latest_key_read(ProcessID, Key, Opts) ->
+    try hb_util:to_lower(Key) of
+        Lower ->
+            % `message@1.0' falls back to the lowercased key when the key
+            % itself is absent (`dev_message:get/4'), so both are read.
+            Fields = lists:usort([Key, Lower | ?KEY_READ_FIELDS]),
+            case dev_process_cache:latest_fields(ProcessID, Fields, Opts) of
+                {ok, Slot, State} ->
+                    Device = maps:get(<<"device">>, State, <<"message@1.0">>),
+                    case plain_key(Device, Key, Opts) of
+                        true ->
+                            ?event(compute_cache,
+                                {serving_latest_cached_key,
+                                    {proc_id, ProcessID},
+                                    {slot, Slot},
+                                    {key, Key}
+                                },
+                                Opts
+                            ),
+                            {ok, mark_cached_state(State, Opts)};
+                        false -> miss
+                    end;
+                not_found -> miss
+            end
+    catch _:_ -> miss
+    end.
+
+%% @doc `{true, Key}' if `Req' is a `now' step followed by a read of `Key' and
+%% `process-now-key-reads' is on; otherwise `false'.
+now_key_read(Req, Opts) when is_map(Req) ->
+    case hb_util:atom(hb_opts:get(<<"process-now-key-reads">>, false, Opts)) of
+        true ->
+            case hb_private:from_message(Req) of
+                #{ <<"ao-next-key">> := Key } when is_binary(Key) -> {true, Key};
+                _ -> false
+            end;
+        _ -> false
+    end;
+now_key_read(_Req, _Opts) -> false.
+
+%% @doc Whether `Key' resolves on a message of `Device' as a plain read of the
+%% message's own field -- the way an unexported key falls through to
+%% `message@1.0' -- rather than by calling a device function on the message.
+%% Decided by the same lookup AO-Core does, compared with that of a key no
+%% device exports.
+plain_key(Device, Key, Opts) ->
+    not hb_private:is_private(Key) andalso
+        try
+            Probe = #{ <<"device">> => Device },
+            hb_device:message_to_fun(Probe, Key, Opts) =:=
+                hb_device:message_to_fun(Probe, ?PLAIN_KEY_PROBE, Opts)
+        catch _:_ -> false
+        end.
 
 %% @doc Recursively push messages to the scheduler until we find a message
 %% that does not lead to any further messages being scheduled.

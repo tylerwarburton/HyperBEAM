@@ -260,7 +260,7 @@ do_resolve_many([Res], Opts) ->
     hb_cache:ensure_loaded(maybe_force_message(Res, Opts), Opts);
 do_resolve_many([Base, Req | MsgList], Opts) ->
     ?event_debug(debug_ao_core, {stage, 0, resolve_many, {base, Base}, {req, Req}}),
-    case resolve_stage(1, Base, Req, Opts) of
+    case resolve_stage(1, Base, with_next_key(Req, MsgList, Opts), Opts) of
         {ok, Res} ->
             ?event_debug(debug_ao_core,
                 {
@@ -278,6 +278,27 @@ do_resolve_many([Base, Req | MsgList], Opts) ->
             ?event_debug(debug_ao_core, {stage, 13, resolve_many_terminating_early, Res}),
             maybe_force_message(Res, Opts)
     end.
+
+%% @doc Tell a `now' step which key the next step reads, in the request's
+%% private `ao-next-key', when the next step is a plain single-key request.
+%% `process@1.0' uses it to answer `now/<key>' with that key alone rather than
+%% with the whole latest state (`dev_process:latest_key/3'); every other device
+%% ignores it. Private keys are part of neither a request's ID nor its hashpath
+%% (`?AO_CORE_KEYS'), and groupers drop them, so the hint changes nothing else.
+with_next_key(Req = #{ <<"path">> := <<"now">> }, [Next | _], Opts)
+        when is_map(Next) ->
+    case hb_maps:get(<<"path">>, Next, undefined, Opts) of
+        Path when is_binary(Path), byte_size(Path) > 0 ->
+            case {binary:match(Path, <<"/">>), catch hb_path:hd(Next, Opts)} of
+                {nomatch, Key} when is_binary(Key) ->
+                    Priv = hb_private:from_message(Req),
+                    Req#{ <<"priv">> => Priv#{ <<"ao-next-key">> => Key } };
+                _ -> Req
+            end;
+        _ -> Req
+    end;
+with_next_key(Req, _MsgList, _Opts) ->
+    Req.
 
 resolve_stage(1, Link, Req, Opts) when ?IS_LINK(Link) ->
     % If the first message is a link, we should load the message and
