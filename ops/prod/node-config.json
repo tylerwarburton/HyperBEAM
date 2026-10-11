@@ -135,5 +135,7 @@
   "essentials-retention-days": 7,
   "essentials-retention-dry-run": false,
   "process-async-checkpoints": true,
-  "process-compute-on-schedule": true
+  "process-compute-on-schedule": true,
+  "process-worker-fullsweep-after": 0,
+  "store-retention-max-cpu-pct": 25
 }

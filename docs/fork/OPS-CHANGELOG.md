@@ -7,19 +7,24 @@ Node: `hyperbeam-prod` on Box A · `hyperbeam.tylerw.ai` · store `/opt/runereal
 
 ---
 
-## Pending - not deployed: `process-compute-on-schedule` (feat/upgrades-m)
+## 2026-10-11 16:51Z - `hyperbeam:upgrades-n` (61196afbbbc8, source 852c669d4)
 
-Opt-in node option, default `false`: compute each slot this node assigns in the
-background instead of waiting for a `compute`/`push` (a schedule-only client
-left a game process at computed slot 4 with 2,004 assignments). To enable, set
-`"process-compute-on-schedule": true` (or a list of process IDs) in
-`node-config.json`; to undo, remove it and restart. With no live worker the
-catch-up replays from the newest checkpoint up to
-`process-compute-on-schedule-replay-limit` slots (default 2 x
-`process-snapshot-slots` = 2000 with the saved config; `infinity` for none),
-independent of `process-historical-replay-limit` (64). `ops/prod/node-config.json`
-in the repo now sets the option to `true`; the live config on the host is
-unchanged. Not on prod yet.
+Prod was `runerealm-hb:bridge-v2` (2b3f18fe, source 014bb536a). Added on top:
+push-reply fix, linear `hb_escape` headers, worker GC options, bounded/budgeted
+store retention, and the opt-in `process-compute-on-schedule` (default `false`):
+compute each slot this node assigns in the background instead of waiting for a
+`compute`/`push` (a schedule-only client left a game process at computed slot 4
+with 2,004 assignments). With no live worker the catch-up replays from the newest
+checkpoint up to `process-compute-on-schedule-replay-limit` slots (default 2 x
+`process-snapshot-slots` = 2000 here; `infinity` for none), independent of
+`process-historical-replay-limit` (64).
+
+Config keys added (live and `ops/prod/node-config.json`):
+`process-compute-on-schedule: true`, `process-worker-fullsweep-after: 0`,
+`store-retention-max-cpu-pct: 25`. One clean restart (relayer was already stopped).
+
+Undo: `bash deploy-n.sh rollback 20261011T165108Z` (restores config, `hb-prod.sh`
+and the bridge-v2 image from the `.pre-n-20261011T165108Z` backups).
 
 ---
 
