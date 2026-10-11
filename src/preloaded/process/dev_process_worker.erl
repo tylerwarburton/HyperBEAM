@@ -475,10 +475,21 @@ finish_catch_up(Name, ProcID, SchedPID, Done, Opts) ->
         false -> ok
     end.
 
+%% The scheduling server's current slot, by its `current' message protocol
+%% (`dev_scheduler_server:current/2'). That module is packaged in
+%% `scheduler@1.0' and loaded under a package-specific name, so naming it from
+%% here raised `undef' -- after the catch-up had unregistered, so every catch-up
+%% ended in a crash report (thousands an hour on prod) and a late wake was lost.
 scheduler_current(SchedPID) when is_pid(SchedPID) ->
-    case dev_scheduler_server:current(SchedPID, 5000) of
-        {ok, Current} when is_integer(Current) -> Current;
-        _ -> -1
+    Mon = erlang:monitor(process, SchedPID, [{alias, reply_demonitor}]),
+    SchedPID ! {current, Mon, Mon},
+    receive
+        {current, Mon, Current} when is_integer(Current) -> Current;
+        {current, Mon, _} -> -1;
+        {'DOWN', Mon, process, _, _} -> -1
+    after 5000 ->
+        erlang:demonitor(Mon, [flush]),
+        -1
     end;
 scheduler_current(_) -> -1.
 
@@ -507,7 +518,7 @@ catch_up_to(ProcID, Process, Target, Opts) ->
                     hb_ao:resolve(
                         Proc,
                         #{ <<"path">> => <<"compute">>, <<"slot">> => Target },
-                        Opts
+                        catch_up_opts(Opts)
                     ),
                 case Res of
                     {ok, _} ->
@@ -539,6 +550,22 @@ catch_up_to(ProcID, Process, Target, Opts) ->
                 Opts
             ),
             Process
+    end.
+
+%% @doc The options a catch-up computes under. The catch-up is woken from
+%% inside the scheduler device, and `hb_ao' strips `spawn-worker' from the
+%% options every device call receives (it is one of its temporary options).
+%% Resolved under them, a catch-up that found no worker became the group's
+%% leader, computed from the newest checkpoint in its own process, and then
+%% unregistered without handing its state to a worker. No worker ever held the
+%% live state, so every catch-up was cold: on prod each hunt process (no
+%% checkpoint but slot 0) replayed every slot from 1 on every wake, ~400 slots
+%% per few new assignments. With process workers on, the catch-up delegates to
+%% a worker as a request does, and every later catch-up finds that worker live.
+catch_up_opts(Opts) ->
+    case hb_opts:get(<<"process-workers">>, false, Opts) of
+        false -> Opts;
+        _ -> Opts#{ <<"spawn-worker">> => true }
     end.
 
 %% @doc A live worker computes forward from the state it holds. Without one,
@@ -1622,3 +1649,128 @@ compute_on_schedule_replay_limit_default_test() ->
             <<"process-compute-on-schedule-replay-limit">> => 10
         })
     ).
+
+%% @doc Regression: a live worker must compute only the slots it has not yet
+%% computed, whatever traffic reaches the process between schedules. Prod
+%% options: compute on schedule, async checkpoints, `now' from the cache, no
+%% checkpoint but the initial one.
+worker_keeps_live_state_under_traffic_test_() ->
+    {timeout, 300, fun() ->
+        Opts =
+            cos_opts(#{
+                <<"process-compute-on-schedule">> => true,
+                <<"process-async-checkpoints">> => true,
+                <<"process-now-from-cache">> => true,
+                <<"process-historical-replay-limit">> => 64,
+                <<"process-snapshot-slots">> => 1000,
+                <<"process-delta-checkpoint-slots">> => 1000
+            }),
+        {Process, ProcID} = cos_process(Opts),
+        cos_schedule(Process, ProcID, lists:seq(1, 20), Opts),
+        cos_await_latest(ProcID, 19, Opts),
+        cos_catch_up_idle(ProcID),
+        Worker = await_worker(ProcID, 50),
+        ?assert(is_pid(Worker)),
+        Step =
+            fun(Label, Traffic, Next) ->
+                {_, Executed} =
+                    count_executed_slots(
+                        fun() ->
+                            Traffic(),
+                            cos_schedule(Process, ProcID, [Next], Opts),
+                            cos_await_latest(ProcID, Next - 1, Opts),
+                            cos_catch_up_idle(ProcID)
+                        end
+                    ),
+                ?event(debug_test, {step, Label, {executed, Executed}}),
+                {Label, Executed}
+            end,
+        Results =
+            [
+                Step(catch_up, fun() -> ok end, 21),
+                Step(
+                    now,
+                    fun() ->
+                        {ok, _} =
+                            hb_ao:resolve(
+                                Process,
+                                #{ <<"path">> => <<"now">> },
+                                Opts
+                            )
+                    end,
+                    22
+                ),
+                Step(
+                    now_key,
+                    fun() ->
+                        hb_ao:resolve(
+                            Process,
+                            #{ <<"path">> => <<"now/at-slot">> },
+                            Opts
+                        )
+                    end,
+                    23
+                ),
+                Step(
+                    now_missing_key,
+                    fun() ->
+                        hb_ao:resolve(
+                            Process,
+                            #{ <<"path">> => <<"now/no-such-key">> },
+                            Opts
+                        )
+                    end,
+                    24
+                ),
+                Step(
+                    old_slot,
+                    fun() ->
+                        {ok, _} =
+                            hb_ao:resolve(
+                                Process,
+                                #{ <<"path">> => <<"compute">>, <<"slot">> => 5 },
+                                Opts
+                            )
+                    end,
+                    25
+                ),
+                Step(
+                    head_slot,
+                    fun() ->
+                        {ok, _} =
+                            hb_ao:resolve(
+                                Process,
+                                #{ <<"path">> => <<"compute">>, <<"slot">> => 23 },
+                                Opts
+                            )
+                    end,
+                    26
+                )
+            ],
+        ?assertEqual(
+            [
+                {catch_up, 1},
+                {now, 1},
+                {now_key, 1},
+                {now_missing_key, 1},
+                {old_slot, 1},
+                {head_slot, 1}
+            ],
+            Results
+        ),
+        ?assertEqual(Worker, hb_name:lookup(ProcID))
+    end}.
+
+%% @doc Regression: the catch-up's last look at the scheduler named
+%% `dev_scheduler_server', which is loaded under a package-specific name, and
+%% raised `undef' at the end of every catch-up.
+scheduler_current_test() ->
+    Server =
+        spawn(fun() ->
+            receive {current, Ref, Reply} -> Reply ! {current, Ref, 41} end
+        end),
+    ?assertEqual(41, scheduler_current(Server)),
+    Dead = spawn(fun() -> ok end),
+    timer:sleep(50),
+    ?assertEqual(-1, scheduler_current(Dead)),
+    ?assertEqual(-1, scheduler_current(undefined)).
