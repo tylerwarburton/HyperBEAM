@@ -18,7 +18,7 @@
 %%% disabled, neither helper is started and assignments are confirmed inline.
 -module(dev_scheduler_server).
 -export([start/3, schedule/2, stop/1]).
--export([info/1, upload_info/1]).
+-export([info/1, upload_info/1, current/2]).
 -export([pending_uploads/1, pending_uploads/2, backfill/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
@@ -202,6 +202,20 @@ info(ProcID) ->
     ProcID ! {info, self()},
     receive {info, Info} -> Info end.
 
+%% @doc Get the current slot of a scheduling server, or `unavailable' if it
+%% does not answer within `Timeout' ms (a late reply is dropped). Unlike
+%% `info/1' it neither copies the server's state nor waits forever.
+current(ProcID, Timeout) ->
+    Mon = erlang:monitor(process, ProcID, [{alias, reply_demonitor}]),
+    ProcID ! {current, Mon, Mon},
+    receive
+        {current, Mon, Current} -> {ok, Current};
+        {'DOWN', Mon, process, _, _} -> unavailable
+    after Timeout ->
+        erlang:demonitor(Mon, [flush]),
+        unavailable
+    end.
+
 %% @doc Get the state of the uploader of a scheduling server, or `undefined' if
 %% remote publication is disabled. The confirmer forwards the request to its
 %% uploader, which may have died before the confirmer has noticed and replaced
@@ -249,6 +263,9 @@ server(State) ->
             end;
         {info, Reply} ->
             Reply ! {info, State},
+            server(State);
+        {current, Ref, Reply} ->
+            Reply ! {current, Ref, maps:get(current, State)},
             server(State);
         {rewind_uploads, To, Reply} ->
             case maps:get(confirmer, State) of

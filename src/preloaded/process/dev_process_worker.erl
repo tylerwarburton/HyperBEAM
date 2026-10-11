@@ -4,6 +4,7 @@
 %%% to computation requests regarding a process as a singleton.
 -module(dev_process_worker).
 -export([server/3, stop/1, group/3, await/5, notify_compute/4]).
+-export([compute_on_schedule/4]).
 -include_lib("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -350,6 +351,218 @@ public_result(Res) ->
 %% @doc Stop a worker process.
 stop(Worker) ->
     exit(Worker, normal).
+
+%%% Compute on schedule (`process-compute-on-schedule').
+
+%% @doc Wake the background catch-up of a process this node has just assigned
+%% `Assignment' for, if `process-compute-on-schedule' covers the process.
+%%
+%% With `process-now-from-cache', `now' serves the newest cached state and never
+%% computes, so a process whose clients only schedule (no `push') stayed
+%% uncomputed until something asked for a slot: on prod a game process sat at
+%% computed slot 4 with 2,004 assignments, then took the whole backlog in one
+%% burst. A node that is both scheduler and compute unit can compute as it
+%% schedules instead.
+%%
+%% The schedule request pays a name lookup and a send (or a spawn): it never
+%% waits for compute, and nothing here raises into it. Per process at most one
+%% catch-up is in flight, registered with `hb_name' as the checkpoint writer is.
+%% A wake that finds it running only raises its target, so a burst of N
+%% assignments costs a few compute requests, not N. The catch-up computes with
+%% an ordinary `compute&slot=N' request, so the slot is computed by the
+%% process's worker exactly as a read would compute it -- same checkpoints,
+%% same cache -- and nothing is pushed: the request carries no `push'.
+compute_on_schedule(ProcID, SchedPID, Assignment, Opts) ->
+    try
+        HumanID = hb_util:human_id(ProcID),
+        case compute_on_schedule_enabled(HumanID, Opts) of
+            false -> ok;
+            true ->
+                Slot =
+                    hb_util:int(
+                        hb_maps:get(<<"slot">>, Assignment, undefined, Opts)
+                    ),
+                wake_catch_up(HumanID, SchedPID, Slot, Opts, 3)
+        end
+    catch
+        Class:Reason ->
+            ?event(compute_on_schedule,
+                {wake_failed,
+                    {proc_id, ProcID},
+                    {class, Class},
+                    {reason, Reason}
+                },
+                Opts
+            ),
+            ok
+    end.
+
+%% @doc `true' (or `<<"true">>') for every process, or a list of the process
+%% IDs to compute on schedule.
+compute_on_schedule_enabled(ProcID, Opts) ->
+    case hb_opts:get(<<"process-compute-on-schedule">>, false, Opts) of
+        true -> true;
+        <<"true">> -> true;
+        IDs when is_list(IDs) -> lists:member(ProcID, IDs);
+        _ -> false
+    end.
+
+catch_up_name(ProcID) -> {?MODULE, compute_on_schedule, ProcID}.
+
+%% @doc Raise the running catch-up's target to `Slot', or start one. The
+%% catch-up is registered before it does anything, so the check and the claim
+%% are atomic; a wake that loses the race raises the winner's target instead.
+wake_catch_up(ProcID, _SchedPID, Slot, Opts, 0) ->
+    ?event(compute_on_schedule,
+        {wake_dropped, {proc_id, ProcID}, {slot, Slot}},
+        Opts
+    ),
+    ok;
+wake_catch_up(ProcID, SchedPID, Slot, Opts, Attempts) ->
+    Name = catch_up_name(ProcID),
+    case hb_name:lookup(Name) of
+        Pid when is_pid(Pid) ->
+            Pid ! {catch_up, Slot},
+            ok;
+        undefined ->
+            CatchUp =
+                spawn(
+                    fun() ->
+                        receive {go, Name} -> ok end,
+                        catch_up(
+                            Name, ProcID, SchedPID, Slot, -1, undefined, Opts
+                        )
+                    end
+                ),
+            case hb_name:register(Name, CatchUp) of
+                ok ->
+                    CatchUp ! {go, Name},
+                    ok;
+                error ->
+                    exit(CatchUp, kill),
+                    wake_catch_up(ProcID, SchedPID, Slot, Opts, Attempts - 1)
+            end
+    end.
+
+%% @doc The catch-up loop: compute to the highest slot it has been woken for,
+%% then to any slot it was woken for meanwhile, until it is level. Every target
+%% is attempted once: a compute that fails or is skipped is logged and not
+%% retried until a later assignment wakes the catch-up again.
+catch_up(Name, ProcID, SchedPID, Target, Done, Process, Opts) ->
+    case drain_catch_up(Target) of
+        Next when Next =< Done ->
+            finish_catch_up(Name, ProcID, SchedPID, Done, Opts);
+        Next ->
+            NextProcess = catch_up_to(ProcID, Process, Next, Opts),
+            catch_up(Name, ProcID, SchedPID, Next, Next, NextProcess, Opts)
+    end.
+
+%% @doc The highest target among `Slot' and the wakes waiting in the mailbox.
+drain_catch_up(Slot) ->
+    receive {catch_up, Next} -> drain_catch_up(max(Slot, Next))
+    after 0 -> Slot
+    end.
+
+%% @doc Leave the registry, then look once more. A wake that found this
+%% catch-up just before it unregistered may have sent its slot after the last
+%% drain; its assignment was made before that, so the scheduler's current slot
+%% covers it, and a newer one starts a fresh catch-up.
+finish_catch_up(Name, ProcID, SchedPID, Done, Opts) ->
+    hb_name:unregister(Name),
+    Late = max(drain_catch_up(Done), scheduler_current(SchedPID)),
+    case Late > Done of
+        true -> wake_catch_up(ProcID, SchedPID, Late, Opts, 3);
+        false -> ok
+    end.
+
+scheduler_current(SchedPID) when is_pid(SchedPID) ->
+    case dev_scheduler_server:current(SchedPID, 5000) of
+        {ok, Current} when is_integer(Current) -> Current;
+        _ -> -1
+    end;
+scheduler_current(_) -> -1.
+
+%% @doc Compute `Target' with an ordinary `compute' request, which joins the
+%% process's worker queue (or, with no worker, becomes its leader), unless the
+%% process is cold and reaching `Target' would replay more than
+%% `process-historical-replay-limit' slots from its newest checkpoint. That
+%% replay is skipped quietly: it is left to the first read that asks for it.
+%% Returns the process message, read on first use.
+catch_up_to(ProcID, Process, Target, Opts) ->
+    try
+        case catch_up_allowed(ProcID, Target, Opts) of
+            false -> Process;
+            true ->
+                Proc =
+                    case Process of
+                        undefined -> hb_util:ok(hb_cache:read(ProcID, Opts));
+                        _ -> Process
+                    end,
+                HookOpt = <<"process-compute-on-schedule-hook">>,
+                case hb_opts:get(HookOpt, undefined, Opts) of
+                    Hook when is_function(Hook, 2) -> Hook(ProcID, Target);
+                    _ -> ok
+                end,
+                Res =
+                    hb_ao:resolve(
+                        Proc,
+                        #{ <<"path">> => <<"compute">>, <<"slot">> => Target },
+                        Opts
+                    ),
+                case Res of
+                    {ok, _} ->
+                        ?event(compute_on_schedule,
+                            {computed, {proc_id, ProcID}, {slot, Target}},
+                            Opts
+                        );
+                    Error ->
+                        ?event(compute_on_schedule,
+                            {compute_failed,
+                                {proc_id, ProcID},
+                                {slot, Target},
+                                {error, Error}
+                            },
+                            Opts
+                        )
+                end,
+                Proc
+        end
+    catch
+        Class:Reason ->
+            ?event(compute_on_schedule,
+                {compute_crashed,
+                    {proc_id, ProcID},
+                    {slot, Target},
+                    {class, Class},
+                    {reason, Reason}
+                },
+                Opts
+            ),
+            Process
+    end.
+
+%% @doc A live worker computes forward from the state it holds. Without one,
+%% the compute restores the newest checkpoint at or below `Target' and replays
+%% from there, which is allowed only within the replay limit.
+catch_up_allowed(ProcID, Target, Opts) ->
+    case hb_name:lookup(ProcID) of
+        Pid when is_pid(Pid) -> true;
+        undefined ->
+            case dev_process:cold_replay_bound(ProcID, Target, Opts) of
+                {true, _, _} -> true;
+                {false, From, Limit} ->
+                    ?event(compute_on_schedule,
+                        {skipped_cold_replay,
+                            {proc_id, ProcID},
+                            {slot, Target},
+                            {checkpoint, From},
+                            {limit, Limit}
+                        },
+                        Opts
+                    ),
+                    false
+            end
+    end.
 
 %%% Tests
 
@@ -1080,4 +1293,270 @@ historical_read_without_worker_test_() ->
             ),
         ?assertEqual(<<"61">>, hb_ao:get(<<"count">>, S60, Opts)),
         ?assert(Executed =< 10)
+    end}.
+
+%%% Compute on schedule (`process-compute-on-schedule').
+
+cos_opts(Extra) ->
+    test_init(),
+    maps:merge(
+        #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"spawn-worker">> => true,
+            <<"process-workers">> => true,
+            <<"await-inprogress">> => named
+        },
+        Extra
+    ).
+
+%% A counter, and a Lua table that grows and is summed every slot: a state
+%% that did not continue exactly from the previous slot reports another sum.
+cos_script() ->
+    <<
+        "Count = Count or 0\n"
+        "Big = Big or {}\n"
+        "function compute(req)\n"
+        "  Count = Count + 1\n"
+        "  Big[Count] = Count\n"
+        "  local sum = 0\n"
+        "  for i = 1, #Big do sum = sum + Big[i] end\n"
+        "  return {\n"
+        "    patches = {\n"
+        "      { path = '/count', value = tostring(Count) },\n"
+        "      { path = '/sum', value = tostring(sum) }\n"
+        "    },\n"
+        "    results = { output = { data = tostring(Count) } }\n"
+        "  }\n"
+        "end\n"
+    >>.
+
+cos_process(Opts) ->
+    Address =
+        hb_util:human_id(
+            ar_wallet:to_address(hb_opts:get(<<"priv-wallet">>, undefined, Opts))
+        ),
+    Process =
+        hb_message:commit(
+            #{
+                <<"device">> => <<"process@1.0">>,
+                <<"type">> => <<"Process">>,
+                <<"scheduler-device">> => <<"scheduler@1.0">>,
+                <<"execution-device">> => <<"lua@5.3b">>,
+                <<"module">> =>
+                    #{
+                        <<"content-type">> => <<"application/lua">>,
+                        <<"body">> => cos_script()
+                    },
+                <<"authority">> => [Address],
+                <<"scheduler-location">> => Address,
+                <<"test-random-seed">> => rand:uniform(1000000)
+            },
+            Opts
+        ),
+    {ok, _} = hb_cache:write(Process, Opts),
+    {Process, hb_util:human_id(hb_message:id(Process, all, Opts))}.
+
+cos_schedule(Process, ProcID, Ns, Opts) ->
+    lists:foreach(
+        fun(N) ->
+            {ok, _} =
+                hb_ao:resolve(
+                    Process,
+                    hb_message:commit(
+                        #{
+                            <<"path">> => <<"schedule">>,
+                            <<"method">> => <<"POST">>,
+                            <<"body">> =>
+                                hb_message:commit(
+                                    #{
+                                        <<"target">> => ProcID,
+                                        <<"type">> => <<"Message">>,
+                                        <<"number">> => N
+                                    },
+                                    Opts
+                                )
+                        },
+                        Opts
+                    ),
+                    Opts
+                )
+        end,
+        Ns
+    ).
+
+%% The newest slot in the process cache, or -1.
+cos_latest(ProcID, Opts) ->
+    case dev_process_cache:latest(ProcID, Opts) of
+        {ok, Slot, _} -> Slot;
+        _ -> -1
+    end.
+
+cos_await_latest(ProcID, Slot, Opts) ->
+    ?assert(
+        hb_util:wait_until(fun() -> cos_latest(ProcID, Opts) == Slot end, 60000)
+    ).
+
+cos_public(ProcID, Slot, Opts) ->
+    {ok, State} = dev_process_cache:read(ProcID, Slot, Opts),
+    {
+        hb_ao:get(<<"at-slot">>, State, Opts),
+        hb_ao:get(<<"count">>, State, Opts),
+        hb_ao:get(<<"sum">>, State, Opts),
+        hb_ao:get(<<"results/output/data">>, State, Opts)
+    }.
+
+%% A hook that reports every compute the catch-up starts, and may stall it.
+cos_hook(Test, Ref, StallMs) ->
+    fun(ProcID, Slot) ->
+        Test ! {cos_compute, Ref, ProcID, Slot},
+        timer:sleep(StallMs)
+    end.
+
+cos_computes(Ref) ->
+    receive {cos_compute, Ref, _, Slot} -> [Slot | cos_computes(Ref)]
+    after 0 -> []
+    end.
+
+cos_catch_up_idle(ProcID) ->
+    ?assert(
+        hb_util:wait_until(
+            fun() -> hb_name:lookup(catch_up_name(ProcID)) == undefined end,
+            30000
+        )
+    ).
+
+%% @doc With the option on, scheduling alone brings the process cache to the
+%% newest assignment: no `compute' or `now' request is made.
+compute_on_schedule_computes_test_() ->
+    {timeout, 120, fun() ->
+        Opts = cos_opts(#{ <<"process-compute-on-schedule">> => true }),
+        {Process, ProcID} = cos_process(Opts),
+        cos_schedule(Process, ProcID, lists:seq(1, 5), Opts),
+        cos_await_latest(ProcID, 4, Opts),
+        ?assertEqual({4, <<"5">>, <<"15">>, <<"5">>}, cos_public(ProcID, 4, Opts)),
+        cos_catch_up_idle(ProcID)
+    end}.
+
+%% @doc With the option off -- or a list that does not name the process --
+%% scheduling computes nothing, as before.
+compute_on_schedule_off_test_() ->
+    {timeout, 120, fun() ->
+        lists:foreach(
+            fun(Setting) ->
+                Opts = cos_opts(Setting),
+                {Process, ProcID} = cos_process(Opts),
+                cos_schedule(Process, ProcID, lists:seq(1, 3), Opts),
+                timer:sleep(1500),
+                ?assertEqual(-1, cos_latest(ProcID, Opts)),
+                ?assertEqual(undefined, hb_name:lookup(catch_up_name(ProcID)))
+            end,
+            [
+                #{},
+                #{ <<"process-compute-on-schedule">> => false },
+                #{ <<"process-compute-on-schedule">> =>
+                    [hb_util:human_id(crypto:strong_rand_bytes(32))] }
+            ]
+        ),
+        % A list that names the process enables it for that process.
+        Opts = cos_opts(#{}),
+        {Process, ProcID} = cos_process(Opts),
+        Listed = Opts#{ <<"process-compute-on-schedule">> => [ProcID] },
+        cos_schedule(Process, ProcID, lists:seq(1, 3), Listed),
+        cos_await_latest(ProcID, 2, Opts)
+    end}.
+
+%% @doc A burst of schedules is coalesced: while the catch-up computes, later
+%% wakes only raise its target, so 50 assignments cost a few computes.
+compute_on_schedule_coalesces_test_() ->
+    {timeout, 180, fun() ->
+        Ref = make_ref(),
+        Opts =
+            cos_opts(#{
+                <<"process-compute-on-schedule">> => true,
+                <<"process-compute-on-schedule-hook">> =>
+                    cos_hook(self(), Ref, 250)
+            }),
+        {Process, ProcID} = cos_process(Opts),
+        cos_schedule(Process, ProcID, lists:seq(1, 50), Opts),
+        cos_await_latest(ProcID, 49, Opts),
+        cos_catch_up_idle(ProcID),
+        Computes = cos_computes(Ref),
+        ?event(debug_test, {computes, Computes}),
+        ?assert(length(Computes) >= 1),
+        ?assert(length(Computes) =< 10),
+        % Targets only ever rise, and the last one is the newest assignment.
+        ?assertEqual(Computes, lists:usort(Computes)),
+        ?assertEqual(49, lists:last(Computes)),
+        ?assertEqual({49, <<"50">>, <<"1275">>, <<"50">>}, cos_public(ProcID, 49, Opts))
+    end}.
+
+%% @doc The state computed on schedule (async checkpoints on, a checkpoint
+%% every 4 slots) is the state a lazy `compute' of the same schedule yields.
+compute_on_schedule_matches_lazy_test_() ->
+    {timeout, 180, fun() ->
+        Base =
+            #{
+                <<"process-async-checkpoints">> => true,
+                <<"process-delta-checkpoint-slots">> => 4
+            },
+        Eager = cos_opts(Base#{ <<"process-compute-on-schedule">> => true }),
+        {EagerProcess, EagerID} = cos_process(Eager),
+        cos_schedule(EagerProcess, EagerID, lists:seq(1, 12), Eager),
+        cos_await_latest(EagerID, 11, Eager),
+        Lazy = cos_opts(Base),
+        {LazyProcess, LazyID} = cos_process(Lazy),
+        cos_schedule(LazyProcess, LazyID, lists:seq(1, 12), Lazy),
+        ?assertEqual(-1, cos_latest(LazyID, Lazy)),
+        {ok, _} =
+            hb_ao:resolve(
+                LazyProcess,
+                #{ <<"path">> => <<"compute">>, <<"slot">> => 11 },
+                Lazy
+            ),
+        lists:foreach(
+            fun(Slot) ->
+                ?assertEqual(
+                    cos_public(LazyID, Slot, Lazy),
+                    cos_public(EagerID, Slot, Eager)
+                )
+            end,
+            lists:seq(0, 11)
+        ),
+        ?assertEqual({11, <<"12">>, <<"78">>, <<"12">>}, cos_public(EagerID, 11, Eager))
+    end}.
+
+%% @doc With no live worker, a wake whose target is further from the newest
+%% checkpoint than `process-historical-replay-limit' is skipped without
+%% computing; within the limit, the same wake computes.
+compute_on_schedule_respects_cold_bound_test_() ->
+    {timeout, 120, fun() ->
+        Ref = make_ref(),
+        Opts =
+            cos_opts(#{
+                <<"spawn-worker">> => false,
+                <<"process-workers">> => false,
+                <<"process-compute-on-schedule-hook">> => cos_hook(self(), Ref, 0)
+            }),
+        {Process, ProcID} = cos_process(Opts),
+        % Slots 0-4 are assigned and never computed: no checkpoint exists.
+        cos_schedule(Process, ProcID, lists:seq(1, 5), Opts),
+        Bounded =
+            Opts#{
+                <<"process-compute-on-schedule">> => true,
+                <<"process-historical-replay-limit">> => 2
+            },
+        cos_schedule(Process, ProcID, [6], Bounded),
+        cos_catch_up_idle(ProcID),
+        timer:sleep(500),
+        ?assertEqual([], cos_computes(Ref)),
+        ?assertEqual(-1, cos_latest(ProcID, Opts)),
+        cos_schedule(
+            Process,
+            ProcID,
+            [7],
+            Bounded#{ <<"process-historical-replay-limit">> => infinity }
+        ),
+        cos_await_latest(ProcID, 6, Opts),
+        ?assertEqual([6], cos_computes(Ref))
     end}.

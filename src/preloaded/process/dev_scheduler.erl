@@ -531,7 +531,7 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
                     {is_alive, is_process_alive(PID)}
                 }
             ),
-            {ok, dev_scheduler_server:schedule(PID, Req)};
+            {ok, assigned(ProcID, PID, dev_scheduler_server:schedule(PID, Req), Opts)};
         {true, _} ->
             ?event(
                 {scheduling_message,
@@ -541,8 +541,39 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
                 }
             ),
             % If Request is not a process, use the ID of Base as the PID
-            {ok, dev_scheduler_server:schedule(PID, Req)}
+            {ok, assigned(ProcID, PID, dev_scheduler_server:schedule(PID, Req), Opts)}
     end.
+
+%% @doc A slot has been assigned locally. With `process-compute-on-schedule',
+%% wake the process's background catch-up to compute it; the call only sends a
+%% message (or spawns), so the schedule response is never held up by compute.
+%% The catch-up lives in the `process@1.0' package, which this package cannot
+%% name directly, so it is reached through the loaded device module (the
+%% function is not a device key: `process@1.0' does not export it over HTTP).
+assigned(ProcID, PID, Assignment, Opts) ->
+    case hb_opts:get(<<"process-compute-on-schedule">>, false, Opts) of
+        false -> ok;
+        _ ->
+            try
+                ProcessDev =
+                    hb_device:message_to_device(
+                        #{ <<"device">> => <<"process@1.0">> },
+                        Opts
+                    ),
+                ProcessDev:compute_on_schedule(ProcID, PID, Assignment, Opts)
+            catch
+                Class:Reason ->
+                    ?event(compute_on_schedule,
+                        {wake_failed,
+                            {proc_id, ProcID},
+                            {class, Class},
+                            {reason, Reason}
+                        },
+                        Opts
+                    )
+            end
+    end,
+    Assignment.
 
 %% @doc Locate the correct scheduling server for a given process.
 find_server(ProcID, Base, Opts) ->

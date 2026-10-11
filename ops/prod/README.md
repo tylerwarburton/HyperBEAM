@@ -47,7 +47,13 @@ beside the originals and has a `rollback <STAMP>` mode.
 - **`push-max-depth` must stay unset**: an explicit depth brings back the silent
   skip past 16 hops; the implicit bound defers instead.
 - `process-now-from-cache: true` means `/now` serves the last computed state;
-  clients must `push&slot` (or `compute&slot`) after scheduling to drive compute.
+  clients must `push&slot` (or `compute&slot`) after scheduling to drive compute,
+  unless `process-compute-on-schedule` is set (default `false`; `true`, or a list
+  of process IDs): then every slot this node assigns is computed in the
+  background, coalesced to one catch-up per process, through the process worker
+  (same checkpoints and cache as a read; nothing is pushed). With no live worker
+  a catch-up that would replay more than `process-historical-replay-limit`
+  slots from the newest checkpoint is skipped and left to the next read.
 - Long `hb eval` calls hit an "Alarm clock" timeout: spawn the work inside the
   node and have it write a result file instead.
 - The node still looks up unknown push targets (wallets, deleted processes) in

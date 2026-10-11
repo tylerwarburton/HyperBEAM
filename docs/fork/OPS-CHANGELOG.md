@@ -7,6 +7,16 @@ Node: `hyperbeam-prod` on Box A · `hyperbeam.tylerw.ai` · store `/opt/runereal
 
 ---
 
+## Pending - not deployed: `process-compute-on-schedule` (feat/upgrades-m)
+
+Opt-in node option, default `false`: compute each slot this node assigns in the
+background instead of waiting for a `compute`/`push` (a schedule-only client
+left a game process at computed slot 4 with 2,004 assignments). To enable, set
+`"process-compute-on-schedule": true` (or a list of process IDs) in
+`node-config.json`; to undo, remove it and restart. Not on prod yet.
+
+---
+
 ## Baseline captured 2026-09-25, before any change
 
 Recorded so that every number below has something to be compared against.
