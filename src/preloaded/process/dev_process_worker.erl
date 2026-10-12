@@ -19,6 +19,9 @@
 %% a process with no worker) holds a dead copy of the state; above this many
 %% words of heap it is collected before it waits for the next target.
 -define(CATCH_UP_GC_WORDS, 1_000_000).
+%% How long a catch-up waits on a live worker before it lets the wake go (a
+%% later assignment wakes it again).
+-define(CATCH_UP_WAIT_MS, 300_000).
 
 %% Request keys a delegated `compute' carries to the worker's resolution.
 -define(CARRIED_KEYS,
@@ -140,14 +143,18 @@ server(GroupName, RawBase, Opts, IdleGCDue) ->
                 }
             ),
             Res =
-                execute(
-                    Base,
-                    Req,
-                    TargetSlot,
-                    hb_maps:merge(ListenerOpts, ServerOpts, Opts)
-                ),
+                case catch_up_covered(Req, TargetSlot, Base) of
+                    true -> {ok, Base};
+                    false ->
+                        execute(
+                            Base,
+                            Req,
+                            TargetSlot,
+                            hb_maps:merge(ListenerOpts, ServerOpts, Opts)
+                        )
+                end,
             ?event(worker, {work_done, {group, GroupName}, {req, Req}, {res, Res}}),
-            send_notification(Listener, GroupName, TargetSlot, Res),
+            send_notification(Listener, GroupName, TargetSlot, Res, Req),
             % The listener has its answer: a quiet point. A forced collection
             % after a checkpoint leaves nothing for the idle one to do until
             % the worker computes again.
@@ -455,20 +462,20 @@ notify_compute(GroupName, SlotToNotify, Res, Opts, Count) ->
     % a request for the latest state only when it has neither.
     BinSlotToNotify = hb_util:bin(SlotToNotify),
     receive
-        {resolve, Listener, GroupName, #{ <<"compute">> := Slot }, _ListenerOpts}
+        {resolve, Listener, GroupName, Msg = #{ <<"compute">> := Slot }, _ListenerOpts}
                 when Slot =:= SlotToNotify; Slot =:= BinSlotToNotify ->
-            send_notification(Listener, GroupName, SlotToNotify, Res),
+            send_notification(Listener, GroupName, SlotToNotify, Res, Msg),
             notify_compute(GroupName, SlotToNotify, Res, Opts, Count + 1);
         {resolve, Listener, GroupName, Msg = #{ <<"slot">> := Slot }, _ListenerOpts}
                 when (Slot =:= SlotToNotify orelse Slot =:= BinSlotToNotify)
                     andalso not is_map_key(<<"compute">>, Msg) ->
-            send_notification(Listener, GroupName, SlotToNotify, Res),
+            send_notification(Listener, GroupName, SlotToNotify, Res, Msg),
             notify_compute(GroupName, SlotToNotify, Res, Opts, Count + 1);
         {resolve, Listener, GroupName, Msg, _ListenerOpts}
                 when is_map(Msg)
                     andalso not is_map_key(<<"slot">>, Msg)
                     andalso not is_map_key(<<"compute">>, Msg) ->
-            send_notification(Listener, GroupName, SlotToNotify, Res),
+            send_notification(Listener, GroupName, SlotToNotify, Res, Msg),
             notify_compute(GroupName, SlotToNotify, Res, Opts, Count + 1)
     after 0 ->
         ?event(worker_short,
@@ -481,14 +488,41 @@ notify_compute(GroupName, SlotToNotify, Res, Opts, Count) ->
     end.
 
 send_notification(Listener, GroupName, SlotToNotify, Res) ->
+    send_notification(Listener, GroupName, SlotToNotify, Res, undefined).
+send_notification(Listener, GroupName, SlotToNotify, Res, Req) ->
     ?event({sending_notification, {group, GroupName}, {slot, SlotToNotify}}),
     Listener ! {
         resolved,
         self(),
         GroupName,
         {slot, SlotToNotify},
-        public_result(Res)
+        case is_catch_up(Req) of
+            true -> catch_up_result(Res);
+            false -> public_result(Res)
+        end
     }.
+
+%% @doc A compute-on-schedule catch-up only waits for its slot to be done, so
+%% it is told whether it was, never sent the state. `public_result/1' is the
+%% whole public state (tens of MB for a large game), and sending it copies it
+%% into the catch-up on every wake, inside the worker every write to the
+%% process queues behind.
+catch_up_result({ok, _}) -> {ok, #{ <<"process-catch-up">> => <<"computed">> }};
+catch_up_result(_) -> {error, #{ <<"process-catch-up">> => <<"failed">> }}.
+
+is_catch_up(Req) when is_map(Req) ->
+    maps:get(<<"process-catch-up">>, Req, false) =:= true;
+is_catch_up(_) -> false.
+
+%% @doc A catch-up for a slot the worker's state has already reached needs no
+%% compute: computing an older slot reads it back out of the process cache.
+catch_up_covered(Req, Slot, Base) when is_integer(Slot) ->
+    is_catch_up(Req) andalso
+        case maps:get(<<"at-slot">>, Base, undefined) of
+            At when is_integer(At) -> At >= Slot;
+            _ -> false
+        end;
+catch_up_covered(_, _, _) -> false.
 
 %% @doc The result a listener receives. The worker's state carries the whole
 %% execution-device state in `priv' (for Lua, the VM: hundreds of MB for a
@@ -677,6 +711,73 @@ scheduler_current(_) -> -1.
 %% replay is skipped quietly: it is left to the first read that asks for it.
 %% Returns the process message, read on first use.
 catch_up_to(ProcID, Process, Target, Opts) ->
+    case hb_name:lookup(ProcID) of
+        Pid when is_pid(Pid) ->
+            catch_up_live(Pid, ProcID, Target, Opts),
+            Process;
+        undefined ->
+            catch_up_cold(ProcID, Process, Target, Opts)
+    end.
+
+%% @doc A process with a live worker (or a leader about to hand off to one) is
+%% caught up by queueing a `compute' for `Target' on it, as `hb_persistent'
+%% would for a request, and waiting for the answer, which is small
+%% (`catch_up_result/1'). Nothing passes through `hb_ao' in the catch-up: no
+%% process read, no cached-slot read, no result caching. Under the swarm that
+%% path did all three on every wake, copying and writing the whole public state,
+%% and per-slot store time on every process went from 7-40 ms to 117-183 ms.
+catch_up_live(Pid, ProcID, Target, Opts) ->
+    try
+        cos_run_hook(ProcID, Target, Opts),
+        Mon = erlang:monitor(process, Pid),
+        Req =
+            #{
+                <<"path">> => <<"compute">>,
+                <<"slot">> => Target,
+                <<"process-catch-up">> => true
+            },
+        Pid ! {resolve, self(), ProcID, Req, catch_up_opts(Opts)},
+        receive
+            {resolved, _, ProcID, _, Res} ->
+                erlang:demonitor(Mon, [flush]),
+                ?event(compute_on_schedule,
+                    {computed_live, {proc_id, ProcID}, {slot, Target}, {res, Res}},
+                    Opts
+                );
+            {'DOWN', Mon, process, Pid, Reason} ->
+                ?event(compute_on_schedule,
+                    {worker_down, {proc_id, ProcID}, {slot, Target}, {reason, Reason}},
+                    Opts
+                )
+        after ?CATCH_UP_WAIT_MS ->
+            erlang:demonitor(Mon, [flush]),
+            ?event(compute_on_schedule,
+                {wait_timeout, {proc_id, ProcID}, {slot, Target}},
+                Opts
+            )
+        end
+    catch
+        Class:Reason2 ->
+            ?event(compute_on_schedule,
+                {compute_crashed,
+                    {proc_id, ProcID},
+                    {slot, Target},
+                    {class, Class},
+                    {reason, Reason2}
+                },
+                Opts
+            )
+    end.
+
+cos_run_hook(ProcID, Target, Opts) ->
+    case hb_opts:get(<<"process-compute-on-schedule-hook">>, undefined, Opts) of
+        Hook when is_function(Hook, 2) -> Hook(ProcID, Target);
+        _ -> ok
+    end.
+
+%% @doc No worker: compute `Target' with an ordinary request, which becomes the
+%% group's leader and spawns the worker every later wake finds.
+catch_up_cold(ProcID, Process, Target, Opts) ->
     try
         case catch_up_allowed(ProcID, Target, Opts) of
             false -> Process;
@@ -686,11 +787,7 @@ catch_up_to(ProcID, Process, Target, Opts) ->
                         undefined -> hb_util:ok(hb_cache:read(ProcID, Opts));
                         _ -> Process
                     end,
-                HookOpt = <<"process-compute-on-schedule-hook">>,
-                case hb_opts:get(HookOpt, undefined, Opts) of
-                    Hook when is_function(Hook, 2) -> Hook(ProcID, Target);
-                    _ -> ok
-                end,
+                cos_run_hook(ProcID, Target, Opts),
                 Res =
                     hb_ao:resolve(
                         Proc,
@@ -1821,6 +1918,69 @@ compute_on_schedule_respects_cold_bound_test_() ->
         cos_await_latest(ProcID, 6, Opts),
         ?assertEqual([6], cos_computes(Ref))
     end}.
+
+%% @doc With a live worker, a catch-up asks the worker directly: each new
+%% assignment costs exactly one executed slot (no replay), every slot comes out
+%% as the lazy path computes it, and the catch-up is answered without the state.
+compute_on_schedule_live_worker_test_() ->
+    {timeout, 180, fun() ->
+        Ref = make_ref(),
+        Opts =
+            cos_opts(#{
+                <<"process-compute-on-schedule">> => true,
+                <<"process-compute-on-schedule-hook">> => cos_hook(self(), Ref, 0)
+            }),
+        {Process, ProcID} = cos_process(Opts),
+        cos_schedule(Process, ProcID, lists:seq(1, 3), Opts),
+        cos_await_latest(ProcID, 2, Opts),
+        cos_catch_up_idle(ProcID),
+        ?assert(is_pid(await_worker(ProcID, 50))),
+        _ = cos_computes(Ref),
+        {_, Executed} =
+            count_executed_slots(
+                fun() ->
+                    lists:foreach(
+                        fun(N) ->
+                            cos_schedule(Process, ProcID, [N], Opts),
+                            % The acceptance test: computed within 5 s with no
+                            % compute or now request.
+                            ?assert(
+                                hb_util:wait_until(
+                                    fun() -> cos_latest(ProcID, Opts) == N - 1 end,
+                                    5000
+                                )
+                            )
+                        end,
+                        lists:seq(4, 8)
+                    ),
+                    cos_catch_up_idle(ProcID)
+                end
+            ),
+        ?assertEqual(5, Executed),
+        ?assertEqual({7, <<"8">>, <<"36">>, <<"8">>}, cos_public(ProcID, 7, Opts)),
+        ?assertEqual([3, 4, 5, 6, 7], lists:usort(cos_computes(Ref)))
+    end}.
+
+%% @doc A catch-up's answer never carries the state, and a catch-up for a slot
+%% the worker already holds computes nothing.
+catch_up_reply_is_small_test() ->
+    Big = #{ <<"at-slot">> => 9, <<"data">> => binary:copy(<<"x">>, 100000) },
+    CatchUp = #{ <<"path">> => <<"compute">>, <<"slot">> => 9, <<"process-catch-up">> => true },
+    send_notification(self(), g, 9, {ok, Big}, CatchUp),
+    receive {resolved, _, g, {slot, 9}, {ok, Small}} ->
+        ?assertEqual(#{ <<"process-catch-up">> => <<"computed">> }, Small)
+    after 1000 -> ?assert(false)
+    end,
+    send_notification(self(), g, 9, {ok, Big}, maps:remove(<<"process-catch-up">>, CatchUp)),
+    receive {resolved, _, g, {slot, 9}, {ok, Full}} ->
+        ?assertEqual(maps:get(<<"data">>, Big), maps:get(<<"data">>, Full))
+    after 1000 -> ?assert(false)
+    end,
+    ?assert(catch_up_covered(CatchUp, 9, Big)),
+    ?assert(catch_up_covered(CatchUp, 3, Big)),
+    ?assertNot(catch_up_covered(CatchUp, 10, Big)),
+    ?assertNot(catch_up_covered(maps:remove(<<"process-catch-up">>, CatchUp), 3, Big)),
+    ?assertNot(catch_up_covered(CatchUp, 3, #{})).
 
 %% @doc The catch-up's replay limit defaults to twice the snapshot cadence, or
 %% 2000 without an integer one, and an explicit setting wins.

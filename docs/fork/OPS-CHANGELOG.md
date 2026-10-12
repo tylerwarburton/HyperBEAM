@@ -7,6 +7,37 @@ Node: `hyperbeam-prod` on Box A · `hyperbeam.tylerw.ai` · store `/opt/runereal
 
 ---
 
+## 2026-10-12 02:22Z - main's bridge member repointed at PUSD N4VZ (config only)
+
+`bridge.pusd` Me10Ndto... -> N4VZxxFb4qArB4SJawvqnLZSRPX9GFs7iGnRQ3Kr-4M after the
+fresh respawn, one restart. Undo: `main-pusd.sh rollback 20261012T022236Z`.
+Known-good baseline tagged `known-good-20261012` (fork 2228804c1, image 178df0187e31).
+
+---
+
+## Pending - staged, not deployed: `hyperbeam:upgrades-r` (d00ddbec954f, branch feat/upgrades-r)
+
+1. Compute on schedule turned back on, with a catch-up that cannot cost the
+   worker the state: for a process with a live worker it queues
+   `compute&slot=N` on the worker itself and is answered with a two-key map,
+   never the state; a catch-up for a slot the worker already holds computes
+   nothing. Before, every wake went through `hb_ao` in the catch-up process:
+   the worker copied the whole public state to it, `hb_ao` cached that result
+   under the HTTP request options, and a slot the worker had already passed was
+   read back out of the store -- the likely cause of store 7-40 ms -> 117-183 ms
+   with the option on (upgrades-o/p). Processes with no worker keep the old cold
+   path (one leader compute that spawns the worker).
+2. Bridge device brought to CipherPlayLabs feat/bridge-device-live 3a58686d7:
+   PUSD succession (`follow-file`), the release signature sent as `releasesig`
+   (the scheduler refused `signature` beside the message's own), `/~bridge@1.0/nudge`.
+Config: `process-compute-on-schedule: true`; bridge `interval` 15000,
+`fast-interval` 1000, `fast-window` 120000, `follow-file`
+/app/keys/bridge-follow.json, `base.confirmations` 3.
+Deploy: `deploy-r.sh`. Fallbacks: `deploy-r.sh cos-off` (keep r, option off),
+`deploy-r.sh rollback STAMP`.
+
+---
+
 ## 2026-10-11 23:17Z - fresh reset onto `hyperbeam:upgrades-q` (178df0187e31, source 2228804c1)
 
 Empty store (old store/export moved aside, stamp 20261011T231755Z) for a fresh contract

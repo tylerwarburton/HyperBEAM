@@ -12,24 +12,37 @@
 %%%   6. votes on each open membership proposal its operator approved
 %%%      (`Attestor-Approve' on PUSD), signing the new set for every chain.
 %%%
+%%% Succession: when PUSD publishes a `successor' (its set voted to move), the
+%%% node moves there, but only if the successor names this PUSD as its
+%%% `predecessor' and holds the same set at the same epoch. Where it is is kept
+%%% in the `follow-file', so a node that missed several moves walks the chain
+%%% one hop per pass. The configured `pusd' is where that walk starts; setting
+%%% a different one in the config restarts it from there.
+%%%
 %%% Every message is committed with the node's own wallet, so the node's address
 %%% IS its AO attestor identity. Its Base, Solana and Sui keys live in the
 %%% `keys-file', made on first start if absent. The node never pays chain gas:
 %%% whoever claims a withdrawal submits the collected signatures.
 %%%
 %%% Proposals and approvals are made on PUSD by the node's operator, from any
-%%% AO wallet; the node only ever signs. Endpoints, both read-only:
+%%% AO wallet; the node only ever signs. Endpoints, all read-only:
 %%%   GET  /~bridge@1.0/keys      this node's four public keys, to join a set
 %%%   GET  /~bridge@1.0/status    cursors, last pass, last error
+%%%   GET  /~bridge@1.0/nudge     a bridge transaction was just sent: pass now,
+%%%                               then every `fast-interval' for `fast-window'
+%%%
+%%% Passes run every `interval' while idle. A nudge only changes WHEN the next
+%%% pass happens, never what it does, so anyone may send one; passes are still
+%%% at least `fast-interval' apart however many arrive.
 %%%
 %%% Configuration, under the node option `bridge':
 %%%   pusd, pusd-node (the URL of the node that runs PUSD; omit when it is this
-%%%   node), interval (ms), keys-file, state-file,
+%%%   node), interval, fast-interval, fast-window (ms), keys-file, state-file, follow-file,
 %%%   base => #{ rpc, contract, chain-id, confirmations, from-block, log-range },
 %%%   solana => #{ rpc, program, commitment }, sui => #{ rpc, package, bridge }
 -module(dev_bridge).
--export([info/1, start/3, status/3, keys/3]).
--export([proposals_to_vote/2]).
+-export([info/1, start/3, status/3, keys/3, nudge/3]).
+-export([proposals_to_vote/2, successor_ok/3]).
 -export([withdrawal_signature/4, minted/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -38,7 +51,7 @@
 -define(RESEND_MS, 60000).
 
 info(_) ->
-    #{ exports => [<<"start">>, <<"status">>, <<"keys">>] }.
+    #{ exports => [<<"start">>, <<"status">>, <<"keys">>, <<"nudge">>] }.
 
 %%% Endpoints -----------------------------------------------------------------
 
@@ -74,6 +87,12 @@ keys(_Base, _Req, _Opts) ->
         Error -> Error
     end.
 
+nudge(_Base, _Req, _Opts) ->
+    case hb_name:lookup(?NAME) of
+        Pid when is_pid(Pid) -> Pid ! nudge, {ok, json(#{ <<"ok">> => true })};
+        _ -> {error, <<"The bridge loop is not running on this node">>}
+    end.
+
 call(Msg) ->
     case hb_name:lookup(?NAME) of
         Pid when is_pid(Pid) ->
@@ -95,13 +114,15 @@ config(Opts) ->
 
 %%% The loop ------------------------------------------------------------------
 
-init(Cfg, Opts) ->
+init(Cfg0, Opts) ->
+    Cfg = load_follow(Cfg0),
     Keys = load_keys(maps:get(<<"keys-file">>, Cfg, <<"bridge-keys.json">>)),
     Me = hb_util:human_id(ar_wallet:to_address(hb_opts:get(priv_wallet, no_viable_wallet, Opts))),
     St = #{
         cfg => Cfg, opts => Opts, keys => Keys, me => Me,
         cursors => load_cursors(Cfg), deposits => #{}, releases => #{}, sent => #{},
-        last_pass => 0, last_error => null, member => false, namespace => 0
+        last_pass => 0, last_error => null, member => false, namespace => 0,
+        timer => undefined, pass_at => 0, fast_until => 0
     },
     ?event(bridge, {started, {ao, Me}}),
     self() ! pass,
@@ -110,13 +131,29 @@ init(Cfg, Opts) ->
 loop(St) ->
     receive
         pass ->
-            St2 = try pass(St)
+            Start = os:system_time(millisecond),
+            St1 = St#{ timer => undefined, pass_at => Start },
+            St2 = try pass(St1)
                   catch C:R:T ->
                       ?event(bridge, {pass_failed, C, R, T}),
-                      St#{ last_error => iolist_to_binary(io_lib:format("~p:~p", [C, R])) }
+                      St1#{ last_error => iolist_to_binary(io_lib:format("~p:~p", [C, R])) }
                   end,
-            erlang:send_after(hb_util:int(maps:get(<<"interval">>, maps:get(cfg, St), 5000)), self(), pass),
-            loop(St2);
+            Next = next_interval(maps:get(cfg, St2), maps:get(fast_until, St2), os:system_time(millisecond)),
+            loop(St2#{ timer => erlang:send_after(Next, self(), pass) });
+        nudge ->
+            Now = os:system_time(millisecond),
+            Cfg = maps:get(cfg, St),
+            St1 = St#{ fast_until => Now + cfg_ms(Cfg, <<"fast-window">>, 120000) },
+            %% No timer means a pass is already queued; a timer that already
+            %% fired has queued one too. Either way that pass is soon enough.
+            Timer = maps:get(timer, St1),
+            case Timer =/= undefined andalso erlang:cancel_timer(Timer) =/= false of
+                true ->
+                    Delay = max(0, maps:get(pass_at, St1) + cfg_ms(Cfg, <<"fast-interval">>, 1000) - Now),
+                    loop(St1#{ timer => erlang:send_after(Delay, self(), pass) });
+                false ->
+                    loop(St1)
+            end;
         {status, From, Ref} ->
             From ! {Ref, {ok, status_view(St)}},
             loop(St);
@@ -125,8 +162,20 @@ loop(St) ->
             loop(St)
     end.
 
-pass(St = #{ cfg := Cfg, me := Me }) ->
+%% Fast while a nudge is recent, idle otherwise.
+next_interval(Cfg, FastUntil, Now) when Now < FastUntil -> cfg_ms(Cfg, <<"fast-interval">>, 1000);
+next_interval(Cfg, _FastUntil, _Now) -> cfg_ms(Cfg, <<"interval">>, 5000).
+
+cfg_ms(Cfg, Key, Default) -> hb_util:int(maps:get(Key, Cfg, Default)).
+
+pass(St) ->
     Info = published(<<"bridgeinfo">>, St),
+    case maps:get(<<"successor">>, Info, <<>>) of
+        Succ when is_binary(Succ), byte_size(Succ) =:= 43 -> follow(Succ, Info, St);
+        _ -> attest(Info, St)
+    end.
+
+attest(Info, St = #{ cfg := Cfg, me := Me }) ->
     Withdrawals = case published(<<"withdrawals">>, St) of L when is_list(L) -> L; _ -> [] end,
     Member = lists:any(fun(A) -> maps:get(<<"ao">>, A, <<>>) =:= Me end,
         maps:get(<<"attestors">>, Info, [])),
@@ -235,11 +284,14 @@ sign_withdrawals(Withdrawals, St = #{ me := Me }) ->
             case Pending andalso not Signed of
                 false -> S;
                 true ->
+                    % `releasesig', never `signature': that is the name of the
+                    % message's own httpsig signature, and the scheduler refuses
+                    % a message that carries both.
                     once(<<"sign:", Id/binary>>, S, fun() ->
                         Sig = withdrawal_signature(W, maps:get(cfg, S), maps:get(keys, S),
                             maps:get(namespace, S)),
                         send(#{ <<"action">> => <<"Bridge-Sign">>, <<"withdrawalid">> => Id,
-                            <<"signature">> => Sig }, S)
+                            <<"releasesig">> => Sig }, S)
                     end)
             end
         end, St, Withdrawals).
@@ -306,7 +358,11 @@ proposals_to_vote(Info, Me) ->
         not maps:is_key(Me, maps:get(<<"votes">>, P, #{}))].
 
 %% The vote IS the chain authorisation: this node's signature over the
-%% proposal's whole set, at its epoch, for each chain.
+%% proposal's whole set, at its epoch, for each chain. A migration changes no
+%% chain, so its vote carries nothing but the proposal.
+vote(#{ <<"op">> := <<"migrate">> } = P, St) ->
+    send(#{ <<"action">> => <<"Attestor-Vote">>,
+        <<"proposalid">> => integer_to_binary(hb_util:int(maps:get(<<"id">>, P))) }, St);
 vote(P, St = #{ cfg := Cfg, keys := Keys }) ->
     Id = hb_util:int(maps:get(<<"id">>, P)),
     Set = maps:get(<<"set">>, P),
@@ -326,6 +382,65 @@ vote(P, St = #{ cfg := Cfg, keys := Keys }) ->
             hb_bridge_sign:sui_attestors(maps:get(<<"bridge">>, Sui), Epoch, Field(<<"sui">>)),
             maps:get(sui, Keys)))
     }, St).
+
+%%% Succession ----------------------------------------------------------------
+
+%% Move to the successor if it checks out; otherwise stay, say why, and keep
+%% attesting here (this PUSD still owes its pending withdrawals).
+follow(Succ, Info, St = #{ cfg := Cfg }) ->
+    Here = maps:get(<<"pusd">>, Cfg),
+    Next = published(<<"bridgeinfo">>, St#{ cfg := Cfg#{ <<"pusd">> => Succ } }),
+    case successor_ok(Info, Next, Here) of
+        true ->
+            Cfg2 = Cfg#{ <<"pusd">> => Succ },
+            save_follow(Cfg2),
+            ?event(bridge, {followed, {from, Here}, {to, Succ}}),
+            St#{ cfg := Cfg2, deposits := #{}, releases := #{}, sent := #{}, namespace := 0,
+                last_pass := os:system_time(millisecond), last_error := null };
+        {false, Why} ->
+            St2 = attest(Info, St),
+            St2#{ last_error := <<"not following ", Succ/binary, ": ", Why/binary>> }
+    end.
+
+%% @doc Does `Next' (the successor's bridgeinfo) carry on from `Info' (the
+%% bridgeinfo of `Here')? It must name `Here' back and hold the same members,
+%% keys and epoch: the set that voted to move is the set that arrives.
+successor_ok(Info, Next, Here) ->
+    Members = fun(I) ->
+        [[maps:get(K, M, <<>>) || K <- [<<"ao">>, <<"base">>, <<"solana">>, <<"sui">>]]
+            || M <- maps:get(<<"attestors">>, I, [])]
+    end,
+    Epoch = fun(I) -> hb_util:int(maps:get(<<"epoch">>, I, -1)) end,
+    case {Next =:= #{}, maps:get(<<"predecessor">>, Next, <<>>) =:= Here,
+            Members(Next) =:= Members(Info), Epoch(Next) =:= Epoch(Info)} of
+        {true, _, _, _} -> {false, <<"its bridgeinfo cannot be read">>};
+        {_, false, _, _} -> {false, <<"it does not name this PUSD">>};
+        {_, _, false, _} -> {false, <<"its set differs">>};
+        {_, _, _, false} -> {false, <<"its epoch differs">>};
+        _ -> true
+    end.
+
+follow_file(Cfg) -> maps:get(<<"follow-file">>, Cfg, <<"bridge-follow.json">>).
+
+%% The configured PUSD, or where the node has followed it to since.
+load_follow(Cfg) ->
+    Genesis = maps:get(<<"pusd">>, Cfg),
+    case file:read_file(follow_file(Cfg)) of
+        {ok, Bin} ->
+            case catch hb_json:decode(Bin) of
+                #{ <<"genesis">> := Genesis, <<"pusd">> := Pusd } -> Cfg#{ <<"pusd">> => Pusd,
+                    <<"genesis">> => Genesis };
+                _ -> Cfg#{ <<"genesis">> => Genesis }
+            end;
+        _ -> Cfg#{ <<"genesis">> => Genesis }
+    end.
+
+save_follow(Cfg) ->
+    File = follow_file(Cfg),
+    Tmp = <<File/binary, ".tmp">>,
+    ok = file:write_file(Tmp, hb_json:encode(#{ <<"genesis">> => maps:get(<<"genesis">>, Cfg),
+        <<"pusd">> => maps:get(<<"pusd">>, Cfg) })),
+    ok = file:rename(Tmp, File).
 
 %%% AO ------------------------------------------------------------------------
 
@@ -439,6 +554,7 @@ save_cursors(Cfg, Cursors) ->
 status_view(St) ->
     #{
         <<"ao">> => maps:get(me, St),
+        <<"pusd">> => maps:get(<<"pusd">>, maps:get(cfg, St)),
         <<"member">> => maps:get(member, St),
         <<"cursors">> => maps:get(cursors, St),
         <<"waiting-deposits">> => maps:size(maps:get(deposits, St)),
@@ -448,6 +564,12 @@ status_view(St) ->
     }.
 
 %%% Tests ---------------------------------------------------------------------
+
+next_interval_test() ->
+    Cfg = #{ <<"interval">> => 15000, <<"fast-interval">> => 1000 },
+    ?assertEqual(1000, next_interval(Cfg, 2000, 1999)),
+    ?assertEqual(15000, next_interval(Cfg, 2000, 2000)),
+    ?assertEqual(5000, next_interval(#{}, 0, 1)).
 
 proposals_to_vote_test() ->
     Me = <<"me">>,
@@ -460,6 +582,35 @@ proposals_to_vote_test() ->
         P(4, <<"applied">>, #{ Me => true }, #{})
     ] },
     ?assertEqual([1], [maps:get(<<"id">>, X) || X <- proposals_to_vote(Info, Me)]).
+
+successor_ok_test() ->
+    Here = <<"here">>,
+    Set = [#{ <<"ao">> => <<"a">>, <<"base">> => <<"0x1">>, <<"solana">> => <<"S">>, <<"sui">> => <<"0x2">>,
+        <<"operator">> => <<"o">> }],
+    Info = #{ <<"attestors">> => Set, <<"epoch">> => 3, <<"successor">> => <<"next">> },
+    Next = #{ <<"attestors">> => Set, <<"epoch">> => 3, <<"predecessor">> => Here },
+    ?assertEqual(true, successor_ok(Info, Next, Here)),
+    ?assertMatch({false, _}, successor_ok(Info, #{}, Here)),
+    ?assertMatch({false, _}, successor_ok(Info, Next#{ <<"predecessor">> => <<"other">> }, Here)),
+    ?assertMatch({false, _}, successor_ok(Info, maps:remove(<<"predecessor">>, Next), Here)),
+    ?assertMatch({false, _}, successor_ok(Info, Next#{ <<"epoch">> => 4 }, Here)),
+    Other = [(hd(Set))#{ <<"sui">> => <<"0x3">> }],
+    ?assertMatch({false, _}, successor_ok(Info, Next#{ <<"attestors">> => Other }, Here)),
+    % An operator is not part of what the chains check.
+    Moved = [(hd(Set))#{ <<"operator">> => <<"p">> }],
+    ?assertEqual(true, successor_ok(Info, Next#{ <<"attestors">> => Moved }, Here)).
+
+follow_file_test() ->
+    Dir = <<"/tmp/bridge-follow-test">>,
+    _ = file:make_dir(Dir),
+    File = <<Dir/binary, "/follow.json">>,
+    _ = file:delete(File),
+    Cfg = #{ <<"pusd">> => <<"g">>, <<"follow-file">> => File },
+    ?assertEqual(<<"g">>, maps:get(<<"pusd">>, load_follow(Cfg))),
+    save_follow((load_follow(Cfg))#{ <<"pusd">> => <<"n">> }),
+    ?assertEqual(<<"n">>, maps:get(<<"pusd">>, load_follow(Cfg))),
+    % A different configured PUSD restarts the walk from there.
+    ?assertEqual(<<"h">>, maps:get(<<"pusd">>, load_follow(Cfg#{ <<"pusd">> => <<"h">> }))).
 
 json_value_test() ->
     Info = #{ <<"epoch">> => 2 },
