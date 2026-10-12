@@ -1671,6 +1671,20 @@ retain_locked(Opts) ->
 %%% in the same schedule as the main store's retention, after it, with its
 %%% own journal so a crash mid-prune is finished by the next run.
 
+%% @doc The lowest slot process `P' must keep: from the main-store plan, or,
+%% for a process whose state is kept as blobs (`process-state-blobs',
+%% `dev_process_cache'), its oldest VM checkpoint there. `none' keeps all.
+ess_need(P, Needs, MainDB) ->
+    case maps:get(P, Needs, none) of
+        none when MainDB =/= undefined ->
+            Prefix = <<"pstate/", (hb_util:human_id(P))/binary, "/s/">>,
+            case catch elmdb:list(MainDB, Prefix, [{limit, 1}]) of
+                {ok, [Oldest | _]} -> binary_to_integer(Oldest);
+                _ -> none
+            end;
+        Need -> Need
+    end.
+
 %% @doc One essentials retention run. `Needs' maps a process ID to the lowest
 %% slot it must keep.
 retain_essentials(Opts, Needs) ->
@@ -1742,6 +1756,7 @@ retain_essentials(Opts, Needs, Inner, Exported, DaysMs, Start) ->
     },
     Cutoff = os:system_time(millisecond) - DaysMs,
     Budget = ret_opt(<<"essentials-retention-max-slots">>, ?ESS_DEFAULT_MAX_SLOTS, Opts),
+    MainDB = try store_db(main_store(Opts)) catch _:_ -> undefined end,
     ok = elmdb:track(DB, true),
     ok = elmdb:flush(DB),
     try
@@ -1752,7 +1767,7 @@ retain_essentials(Opts, Needs, Inner, Exported, DaysMs, Start) ->
                     % At or below what has durably shipped, and -- when the
                     % scheduler publishes remotely -- what it has uploaded.
                     Mark = min(maps:get(P, Exported, -1), upload_limit(Ctx, P, Opts)),
-                    {PD, Why} = ess_plan(Ctx, P, maps:get(P, Needs, none), Mark, Cutoff, B),
+                    {PD, Why} = ess_plan(Ctx, P, ess_need(P, Needs, MainDB), Mark, Cutoff, B),
                     duty(Ctx),
                     {[PD | D], maps:update_with(Why, fun(X) -> X + 1 end, 1, H), B - length(PD)}
                 end,

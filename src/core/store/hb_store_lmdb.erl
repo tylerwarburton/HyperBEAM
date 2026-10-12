@@ -24,6 +24,7 @@
 -export([read/3, write/3, list/3, match/3]).
 -export([group/3, link/3, type/3, resolve/3]).
 -export([sync/3, delete/3]).
+-export([exact_put/3, exact_get/2, exact_children/2]).
 
 %% Test framework and project includes
 -include_lib("eunit/include/eunit.hrl").
@@ -201,6 +202,34 @@ delete(Opts, Req = #{ <<"delete">> := Keys }, _NodeOpts) when is_list(Keys) ->
         {error, Type, Description} ->
             ?event(error, {lmdb_delete_failed, Type, Description}),
             {error, {Type, Description}}
+    end.
+
+%% @doc Exact-key access for callers that own a key namespace of single-row
+%% values (`dev_process_cache' with `process-state-blobs'). No link is
+%% followed and no prefix is scanned: `read/3' over a path scans every key
+%% sharing its bytes as a prefix -- `a/1' also returns `a/10', `a/100' and
+%% their values -- which is harmless for small link rows and ruinous for
+%% multi-megabyte values.
+exact_put(Opts, Key, Value) when is_binary(Key), is_binary(Value) ->
+    case write(ensure_env(Opts), Key, Value) of
+        ok -> ok;
+        Other -> {error, Other}
+    end.
+
+%% @doc The value at exactly `Key' (the uncommitted overlay included), or
+%% `not_found'.
+exact_get(Opts, Key) when is_binary(Key) ->
+    read_direct(ensure_env(Opts), Key).
+
+%% @doc The names of the immediate children of `Prefix' (a group path without
+%% its trailing slash), from the committed store. Commits the overlay first.
+exact_children(Opts, Prefix) ->
+    #{ <<"db">> := DB } = ensure_env(Opts),
+    case elmdb:list(DB, hb_store_utils:child_prefix(Prefix), []) of
+        {ok, Children} -> {ok, Children};
+        not_found -> {ok, []};
+        {error, not_found} -> {ok, []};
+        {error, Type, Description} -> {error, {Type, Description}}
     end.
 
 %% @doc Make every write that has already returned durable.

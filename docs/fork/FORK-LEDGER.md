@@ -177,3 +177,19 @@ docker stop hyperbeam-prod && docker rm hyperbeam-prod
 Every image built for a deploy **must** be preceded by a `rollback-pre-<name>-v1`
 tag pointing at the currently-running image. That convention is already in use;
 keep it.
+
+---
+
+## Built, not deployed: `feat/upgrades-t` (2026-10-12)
+
+`process-state-blobs` (default `false`): a delta process's computed slot is one
+row (`pstate/<proc>/{d,f,s}/<slot>`) instead of ~45-325 content-addressed rows,
+and retention is inline -- publishing a VM checkpoint deletes, by exact key,
+every row below the oldest of the newest `store-retention-checkpoints`. No
+store scan. Legacy rows stay readable; the slot's `results` stay
+content-addressed (the HTTP encoder reads them back by ID). Essentials
+retention takes a blob process's oldest checkpoint as its floor.
+Measured (3,000 slots, ckpt every 250, keep 2): state 12.3 MB and rising
+~4.1 KB/slot (legacy) vs 0.41 MB flat over 503 rows (blobs). Code:
+`dev_process_cache.erl`, `hb_store_lmdb.erl` (`exact_*`), `hb_store_gc.erl`
+(`ess_need/3`).

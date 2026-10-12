@@ -6,6 +6,7 @@
 -export([latest/2, latest/3, latest/4, read/2, read/3, write/4]).
 -export([write_checkpoint/5, latest_slot/4, newest_slot_after/4]).
 -export([latest_fields/3]).
+-export([blob_slots/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 
@@ -30,6 +31,10 @@
 -define(RECENT_FLOOR_SLOTS, 4).
 -define(DEFAULT_REPLAY_CACHE_SLOTS, 128).
 -define(DEFAULT_REPLAY_CACHE_MB, 1536).
+%% `process-state-blobs': each computed slot is one row under this namespace.
+-define(BLOB_NS, <<"pstate">>).
+-define(BLOB_VSN, 1).
+-define(BLOB_DELETE_BATCH, 1000).
 
 %% @doc Read the result of a process at a given slot.
 read(ProcID, Opts) ->
@@ -44,7 +49,26 @@ read(ProcID, SlotRef, Opts) ->
 %% @doc Read a slot from the store, bypassing the in-memory caches. Those hold
 %% states without their VM `snapshot' (see `cacheable/1'), so a caller that
 %% needs the snapshot must come here.
+read_stored(ProcID, SlotRef, Opts) when is_integer(SlotRef), SlotRef >= 0 ->
+    case blob_store(Opts) of
+        none -> read_stored_legacy(ProcID, SlotRef, Opts);
+        Store ->
+            case blob_read(ProcID, SlotRef, Store) of
+                {ok, Stored} ->
+                    case materialize(ProcID, Stored, Opts) of
+                        {ok, Msg} ->
+                            hot_put(ProcID, SlotRef, Msg, Opts),
+                            {ok, Msg};
+                        Res -> Res
+                    end;
+                not_found -> read_stored_legacy(ProcID, SlotRef, Opts);
+                Error -> Error
+            end
+    end;
 read_stored(ProcID, SlotRef, Opts) ->
+    read_stored_legacy(ProcID, SlotRef, Opts).
+
+read_stored_legacy(ProcID, SlotRef, Opts) ->
     Path = path(ProcID, SlotRef, Opts),
     case hb_cache:read(Path, Opts) of
         {ok, Stored} ->
@@ -117,6 +141,13 @@ write_delta(ProcID, Slot, Msg, Delta, Opts) ->
         Error -> erlang:error({invalid_process_delta, Error})
     end,
     PublicMsg = hb_private:reset(Msg),
+    case blob_store(Opts) of
+        Store when Store =/= none, Slot >= 0 ->
+            write_delta_blob(ProcID, Slot, Msg, PublicMsg, Patches, Results, Store, Opts);
+        _ -> write_delta_legacy(ProcID, Slot, Msg, PublicMsg, Patches, Results, Opts)
+    end.
+
+write_delta_legacy(ProcID, Slot, Msg, PublicMsg, Patches, Results, Opts) ->
     case should_checkpoint(ProcID, Slot, Msg, Opts) of
         true ->
             {ok, StoredRoot} = hb_cache:write(PublicMsg, storage_opts(Opts)),
@@ -187,13 +218,7 @@ should_checkpoint(ProcID, Slot, Msg, Opts) ->
     % here would execute that function and build the full VM snapshot merely
     % to test for its presence.
     HasSnapshot = maps:is_key(<<"snapshot">>, Msg),
-    MissingBase =
-        Slot > 0 andalso
-            hb_store:read(
-                hb_opts:get(<<"store">>, no_viable_store, Opts),
-                path(ProcID, Slot - 1, Opts),
-                Opts
-            ) =:= {error, not_found},
+    MissingBase = Slot > 0 andalso not base_exists(ProcID, Slot - 1, Opts),
     Slot =< 0 orelse HasSnapshot orelse cadence_checkpoint(Slot, Opts)
         orelse MissingBase.
 
@@ -222,6 +247,14 @@ cadence_checkpoint(Slot, Opts) ->
 %% the same public state. `BeforeLink' is called once the data is durable
 %% (a test hook).
 write_checkpoint(ProcID, Slot, Msg, BeforeLink, Opts) ->
+    case blob_store(Opts) of
+        Store when Store =/= none, Slot >= 0 ->
+            write_full_blob(ProcID, Slot, hb_private:reset(Msg), BeforeLink, Store, Opts),
+            {ok, blob_key(ProcID, <<"f">>, Slot)};
+        _ -> write_checkpoint_legacy(ProcID, Slot, Msg, BeforeLink, Opts)
+    end.
+
+write_checkpoint_legacy(ProcID, Slot, Msg, BeforeLink, Opts) ->
     PublicMsg = hb_private:reset(Msg),
     {ok, Root} = hb_cache:write(PublicMsg, storage_opts(Opts)),
     ok = hb_store:sync(hb_opts:get(<<"store">>, no_viable_store, Opts), Opts),
@@ -751,7 +784,9 @@ hot_fields(Key, Slot, [Field | Rest], Acc) ->
     end.
 
 latest_from_store(ProcID, RawRequiredPath, Limit, RawOpts) ->
-    {Opts, RequiredPath, CappedSlots} =
+    latest_from_store(ProcID, RawRequiredPath, Limit, RawOpts, 3).
+latest_from_store(ProcID, RawRequiredPath, Limit, RawOpts, Tries) ->
+    {Opts, RequiredPath, CappedSlots, Known} =
         slot_candidates(ProcID, RawRequiredPath, Limit, RawOpts),
     % Find the highest slot that has the necessary path.
     BestSlot =
@@ -759,6 +794,7 @@ latest_from_store(ProcID, RawRequiredPath, Limit, RawOpts) ->
             ProcID,
             RequiredPath,
             lists:reverse(lists:sort(CappedSlots)),
+            Known,
             Opts
         ),
     case BestSlot of
@@ -773,12 +809,21 @@ latest_from_store(ProcID, RawRequiredPath, Limit, RawOpts) ->
             % Found. Return the slot number and the message at that slot. A
             % required path (in practice `snapshot+link', for a cold restore)
             % may name a key the in-memory caches strip, so read the store.
-            {ok, Msg} =
+            Read =
                 case RequiredPath of
                     [] -> read(ProcID, SlotNum, Opts);
                     _ -> read_stored(ProcID, SlotNum, Opts)
                 end,
-            {ok, SlotNum, Msg}
+            case Read of
+                {ok, Msg} -> {ok, SlotNum, Msg};
+                % Pruned between the listing and the read (bounded retention
+                % with `process-state-blobs' removes old checkpoints inline):
+                % list again, which no longer names it.
+                _ when Tries > 1 ->
+                    latest_from_store(ProcID, RawRequiredPath, Limit, RawOpts, Tries - 1);
+                Other ->
+                    erlang:error({latest_read_failed, SlotNum, Other})
+            end
     end.
 
 %% @doc The newest slot at or below `Limit' (`undefined' for none) that has
@@ -793,10 +838,10 @@ newest_slot_after(ProcID, RequiredPath, After, Opts) ->
     slot_in(ProcID, RequiredPath, undefined, fun(S) -> S > After end, Opts).
 
 slot_in(ProcID, RawRequiredPath, Limit, Keep, RawOpts) ->
-    {Opts, RequiredPath, CappedSlots} =
+    {Opts, RequiredPath, CappedSlots, Known} =
         slot_candidates(ProcID, RawRequiredPath, Limit, RawOpts),
     Slots = lists:reverse(lists:sort(lists:filter(Keep, CappedSlots))),
-    case first_with_path(ProcID, RequiredPath, Slots, Opts) of
+    case first_with_path(ProcID, RequiredPath, Slots, Known, Opts) of
         Slot when is_integer(Slot) -> {ok, Slot};
         _ -> not_found
     end.
@@ -827,7 +872,17 @@ slot_candidates(ProcID, RawRequiredPath, Limit, RawOpts) ->
         end,
     ?event({required_path_converted, {proc_id, ProcID}, {required_path, RequiredPath}}),
     Path = path(ProcID, slot_root, Opts),
-    AllSlots = hb_cache:list_numbered(Path, Opts),
+    % With `process-state-blobs', slots in the blob namespace that are known
+    % to satisfy the required path, without reading them: any stored slot for
+    % no path, a VM checkpoint for `snapshot'. Legacy slots are still listed,
+    % so a store written before the option was turned on keeps working.
+    Known =
+        case blob_store(RawOpts) of
+            none -> sets:new([{version, 2}]);
+            Store -> sets:from_list(blob_known(ProcID, RequiredPath, Store), [{version, 2}])
+        end,
+    AllSlots =
+        lists:usort(hb_cache:list_numbered(Path, Opts) ++ sets:to_list(Known)),
     ?event({all_slots, {proc_id, ProcID}, {slots, AllSlots}}),
     CappedSlots =
         case Limit of
@@ -842,25 +897,32 @@ slot_candidates(ProcID, RawRequiredPath, Limit, RawOpts) ->
             {slots_in_range, CappedSlots}
         }
     ),
-    {Opts, RequiredPath, CappedSlots}.
+    {Opts, RequiredPath, CappedSlots, Known}.
 
 %% @doc Find the latest assignment with the requested path suffix.
-first_with_path(ProcID, RequiredPath, Slots, Opts) ->
+first_with_path(ProcID, RequiredPath, Slots, Known, Opts) ->
     first_with_path(
         ProcID,
         RequiredPath,
         Slots,
+        Known,
         Opts,
         hb_opts:get(<<"store">>, no_viable_store, Opts)
     ).
-first_with_path(_ProcID, _Required, [], _Opts, _Store) ->
+first_with_path(_ProcID, _Required, [], _Known, _Opts, _Store) ->
     not_found;
-first_with_path(ProcID, RequiredPath, [Slot | Rest], Opts, Store) ->
+first_with_path(ProcID, RequiredPath, [Slot | Rest], Known, Opts, Store) ->
+    case sets:is_element(Slot, Known) of
+        true -> Slot;
+        false -> first_with_path_legacy(ProcID, RequiredPath, [Slot | Rest], Known, Opts, Store)
+    end.
+
+first_with_path_legacy(ProcID, RequiredPath, [Slot | Rest], Known, Opts, Store) ->
     RawPath = path(ProcID, Slot, RequiredPath, Opts),
     ?event({trying_slot, {slot, Slot}, {path, RawPath}}),
     case hb_store:read(Store, RawPath, Opts) of
         {error, not_found} ->
-            first_with_path(ProcID, RequiredPath, Rest, Opts, Store);
+            first_with_path(ProcID, RequiredPath, Rest, Known, Opts, Store);
         {failure, _} = Failure ->
             Failure;
         {error, _} = Error ->
@@ -868,6 +930,227 @@ first_with_path(ProcID, RequiredPath, [Slot | Rest], Opts, Store) ->
         _ ->
             Slot
     end.
+
+%%% Process state blobs (`process-state-blobs') ------------------------------
+%%%
+%%% The default store layout writes a computed slot through `hb_cache:write':
+%%% content-addressed, every field of the state and of each delta exploded into
+%%% its own rows (~325 rows for one delta measured on prod), shared between
+%%% slots, so nothing can be dropped without a scan of the whole store for
+%%% references (`hb_store_gc'), which at 30 slots/s fell further behind every
+%%% hour. With the option on, a slot of a delta process is one row instead,
+%%% owned by that process and slot and shared with nothing:
+%%%
+%%%   pstate/<proc>/d/<slot>   the delta envelope (patches + results)
+%%%   pstate/<proc>/f/<slot>   a full public state (a checkpoint, with its VM
+%%%                            `snapshot' when it has one)
+%%%   pstate/<proc>/s/<slot>   empty marker: f/<slot> carries a VM snapshot
+%%%
+%%% Slots are zero-padded so a listing is in slot order. Values are
+%%% `term_to_binary' of fully loaded terms (no store links), compressed.
+%%% Retention is inline: once a VM checkpoint is published, every row below the
+%%% oldest of the newest `store-retention-checkpoints' (default 2) checkpoints is
+%%% deleted by exact key. A process therefore holds at most that many full
+%%% states and the deltas after the oldest, whatever its age. Assignments and
+%%% messages (the chain) are never touched. Full-state processes (no delta,
+%%% e.g. WASM) and negative slots keep the default layout.
+
+blob_store(Opts) ->
+    case blobs_enabled(Opts) of
+        false -> none;
+        true ->
+            Scope = hb_opts:get(<<"process-cache-scope">>, local, Opts),
+            Stores =
+                case hb_opts:get(<<"store">>, no_viable_store, Opts) of
+                    M when is_map(M) -> [M];
+                    L when is_list(L) -> L;
+                    _ -> []
+                end,
+            Lmdb =
+                [ S || S <- hb_store:scope(Stores, Scope), is_map(S),
+                       is_lmdb(maps:get(<<"store-module">>, S, undefined)) ],
+            case Lmdb of
+                [Store | _] -> Store;
+                [] -> none
+            end
+    end.
+
+blobs_enabled(Opts) ->
+    Default = os:getenv("HB_PROCESS_STATE_BLOBS") =:= "true",
+    hb_util:atom(hb_opts:get(<<"process-state-blobs">>, Default, Opts)) == true.
+
+is_lmdb(hb_store_lmdb) -> true;
+is_lmdb(<<"hb_store_lmdb">>) -> true;
+is_lmdb(_) -> false.
+
+blob_prefix(ProcID, Kind) ->
+    <<?BLOB_NS/binary, "/", (hb_util:human_id(ProcID))/binary, "/", Kind/binary>>.
+
+blob_key(ProcID, Kind, Slot) ->
+    <<(blob_prefix(ProcID, Kind))/binary, "/", (pad_slot(Slot))/binary>>.
+
+pad_slot(Slot) ->
+    Bin = integer_to_binary(Slot),
+    case byte_size(Bin) < 12 of
+        true -> <<(binary:copy(<<"0">>, 12 - byte_size(Bin)))/binary, Bin/binary>>;
+        false -> Bin
+    end.
+
+blob_encode(Term) ->
+    term_to_binary({?BLOB_VSN, Term}, [{compressed, 1}]).
+
+blob_decode(Bin) ->
+    {?BLOB_VSN, Term} = binary_to_term(Bin),
+    Term.
+
+blob_put(Store, Key, Value) ->
+    case hb_store_lmdb:exact_put(Store, Key, Value) of
+        ok -> ok;
+        Error -> erlang:error({process_state_blob_write_failed, Key, Error})
+    end.
+
+%% @doc The stored form of a slot: the full state when there is one, else the
+%% delta envelope. `not_found' when neither is in the blob namespace.
+blob_read(ProcID, Slot, Store) ->
+    case hb_store_lmdb:exact_get(Store, blob_key(ProcID, <<"f">>, Slot)) of
+        {ok, Full} -> {ok, blob_decode(Full)};
+        not_found ->
+            case hb_store_lmdb:exact_get(Store, blob_key(ProcID, <<"d">>, Slot)) of
+                {ok, Delta} -> {ok, blob_decode(Delta)};
+                not_found -> not_found;
+                Error -> Error
+            end;
+        Error -> Error
+    end.
+
+%% @doc The slots of `Kind' (`d', `f' or `s') a process holds, ascending.
+blob_slots(ProcID, Kind, Store) ->
+    case hb_store_lmdb:exact_children(Store, blob_prefix(ProcID, Kind)) of
+        {ok, Names} ->
+            lists:sort([ binary_to_integer(N) || N <- Names ]);
+        _ -> []
+    end.
+
+%% @doc Slots in the blob namespace that satisfy `RequiredPath' without being
+%% read: any stored slot for none, a VM checkpoint for `snapshot'. Any other
+%% required path is answered by the legacy layout alone.
+blob_known(ProcID, [], Store) ->
+    blob_slots(ProcID, <<"d">>, Store) ++ blob_slots(ProcID, <<"f">>, Store);
+blob_known(ProcID, [Part], Store) when is_binary(Part) ->
+    case binary:split(Part, <<"+">>) of
+        [<<"snapshot">> | _] -> blob_slots(ProcID, <<"s">>, Store);
+        _ -> []
+    end;
+blob_known(_ProcID, _RequiredPath, _Store) ->
+    [].
+
+%% @doc Whether slot `Slot' of the process is stored, in either layout. The hot
+%% cache answers for the slot just written, which is the common case.
+base_exists(ProcID, Slot, Opts) ->
+    HotHit =
+        case hot_newest(ProcID, Opts) of
+            {ok, Slot, _} -> true;
+            _ -> false
+        end,
+    HotHit orelse
+        case blob_store(Opts) of
+            none -> false;
+            Store ->
+                hb_store_lmdb:exact_get(Store, blob_key(ProcID, <<"d">>, Slot)) =/= not_found
+                    orelse hb_store_lmdb:exact_get(Store, blob_key(ProcID, <<"s">>, Slot)) =/= not_found
+                    orelse hb_store_lmdb:exact_get(Store, blob_key(ProcID, <<"f">>, Slot)) =/= not_found
+        end
+    orelse
+        hb_store:read(
+            hb_opts:get(<<"store">>, no_viable_store, Opts),
+            path(ProcID, Slot, Opts),
+            Opts
+        ) =/= {error, not_found}.
+
+write_delta_blob(ProcID, Slot, Msg, PublicMsg, Patches, Results, Store, Opts) ->
+    case should_checkpoint(ProcID, Slot, Msg, Opts) of
+        true ->
+            write_full_blob(ProcID, Slot, PublicMsg, fun() -> ok end, Store, Opts);
+        false ->
+            Envelope = #{
+                <<"cache-format">> => ?DELTA_FORMAT,
+                <<"slot">> => Slot,
+                <<"base-slot">> => Slot - 1,
+                <<"patches">> => hb_cache:ensure_all_loaded(Patches, Opts),
+                <<"results">> => hb_cache:ensure_all_loaded(Results, Opts)
+            },
+            blob_put(Store, blob_key(ProcID, <<"d">>, Slot), blob_encode(Envelope))
+    end,
+    write_results(Results, Opts),
+    hot_put(ProcID, Slot, PublicMsg, Opts),
+    {ok, blob_key(ProcID, <<"d">>, Slot)}.
+
+%% @doc Write a full state. One with a VM snapshot is a checkpoint: its data is
+%% made durable first, `BeforeLink' runs, then the `s' marker publishes it, and
+%% the rows it makes redundant are dropped.
+write_full_blob(ProcID, Slot, PublicMsg, BeforeLink, Store, Opts) ->
+    Loaded = hb_cache:ensure_all_loaded(PublicMsg, Opts),
+    blob_put(Store, blob_key(ProcID, <<"f">>, Slot), blob_encode(Loaded)),
+    case maps:is_key(<<"snapshot">>, Loaded) of
+        false ->
+            BeforeLink(),
+            ok;
+        true ->
+            ok = hb_store:sync(hb_opts:get(<<"store">>, no_viable_store, Opts), Opts),
+            BeforeLink(),
+            blob_put(Store, blob_key(ProcID, <<"s">>, Slot), <<>>),
+            blob_prune(ProcID, Store, Opts)
+    end.
+
+%% @doc Bounded retention for one process: keep the newest
+%% `store-retention-checkpoints' VM checkpoints, and drop every row below the
+%% oldest of them (its own delta row too: the full state answers for it).
+%% Reads below the window miss cleanly (`not_found'), which `dev_process'
+%% treats as a historical read: rebuilt from a checkpoint within
+%% `process-historical-replay-limit' or answered 503.
+blob_prune(ProcID, Store, Opts) ->
+    Keep = max(1, hb_util:int(hb_opts:get(<<"store-retention-checkpoints">>, 2, Opts))),
+    case lists:reverse(blob_slots(ProcID, <<"s">>, Store)) of
+        [] -> ok;
+        Snaps ->
+            Oldest = lists:last(lists:sublist(Snaps, Keep)),
+            Doomed =
+                [ blob_key(ProcID, <<"s">>, S) || S <- Snaps, S < Oldest ] ++
+                [ blob_key(ProcID, <<"f">>, S) || S <- blob_slots(ProcID, <<"f">>, Store), S < Oldest ] ++
+                [ blob_key(ProcID, <<"d">>, S) || S <- blob_slots(ProcID, <<"d">>, Store), S =< Oldest ],
+            blob_delete(Store, Doomed, Opts),
+            ?event(compute_short,
+                {process_state_pruned,
+                    {proc_id, ProcID},
+                    {oldest_kept_checkpoint, Oldest},
+                    {deleted_rows, length(Doomed)}
+                }
+            ),
+            ok
+    end.
+
+%% @doc The slot's `results' stay content-addressed, as the legacy layout left
+%% them as a side effect of writing the state: readers address them by ID --
+%% the HTTP encoder offloads a reply's nested `results' as a link to that ID and
+%% reads it back. They are small next to the state; they are not pruned.
+write_results(Results, Opts) when is_map(Results), map_size(Results) > 0 ->
+    {ok, _} = hb_cache:write(Results, storage_opts(Opts)),
+    ok;
+write_results(_Results, _Opts) ->
+    ok.
+
+blob_delete(_Store, [], _Opts) -> ok;
+blob_delete(Store, Keys, Opts) ->
+    {Batch, Rest} =
+        case length(Keys) > ?BLOB_DELETE_BATCH of
+            true -> lists:split(?BLOB_DELETE_BATCH, Keys);
+            false -> {Keys, []}
+        end,
+    case hb_store_lmdb:delete(Store, #{ <<"delete">> => Batch }, Opts) of
+        {ok, _} -> ok;
+        Error -> ?event(error, {process_state_prune_failed, Error})
+    end,
+    blob_delete(Store, Rest, Opts).
 
 %%% Tests
 
@@ -1808,3 +2091,311 @@ cache_owner_death_is_not_raised_test_() ->
         ets:delete(?HOT_CACHE, {<<"od">>, local}),
         ets:match_delete(?RECENT_CACHE, {{{<<"od">>, local}, '_'}, '_'})
     end}.
+
+%%% Process state blob tests --------------------------------------------------
+
+blob_opts(Extra) ->
+    application:ensure_all_started(hb),
+    maps:merge(
+        #{
+            <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)],
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"process-state-blobs">> => true
+        },
+        Extra
+    ).
+
+drop_memory(ProcID, Opts) ->
+    HotKey = hot_key(ProcID, Opts),
+    ets:delete(?HOT_CACHE, HotKey),
+    ets:match_delete(?RECENT_CACHE, {{HotKey, '_'}, '_'}),
+    ets:match_delete(?REPLAY_CACHE, {{HotKey, '_'}, '_'}).
+
+%% Write slots 0..Last of a counting delta process, with a VM `snapshot' on
+%% every `Every'th slot (as the checkpoint writer would publish it).
+blob_write_slots(ProcID, Last, Every, Opts) ->
+    Results0 = #{ <<"output">> => #{ <<"data">> => <<"0">> } },
+    State0 = #{ <<"at-slot">> => 0, <<"count">> => <<"0">>,
+        <<"old">> => <<"remove-me">>, <<"results">> => Results0 },
+    {ok, _} = write(ProcID, 0, with_delta(State0, [], Results0, Opts), Opts),
+    lists:foldl(
+        fun(Slot, State) ->
+            Bin = integer_to_binary(Slot),
+            Patches = [#{ <<"path">> => <<"/count">>, <<"value">> => Bin }]
+                ++ [ #{ <<"path">> => <<"/old">>, <<"delete">> => true } || Slot == 1 ],
+            Results = #{ <<"output">> => #{ <<"data">> => Bin } },
+            {ok, Next} = hb_process_delta:apply(State, Patches, Results, Slot, Opts),
+            {ok, _} = write(ProcID, Slot, with_delta(Next, Patches, Results, Opts),
+                Opts#{ <<"process-cache-defer-checkpoint">> => true }),
+            case Slot rem Every of
+                0 ->
+                    {ok, _} = write_checkpoint(ProcID, Slot,
+                        Next#{ <<"snapshot">> =>
+                            <<"vm-", Bin/binary, ":", (binary:copy(<<"v">>, 70000))/binary>> },
+                        fun() -> ok end, Opts);
+                _ -> ok
+            end,
+            Next
+        end,
+        State0,
+        lists:seq(1, Last)
+    ).
+
+blob_roundtrip_and_layout_test_() ->
+    {timeout, 60, fun() ->
+        Opts = blob_opts(#{ <<"process-hot-cache-slots">> => 1,
+            <<"process-delta-checkpoint-slots">> => 1000 }),
+        ProcID = hb_util:encode(crypto:strong_rand_bytes(32)),
+        blob_write_slots(ProcID, 7, 5, Opts),
+        % Nothing in the content-addressed layout.
+        ?assertEqual({error, not_found}, hb_cache:read(path(ProcID, 3, Opts), Opts)),
+        Store = blob_store(Opts),
+        ?assertEqual([5], blob_slots(ProcID, <<"s">>, Store)),
+        drop_memory(ProcID, Opts),
+        % One checkpoint (slot 5): everything below it is already dropped.
+        ?assertEqual({error, not_found}, read(ProcID, 3, Opts)),
+        {ok, S6} = read(ProcID, 6, Opts),
+        ?assertEqual(<<"6">>, hb_ao:get(<<"count">>, S6, Opts)),
+        ?assertEqual(not_found, hb_ao:get(<<"old">>, S6, not_found, Opts)),
+        ?assertEqual(<<"6">>, hb_ao:get(<<"results/output/data">>, S6, Opts)),
+        drop_memory(ProcID, Opts),
+        {ok, 7, L} = latest(ProcID, Opts),
+        ?assertEqual(<<"7">>, hb_ao:get(<<"count">>, L, Opts)),
+        % A cold restore finds the VM checkpoint, snapshot and all.
+        {ok, 5, C} = latest(ProcID, [<<"snapshot+link">>], undefined, Opts),
+        ?assertMatch(<<"vm-5:", _/binary>>, maps:get(<<"snapshot">>, C)),
+        ?assertEqual({ok, 5}, latest_slot(ProcID, [<<"snapshot+link">>], 6, Opts)),
+        ?assertEqual(not_found, newest_slot_after(ProcID, [<<"snapshot+link">>], 5, Opts)),
+        % A missing base forces a full write, as in the legacy layout.
+        Gap = #{ <<"at-slot">> => 20, <<"count">> => <<"20">>,
+            <<"results">> => #{ <<"output">> => #{ <<"data">> => <<"20">> } } },
+        {ok, _} = write(ProcID, 20, with_delta(Gap, [], #{}, Opts), Opts),
+        ?assert(lists:member(20, blob_slots(ProcID, <<"f">>, Store)))
+    end}.
+
+blob_retention_is_bounded_test_() ->
+    {timeout, 120, fun() ->
+        Opts = blob_opts(#{ <<"process-hot-cache-slots">> => 1,
+            <<"store-retention-checkpoints">> => 2,
+            <<"process-delta-checkpoint-slots">> => 1000 }),
+        ProcID = hb_util:encode(crypto:strong_rand_bytes(32)),
+        blob_write_slots(ProcID, 105, 20, Opts),
+        Store = blob_store(Opts),
+        ?assertEqual([80, 100], blob_slots(ProcID, <<"s">>, Store)),
+        ?assertEqual([80, 100], blob_slots(ProcID, <<"f">>, Store)),
+        ?assertEqual(lists:seq(81, 105), blob_slots(ProcID, <<"d">>, Store)),
+        drop_memory(ProcID, Opts),
+        % Inside the window: rebuilt from the oldest kept checkpoint.
+        {ok, S90} = read(ProcID, 90, Opts),
+        ?assertEqual(<<"90">>, hb_ao:get(<<"count">>, S90, Opts)),
+        {ok, S80} = read(ProcID, 80, Opts),
+        ?assertEqual(<<"80">>, hb_ao:get(<<"count">>, S80, Opts)),
+        % Below it: a clean miss, which `dev_process' rebuilds or refuses.
+        drop_memory(ProcID, Opts),
+        ?assertEqual({error, not_found}, read(ProcID, 50, Opts)),
+        ?assertEqual({ok, 100}, latest_slot(ProcID, [<<"snapshot+link">>], undefined, Opts)),
+        ?assertEqual({ok, 80}, latest_slot(ProcID, [<<"snapshot+link">>], 99, Opts)),
+        ?assertEqual(not_found, latest_slot(ProcID, [<<"snapshot+link">>], 79, Opts))
+    end}.
+
+%% The option off leaves the legacy layout untouched.
+blob_option_off_is_legacy_test_() ->
+    {timeout, 60, fun() ->
+        Opts = blob_opts(#{ <<"process-state-blobs">> => false }),
+        ?assertEqual(none, blob_store(Opts)),
+        ProcID = hb_util:encode(crypto:strong_rand_bytes(32)),
+        blob_write_slots(ProcID, 3, 2, Opts),
+        {ok, Raw} = hb_cache:read(path(ProcID, 3, Opts), Opts),
+        ?assertEqual(?DELTA_FORMAT, maps:get(<<"cache-format">>, Raw))
+    end}.
+
+%% A store written in the legacy layout keeps working once the option is on:
+%% its slots are still found and read, and new slots go to blobs.
+blob_reads_legacy_store_test_() ->
+    {timeout, 60, fun() ->
+        Legacy = blob_opts(#{ <<"process-state-blobs">> => false,
+            <<"process-hot-cache-slots">> => 1 }),
+        ProcID = hb_util:encode(crypto:strong_rand_bytes(32)),
+        Last = blob_write_slots(ProcID, 4, 2, Legacy),
+        Opts = Legacy#{ <<"process-state-blobs">> => true },
+        drop_memory(ProcID, Opts),
+        {ok, 4, L4} = latest(ProcID, Opts),
+        ?assertEqual(<<"4">>, hb_ao:get(<<"count">>, L4, Opts)),
+        % A cold restore's lookup answers as it did with the option off.
+        Strip = fun({ok, Sl, _}) -> {ok, Sl}; (Other) -> Other end,
+        ?assertEqual(
+            Strip(latest(ProcID, [<<"snapshot+link">>], undefined, Legacy)),
+            Strip(latest(ProcID, [<<"snapshot+link">>], undefined, Opts))),
+        Patches = [#{ <<"path">> => <<"/count">>, <<"value">> => <<"5">> }],
+        Results = #{ <<"output">> => #{ <<"data">> => <<"5">> } },
+        {ok, S5} = hb_process_delta:apply(Last, Patches, Results, 5, Opts),
+        {ok, _} = write(ProcID, 5, with_delta(S5, Patches, Results, Opts), Opts),
+        ?assertEqual([5], blob_slots(ProcID, <<"d">>, blob_store(Opts))),
+        drop_memory(ProcID, Opts),
+        % The blob delta materializes onto the legacy base.
+        {ok, R5} = read(ProcID, 5, Opts),
+        ?assertEqual(<<"5">>, hb_ao:get(<<"count">>, R5, Opts))
+    end}.
+
+%%% Store growth benchmark (HB_STATE_BLOB_BENCH=<slots>): a lua@5.3b process
+%%% with ~2,000 public keys and a matching VM table, one message per slot,
+%%% collecting Lua garbage every 50 slots as the production contracts do,
+%%% checkpointed every 250 slots, run once with each layout. Reports LMDB rows
+%%% and bytes (key + value) per computed slot and the totals as it goes.
+
+bench_script() ->
+    <<
+        "Count = Count or 0\n"
+        "Players = Players or {}\n"
+        "function compute(req)\n"
+        "  Count = Count + 1\n"
+        "  local k = 'p' .. (Count % 2000)\n"
+        "  local v = string.rep('v', 160) .. tostring(Count)\n"
+        "  Players[k] = v\n"
+        "  local p = { { path = '/count', value = tostring(Count) }, { path = '/' .. k, value = v } }\n"
+        "  if Count % 50 == 0 then collectgarbage('collect') end\n"
+        "  return { patches = p, results = { output = { data = tostring(Count) } } }\n"
+        "end\n"
+    >>.
+
+bench_store_stats(Store) ->
+    #{ <<"db">> := DB } = hb_store:find(Store),
+    {ok, Acc} = elmdb:fold(DB,
+        fun(K, V, {Rows, Bytes, PRows, PBytes}) ->
+            Sz = byte_size(K) + byte_size(V),
+            case K of
+                <<"pstate/", _/binary>> -> {Rows + 1, Bytes + Sz, PRows + 1, PBytes + Sz};
+                _ -> {Rows + 1, Bytes + Sz, PRows, PBytes}
+            end
+        end,
+        {0, 0, 0, 0}),
+    Acc.
+
+%% Sizes of the blob rows by kind, and the newest checkpoint's parts.
+bench_blob_breakdown(Store, ID) ->
+    #{ <<"db">> := DB } = hb_store:find(Store),
+    Prefix = <<"pstate/", ID/binary, "/">>,
+    {ok, Kinds} = elmdb:fold(DB,
+        fun(K, V, Acc) ->
+            case K of
+                <<Prefix:(byte_size(Prefix))/binary, Kind:1/binary, "/", _/binary>> ->
+                    maps:update_with(Kind, fun({N, Sz}) -> {N + 1, Sz + byte_size(V)} end,
+                        {1, byte_size(V)}, Acc);
+                _ -> Acc
+            end
+        end, #{}),
+    Snapshot =
+        case lists:reverse(blob_slots(ID, <<"s">>, Store)) of
+            [Newest | _] ->
+                {ok, Bin} = hb_store_lmdb:exact_get(Store, blob_key(ID, <<"f">>, Newest)),
+                Full = blob_decode(Bin),
+                {Newest, byte_size(Bin), byte_size(term_to_binary(maps:remove(<<"snapshot">>, Full))),
+                    byte_size(term_to_binary(maps:get(<<"snapshot">>, Full, <<>>)))};
+            [] -> none
+        end,
+    io:format(standard_error, "BENCH   blob rows by kind ~p; newest checkpoint {slot, row bytes, public bytes, snapshot bytes} ~p~n",
+        [Kinds, Snapshot]),
+    case lists:reverse(blob_slots(ID, <<"s">>, Store)) of
+        [N1 | _] ->
+            {ok, B1} = hb_store_lmdb:exact_get(Store, blob_key(ID, <<"f">>, N1)),
+            #{ <<"body">> := VMBin } = maps:get(<<"snapshot">>, blob_decode(B1)),
+            VM = binary_to_term(VMBin),
+            Fields = case is_tuple(VM) of
+                true -> [ {I, erts_debug:flat_size(element(I, VM))} || I <- lists:seq(1, tuple_size(VM)) ];
+                false -> erts_debug:flat_size(VM)
+            end,
+            io:format(standard_error, "BENCH   vm record ~p fields (index, words): ~p~n",
+                [element(1, VM), Fields]);
+        [] -> ok
+    end.
+
+bench_run(Blobs, N) ->
+    Store = hb_test_utils:test_store(hb_store_lmdb),
+    Opts = #{
+        <<"store">> => [Store],
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"spawn-worker">> => true,
+        <<"process-workers">> => true,
+        <<"await-inprogress">> => named,
+        <<"process-async-checkpoints">> => true,
+        <<"process-delta-checkpoint-slots">> => 250,
+        <<"store-retention-checkpoints">> => 2,
+        <<"process-state-blobs">> => Blobs
+    },
+    Address = hb_util:human_id(ar_wallet:to_address(maps:get(<<"priv-wallet">>, Opts))),
+    P = hb_message:commit(#{
+            <<"device">> => <<"process@1.0">>, <<"type">> => <<"Process">>,
+            <<"scheduler-device">> => <<"scheduler@1.0">>,
+            <<"execution-device">> => <<"lua@5.3b">>,
+            <<"module">> => #{ <<"content-type">> => <<"application/lua">>, <<"body">> => bench_script() },
+            <<"authority">> => [Address], <<"scheduler-location">> => Address,
+            <<"test-random-seed">> => rand:uniform(1000000)
+        }, Opts),
+    {ok, _} = hb_cache:write(P, Opts),
+    ID = hb_util:human_id(hb_message:id(P, all, Opts)),
+    Schedule = fun(K) ->
+        {ok, _} = hb_ao:resolve(P,
+            hb_message:commit(#{ <<"path">> => <<"schedule">>, <<"method">> => <<"POST">>,
+                <<"body">> => hb_message:commit(#{ <<"target">> => ID,
+                    <<"type">> => <<"Message">>, <<"number">> => K }, Opts) }, Opts), Opts)
+    end,
+    Compute = fun(K) ->
+        {ok, _} = hb_ao:resolve(P, #{ <<"path">> => <<"compute">>, <<"slot">> => K }, Opts)
+    end,
+    Base = bench_store_stats(Store),
+    T0 = erlang:monotonic_time(millisecond),
+    Rows = lists:map(
+        fun(K) ->
+            Schedule(K), Compute(K),
+            case (K + 1) rem 500 of
+                0 ->
+                    % Let the checkpoint writer land before measuring.
+                    timer:sleep(300),
+                    {R, B, PR, PB} = bench_store_stats(Store),
+                    bench_blob_breakdown(Store, ID),
+                    {R0, B0, _, _} = Base,
+                    io:format(standard_error,
+                        "BENCH blobs=~p slot=~p rows=~p bytes=~p pstate_rows=~p pstate_bytes=~p rows/slot=~.1f bytes/slot=~p~n",
+                        [Blobs, K, R - R0, B - B0, PR, PB, (R - R0) / (K + 1), round((B - B0) / (K + 1))]),
+                    {K, R - R0, B - B0, PR, PB};
+                _ -> skip
+            end
+        end,
+        lists:seq(0, N - 1)),
+    T1 = erlang:monotonic_time(millisecond),
+    io:format(standard_error, "BENCH blobs=~p ~p slots in ~p ms (~.1f ms/slot)~n",
+        [Blobs, N, T1 - T0, (T1 - T0) / N]),
+    [ R || R = {_, _, _, _, _} <- Rows ].
+
+state_blob_growth_bench_test_() ->
+    case os:getenv("HB_STATE_BLOB_BENCH") of
+        false -> [];
+        NStr ->
+            N = list_to_integer(NStr),
+            {timeout, 3600, fun() ->
+                application:ensure_all_started(hb),
+                Legacy =
+                    case os:getenv("HB_STATE_BLOB_BENCH_ONLY") of
+                        "blobs" -> [];
+                        _ -> bench_run(false, N)
+                    end,
+                Blobs = bench_run(true, N),
+                % Computed state alone: the blob run's state rows, and the
+                % legacy run's total less the chain (assignments, messages,
+                % the process), which the blob run measures as its non-state
+                % rows and both runs write alike.
+                lists:foreach(
+                    fun({{K, LR, LB, _, _}, {K, BR, BB, PR, PB}}) ->
+                        io:format(standard_error,
+                            "BENCH slot ~p: state bytes legacy ~p (~p/slot, ~.1f rows/slot) "
+                            "blobs ~p (~p rows); chain ~p bytes~n",
+                            [K, LB - (BB - PB), round((LB - (BB - PB)) / (K + 1)),
+                             (LR - (BR - PR)) / (K + 1), PB, PR, BB - PB])
+                    end,
+                    case Legacy of [] -> []; _ -> lists:zip(Legacy, Blobs) end),
+                % Bounded: state bytes stop growing once retention starts.
+                {_, _, _, _, PMid} = lists:nth(length(Blobs) div 2, Blobs),
+                {_, _, _, _, PEnd} = lists:last(Blobs),
+                ?assert(PEnd < PMid * 1.5)
+            end}
+    end.
