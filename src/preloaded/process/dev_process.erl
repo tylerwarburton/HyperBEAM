@@ -1023,7 +1023,17 @@ store_result_sync(ForceSnapshot, ProcID, Slot, Res, Req, Opts) ->
     ?event(compute, {caching_result, {proc_id, ProcID}, {slot, Slot}}, Opts),
     dev_process_cache:write(ProcID, Slot, ResMaybeWithSnapshot, Opts),
     ?event(compute, {caching_completed, {proc_id, ProcID}, {slot, Slot}}, Opts),
-    hb_maps:without([<<"snapshot">>], ResMaybeWithSnapshot, Opts).
+    mark_stored(hb_maps:without([<<"snapshot">>], ResMaybeWithSnapshot, Opts)).
+
+%% @doc Mark a state the process cache now holds, so the resolver's result
+%% cache (`hb_cache_control', which every HTTP request asks to `always' store)
+%% does not write it -- and every read of a key below it -- a second time,
+%% content-addressed and never collected.
+mark_stored(Res) when is_map(Res) ->
+    hb_private:set_priv(Res,
+        (hb_private:from_message(Res))#{ <<"stored-elsewhere">> => true });
+mark_stored(Res) ->
+    Res.
 
 %% @doc Asynchronous checkpoints: the compute path never waits for one.
 %%
@@ -1082,7 +1092,7 @@ store_result_async(ProcID, Slot, Res, Req, Opts) ->
                         set_checkpoint_overdue(Res, true)
                 end
         end,
-    hb_maps:without([<<"snapshot">>], Next, Opts).
+    mark_stored(hb_maps:without([<<"snapshot">>], Next, Opts)).
 
 checkpoint_overdue(Res) ->
     maps:get(<<"checkpoint-overdue">>, hb_private:from_message(Res), false)

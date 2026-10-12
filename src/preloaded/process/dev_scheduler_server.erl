@@ -388,7 +388,10 @@ do_assign(State, Message, ReplyPID, AbortTime) ->
 %% @doc Commit to the assignment using all of our appropriate wallets.
 commit_assignment(BaseAssignment, State) ->
     Wallets = maps:get(wallets, State),
-    Opts = maps:get(opts, State),
+    % Committing offloads the assignment's nested messages (the scheduled
+    % message itself) to the first store: the essentials store when there is
+    % one, with the rest of the chain, not the main store.
+    Opts = hb_store_essentials:opts(maps:get(opts, State)),
     CommittmentSpec = maps:get(committment_spec, State),
     lists:foldr(
         fun(Wallet, Assignment) ->

@@ -2691,5 +2691,14 @@ e2e_results_and_state_bounded_http_test_() ->
         {R1, B1} = Peak(First),
         {R2, B2} = Peak(Second),
         ?assert(R2 =< R1),
-        ?assert(B2 =< B1 * 1.05)
+        ?assert(B2 =< B1 * 1.05),
+        % With request messages kept in memory, the scheduler's writes in the
+        % essentials store and stored results skipped by the result cache, the
+        % whole main store -- every key -- stops growing too.
+        MainPeak = fun(L) -> {lists:max([ R || {_, {R, _, _, _, _}} <- L ]),
+                              lists:max([ B || {_, {_, B, _, _, _}} <- L ])} end,
+        {MR1, MB1} = MainPeak(First),
+        {MR2, MB2} = MainPeak(Second),
+        ?assert(MR2 =< MR1 * 1.01),
+        ?assert(MB2 =< MB1 * 1.05)
     end}.
