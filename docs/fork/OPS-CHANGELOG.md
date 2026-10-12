@@ -15,7 +15,16 @@ Known-good baseline tagged `known-good-20261012` (fork 2228804c1, image 178df018
 
 ---
 
-## Pending - staged, not deployed: `hyperbeam:upgrades-r` (d00ddbec954f, branch feat/upgrades-r)
+## 2026-10-12 10:17Z - `hyperbeam:upgrades-r` (d00ddbec954f, source 3e30aa086) DEPLOYED
+
+Outcome: restart replay done in ~4 min (game 109,521/109,524); PUSD stays level with no
+compute requests. Swarm 10:21-10:24Z, 18 schedules/s: every busy process 0-3 behind, 0
+replays, exec p50 27 / p90 92 ms, store p50 8 / p90 23 ms. Nudge {"ok":true}, bridge
+member on N4VZ. A process far behind its last checkpoint (PUSD: computed 100 of 4,825) is
+past the cold-replay bound, so the catch-up skips it until one compute brings it level.
+Undo: `deploy-r.sh rollback 20261012T101715Z`; option only: `deploy-r.sh cos-off`.
+
+### What shipped
 
 1. Compute on schedule turned back on, with a catch-up that cannot cost the
    worker the state: for a process with a live worker it queues
