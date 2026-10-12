@@ -25,6 +25,10 @@ node_opts(Extra) ->
             % structure retention does not collect (it grows ~9 rows/slot).
             <<"match-index">> => false,
             <<"process-delta-checkpoint-slots">> => ?CADENCE,
+            % The store sweep collects the content-addressed process cache:
+            % these tests need that layout even where `process-state-blobs'
+            % is on by default (HB_PROCESS_STATE_BLOBS=true).
+            <<"process-state-blobs">> => false,
             <<"process-hot-cache-slots">> => 4,
             <<"store-retention">> => true,
             <<"store-retention-recent-slots">> => 4,

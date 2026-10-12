@@ -6,7 +6,7 @@
 -export([latest/2, latest/3, latest/4, read/2, read/3, write/4]).
 -export([write_checkpoint/5, latest_slot/4, newest_slot_after/4]).
 -export([latest_fields/3]).
--export([blob_slots/3]).
+-export([blob_slots/3, blob_store/1, raw_slot/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 
@@ -1081,7 +1081,6 @@ write_delta_blob(ProcID, Slot, Msg, PublicMsg, Patches, Results, Store, Opts) ->
             },
             blob_put(Store, blob_key(ProcID, <<"d">>, Slot), blob_encode(Envelope))
     end,
-    write_results(Results, Opts),
     hot_put(ProcID, Slot, PublicMsg, Opts),
     {ok, blob_key(ProcID, <<"d">>, Slot)}.
 
@@ -1128,16 +1127,6 @@ blob_prune(ProcID, Store, Opts) ->
             ),
             ok
     end.
-
-%% @doc The slot's `results' stay content-addressed, as the legacy layout left
-%% them as a side effect of writing the state: readers address them by ID --
-%% the HTTP encoder offloads a reply's nested `results' as a link to that ID and
-%% reads it back. They are small next to the state; they are not pruned.
-write_results(Results, Opts) when is_map(Results), map_size(Results) > 0 ->
-    {ok, _} = hb_cache:write(Results, storage_opts(Opts)),
-    ok;
-write_results(_Results, _Opts) ->
-    ok.
 
 blob_delete(_Store, [], _Opts) -> ok;
 blob_delete(Store, Keys, Opts) ->
@@ -1752,10 +1741,16 @@ delta_roundtrip(RawOpts) ->
         with_delta(State1, Patches1, Results1, Opts),
         Opts
     ),
-    {ok, RawSlot1} = hb_cache:read(path(ProcID, 1, Opts), Opts),
+    {ok, RawSlot1} = raw_slot(ProcID, 1, Opts),
     ?assertEqual(?DELTA_FORMAT, maps:get(<<"cache-format">>, RawSlot1)),
-    {ok, DeltaID1} = hb_cache:write(RawSlot1, Opts),
-    {ok, ReadByID1} = read(ProcID, DeltaID1, Opts),
+    {ok, ReadByID1} =
+        case blob_store(Opts) of
+            none ->
+                {ok, DeltaID1} = hb_cache:write(RawSlot1, Opts),
+                read(ProcID, DeltaID1, Opts);
+            % Blob slots have no state-ID alias: read it by slot.
+            _ -> read(ProcID, 1, Opts)
+        end,
     ?assertEqual(<<"1">>, hb_ao:get(<<"count">>, ReadByID1, Opts)),
     ?assertEqual(<<"11">>, hb_ao:get(<<"ledger/alice">>, ReadByID1, Opts)),
     ?assertEqual(not_found, hb_ao:get(<<"old">>, ReadByID1, not_found, Opts)),
@@ -1776,7 +1771,7 @@ delta_roundtrip(RawOpts) ->
     ),
     % Slot 2 is a full checkpoint. Writing it also evicts slot 1 from the
     % one-state hot cache, forcing the historical read through its delta.
-    {ok, RawSlot2} = hb_cache:read(path(ProcID, 2, Opts), Opts),
+    {ok, RawSlot2} = raw_slot(ProcID, 2, Opts),
     ?assertEqual(
         not_found,
         hb_ao:get(<<"cache-format">>, RawSlot2, not_found, Opts)
@@ -1785,6 +1780,13 @@ delta_roundtrip(RawOpts) ->
     ?assertEqual(<<"1">>, hb_ao:get(<<"count">>, Historical1, Opts)),
     {ok, 2, Latest} = latest(ProcID, Opts),
     ?assertEqual(<<"2">>, hb_ao:get(<<"count">>, Latest, Opts)).
+
+%% The stored form of a slot, in whichever layout the options select.
+raw_slot(ProcID, Slot, Opts) ->
+    case blob_store(Opts) of
+        none -> hb_cache:read(path(ProcID, Slot, Opts), Opts);
+        Store -> blob_read(ProcID, Slot, Store)
+    end.
 
 with_delta(State, Patches, Results, Opts) ->
     hb_private:set(

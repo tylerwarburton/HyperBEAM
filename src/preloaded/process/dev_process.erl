@@ -1906,9 +1906,16 @@ async_checkpoint_writer_crash_leaves_previous_test_() ->
         end,
         L6 = ckpt_run(ProcID, L4, [5, 6], Opts),
         ?assertEqual(0, checkpoint_slot(ProcID, 6, Opts)),
-        {ok, Raw4} =
-            hb_cache:read(dev_process_cache_path(ProcID, 4), Opts),
-        ?assertEqual(<<"process-delta@1.0">>, hb_ao:get(<<"cache-format">>, Raw4, Opts)),
+        case dev_process_cache:blob_store(Opts) of
+            none ->
+                {ok, Raw4} = dev_process_cache:raw_slot(ProcID, 4, Opts),
+                ?assertEqual(<<"process-delta@1.0">>,
+                    hb_ao:get(<<"cache-format">>, Raw4, Opts));
+            % Blob layout: the full state may be durable, but it was never
+            % published as a checkpoint (no `s' marker).
+            Store ->
+                ?assertNot(lists:member(4, dev_process_cache:blob_slots(ProcID, <<"s">>, Store)))
+        end,
         dev_process_cache_clear(ProcID, Opts),
         % The cold replay passes slot 4 again, which is due: let that writer go.
         Self = self(),
@@ -1960,7 +1967,12 @@ async_checkpoint_survives_retention_in_flight_test_() ->
         _ = ckpt_wait(Ref, linked, 4),
         Writer = ckpt_wait(Ref, data_written, 8),
         Report = hb_store_gc:retain(Opts),
-        ?assert(maps:get(dropped_slots, Report) > 0),
+        case dev_process_cache:blob_store(Opts) of
+            % The store sweep collects the content-addressed layout; blob
+            % state is pruned inline and is not its business.
+            none -> ?assert(maps:get(dropped_slots, Report) > 0);
+            _ -> ?assertEqual(0, maps:get(dropped_slots, Report))
+        end,
         ?assert(is_process_alive(Writer)),
         ?assertEqual(4, checkpoint_slot(ProcID, 9, Opts)),
         dev_process_cache_clear(ProcID, Opts),
@@ -2058,10 +2070,6 @@ async_checkpoint_outlives_worker_stop_test_() ->
         ?assertEqual(4, From),
         ?assertEqual({6, <<"7">>, <<"28">>, <<"7">>}, ckpt_public(Cold6, Opts))
     end}.
-
-dev_process_cache_path(ProcID, Slot) ->
-    <<"computed/", (hb_util:human_id(ProcID))/binary, "/slot/",
-        (integer_to_binary(Slot))/binary>>.
 
 %% Drop a process's in-memory cache entries, so reads come from the store.
 dev_process_cache_clear(_ProcID, _Opts) ->

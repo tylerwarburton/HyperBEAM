@@ -419,6 +419,16 @@ maybe_sign(Res, NodeMsg) ->
                 not_found ->
                     Res;
                 Hashpath ->
+                    % An unsigned commitment is computed with `linkify-mode'
+                    % `discard': the message it returns holds each nested
+                    % message as a link to its ID, written nowhere. Signing
+                    % that copy is store-free, but encoding it would have to
+                    % read every nested message back from the store by ID --
+                    % which only worked while something else (the per-slot
+                    % process cache) happened to have written them. Keep the
+                    % commitments and reply with the original, whose nested
+                    % messages are in hand: the same IDs, so the same
+                    % signatures.
                     WithUnsigned =
                         hb_message:commit(
                             Res,
@@ -428,17 +438,28 @@ maybe_sign(Res, NodeMsg) ->
                                 <<"type">> => <<"unsigned">>
                             }
                         ),
-                    hb_message:commit(
-                        WithUnsigned#{ <<"hashpath">> => Hashpath },
-                        NodeMsg,
-                        #{
-                            <<"device">> => <<"httpsig@1.0">>,
-                            <<"committed">> => [<<"hashpath">>]
-                        }
-                    )
+                    Signed =
+                        hb_message:commit(
+                            WithUnsigned#{ <<"hashpath">> => Hashpath },
+                            NodeMsg,
+                            #{
+                                <<"device">> => <<"httpsig@1.0">>,
+                                <<"committed">> => [<<"hashpath">>]
+                            }
+                        ),
+                    with_commitments_of(Signed, Res#{ <<"hashpath">> => Hashpath })
             end;
         false -> Res
     end.
+
+%% @doc `Target' with the commitments of `Committed', when both are messages.
+with_commitments_of(Committed, Target) when is_map(Committed), is_map(Target) ->
+    case maps:find(<<"commitments">>, Committed) of
+        {ok, Commitments} -> Target#{ <<"commitments">> => Commitments };
+        error -> Committed
+    end;
+with_commitments_of(Committed, _Target) ->
+    Committed.
 
 %% @doc Check if the request in question is signed by a given `role' on the node.
 %% The `role' can be one of `operator' or `initiator'.

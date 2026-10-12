@@ -193,3 +193,18 @@ Measured (3,000 slots, ckpt every 250, keep 2): state 12.3 MB and rising
 ~4.1 KB/slot (legacy) vs 0.41 MB flat over 503 rows (blobs). Code:
 `dev_process_cache.erl`, `hb_store_lmdb.erl` (`exact_*`), `hb_store_gc.erl`
 (`ess_need/3`).
+
+### `upgrades-t2` (on top of t1 `74c452cc3`)
+
+Blob slots no longer write `results` content-addressed: t1's `write_results`
+kept every slot's `results` (~2 KB on prod: outbox) forever. It was there
+because `dev_meta:maybe_sign/2` replied with the copy an unsigned commitment
+returns, whose nested messages are ID links written nowhere (`linkify-mode`
+`discard`), so the httpsig encoder read them back from the store. It now keeps
+the commitments and replies with the original message: no store round trip.
+HTTP end-to-end (1,500 slots, prod settings): no main-store row outside
+`pstate/` holds a slot's results (legacy: one per slot); `pstate/` flat.
+Plain restart over a t1 store: same row format; t1's results rows remain.
+Not in t2 (per-request writes, not results; patch kept separately): request
+parsing, the result cache of `POST /schedule` and the assignment commit still
+write ~17 KB per scheduled+read slot to the main store.

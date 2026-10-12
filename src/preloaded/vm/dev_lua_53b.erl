@@ -845,13 +845,28 @@ count_slot_computes(Fun) ->
             [{is_map, '$1'}, {is_map_key, <<"cache-format">>, '$1'}],
             []}],
     erlang:trace_pattern({hb_cache, write, 2}, MatchSpec, [global]),
+    % With `process-state-blobs' a delta slot is one `d' row instead.
+    erlang:trace_pattern({hb_store_lmdb, exact_put, 3}, true, [global]),
     erlang:trace(all, true, [call, {tracer, self()}]),
     try Fun()
     after
         erlang:trace(all, false, [call]),
-        erlang:trace_pattern({hb_cache, write, 2}, false, [global])
+        erlang:trace_pattern({hb_cache, write, 2}, false, [global]),
+        erlang:trace_pattern({hb_store_lmdb, exact_put, 3}, false, [global])
     end,
-    count_trace_messages(0).
+    count_slot_trace_messages(0).
+
+count_slot_trace_messages(N) ->
+    receive
+        {trace, _, call, {hb_cache, write, _}} ->
+            count_slot_trace_messages(N + 1);
+        {trace, _, call, {hb_store_lmdb, exact_put, [_, Key, _]}} ->
+            case binary:match(Key, <<"/d/">>) of
+                nomatch -> count_slot_trace_messages(N);
+                _ -> count_slot_trace_messages(N + 1)
+            end
+    after 100 -> N
+    end.
 
 %% @doc A worker computing a slot for a listener that runs under
 %% `cache-control: always' (every HTTP request) stores only what the process

@@ -2304,7 +2304,10 @@ trace_collected(Tracer) ->
 %% written.
 worker_store_traffic(Worker, Fun) ->
     Tracer = spawn(fun() -> trace_collector([]) end),
-    MFAs = [ {hb_store, F, 3} || F <- [write, link, read] ],
+    % With `process-state-blobs' a slot is one exact-key row, written past
+    % `hb_store:write/3': count it as a write too.
+    MFAs = [ {hb_store, F, 3} || F <- [write, link, read] ]
+        ++ [ {hb_store_lmdb, exact_put, 3} ],
     Calls =
         try
             [ erlang:trace_pattern(MFA, true, [global]) || MFA <- MFAs ],
@@ -2317,7 +2320,10 @@ worker_store_traffic(Worker, Fun) ->
             exit(Tracer, kill)
         end,
     lists:foldl(
-        fun({_, {hb_store, F, [_, Req, _]}}, Acc) ->
+        fun({_, {hb_store_lmdb, exact_put, [_, _Key, Value]}}, Acc) ->
+            Bytes = byte_size(Value),
+            maps:update_with(write, fun({N, B}) -> {N + 1, B + Bytes} end, {1, Bytes}, Acc);
+           ({_, {hb_store, F, [_, Req, _]}}, Acc) ->
             Bytes =
                 case {F, Req} of
                     {write, #{}} ->
@@ -2536,4 +2542,154 @@ worker_gc_results_unchanged_test_() ->
         Off = Run(<<"off">>),
         ?assertEqual(Off, Run(<<"checkpoint+idle">>)),
         ?assertEqual({25, <<"26">>, <<"26">>}, lists:last(Off))
+    end}.
+
+%%% End to end, through the HTTP server, as clients drive the production
+%%% node: each slot is scheduled over HTTP, its `results' read back over HTTP
+%%% (`compute&slot=N/results': the reply is signed and encoded), and a `now'
+%%% key read. The chain goes to its own `essentials-store', as on that node.
+%%% With `process-state-blobs', no slot's `results' is left in the main store
+%%% outside the process state rows, and those stop growing. Slots per run:
+%%% HB_E2E_PLATEAU_SLOTS (default 1500). The total main store is printed too:
+%%% each HTTP request still writes some request messages of its own there.
+
+plateau_script() ->
+    <<
+        "Count = Count or 0\n"
+        "Seen = Seen or {}\n"
+        "function compute(req)\n"
+        "  Count = Count + 1\n"
+        "  local k = 'p' .. (Count % 500)\n"
+        "  Seen[k] = Count\n"
+        "  if Count % 50 == 0 then collectgarbage('collect') end\n"
+        "  return {\n"
+        "    patches = {\n"
+        "      { path = '/count', value = tostring(Count) },\n"
+        "      { path = '/' .. k, value = tostring(Count) }\n"
+        "    },\n"
+        "    results = {\n"
+        "      output = { data = tostring(Count) },\n"
+        "      outbox = { ['1'] = { target = 'peer', action = 'Note',\n"
+        "        data = string.rep('m', 2000) .. tostring(Count) } }\n"
+        "    }\n"
+        "  }\n"
+        "end\n"
+    >>.
+
+%% The main store: {all rows, all bytes, rows outside `pstate/' holding a
+%% slot's outbox payload, `pstate/' rows, `pstate/' bytes}.
+plateau_stats(Store) ->
+    #{ <<"db">> := DB } = hb_store:find(Store),
+    {ok, Acc} = elmdb:fold(DB,
+        fun(K, V, {R, B, Res, PR, PB}) ->
+            Sz = byte_size(K) + byte_size(V),
+            case K of
+                <<"pstate/", _/binary>> -> {R + 1, B + Sz, Res, PR + 1, PB + Sz};
+                _ ->
+                    Payload = binary:match(V, binary:copy(<<"m">>, 64)) =/= nomatch,
+                    {R + 1, B + Sz, Res + case Payload of true -> 1; false -> 0 end, PR, PB}
+            end
+        end,
+        {0, 0, 0, 0, 0}),
+    Acc.
+
+e2e_plateau_run(Blobs, N) ->
+    Main = hb_test_utils:test_store(hb_store_lmdb),
+    Ess = hb_test_utils:test_store(hb_store_lmdb),
+    Base =
+        #{
+            <<"store">> => Main,
+            <<"essentials-store">> => Ess,
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"spawn-worker">> => true,
+            <<"process-workers">> => true,
+            <<"await-inprogress">> => named,
+            <<"process-async-checkpoints">> => true,
+            <<"process-compute-on-schedule">> => true,
+            <<"process-now-from-cache">> => true,
+            <<"process-delta-checkpoint-slots">> => 100,
+            <<"store-retention-checkpoints">> => 2,
+            <<"process-state-blobs">> => Blobs,
+            % As on the production node.
+            <<"store-all-signed">> => false,
+            % One client drives every request: keep it under the limiter.
+            <<"rate-limit-requests">> => 1000000,
+            <<"rate-limit-max">> => 1000000
+        },
+    Address = hb_util:human_id(ar_wallet:to_address(maps:get(<<"priv-wallet">>, Base))),
+    % The client is separate from the node: its own wallet and store, so its
+    % writes are not counted in the node's.
+    Client = #{ <<"priv-wallet">> => ar_wallet:new(),
+        <<"store">> => hb_test_utils:test_store(hb_store_lmdb) },
+    Proc =
+        hb_message:commit(
+            #{
+                <<"device">> => <<"process@1.0">>,
+                <<"type">> => <<"Process">>,
+                <<"scheduler-device">> => <<"scheduler@1.0">>,
+                <<"execution-device">> => <<"lua@5.3b">>,
+                <<"module">> => #{ <<"content-type">> => <<"application/lua">>,
+                    <<"body">> => plateau_script() },
+                <<"authority">> => [Address],
+                <<"scheduler-location">> => Address,
+                <<"test-random-seed">> => rand:uniform(1000000)
+            },
+            Client
+        ),
+    ID = hb_util:human_id(hb_message:id(Proc, all, Client)),
+    Node = hb_http_server:start_node(Base),
+    {ok, _} = hb_http:post(Node, <<"/schedule">>, Proc, Client),
+    lists:filtermap(
+        fun(Slot) ->
+            http_schedule(Node, ID, Slot, Client),
+            {ok, Res} =
+                hb_http:get(Node,
+                    <<ID/binary, "~process@1.0/compute&slot=",
+                        (integer_to_binary(Slot))/binary, "/results">>, Client),
+            ?assertEqual(integer_to_binary(Slot + 1),
+                hb_ao:get(<<"output/data">>, Res, Client)),
+            {ok, _} = hb_http:get(Node, <<ID/binary, "~process@1.0/now/count">>, Client),
+            case Slot rem 250 of
+                249 ->
+                    % Let an in-flight checkpoint writer land first.
+                    timer:sleep(500),
+                    Stats = {R, B, ResRows, PR, PB} = plateau_stats(Main),
+                    {ER, EB, _, _, _} = plateau_stats(Ess),
+                    io:format(standard_error,
+                        "E2E blobs=~p slot=~p main rows=~p bytes=~p results-rows=~p "
+                        "pstate rows=~p bytes=~p | essentials rows=~p bytes=~p~n",
+                        [Blobs, Slot, R, B, ResRows, PR, PB, ER, EB]),
+                    {true, {Slot, Stats}};
+                _ -> false
+            end
+        end,
+        lists:seq(1, N)
+    ).
+
+e2e_results_and_state_bounded_http_test_() ->
+    {timeout, 3600, fun() ->
+        test_init(),
+        N =
+            case os:getenv("HB_E2E_PLATEAU_SLOTS") of
+                false -> 1500;
+                S -> list_to_integer(S)
+            end,
+        Samples = e2e_plateau_run(true, N),
+        case os:getenv("HB_E2E_PLATEAU_LEGACY") of
+            false -> ok;
+            _ -> e2e_plateau_run(false, N)
+        end,
+        % No slot's results is left behind outside the state rows.
+        ?assertEqual([], [ X || X = {_, {_, _, ResRows, _, _}} <- Samples, ResRows > 0 ]),
+        % The state rows stop growing: the second half of the run reaches no
+        % higher peak than the first. (Samples fall at different points of the
+        % checkpoint cycle, so compare peaks; bytes get 5% because the script's
+        % state fills its 500 keys at slot 500.)
+        {First, Second} = lists:split(length(Samples) div 2, Samples),
+        Peak = fun(L) -> {lists:max([ PR || {_, {_, _, _, PR, _}} <- L ]),
+                          lists:max([ PB || {_, {_, _, _, _, PB}} <- L ])} end,
+        {R1, B1} = Peak(First),
+        {R2, B2} = Peak(Second),
+        ?assert(R2 =< R1),
+        ?assert(B2 =< B1 * 1.05)
     end}.
