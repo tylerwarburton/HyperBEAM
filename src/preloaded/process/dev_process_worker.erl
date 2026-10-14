@@ -187,7 +187,22 @@ next_request(GroupName, Timeout, IdleGCDue, Opts) ->
             _ -> none
         end,
     receive
-        {resolve, _Listener, GroupName, _Req, _ListenerOpts} = Msg -> Msg;
+        {resolve, Listener, GroupName, _Req, _ListenerOpts} = Msg ->
+            case abandoned(Listener, Opts) of
+                false -> Msg;
+                true ->
+                    ?event(worker_short,
+                        {skipped_abandoned_request,
+                            {group, GroupName},
+                            {listener, Listener}
+                        }
+                    ),
+                    case hb_opts:get(<<"process-worker-skip-hook">>, undefined, Opts) of
+                        Hook when is_function(Hook, 1) -> Hook(Listener);
+                        _ -> ok
+                    end,
+                    next_request(GroupName, Timeout, IdleGCDue, Opts)
+            end;
         stop -> stop
     after wait_ms(IdleMs, Timeout) ->
         case IdleMs of
@@ -197,6 +212,23 @@ next_request(GroupName, Timeout, IdleGCDue, Opts) ->
                 next_request(GroupName, remaining(Timeout, IdleMs), false, Opts)
         end
     end.
+
+%% @doc `process-worker-skip-abandoned' (default false): is this request's
+%% listener a local process that has already exited? An HTTP request's listener
+%% is its connection's request process, which exits when the client goes away
+%% (a timeout, a closed tab, a retry). Its request still waits in the worker's
+%% mailbox, and computing it answers nobody: under a backlog those requests are
+%% most of the queue, each one served in turn while the live ones wait behind
+%% it. With the option on they are dropped as they are reached. Only the
+%% listener's own answer is skipped: a slot it asked for is still computed by
+%% the next request, read or catch-up that needs it.
+abandoned(Listener, Opts) when is_pid(Listener), node(Listener) =:= node() ->
+    case hb_opts:get(<<"process-worker-skip-abandoned">>, false, Opts) of
+        Skip when Skip =:= true; Skip =:= <<"true">> ->
+            not erlang:is_process_alive(Listener);
+        _ -> false
+    end;
+abandoned(_, _) -> false.
 
 wait_ms(none, Timeout) -> Timeout;
 wait_ms(IdleMs, _Timeout) -> IdleMs.
@@ -1140,6 +1172,67 @@ worker_survives_forced_message_slot_test_() ->
         % of a persistent worker.
         ?assert(is_process_alive(Worker)),
         exit(Worker, normal)
+    end}.
+
+%% @doc `process-worker-skip-abandoned': a request whose listener has exited
+%% is dropped when the worker reaches it (and reported to the skip hook), while
+%% a live listener queued behind it is answered. Off (the default), the
+%% abandoned request is served like any other.
+worker_skips_abandoned_requests_test_() ->
+    {timeout, 90, fun() ->
+        test_init(),
+        Opts =
+            #{
+                <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+                <<"priv-wallet">> => ar_wallet:new()
+            },
+        Base = hb_process_test_vectors:aos_process(Opts),
+        hb_process_test_vectors:schedule_aos_call(Base, <<"return 1+1">>, Opts),
+        Self = self(),
+        Run =
+            fun(Skip, Group) ->
+                WorkerOpts =
+                    Opts#{
+                        <<"spawn-worker">> => false,
+                        <<"process-workers">> => false,
+                        <<"process-worker-skip-abandoned">> => Skip,
+                        <<"process-worker-skip-hook">> =>
+                            fun(L) -> Self ! {skipped, Group, L} end
+                    },
+                Dead = spawn(fun() -> ok end),
+                DMon = erlang:monitor(process, Dead),
+                receive {'DOWN', DMon, process, Dead, _} -> ok end,
+                Worker = spawn(fun() -> server(Group, Base, WorkerOpts) end),
+                Req = #{ <<"path">> => <<"compute">>, <<"slot">> => 0 },
+                Worker ! {resolve, Dead, Group, Req, WorkerOpts},
+                Worker ! {resolve, Self, Group, Req, WorkerOpts},
+                Answer =
+                    receive
+                        {resolved, _, Group, {slot, 0}, Res} -> Res
+                    after 30000 -> timeout
+                    end,
+                Skipped =
+                    receive {skipped, Group, Dead} -> true
+                    after 200 -> false
+                    end,
+                exit(Worker, normal),
+                {Answer, Skipped}
+            end,
+        {On, SkippedOn} = Run(true, <<"skip-abandoned-on">>),
+        ?assertMatch({ok, _}, On),
+        ?assert(SkippedOn),
+        {Off, SkippedOff} = Run(false, <<"skip-abandoned-off">>),
+        ?assertMatch({ok, _}, Off),
+        ?assertNot(SkippedOff),
+        % Unit: only a local, dead listener is abandoned, and only when on.
+        DeadPid = spawn(fun() -> ok end),
+        receive after 50 -> ok end,
+        On1 = #{ <<"process-worker-skip-abandoned">> => true },
+        ?assert(abandoned(DeadPid, On1)),
+        ?assertNot(abandoned(self(), On1)),
+        ?assertNot(abandoned(DeadPid, #{})),
+        ?assert(abandoned(DeadPid,
+            #{ <<"process-worker-skip-abandoned">> => <<"true">> }))
     end}.
 
 %%% Regression tests: requests that reach a live worker over HTTP. Every test

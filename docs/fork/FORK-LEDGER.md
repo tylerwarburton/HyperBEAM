@@ -248,3 +248,40 @@ store, none in the main store; on: copies in main), and
 checkpoint and not below, 0.25 days keeps all, cold resume, boot start only
 when configured). Pre-existing failures unchanged from t2 in the image test
 env: dev_push `test_push_prompts_encoding_change`, dev_scheduler 4 legacy HTTP.
+
+### `upgrades-t4` (on top of t3 `0ed2aebb7`)
+
+The game worker's queue spiral (prod, 2026-10-14 ~02:00Z): 5,052 queued
+`compute` requests, each carrying its listener's options (~6,000 words, ~48 KB),
+68% of them from listeners that had already exited; the worker spent 4.77 s of
+every 5 s in minor collections (~72 ms each) and computed ~1 slot/s, so the
+queue only grew. Two options, both default off (old behaviour); prod turns both
+on:
+
+- `process-worker-off-heap-queue` (`hb_persistent:worker_spawn_opts/1`): spawn
+  process workers with `{message_queue_data, off_heap}`, so waiting requests
+  are not part of the worker's heap and no collection copies them. Mechanism
+  benchmark (large live heap, allocation-heavy slots, prod-sized requests
+  arriving continuously): on_heap 3.8 -> 36.6 ms/slot with 5,000 waiting;
+  off_heap 3.7 -> 3.6. Cost: a separate allocation per message received.
+- `process-worker-skip-abandoned` (`dev_process_worker:next_request/4`): a
+  request whose listener is a local process that has exited (the HTTP client
+  went away) is dropped when the worker reaches it, instead of being computed
+  for nobody. The slot it named is still computed by whatever next needs it.
+  Test hook: `process-worker-skip-hook`.
+
+Not added: a catch-up coalescing option. Compute-on-schedule already keeps at
+most one catch-up per process (registered in `hb_name`), which drains every
+wake to the newest target and waits for one compute at a time
+(`?CATCH_UP_WAIT_MS`); a hung one is bounded by that wait, a dead one is
+dropped by the registry lookup. The queue was readers, not catch-ups.
+
+Remaining main-store growth after t3 (~20 KB/slot) is the battle-fleet workers:
+they run `lua@5.3a` (full-state `compute(base, req)`), so `dev_process_cache`
+writes their full public state content-addressed every slot
+(`write_full/4`; blobs only cover delta processes), and with the full sweep off
+nothing collects it. Their state is ~3.6 MB and grows with every ended battle
+(`battle-fb*` keys are kept). Not fixed in the node: a per-slot full-state blob
+would compress and write ~3.6 MB per slot. The fix is contract-side: move the
+battle workers to `lua@5.3b` patches (they then use blobs), and/or prune ended
+battle views from their state.
