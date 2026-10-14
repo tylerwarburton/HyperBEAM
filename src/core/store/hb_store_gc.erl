@@ -68,6 +68,9 @@
 -export([classify_root/2, classify_slot/3, retention/4, window_start/4]).
 -export([assignment_timestamp_probe/3]).
 -export([retain_essentials/2]).
+-export([maybe_start_essentials_retention/1, start_essentials_retention/1,
+         stop_essentials_retention/0, run_essentials_retention/1,
+         essentials_retention_status/0]).
 -export([retain/1, maybe_start_retention/1, start_retention/1, stop_retention/0,
          run_retention/1, retention_status/0, retention_running/0, retain_plan/3,
          copy_essential_namespaces/3, forget_process_cache/3,
@@ -1395,13 +1398,112 @@ report(Acc, Plans, Policy, SrcStore, DstStore) ->
 -define(ESS_DEFAULT_MAX_SLOTS, 100000).
 -define(RET_SERVER, hb_store_gc_retention).
 -define(RET_STATUS, {?MODULE, retention_status}).
+-define(ESS_SERVER, hb_store_gc_essentials_retention).
+-define(ESS_STATUS, {?MODULE, essentials_retention_status}).
 
 %% @doc Start the background retention loop when `store-retention' is true.
+%% Otherwise, start the essentials-only loop when that is configured
+%% (`maybe_start_essentials_retention/1'): the main run already trims the
+%% essentials store after itself, so the two never both run.
 maybe_start_retention(Opts) ->
     case hb_util:atom(hb_opts:get(<<"store-retention">>, false, Opts)) of
         true -> start_retention(Opts);
+        _ -> maybe_start_essentials_retention(Opts)
+    end.
+
+%% @doc Essentials (chain) retention on its own, without the main-store
+%% sweep: `retain_essentials/2' with no main-store plan, so each process's
+%% floor is its oldest kept state-blob checkpoint (`ess_need/3'), and a process
+%% without one keeps everything. No scan of the main store. Started when
+%% `essentials-retention-days' is set and `essentials-export' is configured
+%% (without an export nothing may be pruned). Every
+%% `essentials-retention-interval-ms' (default `store-retention-interval-ms',
+%% else 10 minutes), first after `store-retention-first-ms'.
+maybe_start_essentials_retention(Opts) ->
+    case {ess_days_ms(Opts), hb_opts:get(<<"essentials-export">>, undefined, Opts)} of
+        {undefined, _} -> ok;
+        {_, Export} when is_map(Export) -> start_essentials_retention(Opts);
         _ -> ok
     end.
+
+start_essentials_retention(Opts) ->
+    case whereis(?ESS_SERVER) of
+        undefined ->
+            Pid = spawn(fun() -> ess_server_init(Opts) end),
+            try register(?ESS_SERVER, Pid), ok
+            catch error:badarg -> exit(Pid, kill), ok
+            end;
+        _ -> ok
+    end.
+
+stop_essentials_retention() ->
+    case whereis(?ESS_SERVER) of
+        undefined -> ok;
+        Pid -> exit(Pid, kill), ok
+    end.
+
+ess_server_init(Opts) ->
+    erlang:send_after(ret_opt(<<"store-retention-first-ms">>, 60000, Opts), self(), run),
+    ess_server(Opts).
+
+ess_server(Opts) ->
+    receive
+        run ->
+            _ = ess_retain_safely(Opts),
+            erlang:send_after(ess_interval(Opts), self(), run),
+            ess_server(Opts);
+        {run_now, From, Ref} ->
+            From ! {Ref, ess_retain_safely(Opts)},
+            ess_server(Opts)
+    end.
+
+ess_interval(Opts) ->
+    ret_opt(<<"essentials-retention-interval-ms">>,
+        ret_opt(<<"store-retention-interval-ms">>, ?RET_DEFAULT_INTERVAL, Opts), Opts).
+
+%% @doc Run the essentials-only retention once now, in its server when one
+%% runs, else inline.
+run_essentials_retention(Opts) ->
+    case whereis(?ESS_SERVER) of
+        undefined -> ess_retain_safely(Opts);
+        Pid ->
+            Ref = make_ref(),
+            Pid ! {run_now, self(), Ref},
+            receive {Ref, R} -> R after infinity -> timeout end
+    end.
+
+%% Under the same run lock as the main retention, so a manual main run never
+%% overlaps it.
+ess_retain_safely(Opts) ->
+    Report =
+        case run_lock() of
+            false -> #{ status => already_running };
+            true ->
+                try
+                    duty_start(),
+                    retain_essentials(Opts, #{})
+                catch C:R:St ->
+                    ?event(error, {essentials_retention_failed, C, R, {trace, St}}),
+                    #{ status => failed, error => {C, R} }
+                after
+                    run_unlock()
+                end
+        end,
+    Prev = persistent_term:get(?ESS_STATUS, #{}),
+    persistent_term:put(?ESS_STATUS,
+        Prev#{ last_run => Report#{ finished_at => os:system_time(second) },
+               runs => maps:get(runs, Prev, 0) + 1,
+               total_deleted_keys =>
+                   maps:get(total_deleted_keys, Prev, 0) + maps:get(deleted_keys, Report, 0),
+               total_pruned_assignments =>
+                   maps:get(total_pruned_assignments, Prev, 0) +
+                       max(0, maps:get(pruned_assignments, Report, 0)) }),
+    ?event(store_retention, {essentials_retention_run, Report}),
+    Report.
+
+%% @doc The essentials-only loop's last report and totals.
+essentials_retention_status() ->
+    (persistent_term:get(?ESS_STATUS, #{}))#{ server => whereis(?ESS_SERVER) =/= undefined }.
 
 start_retention(Opts) ->
     case whereis(?RET_SERVER) of

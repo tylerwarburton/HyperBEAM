@@ -208,3 +208,43 @@ Plain restart over a t1 store: same row format; t1's results rows remain.
 Not in t2 (per-request writes, not results; patch kept separately): request
 parsing, the result cache of `POST /schedule` and the assignment commit still
 write ~17 KB per scheduled+read slot to the main store.
+
+### `upgrades-t3` (on top of t2 `4affa6852`)
+
+What t2 still wrote to the main store per message, content-addressed and never
+collected (~72 KB/slot on prod under the battle contracts, ~7 GB/h), and the
+chain trim that only ran inside the disabled main-store sweep.
+
+- `push-cache-messages` (default `true` = old behaviour; prod sets `false`):
+  the push path writes nothing to the main store. No pre-schedule copy of the
+  signed message; signing offloads the linked nested messages through the
+  essentials writer's options (`hb_store_essentials:opts/1`), i.e. into the
+  essentials store with the rest of the message's closure; the local schedule
+  call and the downstream push use the node's `cache-control` instead of
+  `always`. Remote targets unchanged (`remote_schedule_result/3` keeps its own
+  copy).
+- Assignment commit (`dev_scheduler_server:commit_assignment/2`) offloads
+  through the essentials writer's options (unconditional; identity without an
+  essentials store).
+- `POST /schedule` result: marked `stored-elsewhere` (private) so
+  `hb_cache_control` skips re-writing process, message and assignment into the
+  main store.
+- Request parsing (`hb_singleton`) converts with `linkify-mode` false: no
+  per-request writes of nested request parts.
+- Standalone essentials retention: with `store-retention` not true and
+  `essentials-retention-days` + `essentials-export` set, a small loop
+  (`hb_store_gc:maybe_start_essentials_retention/1`) runs
+  `retain_essentials(Opts, #{})` every `essentials-retention-interval-ms`
+  (default `store-retention-interval-ms`, 10 min). Floor per process = its
+  oldest `pstate/<p>/s/` checkpoint (one listing; no main-store scan); a process
+  without one keeps everything. Fractional days work. Status:
+  `hb_store_gc:essentials_retention_status/0`. It still scans the essentials
+  store for references, so keep the local window small (prod: 0.25 days) and
+  the interval long (prod: 1 h).
+
+Tests: `push_cache_messages_test_` (off: pushed messages in the essentials
+store, none in the main store; on: copies in main), and
+`essentials_retention_standalone_blobs_test_` (prunes to the oldest blob
+checkpoint and not below, 0.25 days keeps all, cold resume, boot start only
+when configured). Pre-existing failures unchanged from t2 in the image test
+env: dev_push `test_push_prompts_encoding_change`, dev_scheduler 4 legacy HTTP.

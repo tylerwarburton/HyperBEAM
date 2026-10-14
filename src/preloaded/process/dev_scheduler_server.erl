@@ -388,7 +388,13 @@ do_assign(State, Message, ReplyPID, AbortTime) ->
 %% @doc Commit to the assignment using all of our appropriate wallets.
 commit_assignment(BaseAssignment, State) ->
     Wallets = maps:get(wallets, State),
-    Opts = maps:get(opts, State),
+    % Committing offloads the nested messages it links (the assignment's body
+    % and its closure) to the first store of the options: the essentials
+    % writer's options put them in the essentials store, where
+    % `dev_scheduler_cache:write/2' stores the same rows next, not in the main
+    % store, where nothing collects them. Unchanged without an essentials
+    % store (`hb_store_essentials:opts/1').
+    Opts = hb_store_essentials:opts(maps:get(opts, State)),
     CommittmentSpec = maps:get(committment_spec, State),
     lists:foldr(
         fun(Wallet, Assignment) ->

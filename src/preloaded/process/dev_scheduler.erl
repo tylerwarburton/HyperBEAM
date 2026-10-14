@@ -531,7 +531,7 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
                     {is_alive, is_process_alive(PID)}
                 }
             ),
-            {ok, assigned(ProcID, PID, dev_scheduler_server:schedule(PID, Req), Opts)};
+            {ok, stored_elsewhere(assigned(ProcID, PID, dev_scheduler_server:schedule(PID, Req), Opts))};
         {true, _} ->
             ?event(
                 {scheduling_message,
@@ -541,8 +541,19 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
                 }
             ),
             % If Request is not a process, use the ID of Base as the PID
-            {ok, assigned(ProcID, PID, dev_scheduler_server:schedule(PID, Req), Opts)}
+            {ok, stored_elsewhere(assigned(ProcID, PID, dev_scheduler_server:schedule(PID, Req), Opts))}
     end.
+
+%% @doc The scheduler writes every assignment, with its message, through its
+%% own cache (`dev_scheduler_cache', to the essentials store when there is
+%% one). Mark it, so the resolver's result cache -- which every HTTP request
+%% asks to `always' store -- does not write the process, the message and the
+%% assignment again into the main store.
+stored_elsewhere(Assignment) when is_map(Assignment) ->
+    hb_private:set_priv(Assignment,
+        (hb_private:from_message(Assignment))#{ <<"stored-elsewhere">> => true });
+stored_elsewhere(Other) ->
+    Other.
 
 %% @doc A slot has been assigned locally. With `process-compute-on-schedule',
 %% wake the process's background catch-up to compute it; the call only sends a

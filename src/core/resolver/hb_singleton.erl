@@ -276,6 +276,14 @@ parse_scope(KeyBin) ->
         _ -> global
     end.
 
+%% @doc The options a request part is converted under. The conversion is a
+%% round trip in memory; with the default `linkify-mode' (`offload') it wrote
+%% every nested message of every request -- headers, sub-paths, slot numbers --
+%% to the store under its ID, unique per request and never read back, so the
+%% store grew with every HTTP read. Inline, nothing is written.
+build_opts(Opts) ->
+    Opts#{ <<"topic">> => ao_internal, <<"linkify-mode">> => false }.
+
 %% @doc Step 5: Merge the base message with the scoped messages.
 build_messages(Msgs, ScopedModifications, Opts) ->
     do_build(1, Msgs, ScopedModifications, Opts).
@@ -312,7 +320,7 @@ do_build(I, [{as, DevID, RawMsg} | Rest], ScopedKeys, Opts) when is_map(RawMsg) 
     StepMsg = hb_message:convert(
         Merged, 
         <<"structured@1.0">>, 
-        Opts#{ <<"topic">> => ao_internal }
+        build_opts(Opts)
     ),
     ?event_debug(parsing, {build_messages, {base, Msg}, {additional, Additional}}),
     [{as, DevID, StepMsg} | do_build(I + 1, Rest, ScopedKeys, Opts)];
@@ -324,7 +332,7 @@ do_build(I, [Msg | Rest], ScopedKeys, Opts) ->
     StepMsg = hb_message:convert(
         Merged, 
         <<"structured@1.0">>, 
-        Opts#{ <<"topic">> => ao_internal }
+        build_opts(Opts)
     ),
     ?event_debug(parsing, {build_messages, {base, Msg}, {additional, Additional}}),
     [StepMsg | do_build(I + 1, Rest, ScopedKeys, Opts)].
