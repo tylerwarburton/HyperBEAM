@@ -17,6 +17,24 @@ process_id(Base, Req, Opts) ->
         not_found ->
             process_id(ensure_process_key(Base, Opts), Req, Opts);
         Process ->
+            Spec = hb_util:atom(maps:get(<<"commitments">>, Req, <<"signed">>)),
+            Key = {crypto:hash(sha256, term_to_binary(Process)), Spec},
+            case cached_id(Key) of
+                {ok, ID} -> ID;
+                not_found ->
+                    ID = verified_id(Process, Spec, Opts),
+                    cache_id(Key, ID),
+                    ID
+            end
+    end.
+
+%% @doc Verify a process definition and return its ID. Every `now' read, every
+%% compute and every scheduler call asks for the process ID, and verifying the
+%% definition -- RSA-PSS plus httpsig normalisation of the whole message,
+%% including its module -- was the largest single cost in a busy process
+%% worker after Lua itself. The result depends only on the message, so it is
+%% cached by the message's exact serialized form.
+verified_id(Process, Spec, Opts) ->
             Signers = hb_message:signers(Process, Opts),
             case {hb_message:verify(Process, all, Opts), Signers} of
                 {false, _} ->
@@ -26,12 +44,57 @@ process_id(Base, Req, Opts) ->
                     ?event({process_has_no_signers, {process, Process}}),
                     throw({process_has_no_signers, Process});
                 {true, _} ->
-                    hb_message:id(
-                        Process,
-                        hb_util:atom(maps:get(<<"commitments">>, Req, <<"signed">>)),
-                        Opts
-                    )
-            end
+                    hb_message:id(Process, Spec, Opts)
+            end.
+
+-define(PROCESS_IDS, lib_process_verified_ids).
+-define(PROCESS_IDS_MAX, 10000).
+
+cached_id(Key) ->
+    try ets:lookup(?PROCESS_IDS, Key) of
+        [{Key, ID}] -> {ok, ID};
+        [] -> not_found
+    catch error:badarg -> not_found
+    end.
+
+cache_id(Key, ID) ->
+    ensure_ids_table(),
+    try
+        case ets:info(?PROCESS_IDS, size) of
+            Size when Size >= ?PROCESS_IDS_MAX -> ets:delete_all_objects(?PROCESS_IDS);
+            _ -> ok
+        end,
+        ets:insert(?PROCESS_IDS, {Key, ID})
+    catch error:badarg -> ok
+    end,
+    ok.
+
+%% @doc The table is owned by a process that never exits: a table dies with its
+%% owner, and the first caller is usually a short-lived request.
+ensure_ids_table() ->
+    case ets:whereis(?PROCESS_IDS) of
+        undefined ->
+            Parent = self(),
+            Ref = make_ref(),
+            {Owner, Mon} =
+                spawn_monitor(
+                    fun() ->
+                        try ets:new(?PROCESS_IDS, [named_table, public, set, {read_concurrency, true}]) of
+                            _ ->
+                                Parent ! {Ref, created},
+                                receive after infinity -> ok end
+                        catch error:badarg -> Parent ! {Ref, exists}
+                        end
+                    end
+                ),
+            receive
+                {Ref, _} -> ok;
+                {'DOWN', Mon, process, Owner, _} -> ok
+            after 5000 -> ok
+            end,
+            erlang:demonitor(Mon, [flush]),
+            ok;
+        _ -> ok
     end.
 
 %% @doc Run a message against Base, with the device being swapped out for

@@ -1,0 +1,35 @@
+# RuneRealm production HyperBEAM node (Box B).
+# Source: fork branch edge-local-deployed = upstream 14e9f68a6 + 8 fork commits
+# + the three edits that were live-but-uncommitted on Box A.
+# Layer order matches the benchmark image so the erlang/apt/node/rust layers hit cache.
+FROM erlang:27
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake git curl pkg-config libssl-dev ncurses-dev \
+      ca-certificates jq procps net-tools dos2unix \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /app
+COPY . /app
+
+RUN git config --global --add safe.directory /app \
+    && find /app/scripts /app/native -type f \( -name "*.escript" -o -name "*.sh" -o -name "Makefile" \) -print0 | xargs -0 dos2unix -q \
+    && dos2unix -q /app/Makefile \
+    && touch /app/config.flat
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN rebar3 as rocksdb,genesis_wasm get-deps \
+    && patch --forward --batch -p1 \
+        -d _build/rocksdb+genesis_wasm/lib/luerl \
+        < patches/luerl-incremental-gc.patch
+RUN rebar3 as rocksdb,genesis_wasm release 2>&1 | tail -80
+
+EXPOSE 10000
+CMD ["/app/_build/rocksdb+genesis_wasm/rel/hb/bin/hb", "foreground"]

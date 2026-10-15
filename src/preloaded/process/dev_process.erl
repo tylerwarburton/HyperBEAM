@@ -43,7 +43,7 @@
 -device_libraries([lib_process]).
 %%% Public API
 -export([info/1, as/3, compute/3, schedule/3, slot/3, now/3, push/3, snapshot/3]).
--export([target_slot/2]).
+-export([target_slot/2, is_cached_state/1]).
 -export([default_device/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("include/hb.hrl").
@@ -217,7 +217,7 @@ compute(Base, Req, Opts) ->
                             {result, Result}
                         }
                     ),
-                    {ok, without_snapshot(Result, Opts)};
+                    {ok, mark_cached_state(without_snapshot(Result, Opts), Opts)};
                 {error, not_found} ->
                     {ok, Loaded} = ensure_loaded(ProcBase, Req, Opts),
                     ?event(compute,
@@ -236,21 +236,57 @@ compute(Base, Req, Opts) ->
     end.
 
 %% @doc Return the slot requested by a `compute' request, or `not_found'.
+%%
+%% A slot reference can arrive HTTP-wrapped as a typed-result map (e.g.
+%% `#{<<"ao-result">> => <<"body">>, <<"body">> => <<"243">>}') rather than as
+%% the bare scalar, because a path segment such as `compute&slot=243' is parsed
+%% into a sub-message. Unwrap it here, at the single point that produces the
+%% value, so every caller receives a scalar and no caller needs an unwrapper of
+%% its own. Callers still coerce with `hb_util:int/1' as before.
+%%
+%% Previously `compute/3' passed the map straight into `hb_util:int/1', raising
+%% a `function_clause' that killed the process worker. The next request then
+%% cold-resumed from the last snapshot: one full re-execution of the preceding
+%% slot in the steady state, and up to `process-snapshot-slots' of replay after
+%% a gap. Measured on this node before the fix: 171 worker deaths in 26 minutes,
+%% an execution factor of 1.99, and read latency of 474ms per replayed slot
+%% (r=0.982) reaching 77 seconds at depth 141. (local patch over upstream edge.)
 target_slot(Req, Opts) ->
-    hb_ao:get_first(
-        [
-            {{as, <<"message@1.0">>, Req}, <<"compute">>},
-            {{as, <<"message@1.0">>, Req}, <<"slot">>}
-        ],
-        Opts
+    unwrap_slot(
+        hb_ao:get_first(
+            [
+                {{as, <<"message@1.0">>, Req}, <<"compute">>},
+                {{as, <<"message@1.0">>, Req}, <<"slot">>}
+            ],
+            Opts
+        )
     ).
+
+%% @doc Unwrap an HTTP typed-result map to the scalar it carries. Any other
+%% term -- including `not_found', which both callers depend on -- is returned
+%% untouched.
+unwrap_slot(Slot) when is_map(Slot) ->
+    maps:get(maps:get(<<"ao-result">>, Slot, <<"body">>), Slot, Slot);
+unwrap_slot(Slot) ->
+    Slot.
 
 %% @doc Continually get and apply the next assignment from the scheduler until
 %% we reach the target slot that the user has requested.
 compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
+    compute_to_slot(ProcID, Base, Req, TargetSlot, Opts, false).
+compute_to_slot(ProcID, Base, Req, TargetSlot, Opts, Stored) ->
     case hb_ao:get(<<"at-slot">>, Base, Opts#{ <<"hashpath">> => ignore }) of
         CurrentSlot when CurrentSlot == TargetSlot ->
-            % We reached the target height so we force a snapshot and return.
+            % We reached the target height and return. The snapshot here is
+            % gated on the configured cadence (`process_snapshot_slots' /
+            % `process_snapshot_time') instead of being forced every slot:
+            % forcing a full-state snapshot on every latest slot dumps the
+            % entire process heap (100s of MB for large Luerl/WASM processes)
+            % on every action, blocking the node for seconds per slot and
+            % filling disk. Cadence-gating leaves a resume point (first compute
+            % always snapshots; then every interval) while cold-resume replays
+            % only the slots since the last snapshot. (local override of the
+            % upstream force-snapshot behavior.)
             ?event(compute_short,
                 {reached_target_slot_returning_state,
                     {proc_id, ProcID},
@@ -258,7 +294,10 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
                 },
                 Opts
             ),
-            store_result(true, ProcID, TargetSlot, Base, Req, Opts),
+            case Stored of
+                false -> store_result(false, ProcID, TargetSlot, Base, Req, Opts);
+                true -> ok
+            end,
             {ok, without_snapshot(lib_process:as_process(Base, Opts), Opts)};
         CurrentSlot when CurrentSlot < TargetSlot ->
             % Compute the next state transition.
@@ -293,7 +332,8 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
                                 NewState,
                                 Req,
                                 TargetSlot,
-                                Opts
+                                Opts,
+                                true
                             );
                         {error, Error} ->
                             % Forward error details back to the caller.
@@ -385,7 +425,6 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                     {prep_ms, PrepTimeMicroSecs div 1000},
                     {execution_ms, RuntimeMicroSecs div 1000},
                     {store_ms, StoreTimeMicroSecs div 1000},
-                    {computed_slot_size, erlang:external_size(NewProcStateMsgWithSlot)},
                     {action,
                         hb_ao:get(
                             <<"body/action">>,
@@ -578,11 +617,35 @@ store_result(ForceSnapshot, ProcID, Slot, Res, Req, Opts) ->
 %% `process_snapshot_slots' option. If it is set, we check if the slot is
 %% a multiple of the interval. If either are true, we must snapshot.
 should_snapshot(Slot, Res, Opts) ->
-    should_snapshot_slots(Slot, Opts) orelse should_snapshot_time(Res, Opts).
+    case hb_private:get(
+        <<"process-cache-delta">>,
+        Res,
+        not_found,
+        Opts#{ <<"hashpath">> => ignore }
+    ) of
+        Delta when is_map(Delta) ->
+            should_snapshot_delta_slots(Slot, Opts);
+        _ ->
+            should_snapshot_slots(Slot, Opts) orelse
+                should_snapshot_time(Res, Opts)
+    end.
+
+%% @doc `lua@5.3b' public checkpoints and VM snapshots use one cadence. The
+%% production `lua@5.3a' cadence remains untouched.
+should_snapshot_delta_slots(Slot, Opts) ->
+    RawInterval = hb_opts:get(
+        <<"process-delta-checkpoint-slots">>,
+        1000,
+        Opts
+    ),
+    case hb_util:int(RawInterval) of
+        Interval when Interval > 0 -> Slot rem Interval == 0;
+        _ -> erlang:error({invalid_process_delta_checkpoint_slots, RawInterval})
+    end.
 
 %% @doc Calculate if we should snapshot based on the number of slots.
 should_snapshot_slots(Slot, Opts) ->
-    case hb_opts:get(process_snapshot_slots, ?DEFAULT_SNAPSHOT_SLOTS, Opts) of
+    case hb_opts:get(<<"process-snapshot-slots">>, ?DEFAULT_SNAPSHOT_SLOTS, Opts) of
         Undef when (Undef == undefined) or (Undef == <<"false">>) ->
             false;
         RawSnapshotSlots ->
@@ -593,7 +656,7 @@ should_snapshot_slots(Slot, Opts) ->
 %% @doc Calculate if we should snapshot based on the elapsed time since the last
 %% snapshot.
 should_snapshot_time(Res, Opts) ->
-    case hb_opts:get(process_snapshot_time, ?DEFAULT_SNAPSHOT_TIME, Opts) of
+    case hb_opts:get(<<"process-snapshot-time">>, ?DEFAULT_SNAPSHOT_TIME, Opts) of
         Undef when (Undef == undefined) or (Undef == <<"false">>) ->
             false;
         RawSecs ->
@@ -649,7 +712,14 @@ now(RawBase, Req, Opts) ->
             LatestKnown = dev_process_cache:latest(ProcessID, [], Opts),
             case LatestKnown of
                 {ok, LatestSlot, RawLatestMsg} ->
-                    LatestMsg = without_snapshot(RawLatestMsg, Opts),
+                    % Marked as a cache hit: it is public state only (never a
+                    % base to compute from), and the store already holds it,
+                    % so result caching must not write it back on every read.
+                    LatestMsg =
+                        mark_cached_state(
+                            without_snapshot(RawLatestMsg, Opts),
+                            Opts
+                        ),
                     ?event(compute_cache,
                         {serving_latest_cached_state,
                             {proc_id, ProcessID},
@@ -691,6 +761,21 @@ push(Base, Req, Opts) ->
 %% @doc Ensure that the process message we have in memory is live and
 %% up-to-date.
 ensure_loaded(Base, Req, Opts) ->
+    case is_cached_state(Base) of
+        true ->
+            % A state read back from the cache (or sent to a listener) is
+            % public only: it has no execution-device state, so it must never
+            % be computed onward. Restore from the process definition instead.
+            ensure_loaded_state(
+                hb_maps:get(<<"process">>, Base, Base, Opts),
+                Req,
+                Opts
+            );
+        false ->
+            ensure_loaded_state(Base, Req, Opts)
+    end.
+
+ensure_loaded_state(Base, Req, Opts) ->
     % Get the nonce we are currently on and the inbound nonce.
     TargetSlot = hb_ao:get(<<"slot">>, Req, undefined, Opts),
     ProcID = lib_process:process_id(Base, #{}, Opts),
@@ -791,6 +876,67 @@ ensure_loaded(Base, Req, Opts) ->
             end
     end.
 
+%% @doc Mark a state that was read back from the process cache. Cached states
+%% are public only: they carry no execution-device state (for Lua, no VM), so
+%% they are answers, never a base to compute the next slot from.
+mark_cached_state(Msg, Opts) ->
+    hb_private:set(Msg, #{ <<"process-cached-state">> => true }, Opts).
+
+%% @doc Return `true' if a state came from the process cache rather than from
+%% executing the process.
+is_cached_state(Msg) ->
+    maps:get(<<"process-cached-state">>, hb_private:from_message(Msg), false)
+        =:= true.
+
 %% @doc Remove the `snapshot' key from a message and return it.
 without_snapshot(Msg, Opts) ->
     hb_ao:set(Msg, <<"snapshot">>, unset, Opts).
+
+%% @doc A 5.3b process uses the delta checkpoint cadence rather than the
+%% production 5.3a slot/time cadence.
+%% @doc A process definition is verified once, not on every request; a
+%% different (tampered) definition is still verified and rejected.
+process_id_verifies_once_test() ->
+    application:ensure_all_started(hb),
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+        <<"priv-wallet">> => ar_wallet:new()
+    },
+    Process = hb_process_test_vectors:aos_process(Opts),
+    Base = #{ <<"process">> => Process },
+    Verifies =
+        fun(Fun) ->
+            erlang:trace_pattern({hb_message, verify, 3}, true, [call_count]),
+            Res = Fun(),
+            {call_count, N} = erlang:trace_info({hb_message, verify, 3}, call_count),
+            erlang:trace_pattern({hb_message, verify, 3}, false, [call_count]),
+            {Res, N}
+        end,
+    {ID, _} = Verifies(fun() -> lib_process:process_id(Base, #{}, Opts) end),
+    ?assertEqual(hb_message:id(Process, signed, Opts), ID),
+    ?assertEqual(
+        {ID, 0},
+        Verifies(fun() -> lib_process:process_id(Base, #{}, Opts) end)
+    ),
+    Tampered = Process#{ <<"scheduler-location">> => <<"someone-else">> },
+    ?assertThrow(
+        {process_not_verified, _},
+        lib_process:process_id(#{ <<"process">> => Tampered }, #{}, Opts)
+    ).
+
+delta_snapshot_cadence_test() ->
+    Opts = #{
+        <<"process-snapshot-slots">> => 50,
+        <<"process-snapshot-time">> => 1,
+        <<"process-delta-checkpoint-slots">> => 1000
+    },
+    DeltaState = hb_private:set(
+        #{},
+        <<"process-cache-delta">>,
+        #{ <<"patches">> => [], <<"results">> => #{} },
+        Opts
+    ),
+    ?assert(should_snapshot(0, DeltaState, Opts)),
+    ?assertNot(should_snapshot(50, DeltaState, Opts)),
+    ?assertNot(should_snapshot(999, DeltaState, Opts)),
+    ?assert(should_snapshot(1000, DeltaState, Opts)).
