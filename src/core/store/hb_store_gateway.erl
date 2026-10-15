@@ -121,7 +121,10 @@ opts(Opts) ->
                             },
                             #{
                                 <<"template">> => <<"/raw">>,
-                                <<"nodes">> => [#{ <<"prefix">> => Node }]
+                                <<"nodes">> => [#{
+                                    <<"match">> => <<"^/arweave">>,
+                                    <<"with">> => Node
+                                }]
                             }
                         ]
                     };
@@ -154,6 +157,13 @@ opts(Opts) ->
     end.
 
 %%% Tests
+
+configured_arweave_raw_route_test() ->
+    Node = <<"https://arweave.net">>,
+    #{ <<"routes">> := [_, #{ <<"nodes">> := [RawRoute] }] } =
+        opts(#{ <<"node">> => Node }),
+    ?assertEqual(<<"^/arweave">>, maps:get(<<"match">>, RawRoute)),
+    ?assertEqual(Node, maps:get(<<"with">>, RawRoute)).
 
 %% @doc Store is accessible via the default options.
 graphql_as_store_test_() ->
