@@ -248,9 +248,12 @@ target_slot(Req, Opts) ->
 %% @doc Continually get and apply the next assignment from the scheduler until
 %% we reach the target slot that the user has requested.
 compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
+    compute_to_slot(ProcID, Base, Req, TargetSlot, Opts, false).
+compute_to_slot(ProcID, Base, Req, TargetSlot, Opts, Stored) ->
     case hb_ao:get(<<"at-slot">>, Base, Opts#{ <<"hashpath">> => ignore }) of
         CurrentSlot when CurrentSlot == TargetSlot ->
-            % We reached the target height so we force a snapshot and return.
+            % We reached the target height, so store it if the preceding walk
+            % did not already do so and return.
             ?event(compute_short,
                 {reached_target_slot_returning_state,
                     {proc_id, ProcID},
@@ -258,7 +261,18 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
                 },
                 Opts
             ),
-            store_result(true, ProcID, TargetSlot, Base, Req, Opts),
+            case Stored of
+                false ->
+                    store_result(
+                        force_target_snapshot(TargetSlot, TargetSlot, Opts),
+                        ProcID,
+                        TargetSlot,
+                        Base,
+                        Req,
+                        Opts
+                    );
+                true -> ok
+            end,
             {ok, without_snapshot(lib_process:as_process(Base, Opts), Opts)};
         CurrentSlot when CurrentSlot < TargetSlot ->
             % Compute the next state transition.
@@ -293,7 +307,8 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
                                 NewState,
                                 Req,
                                 TargetSlot,
-                                Opts
+                                Opts,
+                                true
                             );
                         {error, Error} ->
                             % Forward error details back to the caller.
@@ -368,7 +383,7 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                 timer:tc(
                     fun() ->
                         store_result(
-                            false,
+                            force_target_snapshot(Slot, TargetSlot, Opts),
                             ProcID,
                             Slot,
                             NewProcStateMsgWithSlot,
@@ -385,7 +400,6 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                     {prep_ms, PrepTimeMicroSecs div 1000},
                     {execution_ms, RuntimeMicroSecs div 1000},
                     {store_ms, StoreTimeMicroSecs div 1000},
-                    {computed_slot_size, erlang:external_size(NewProcStateMsgWithSlot)},
                     {action,
                         hb_ao:get(
                             <<"body/action">>,
@@ -572,6 +586,15 @@ store_result(ForceSnapshot, ProcID, Slot, Res, Req, Opts) ->
     ?event(compute, {caching_completed, {proc_id, ProcID}, {slot, Slot}}, Opts),
     hb_maps:without([<<"snapshot">>], ResMaybeWithSnapshot, Opts).
 
+%% @doc Should a requested target slot force a snapshot rather than use the
+%% configured slot and time cadence? Defaults to the existing force-on-target
+%% behavior.
+force_target_snapshot(Slot, TargetSlot, Opts) ->
+    Slot == TargetSlot andalso
+        hb_util:atom(
+            hb_opts:get(<<"process-force-target-snapshot">>, true, Opts)
+        ).
+
 %% @doc Should we snapshot a new full state result? First, we check if the 
 %% `process_snapshot_time' option is set. If it is, we check if the elapsed time
 %% since the last snapshot is greater than the value. We also check the
@@ -582,7 +605,7 @@ should_snapshot(Slot, Res, Opts) ->
 
 %% @doc Calculate if we should snapshot based on the number of slots.
 should_snapshot_slots(Slot, Opts) ->
-    case hb_opts:get(process_snapshot_slots, ?DEFAULT_SNAPSHOT_SLOTS, Opts) of
+    case hb_opts:get(<<"process-snapshot-slots">>, ?DEFAULT_SNAPSHOT_SLOTS, Opts) of
         Undef when (Undef == undefined) or (Undef == <<"false">>) ->
             false;
         RawSnapshotSlots ->
@@ -593,7 +616,7 @@ should_snapshot_slots(Slot, Opts) ->
 %% @doc Calculate if we should snapshot based on the elapsed time since the last
 %% snapshot.
 should_snapshot_time(Res, Opts) ->
-    case hb_opts:get(process_snapshot_time, ?DEFAULT_SNAPSHOT_TIME, Opts) of
+    case hb_opts:get(<<"process-snapshot-time">>, ?DEFAULT_SNAPSHOT_TIME, Opts) of
         Undef when (Undef == undefined) or (Undef == <<"false">>) ->
             false;
         RawSecs ->
@@ -794,3 +817,21 @@ ensure_loaded(Base, Req, Opts) ->
 %% @doc Remove the `snapshot' key from a message and return it.
 without_snapshot(Msg, Opts) ->
     hb_ao:set(Msg, <<"snapshot">>, unset, Opts).
+
+target_snapshot_policy_test() ->
+    ?assert(force_target_snapshot(3, 3, #{})),
+    ?assertNot(force_target_snapshot(2, 3, #{})),
+    ?assertNot(
+        force_target_snapshot(
+            3,
+            3,
+            #{ <<"process-force-target-snapshot">> => false }
+        )
+    ),
+    ?assertNot(
+        force_target_snapshot(
+            3,
+            3,
+            #{ <<"process-force-target-snapshot">> => <<"false">> }
+        )
+    ).
