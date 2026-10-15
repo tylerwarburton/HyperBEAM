@@ -80,7 +80,8 @@ start(ProcID, Proc, Opts) ->
                             remote_confirmation,
                             Opts
                         ),
-                    opts => Opts
+                    opts => Opts,
+                    uploader => start_uploader(Opts)
                 }
             )
         end
@@ -184,8 +185,24 @@ server(State) ->
         {info, Reply} ->
             Reply ! {info, State},
             server(State);
+        {'DOWN', _Ref, process, Uploader, Reason} ->
+            % The uploader is monitored, so its death cannot pass unnoticed.
+            % Replace it and carry on: uploads resume rather than falling back
+            % to the loop for the rest of the server's life.
+            case Uploader == maps:get(uploader, State) of
+                true ->
+                    ?event(warning,
+                        {scheduler_uploader_down, {reason, Reason}}
+                    ),
+                    server(
+                        State#{ uploader => start_uploader(maps:get(opts, State)) }
+                    );
+                false ->
+                    server(State)
+            end;
         stop ->
             ?event({stopping_scheduler_server, {proc_id, maps:get(id, State)}}),
+            maps:get(uploader, State) ! stop,
             ok
     end.
 
@@ -264,16 +281,40 @@ do_assign(State, Message, ReplyPID) ->
             ),
             ?event(writes_complete),
             ?event(uploading_message),
-            hb_client_remote:upload(Message, Opts),
-            hb_client_remote:upload(Assignment, Opts),
-            ?event(uploads_complete),
-            maybe_inform_recipient(
-                remote_confirmation,
-                ReplyPID,
-                Message,
-                Assignment,
-                State
-            )
+            % Uploading is a network round trip; running it from the loop
+            % holds the next slot behind the current slot's upload. Hand the
+            % uploads to a single uploader process that drains them off the
+            % loop, in slot order. The slot, commitment, and local cache write
+            % are synchronous above, so ordering and `local_confirmation' are
+            % unaffected; `remote_confirmation' informs from the uploader.
+            % When the uploader has fallen behind the bundler -- its mailbox
+            % has grown past `scheduler_upload_queue_max', or it is gone --
+            % upload on the loop instead, so a slow bundler becomes
+            % backpressure on the caller rather than unbounded memory.
+            Uploader = maps:get(uploader, State),
+            Max = hb_opts:get(scheduler_upload_queue_max, 64, Opts),
+            case erlang:process_info(Uploader, message_queue_len) of
+                {message_queue_len, Pending} when Pending < Max ->
+                    Uploader !
+                        {upload,
+                            Message,
+                            Assignment,
+                            maps:get(mode, State),
+                            ReplyPID
+                        };
+                _ ->
+                    UploadOpts = upload_opts(Opts),
+                    hb_client_remote:upload(Message, UploadOpts),
+                    hb_client_remote:upload(Assignment, UploadOpts),
+                    ?event(uploads_complete),
+                    maybe_inform_recipient(
+                        remote_confirmation,
+                        ReplyPID,
+                        Message,
+                        Assignment,
+                        State
+                    )
+            end
         end,
     case hb_opts:get(scheduling_mode, sync, Opts) of
         aggressive ->
@@ -313,6 +354,57 @@ maybe_inform_recipient(Mode, ReplyPID, Message, Assignment, State) ->
     case maps:get(mode, State) of
         Mode -> ReplyPID ! {scheduled, Message, Assignment};
         _ -> ok
+    end.
+
+%% @doc Start the uploader process for a scheduling server. It is monitored, so
+%% `server/1' is told if it dies and can replace it, and it runs with
+%% `upload_opts/1' rather than the raw server options.
+start_uploader(Opts) ->
+    {Uploader, _Ref} = spawn_monitor(fun() -> uploader(upload_opts(Opts)) end),
+    Uploader.
+
+%% @doc The options an assignment upload runs under: the server's options with
+%% request-scoped keys removed. `http-monitor' installs a per-request
+%% performance monitor, so an upload that runs after the request is answered --
+%% off the loop, or on it under backpressure -- must not fire it.
+upload_opts(Opts) ->
+    maps:remove(<<"http-monitor">>, Opts).
+
+%% @doc Drain assignment uploads to the bundler, off the scheduling loop and in
+%% the order they were sequenced. Uploading is a network round trip; run from
+%% the loop it would bound a process's assignment rate to upload latency. A
+%% single uploader per server keeps uploads in slot order and holds the
+%% in-flight upload count to one. Upload failures are swallowed, so a slow or
+%% failed bundler never stalls or crashes the scheduler; if the process does
+%% die, `server/1' replaces it. `remote_confirmation' is informed from here,
+%% after the upload.
+uploader(Opts) ->
+    receive
+        {upload, Message, Assignment, Mode, ReplyPID} ->
+            try
+                hb_client_remote:upload(Message, Opts),
+                hb_client_remote:upload(Assignment, Opts),
+                ?event(uploads_complete),
+                maybe_inform_recipient(
+                    remote_confirmation,
+                    ReplyPID,
+                    Message,
+                    Assignment,
+                    #{ mode => Mode }
+                )
+            catch
+                Class:Reason:Stack ->
+                    ?event(error,
+                        {upload_failed,
+                            {class, Class},
+                            {reason, Reason},
+                            {trace, Stack}
+                        }
+                    )
+            end,
+            uploader(Opts);
+        stop ->
+            ok
     end.
 
 %% @doc Find the hashpath of the base state upon which a new assignment should
@@ -368,7 +460,95 @@ new_proc_test() ->
         #{ current := 2 },
         dev_scheduler_server:info(dev_scheduler_registry:find(ID))
     ).
-    
+
+%% @doc Assignments are sequenced on the loop while their uploads are drained
+%% off it, so a run of scheduling requests still advances the slot by one each
+%% time and leaves every assignment in the local cache -- independently of
+%% whether the bundler upload has completed.
+async_upload_preserves_sequence_test() ->
+    Wallet = ar_wallet:new(),
+    Proc = hb_message:commit(
+        #{ <<"data">> => <<"test">>, <<"random-key">> => rand:uniform(10000) },
+        #{ <<"priv-wallet">> => Wallet }
+    ),
+    ID = hb_message:id(Proc, all),
+    dev_scheduler_registry:find(ID, Proc),
+    Messages =
+        [
+            hb_message:commit(
+                #{ <<"data">> => <<"message">>, <<"index">> => N },
+                #{ <<"priv-wallet">> => Wallet }
+            )
+        ||
+            N <- lists:seq(1, 5)
+        ],
+    lists:foreach(fun(Message) -> schedule(ID, Message) end, Messages),
+    State = dev_scheduler_server:info(dev_scheduler_registry:find(ID)),
+    % The five messages land on slots 0..4 in order.
+    ?assertMatch(#{ current := 4 }, State),
+    % Every assignment is readable from the local cache, written on the loop
+    % and not gated on the upload.
+    Opts = maps:get(opts, State),
+    lists:foreach(
+        fun(Slot) ->
+            ?assertMatch({ok, _}, dev_scheduler_cache:read(ID, Slot, Opts))
+        end,
+        lists:seq(0, 4)
+    ).
+
+%% @doc Killing the uploader must neither take the scheduler down nor stop
+%% uploads: the server is monitoring it and brings a fresh one back, and
+%% assignment continues throughout.
+uploader_respawns_after_death_test() ->
+    Wallet = ar_wallet:new(),
+    Proc = hb_message:commit(
+        #{ <<"data">> => <<"test">>, <<"random-key">> => rand:uniform(10000) },
+        #{ <<"priv-wallet">> => Wallet }
+    ),
+    ID = hb_message:id(Proc, all),
+    dev_scheduler_registry:find(ID, Proc),
+    Server = dev_scheduler_registry:find(ID),
+    #{ uploader := Uploader } = dev_scheduler_server:info(Server),
+    ?assert(erlang:is_process_alive(Uploader)),
+    exit(Uploader, kill),
+    schedule(ID,
+        hb_message:commit(
+            #{ <<"data">> => <<"after-kill">> },
+            #{ <<"priv-wallet">> => Wallet }
+        )
+    ),
+    % The assignment still landed, and a new uploader is running in place of
+    % the killed one.
+    #{ current := Current, uploader := NewUploader } =
+        dev_scheduler_server:info(Server),
+    ?assertEqual(0, Current),
+    ?assert(erlang:is_process_alive(NewUploader)),
+    ?assertNotEqual(Uploader, NewUploader).
+
+%% @doc A zero queue bound forces every upload onto the loop, so this exercises
+%% the inline backpressure branch: assignment must still sequence correctly
+%% when the uploader is bypassed.
+upload_backpressure_falls_back_inline_test() ->
+    Wallet = ar_wallet:new(),
+    Proc = hb_message:commit(
+        #{ <<"data">> => <<"test">>, <<"random-key">> => rand:uniform(10000) },
+        #{ <<"priv-wallet">> => Wallet }
+    ),
+    ID = hb_message:id(Proc, all),
+    dev_scheduler_registry:find(ID, Proc, #{ <<"scheduler-upload-queue-max">> => 0 }),
+    lists:foreach(
+        fun(N) ->
+            schedule(ID,
+                hb_message:commit(
+                    #{ <<"data">> => <<"message">>, <<"index">> => N },
+                    #{ <<"priv-wallet">> => Wallet }
+                )
+            )
+        end,
+        lists:seq(1, 3)
+    ),
+    ?assertMatch(#{ current := 2 },
+        dev_scheduler_server:info(dev_scheduler_registry:find(ID))).
 
 benchmark_test() ->
     BenchTime = 1,
