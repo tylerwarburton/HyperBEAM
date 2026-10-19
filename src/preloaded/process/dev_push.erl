@@ -80,10 +80,72 @@ push(Base, Req, Opts) ->
         _ -> push_with_mode(Process, Req, Opts)
     end.
 
+%% @doc Select between a fire-and-forget push and one whose result is
+%% returned to the caller. Both run the delivery outside the calling
+%% process.
 push_with_mode(Process, Req, Opts) ->
     case is_async(Process, Req, Opts) of
         true -> spawn(fun() -> do_push(Process, Req, Opts) end);
-        false -> do_push(Process, Req, Opts)
+        false -> detached_push(Process, Req, Opts)
+    end.
+
+%% @doc Run `do_push' in a process that is monitored but not linked, then
+%% block on its result. The caller of a `/push' served over HTTP is the
+%% Cowboy request process, which is killed the moment the client
+%% disconnects; the hop-by-hop delivery must not live there, or every
+%% outbox entry the recursion has not reached yet is silently dropped.
+%% The caller observes exactly what a direct call would yield, exceptions
+%% included: they are re-raised here with their original stacktrace.
+%% Recursive `/push'es raised by `push_downstream_local' already execute
+%% inside a detached process, so they run in-line.
+detached_push(Process, Req, Opts) ->
+    case hb_opts:get(push_detached, false, Opts) of
+        true -> do_push(Process, Req, Opts);
+        false ->
+            Caller = self(),
+            {Worker, Monitor} =
+                spawn_monitor(
+                    fun() ->
+                        Caller !
+                            {push_result,
+                                self(),
+                                run_push(
+                                    Process,
+                                    Req,
+                                    Opts#{ <<"push-detached">> => true }
+                                )
+                            }
+                    end
+                ),
+            await_detached_push(Worker, Monitor)
+    end.
+
+%% @doc Execute a push, tagging the outcome so that a detached worker can
+%% hand back either a result or the exception it hit.
+run_push(Process, Req, Opts) ->
+    try {ok, do_push(Process, Req, Opts)}
+    catch Class:Reason:Stacktrace -> {raise, Class, Reason, Stacktrace}
+    end.
+
+%% @doc Wait for the outcome of a detached push. A worker that exits before
+%% reporting has taken an exit signal of its own, so we surface it as a
+%% push failure rather than blocking forever.
+await_detached_push(Worker, Monitor) ->
+    receive
+        {push_result, Worker, {ok, Res}} ->
+            erlang:demonitor(Monitor, [flush]),
+            Res;
+        {push_result, Worker, {raise, Class, Reason, Stacktrace}} ->
+            erlang:demonitor(Monitor, [flush]),
+            erlang:raise(Class, Reason, Stacktrace);
+        {'DOWN', Monitor, process, Worker, Reason} ->
+            ?event(push, {push_worker_died, {reason, Reason}}),
+            {error,
+                #{
+                    <<"body">> => <<"The push worker exited before finishing.">>,
+                    <<"reason">> => hb_util:bin(hb_format:term(Reason))
+                }
+            }
     end.
 
 %% @doc Determine if the push is asynchronous. The boolean `async' key
@@ -992,6 +1054,11 @@ max_depth_test_cases() ->
 cron_depth_zero_push_test_() ->
     {timeout, 120, fun test_cron_depth_zero_push/0}.
 
+%% @doc Delivery of a slot's outbox does not depend on the process that asked
+%% for the push. Runs on its own because it kills a process mid-resolution.
+push_detachment_test_() ->
+    {timeout, 120, fun test_push_survives_caller_death/0}.
+
 test_paranoid_push_result() ->
     % The `push_result' topic verifies the result before it is signed for
     % POSTing (at the `apply_security' entry): corrupting a committed
@@ -1772,6 +1839,161 @@ test_compute_push_hook_idempotent() ->
     {ok, ReceiverSlot2} =
         hb_ao:resolve(Receiver, #{ <<"path">> => <<"slot/current">> }, Opts),
     ?assertEqual(ReceiverSlot1, ReceiverSlot2).
+
+%% @doc A `/push' whose caller vanishes mid-flight still delivers the source
+%% slot's outbox to its target. The caller is a throwaway process killed with
+%% an untrapped `shutdown' exit while the source slot is still computing --
+%% the teardown Cowboy applies to a request process when its client
+%% disconnects. Only a delivery that runs outside the caller can reach the
+%% receiver's scheduler afterwards.
+test_push_survives_caller_death() ->
+    {Sender, Receiver, MsgSlot, Opts} = setup_lua_push_pair(),
+    {ok, ReceiverSlot0} =
+        hb_ao:resolve(Receiver, #{ <<"path">> => <<"slot/current">> }, Opts),
+    Test = self(),
+    Caller =
+        spawn(
+            fun() ->
+                Test ! {pushing, self()},
+                hb_ao:resolve(
+                    Sender,
+                    #{ <<"path">> => <<"push">>, <<"slot">> => MsgSlot },
+                    Opts
+                )
+            end
+        ),
+    receive {pushing, Caller} -> ok
+    after 5000 -> erlang:error(caller_never_started)
+    end,
+    % Every slot of the sender sleeps for seconds inside `compute', so this
+    % kill lands long before the outbox reaches the receiver's scheduler.
+    timer:sleep(200),
+    Monitor = erlang:monitor(process, Caller),
+    exit(Caller, shutdown),
+    receive {'DOWN', Monitor, process, Caller, shutdown} -> ok
+    after 5000 -> erlang:error(caller_survived)
+    end,
+    ?assert(
+        wait_until(
+            fun() ->
+                {ok, Slot} =
+                    hb_ao:resolve(
+                        Receiver,
+                        #{ <<"path">> => <<"slot/current">> },
+                        Opts
+                    ),
+                Slot > ReceiverSlot0
+            end,
+            60000
+        )
+    ).
+
+%% @doc Stage a sender and a receiver `lua@5.3a' process and schedule -- without
+%% pushing -- one message on the sender. Every sender slot sleeps for seconds
+%% before emitting its single outbox entry, so a push against that slot is
+%% reliably still in flight for as long as the caller lives. Returns
+%% `{Sender, Receiver, MsgSlot, Opts}'.
+setup_lua_push_pair() ->
+    hb_process_test_vectors:init(),
+    Opts = #{
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"cache-control">> => <<"always">>,
+        <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)]
+    },
+    Receiver = lua_push_process(receiver_module(), Opts),
+    {ok, _} = hb_cache:write(Receiver, Opts),
+    {ok, _} = schedule_body(Receiver, Receiver, Opts),
+    Sender =
+        lua_push_process(
+            sender_module(hb_message:id(Receiver, all, Opts)),
+            Opts
+        ),
+    {ok, _} = hb_cache:write(Sender, Opts),
+    {ok, _} = schedule_body(Sender, Sender, Opts),
+    {ok, MsgSched} =
+        schedule_body(
+            Sender,
+            hb_message:commit(
+                #{
+                    <<"target">> => hb_message:id(Sender, all, Opts),
+                    <<"type">> => <<"Message">>,
+                    <<"action">> => <<"Fire">>
+                },
+                Opts
+            ),
+            Opts
+        ),
+    {ok, MsgSlot} = hb_ao:resolve(MsgSched, #{ <<"path">> => <<"slot">> }, Opts),
+    {Sender, Receiver, MsgSlot, Opts}.
+
+%% @doc POST a body onto a process's schedule.
+schedule_body(Process, Body, Opts) ->
+    hb_ao:resolve(
+        Process,
+        #{
+            <<"method">> => <<"POST">>,
+            <<"path">> => <<"schedule">>,
+            <<"body">> => Body
+        },
+        Opts
+    ).
+
+%% @doc Build a signed `lua@5.3a' process that runs the given module source.
+lua_push_process(Module, Opts) ->
+    Address =
+        hb_util:human_id(
+            ar_wallet:to_address(hb_opts:get(priv_wallet, hb:wallet(), Opts))
+        ),
+    hb_message:commit(
+        #{
+            <<"device">> => <<"process@1.0">>,
+            <<"type">> => <<"Process">>,
+            <<"scheduler-device">> => <<"scheduler@1.0">>,
+            <<"execution-device">> => <<"lua@5.3a">>,
+            <<"module">> =>
+                #{
+                    <<"content-type">> => <<"application/lua">>,
+                    <<"body">> => Module
+                },
+            <<"scheduler">> => Address,
+            <<"scheduler-location">> => Address,
+            <<"authority">> => Address,
+            <<"test-random-seed">> => rand:uniform(1337)
+        },
+        Opts
+    ).
+
+%% @doc A Lua module whose `compute' sleeps for three seconds -- four turns of
+%% `test-device@1.0/delay', which sleeps 750ms per call -- then emits a single
+%% outbox entry addressed to `TargetID'. The entry names its target with a
+%% lower-case `target', the shape `dev_push' dispatches on and the one the Lua
+%% processes this node runs emit.
+sender_module(TargetID) ->
+    <<
+        "function compute(process, message, opts)\n"
+        "  for i = 1, 4 do\n"
+        "    ao.resolve({ path = \"/~test-device@1.0/delay\" })\n"
+        "  end\n"
+        "  process.results = {\n"
+        "    outbox = {\n"
+        "      [\"1\"] = {\n"
+        "        target = \"", TargetID/binary, "\",\n"
+        "        action = \"Ping\"\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "  return process\n"
+        "end\n"
+    >>.
+
+%% @doc A Lua module whose `compute' emits no outbox, ending the push chain.
+receiver_module() ->
+    <<
+        "function compute(process, message, opts)\n"
+        "  process.results = { output = { data = \"pong\" } }\n"
+        "  return process\n"
+        "end\n"
+    >>.
 
 %% @doc Spin up two AOS processes -- a Sender and a Receiver with a `Reply'
 %% handler for `Action = "Ping"' -- and schedule (without pushing) a single
