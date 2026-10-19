@@ -97,8 +97,14 @@ lookup(Base, Req, Opts) ->
 %% @doc Is this a process state served from the process cache? The process
 %% device marks such states privately with `process-cached-state'.
 is_process_cached_state(Msg) ->
-    maps:get(<<"process-cached-state">>, hb_private:from_message(Msg), false)
-        =:= true.
+    Priv = hb_private:from_message(Msg),
+    maps:get(<<"process-cached-state">>, Priv, false) =:= true orelse
+        % A result its device has already written durably, where it belongs:
+        % a state just computed into the process cache, or an assignment the
+        % scheduler wrote with the chain (to the essentials store, when there
+        % is one). Writing it again here only duplicates it, content-addressed
+        % and never collected.
+        maps:get(<<"stored-elsewhere">>, Priv, false) =:= true.
 
 %% @doc Load an ID base required to execute the request.
 maybe_load_base(Base, Req, _Opts) when not ?IS_ID(Base) ->

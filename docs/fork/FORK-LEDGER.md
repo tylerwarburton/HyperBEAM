@@ -208,3 +208,80 @@ Plain restart over a t1 store: same row format; t1's results rows remain.
 Not in t2 (per-request writes, not results; patch kept separately): request
 parsing, the result cache of `POST /schedule` and the assignment commit still
 write ~17 KB per scheduled+read slot to the main store.
+
+### `upgrades-t3` (on top of t2 `4affa6852`)
+
+What t2 still wrote to the main store per message, content-addressed and never
+collected (~72 KB/slot on prod under the battle contracts, ~7 GB/h), and the
+chain trim that only ran inside the disabled main-store sweep.
+
+- `push-cache-messages` (default `true` = old behaviour; prod sets `false`):
+  the push path writes nothing to the main store. No pre-schedule copy of the
+  signed message; signing offloads the linked nested messages through the
+  essentials writer's options (`hb_store_essentials:opts/1`), i.e. into the
+  essentials store with the rest of the message's closure; the local schedule
+  call and the downstream push use the node's `cache-control` instead of
+  `always`. Remote targets unchanged (`remote_schedule_result/3` keeps its own
+  copy).
+- Assignment commit (`dev_scheduler_server:commit_assignment/2`) offloads
+  through the essentials writer's options (unconditional; identity without an
+  essentials store).
+- `POST /schedule` result: marked `stored-elsewhere` (private) so
+  `hb_cache_control` skips re-writing process, message and assignment into the
+  main store.
+- Request parsing (`hb_singleton`) converts with `linkify-mode` false: no
+  per-request writes of nested request parts.
+- Standalone essentials retention: with `store-retention` not true and
+  `essentials-retention-days` + `essentials-export` set, a small loop
+  (`hb_store_gc:maybe_start_essentials_retention/1`) runs
+  `retain_essentials(Opts, #{})` every `essentials-retention-interval-ms`
+  (default `store-retention-interval-ms`, 10 min). Floor per process = its
+  oldest `pstate/<p>/s/` checkpoint (one listing; no main-store scan); a process
+  without one keeps everything. Fractional days work. Status:
+  `hb_store_gc:essentials_retention_status/0`. It still scans the essentials
+  store for references, so keep the local window small (prod: 0.25 days) and
+  the interval long (prod: 1 h).
+
+Tests: `push_cache_messages_test_` (off: pushed messages in the essentials
+store, none in the main store; on: copies in main), and
+`essentials_retention_standalone_blobs_test_` (prunes to the oldest blob
+checkpoint and not below, 0.25 days keeps all, cold resume, boot start only
+when configured). Pre-existing failures unchanged from t2 in the image test
+env: dev_push `test_push_prompts_encoding_change`, dev_scheduler 4 legacy HTTP.
+
+### `upgrades-t4` (on top of t3 `0ed2aebb7`)
+
+The game worker's queue spiral (prod, 2026-10-14 ~02:00Z): 5,052 queued
+`compute` requests, each carrying its listener's options (~6,000 words, ~48 KB),
+68% of them from listeners that had already exited; the worker spent 4.77 s of
+every 5 s in minor collections (~72 ms each) and computed ~1 slot/s, so the
+queue only grew. Two options, both default off (old behaviour); prod turns both
+on:
+
+- `process-worker-off-heap-queue` (`hb_persistent:worker_spawn_opts/1`): spawn
+  process workers with `{message_queue_data, off_heap}`, so waiting requests
+  are not part of the worker's heap and no collection copies them. Mechanism
+  benchmark (large live heap, allocation-heavy slots, prod-sized requests
+  arriving continuously): on_heap 3.8 -> 36.6 ms/slot with 5,000 waiting;
+  off_heap 3.7 -> 3.6. Cost: a separate allocation per message received.
+- `process-worker-skip-abandoned` (`dev_process_worker:next_request/4`): a
+  request whose listener is a local process that has exited (the HTTP client
+  went away) is dropped when the worker reaches it, instead of being computed
+  for nobody. The slot it named is still computed by whatever next needs it.
+  Test hook: `process-worker-skip-hook`.
+
+Not added: a catch-up coalescing option. Compute-on-schedule already keeps at
+most one catch-up per process (registered in `hb_name`), which drains every
+wake to the newest target and waits for one compute at a time
+(`?CATCH_UP_WAIT_MS`); a hung one is bounded by that wait, a dead one is
+dropped by the registry lookup. The queue was readers, not catch-ups.
+
+Remaining main-store growth after t3 (~20 KB/slot) is the battle-fleet workers:
+they run `lua@5.3a` (full-state `compute(base, req)`), so `dev_process_cache`
+writes their full public state content-addressed every slot
+(`write_full/4`; blobs only cover delta processes), and with the full sweep off
+nothing collects it. Their state is ~3.6 MB and grows with every ended battle
+(`battle-fb*` keys are kept). Not fixed in the node: a per-slot full-state blob
+would compress and write ~3.6 MB per slot. The fix is contract-side: move the
+battle workers to `lua@5.3b` patches (they then use blobs), and/or prune ended
+battle views from their state.

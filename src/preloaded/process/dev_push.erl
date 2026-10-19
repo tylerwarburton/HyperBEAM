@@ -942,11 +942,16 @@ push_downstream_local(TargetID, NextSlotOnProc, Origin, Opts) ->
             N when is_integer(N), N > 0 ->
                 BaseReq#{ <<"max-depth">> => N - 1 }
         end,
-    hb_ao:resolve(
-        {as, <<"process@1.0">>, TargetID},
-        Req,
-        Opts#{ <<"cache-control">> => <<"always">> }
-    ).
+    % With `push-cache-messages' false, the node's own `cache-control': the
+    % pushed slot is computed and stored by the process device either way,
+    % and `always' wrote the push's response tree to the main store, where
+    % nothing collects it.
+    PushOpts =
+        case hb_util:atom(hb_opts:get(<<"push-cache-messages">>, true, Opts)) of
+            false -> Opts;
+            _ -> Opts#{ <<"cache-control">> => <<"always">> }
+        end,
+    hb_ao:resolve({as, <<"process@1.0">>, TargetID}, Req, PushOpts).
 
 %% @doc Options for computing the pushed slot. A push computes its process
 %% from inside another resolution, and `hb_ao' strips `spawn-worker' from
@@ -1067,12 +1072,44 @@ schedule_result(TargetProcess, MsgToPush, Codec, Origin, Opts) ->
     ),
     AugmentedMsg = augment_message(Origin, MsgToPush, Opts),
     ?event(push, {prepared_msg, {msg, AugmentedMsg}}, Opts),
+    % With `push-cache-messages' false (default true) the push writes nothing
+    % to the main store: every copy of a pushed message there is
+    % content-addressed and nothing ever collects it.
+    %   - No copy of the signed message before scheduling: the schedule
+    %     request carries it, a local scheduler stores it with its assignment
+    %     (in the essentials store when one is configured), and a redirect to
+    %     a remote scheduler writes the re-signed copy it sends
+    %     (`remote_schedule_result/3').
+    %   - Signing offloads the nested messages it links (`linkify-mode'
+    %     offload) through the essentials writer's options, so they land in
+    %     the essentials store with the rest of the message's closure, which
+    %     the scheduler writes there anyway (`hb_store_essentials:opts/1';
+    %     the node's options unchanged without an essentials store).
+    %   - The schedule request is resolved with the node's `cache-control',
+    %     not `always': its response (the assignment) is already stored by
+    %     the scheduler.
+    CacheMsgs = hb_util:atom(hb_opts:get(<<"push-cache-messages">>, true, Opts)) =/= false,
+    SignOpts =
+        case CacheMsgs of
+            true -> Opts;
+            false -> hb_store_essentials:opts(Opts)
+        end,
     % Load the `accept-id`'d wallet into the `Opts` map, if requested.
-    SignedMsg = apply_security(AugmentedMsg, TargetProcess, Codec, Opts),
+    SignedMsg = apply_security(AugmentedMsg, TargetProcess, Codec, SignOpts),
     % Verify the signed message before writing to cache
-    true = hb_message:verify(SignedMsg, signers, Opts),
-    % Write the signed message to cache before including it in the schedule request
-    {ok, _} = hb_cache:write(SignedMsg, Opts),
+    true = hb_message:verify(SignedMsg, signers, SignOpts),
+    case CacheMsgs of
+        true ->
+            % Write the signed message to cache before including it in the
+            % schedule request.
+            {ok, _} = hb_cache:write(SignedMsg, Opts);
+        false -> ok
+    end,
+    SchedOpts =
+        case CacheMsgs of
+            true -> Opts#{ <<"cache-control">> => <<"always">> };
+            false -> SignOpts
+        end,
     ScheduleReq = #{
         <<"path">> => <<"schedule">>,
         <<"method">> => <<"POST">>,
@@ -1097,7 +1134,7 @@ schedule_result(TargetProcess, MsgToPush, Codec, Origin, Opts) ->
                 hb_ao:resolve(
                     {as, <<"process@1.0">>, TargetProcess},
                     ScheduleReq,
-                    Opts#{ <<"cache-control">> => <<"always">> }
+                    SchedOpts
                 )
         end,
     ?event(push, {push_sched_result, {status, ErlStatus}, {response, Res}}, Opts),
@@ -1946,6 +1983,68 @@ max_depth_test_cases() ->
         fun test_paranoid_push_result/0,
         fun test_parse_max_depth/0
     ].
+
+%% @doc With `push-cache-messages' false a local push writes no copy of the
+%% pushed message to the main store: the scheduler's copy in the essentials
+%% store is the only one, and the chain still computes. With the default
+%% (true) the copy is there, so the test tells the two apart.
+push_cache_messages_test_() ->
+    {timeout, 120, fun() ->
+        {false, InMainOff, InEssOff} = push_copies(false),
+        ?assertEqual([], InMainOff),
+        ?assert(length(InEssOff) >= 2),
+        {true, InMainOn, _} = push_copies(true),
+        ?assert(length(InMainOn) >= 2)
+    end}.
+
+push_copies(CacheMessages) ->
+    hb_process_test_vectors:init(),
+    Main = hb_test_utils:test_store(hb_store_lmdb),
+    Ess = hb_test_utils:test_store(hb_store_lmdb),
+    Opts =
+        hb_store_essentials:node_message(#{
+            <<"priv-wallet">> => hb:wallet(),
+            <<"store">> => [Main],
+            <<"essentials-store">> => Ess,
+            <<"push-cache-messages">> => CacheMessages
+        }),
+    Base = hb_process_test_vectors:aos_process(Opts),
+    hb_cache:write(Base, Opts),
+    {ok, _} =
+        hb_ao:resolve(Base, #{
+            <<"method">> => <<"POST">>,
+            <<"path">> => <<"schedule">>,
+            <<"body">> => Base
+        },
+        Opts
+    ),
+    {ok, Req} = hb_process_test_vectors:schedule_aos_call(Base, ping_pong_script(2), Opts),
+    {ok, Slot} = hb_ao:resolve(Req, #{ <<"path">> => <<"slot">> }, Opts),
+    {ok, _} = hb_ao:resolve(Base, #{ <<"path">> => <<"push">>, <<"slot">> => Slot }, Opts),
+    ?assertEqual({ok, <<"Done.">>}, hb_ao:resolve(Base, <<"now/results/data">>, Opts)),
+    ProcID = hb_message:id(Base, all, Opts),
+    % Every slot after the script's was scheduled by the push.
+    Pushed =
+        [ begin
+              {ok, A} =
+                  hb_cache:read(
+                      <<"~scheduler@1.0/assignments/", ProcID/binary, "/",
+                          (integer_to_binary(S))/binary>>,
+                      Opts
+                  ),
+              Loaded = hb_cache:ensure_all_loaded(A, Opts),
+              hb_message:id(hb_ao:get(<<"body">>, Loaded, Opts), signed, Opts)
+          end
+        || S <- lists:seq(hb_util:int(Slot) + 1, hb_util:int(Slot) + 3) ],
+    Has = fun(Store, ID) ->
+              case hb_cache:read(ID, Opts#{ <<"store">> => [Store] }) of
+                  {ok, _} -> true;
+                  _ -> false
+              end
+          end,
+    {CacheMessages,
+        [ ID || ID <- Pushed, Has(Main, ID) ],
+        [ ID || ID <- Pushed, Has(Ess, ID) ]}.
 
 cron_depth_zero_push_test_() ->
     {timeout, 120, fun test_cron_depth_zero_push/0}.

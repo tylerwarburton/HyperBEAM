@@ -416,7 +416,28 @@ worker_spawn_opts(Opts) ->
             {<<"process-worker-min-heap-size">>, min_heap_size},
             {<<"process-worker-min-bin-vheap-size">>, min_bin_vheap_size}
         ]
-    ).
+    ) ++ worker_queue_opts(Opts).
+
+%% @doc `process-worker-off-heap-queue' (default false): spawn the worker with
+%% `{message_queue_data, off_heap}'.
+%%
+%% A worker's mailbox is where every request for its process waits. With the
+%% VM default (`on_heap') the waiting messages live in the worker's own heap,
+%% and every garbage collection -- minor ones included -- has to walk and move
+%% them as live data. Under a backlog that cost grows with the queue, not with
+%% the work: on prod (2026-10-14) the game worker held 5,052 waiting requests
+%% and spent 4.77 s of every 5 s in 66 minor collections (~72 ms each),
+%% computing ~1 slot/s, so the queue only grew -- a spiral. `off_heap' keeps
+%% waiting messages outside the heap until the worker receives them, so a
+%% collection's cost no longer depends on the queue's length. The cost is a
+%% little more work per message sent (a separate allocation), microseconds
+%% against a slot's tens to hundreds of milliseconds.
+worker_queue_opts(Opts) ->
+    case hb_opts:get(<<"process-worker-off-heap-queue">>, false, Opts) of
+        true -> [{message_queue_data, off_heap}];
+        <<"true">> -> [{message_queue_data, off_heap}];
+        _ -> []
+    end.
 
 spawn_opt_int(N) when is_integer(N), N >= 0 -> N;
 spawn_opt_int(B) when is_binary(B) ->
@@ -714,6 +735,114 @@ worker_carries_gc_opts_test() ->
         proplists:get_value(fullsweep_after, Default)),
     Tuned = Spawn(#{ <<"process-worker-fullsweep-after">> => 0 }),
     ?assertEqual(0, proplists:get_value(fullsweep_after, Tuned)).
+
+%% @doc `process-worker-off-heap-queue': unset or false, the worker's mailbox
+%% is the VM default (`on_heap'); true (or <<"true">>), it is `off_heap'.
+worker_off_heap_queue_test() ->
+    start(),
+    Spawn =
+        fun(Extra, Case) ->
+            Base = #{ <<"device">> => test_device(), <<"queue-case">> => Case },
+            Req = #{ <<"path">> => <<"slow_key">>, <<"wait">> => 10 },
+            Opts =
+                Extra#{
+                    <<"spawn-worker">> => true,
+                    <<"static-worker">> => true,
+                    <<"hashpath">> => ignore
+                },
+            GroupName = group(Base, Req, Opts),
+            {ok, _} = hb_ao:resolve(Base, Req, Opts),
+            Worker = await_registration(GroupName, 100),
+            ?assert(is_pid(Worker)),
+            {message_queue_data, Q} =
+                erlang:process_info(Worker, message_queue_data),
+            exit(Worker, normal),
+            Q
+        end,
+    ?assertEqual(on_heap, Spawn(#{}, 1)),
+    ?assertEqual(on_heap,
+        Spawn(#{ <<"process-worker-off-heap-queue">> => false }, 2)),
+    ?assertEqual(off_heap,
+        Spawn(#{ <<"process-worker-off-heap-queue">> => true }, 3)),
+    ?assertEqual(off_heap,
+        Spawn(#{ <<"process-worker-off-heap-queue">> => <<"true">> }, 4)),
+    ?assertEqual([], worker_queue_opts(#{})),
+    ?assertEqual([{message_queue_data, off_heap}],
+        worker_queue_opts(#{ <<"process-worker-off-heap-queue">> => true })).
+
+%% @doc Evidence for `process-worker-off-heap-queue', at the mechanism level: a
+%% process holding a large live heap computes allocation-heavy "slots" while
+%% requests keep arriving and thousands wait in its mailbox. With the queue
+%% off-heap the per-slot time does not depend on the backlog. (The on-heap
+%% figure is reported, not asserted: how badly it degrades depends on the heap
+%% shape. The requests are prod-sized: a queued `compute' carries its
+%% listener's options, ~6,000 words, and on 2026-10-14 the game worker held
+%% 5,052 of them, 68% from listeners that had already exited. Measured here:
+%% on_heap 3.8 -> 36.6 ms per slot with 5,000 waiting, off_heap 3.7 -> 3.6.)
+worker_queue_flood_test_() ->
+    {timeout, 300, fun() ->
+        Measure =
+            fun(Mode, Backlog) ->
+                Self = self(),
+                P = spawn_opt(
+                    fun() ->
+                        State =
+                            [ {I, lists:seq(1, 50), <<I:64>>}
+                            || I <- lists:seq(1, 200000) ],
+                        erlang:garbage_collect(),
+                        erlang:garbage_collect(self(), [{type, minor}]),
+                        receive go -> ok end,
+                        T0 = erlang:monotonic_time(microsecond),
+                        flood_work(20, State),
+                        T1 = erlang:monotonic_time(microsecond),
+                        Self ! {flood_done, (T1 - T0) / 20000}
+                    end,
+                    [{message_queue_data, Mode}]
+                ),
+                Msg = #{
+                    <<"path">> => <<"compute">>,
+                    <<"slot">> => 1,
+                    <<"opts">> =>
+                        maps:from_list(
+                            [ {integer_to_binary(K), lists:seq(1, 20)}
+                            || K <- lists:seq(1, 130) ])
+                },
+                [ P ! {resolve, self(), flood, Msg, #{}}
+                || _ <- lists:seq(1, Backlog) ],
+                Sender =
+                    spawn(fun Loop() ->
+                        P ! {resolve, self(), flood, Msg, #{}},
+                        receive stop -> ok after 1 -> Loop() end
+                    end),
+                P ! go,
+                receive
+                    {flood_done, Ms} ->
+                        Sender ! stop,
+                        exit(P, kill),
+                        Ms
+                after 240000 -> exit(flood_timeout)
+                end
+            end,
+        OnIdle = Measure(on_heap, 0),
+        OnFlood = Measure(on_heap, 5000),
+        OffIdle = Measure(off_heap, 0),
+        OffFlood = Measure(off_heap, 5000),
+        ?debugFmt(
+            "flood ms/slot: on_heap ~.1f -> ~.1f, off_heap ~.1f -> ~.1f",
+            [OnIdle, OnFlood, OffIdle, OffFlood]
+        ),
+        ?assert(OffFlood < 2 * OffIdle + 1)
+    end}.
+
+flood_work(0, _) -> ok;
+flood_work(N, State) ->
+    _ = lists:foldl(
+        fun(I, Acc) -> [{I, integer_to_binary(I), [I, I + 1]} | Acc] end,
+        [],
+        lists:seq(1, 60000)
+    ),
+    _ = element(1, hd(State)),
+    flood_work(N - 1, State).
 
 %% @doc An execution whose group name is the `ungrouped_exec' sentinel was
 %% never registered under a name, so there is nothing for a later resolution to

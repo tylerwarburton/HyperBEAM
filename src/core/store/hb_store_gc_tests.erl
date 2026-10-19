@@ -1344,6 +1344,62 @@ essentials_retention_prunes_old_assignments_test_() ->
         ?assertMatch(#{ status := ok }, maps:get(essentials, R3))
     end}.
 
+%% @doc Essentials retention on its own (`store-retention' false, state
+%% blobs on): the floor of each process is its oldest kept blob checkpoint,
+%% read with one `pstate/<p>/s/' listing, never a main-store scan. Assignments
+%% below it go, none at or above it; a fractional `essentials-retention-days'
+%% keeps everything younger; the process computes on cold; the loop starts at
+%% boot only when configured.
+essentials_retention_standalone_blobs_test_() ->
+    {timeout, 300, fun() ->
+        {Opts0, _Ess, EssDB} =
+            ess_node(<<"ess-standalone">>,
+                #{ <<"process-state-blobs">> => true, <<"store-retention">> => false }),
+        Process = lua_process(Opts0),
+        Next = run_slots(Process, 0, 4 * ?CADENCE + 3, Opts0),
+        P = proc_id(Process, Opts0),
+        Ckpts = blob_checkpoints(Opts0, P),
+        ?assert(length(Ckpts) >= 1),
+        Need = hd(Ckpts),
+        ?assert(Need > 0),
+        ok = ess_shipped(Opts0),
+        % A quarter of a day: every assignment is younger, nothing goes.
+        R0 = hb_store_gc:run_essentials_retention(
+            Opts0#{ <<"essentials-retention-days">> => 0.25 }),
+        ?assertEqual(0, maps:get(pruned_assignments, R0)),
+        ?assertEqual(lists:seq(0, Next - 1), ess_slots(EssDB, P)),
+        Opts = Opts0#{ <<"essentials-retention-days">> => 0 },
+        R1 = hb_store_gc:run_essentials_retention(Opts),
+        ?assertMatch(#{ status := ok }, R1),
+        ?assertEqual(Need, maps:get(pruned_assignments, R1)),
+        ?assertEqual(lists:seq(Need, Next - 1), ess_slots(EssDB, P)),
+        % Nothing more below the same floor.
+        R2 = hb_store_gc:run_essentials_retention(Opts),
+        ?assertEqual(0, maps:get(pruned_assignments, R2)),
+        #{ runs := Runs } = hb_store_gc:essentials_retention_status(),
+        ?assert(Runs >= 3),
+        % Cold: caches gone, the process rebuilds from its checkpoint.
+        clear_process_caches(),
+        _ = run_slots(Process, Next, 3, Opts),
+        % The loop starts at boot when configured, and not otherwise.
+        ok = hb_store_gc:stop_essentials_retention(),
+        ok = hb_store_gc:maybe_start_retention(
+            maps:remove(<<"essentials-retention-days">>, Opts)),
+        ?assertMatch(#{ server := false }, hb_store_gc:essentials_retention_status()),
+        ok = hb_store_gc:maybe_start_retention(
+            Opts#{ <<"store-retention-first-ms">> => 3600000 }),
+        ?assertMatch(#{ server := true }, hb_store_gc:essentials_retention_status()),
+        ok = hb_store_gc:stop_essentials_retention()
+    end}.
+
+blob_checkpoints(Opts, P) ->
+    DB = main_db(Opts),
+    ok = elmdb:flush(DB),
+    case elmdb:list(DB, <<"pstate/", P/binary, "/s/">>) of
+        {ok, L} -> lists:sort([ binary_to_integer(S) || S <- L ]);
+        _ -> []
+    end.
+
 %% @doc A process the main store keeps no checkpoint for keeps every
 %% assignment.
 essentials_retention_keeps_processes_without_checkpoints_test_() ->
