@@ -63,9 +63,17 @@ start(Opts = #{ <<"name">> := DataDir }, _Req, _NodeOpts) ->
                 batch_size,
                 hb_util:int(maps:get(<<"batch-size">>, Opts, ?DEFAULT_BATCH_SIZE))
             },
-            no_mem_init,
-            no_sync
+            no_mem_init
         ] ++
+        % Every commit is fsynced unless `no-sync' is set. With `no_sync' a host
+        % crash can leave LMDB's meta page ahead of its data pages: the tree is
+        % then corrupt (2026-10-20: 13.3M entries, ~7k readable, and an
+        % `mdb_page_dirty' assertion on every start). Commits are grouped, so
+        % the sync is paid per batch, not per write.
+        case hb_util:atom(maps:get(<<"no-sync">>, Opts, false)) of
+            true -> [no_sync];
+            false -> []
+        end ++
         case maps:get(<<"read-ahead">>, Opts, true) of
             true -> [];
             false -> [no_readahead]

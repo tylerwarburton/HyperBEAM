@@ -810,7 +810,9 @@ records(_) -> [].
 
 valid_prefix(Bin, Off) ->
     case Bin of
-        <<_:Off/binary, Len:32, Crc:32, Frame:Len/binary, _/binary>> ->
+        % A zero-length frame is never written; it is the zero-filled tail a
+        % host crash leaves on ext4, and its CRC (crc32(<<>>) = 0) matches.
+        <<_:Off/binary, Len:32, Crc:32, Frame:Len/binary, _/binary>> when Len > 0 ->
             case erlang:crc32(Frame) of
                 Crc -> valid_prefix(Bin, Off + 8 + Len);
                 _ -> Off
@@ -1831,7 +1833,7 @@ apply_file(File, Manifest, Target, Opts) ->
     Bin = case Bin0 of <<31, 139, _/binary>> -> zlib:gunzip(Bin0); _ -> Bin0 end,
     apply_records(Bin, Target, Opts, 0, []).
 
-apply_records(<<Len:32, Crc:32, Bin:Len/binary, Rest/binary>>, Target, Opts, N, Filled) ->
+apply_records(<<Len:32, Crc:32, Bin:Len/binary, Rest/binary>>, Target, Opts, N, Filled) when Len > 0 ->
     case erlang:crc32(Bin) of
         Crc ->
             case binary_to_term(Bin) of
