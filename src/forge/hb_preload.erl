@@ -91,11 +91,7 @@ build_dir(Pkgs, Wallet, OutputDir, Opts) ->
         ),
     IndexMsg = build_index_message(SpecIDs),
     IndexID = persist_signed(IndexMsg, LocalOpts),
-    ok = hb_store:link(
-        StoreCfg,
-        #{ ?PRELOADED_INDEX_KEY => IndexID },
-        Opts
-    ),
+    ok = hb_cache:link(IndexID, ?PRELOADED_INDEX_KEY, LocalOpts),
     ?event(preload, {build_complete, {output, OutputBin}, {index, IndexID}}),
     ok = hb_store:stop(StoreCfg, #{}, Opts),
     {
@@ -186,7 +182,7 @@ build_signs_and_indexes_test() ->
             }
         ),
     Wallet = ar_wallet:new(),
-    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Address = hb_test_utils:committer(Wallet),
     {ok, Result} =
         build_groups(
             Groups,
@@ -216,24 +212,21 @@ build_signs_and_indexes_test() ->
     ?assert(byte_size(IndexID) == 43),
     % Store must be an LMDB store at our dir.
     ?assertMatch(#{ <<"store-module">> := hb_store_lmdb }, Store),
-    % The stable index link and raw index ID must both resolve names.
+    % The stable index key holds `ao:' and the index ID, and names resolve
+    % under the index ID.
     Name = maps:get(device_name, Pkg),
     NodeOpts = #{ <<"store">> => [Store] },
     SpecID = maps:get(Name, SpecIDs),
     ?assertEqual(
-        {ok, SpecID},
-        hb_store:read(
-            Store,
-            <<?PRELOADED_INDEX_KEY/binary, "/", Name/binary>>,
-            NodeOpts
-        )
+        {ok, <<"ao:", IndexID/binary>>},
+        hb_store:read(Store, ?PRELOADED_INDEX_KEY, NodeOpts)
     ),
     {ok, Got} =
-        hb_store:read(Store, <<IndexID/binary, "/", Name/binary>>, NodeOpts),
+        hb_cache:read(<<IndexID/binary, "/", Name/binary>>, NodeOpts),
     ?assertEqual(SpecID, Got),
     ?assertEqual(
         {error, not_found},
-        hb_store:read(Store, <<IndexID/binary, "/type">>, NodeOpts)
+        hb_cache:read(<<IndexID/binary, "/type">>, NodeOpts)
     ),
     ?assertEqual({ok, Address}, signer(Store, IndexID, NodeOpts)),
     ?assertEqual({ok, Address}, signer(Store, SpecID, NodeOpts)),
@@ -245,10 +238,9 @@ build_signs_and_indexes_test() ->
     ).
 
 signer(Store, ID, Opts) ->
-    hb_store:read(
-        Store,
+    hb_cache:read(
         <<ID/binary, "/commitments/", ID/binary, "/committer">>,
-        Opts
+        Opts#{ <<"store">> => [Store] }
     ).
 
 -endif.

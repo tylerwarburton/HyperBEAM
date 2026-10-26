@@ -15,21 +15,19 @@
 %%%     start/3:      Initialize the store.
 %%%     stop/3:       Stop any processes (etc.) that manage the store.
 %%%     reset/3:      Restore the store to its original, empty state.
+%%%     flush/3:      Commit the writes that the store holds in memory, such
+%%%                   that they survive a halt of the node.
 %%%     scope/0:      A tag describing the 'scope' of a stores search: `in_memory',
 %%%                   `local', `remote', `arweave', etc. Used in order to allow
 %%%                   node operators to prioritize their stores for search.
-%%%     group/3:      Create a new group of keys in the store using a request
-%%%                   map of the form `#{ <<"group">> => Path }`.
-%%%     link/3:       Create links using a request map of the form
-%%%                   `#{ NewPath => ExistingPath }`.
-%%%     type/3:       Return whether the value found at the given key is a
-%%%                   `composite' (group) type, or a `simple' direct binary,
-%%%                   using a request map of the form `#{ <<"type">> => Path }`.
-%%%     read/3:       Read the data at the given location, returning a binary
-%%%                   if it is a `simple' value, or a message if it is a complex
-%%%                   term, using a request map of the form `#{ <<"read">> => Path }`.
+%%%     read/3:       Read the data at the given location, using a request map
+%%%                   of the form `#{ <<"read">> => Path }`. A location that
+%%%                   has a value returns `{ok, Value}'. A location with keys
+%%%                   below it returns `{composite, Children}'. A child that
+%%%                   has a value is given as a `{Key, Value}' pair, and a
+%%%                   child with keys below it as its `Key'.
 %%%     write/3:      Write a request map of the form `#{ Path => Value }`.
-%%%     list/3:       For `composite' type keys, return child keys using a
+%%%     list/3:       For a path with keys below it, return child keys using a
 %%%                   request map of the form `#{ <<"list">> => Path }`:
 %%%                   every child, in the store's own order. A request may
 %%%                   instead bound the list: `from' is the child it should
@@ -37,9 +35,6 @@
 %%%                   `desc'), and `limit' the most children returned.
 %%%                   `limit' can also be `batch' for every child the store
 %%%                   finds without further work (store determined).
-%%%                   Composite read results may also return children as
-%%%                   `{Key, Value}' pairs when the store can provide a child
-%%%                   value without an additional read.
 %%% '''
 %%% Each function takes a `store' message first, containing an arbitrary set
 %%% of its necessary configuration keys, as well as the `store-module' key which
@@ -52,6 +47,17 @@
 %%% store is tried. If none of the given store messages are able to execute a
 %%% requested service, the store manager will return the strongest terminal
 %%% result observed, or `{error, not_found}`.
+%%%
+%%% If a store raises, it is stopped and started again, and the call is
+%%% retried, up to its `max-retries' (default 1). An exception that remains,
+%%% or one from the store's normalization pipeline (below), is a failure with
+%%% the exception in it: `{failure, {Class, Reason, Stacktrace}}'. A store's
+%%% `store-failure' applies to every failure: `skip' (the default) tries the
+%%% next store, and `throw' raises the failure to the caller without trying
+%%% the rest of the stores: an exception again as it was, and any other
+%%% failure with `throw/1'. `store-failure' is read from the store message
+%%% first, then from the node's options. If a store does not export the
+%%% function, it is skipped, and this is not a failure.
 %%%
 %%% A store message may additionally specify a normalization pipeline, called
 %%% upon its paths and values during store invocation. These pipelines allow
@@ -66,7 +72,6 @@
 %%%     Pre-normalization ->
 %%%     Store invocation ->
 %%%     Post-normalization ->
-%%%     Re-prefixing (only for `resolve`) ->
 %%%     Return.
 %%% '''
 %%%
@@ -87,26 +92,25 @@
 %%%                         store sees.
 %%%     `[to|from]-value`:  An AO-Core path, resolved in `raw' mode with a
 %%%                         successful result as the `Base/body`.
+%%%     `from-list`:        An AO-Core path receiving all enumerated children
+%%%                         as `Base/body', returning their normalized list.
+%%%                         Replaces per-child `from-key' and `from-value'
+%%%                         for `list' results.
 %%% '''
 -module(hb_store).
 -export([behavior_info/1]).
 -export([
     start/1, start/2, start/3,
     stop/1, stop/2, stop/3,
-    reset/1, reset/2, reset/3
+    reset/1, reset/2, reset/3,
+    flush/2
 ]).
 -export([filter/2, scope/2, sort/2]).
 -export([
-    type/2, type/3,
     read/2, read/3,
     write/2, write/3,
     list/2, list/3,
     match/2, match/3
-]).
--export([
-    group/2, group/3,
-    link/2, link/3,
-    resolve/2, resolve/3
 ]).
 -export([find/1]).
 -export([generate_test_suite/1, generate_test_suite/2, test_stores/0]).
@@ -125,9 +129,8 @@
 
 behavior_info(callbacks) ->
     [
-        {start, 3}, {stop, 3}, {reset, 3}, {group, 3}, {link, 3},
-        {type, 3}, {read, 3}, {write, 3}, {list, 3}, {match, 3},
-        {resolve, 3}
+        {start, 3}, {stop, 3}, {reset, 3}, {read, 3}, {write, 3}, {list, 3},
+        {match, 3}
     ].
 
 -define(DEFAULT_SCOPE, local).
@@ -136,14 +139,15 @@ behavior_info(callbacks) ->
 
 %% @doc Store access policies to function names.
 -define(STORE_ACCESS_POLICIES, #{
-    <<"read">> => [read, resolve, list, type, match] ++ ?COMMON_POLICIES,
-    <<"write">> => [write, link, group, reset] ++ ?COMMON_POLICIES,
+    <<"read">> => [read, list, match] ++ ?COMMON_POLICIES,
+    <<"write">> => [write, reset, flush] ++ ?COMMON_POLICIES,
     <<"admin">> => [reset] ++ ?COMMON_POLICIES
 }).
 
 %% @doc The store message keys that describe a normalization pipeline.
 -define(PIPELINE_KEYS, [
-    <<"prefix">>, <<"to-key">>, <<"from-key">>, <<"to-value">>, <<"from-value">>
+    <<"prefix">>, <<"to-key">>, <<"from-key">>, <<"to-value">>, <<"from-value">>,
+    <<"from-list">>
 ]).
 
 %%% Store named terms registry functions.
@@ -181,18 +185,20 @@ find(StoreOpts) ->
 do_find(StoreOpts = #{ <<"store-module">> := Mod }) ->
     Name = maps:get(<<"name">>, StoreOpts, Mod),
     LookupName = {store, Mod, Name},
-    case get(LookupName) of
-        undefined ->
-            try persistent_term:get(LookupName) of
-                Instance1 ->
-                    EnsuredInstance = ensure_instance_alive(StoreOpts, Instance1),
-                    put(LookupName, EnsuredInstance),
-                    EnsuredInstance
-            catch
-                error:badarg -> spawn_instance(StoreOpts)
-            end;
-        InstanceMessage ->
-            ensure_instance_alive(StoreOpts, InstanceMessage)
+    case live(get(LookupName)) of
+        {error, not_found} ->
+            % Find the store's live instance, or start the store once.
+            {ok, Instance} =
+                hb_name:ok_or_atomic_apply(
+                    LookupName,
+                    fun() ->
+                        live(persistent_term:get(LookupName, undefined))
+                    end,
+                    fun() -> {ok, spawn_instance(StoreOpts)} end
+                ),
+            put(LookupName, Instance),
+            Instance;
+        {ok, Instance} -> Instance
     end.
 
 %% @doc Create a new instance of a store and return its term.
@@ -214,15 +220,16 @@ spawn_instance(StoreOpts = #{ <<"store-module">> := Mod }) ->
         ok
     end.
 
-%% @doc Handle a found instance message. If it contains a PID, we check if it
-%% is alive. If it does not, we return it as is.
-ensure_instance_alive(StoreOpts, InstanceMessage = #{ <<"pid">> := Pid }) ->
+%% @doc Return `{ok, InstanceMessage}', or `{error, not_found}' if it is
+%% `undefined' or contains the PID of a process that has exited.
+live(undefined) -> {error, not_found};
+live(InstanceMessage = #{ <<"pid">> := Pid }) ->
     case is_process_alive(Pid) of
-        true -> InstanceMessage;
-        false -> spawn_instance(StoreOpts)
+        true -> {ok, InstanceMessage};
+        false -> {error, not_found}
     end;
-ensure_instance_alive(_, InstanceMessage) ->
-    InstanceMessage.
+live(InstanceMessage) ->
+    {ok, InstanceMessage}.
 
 %%% Library wrapper implementations.
 
@@ -255,6 +262,24 @@ stop(Store, Opts) ->
     stop(Store, #{}, Opts).
 stop(Stores, Req, Opts) ->
     admin_call(Stores, stop, Req, Opts).
+
+%% @doc Commit the writes that the stores hold in memory, such that they
+%% survive a halt of the node. Stores whose module does not implement
+%% `flush/3' are skipped.
+flush(Store, Opts) when not is_list(Store) ->
+    flush([Store], Opts);
+flush(Stores, Opts) ->
+    admin_call(
+        lists:filter(
+            fun(#{ <<"store-module">> := Mod }) ->
+                erlang:function_exported(Mod, flush, 3)
+            end,
+            Stores
+        ),
+        flush,
+        #{},
+        Opts
+    ).
 
 %% @doc Takes a store object and a filter function or match spec, returning a
 %% new store object with only the modules that match the filter. The filter
@@ -355,21 +380,6 @@ write(Req, Opts) ->
 write(Modules, Req, Opts) ->
     call_function(Modules, write, [Req, Opts]).
 
-%% @doc Make a group in the store. A group can be seen as a namespace or
-%% 'directory' in a filesystem.
-group(Path, Opts) ->
-    group(hb_opts:get(<<"store">>, [], Opts), Path, Opts).
-group(Modules, Req = #{ <<"group">> := _ }, Opts) ->
-    call_function(Modules, group, [Req, Opts]);
-group(Modules, Path, Opts) ->
-    group(Modules, #{ <<"group">> => hb_path:to_binary(Path) }, Opts).
-
-%% @doc Make a link from one path to another in the store.
-link(Req, Opts) ->
-    link(hb_opts:get(<<"store">>, [], Opts), Req, Opts).
-link(Modules, Req, Opts) ->
-    call_function(Modules, link, [Req, Opts]).
-
 %% @doc Delete all of the keys in a store. Should be used with extreme
 %% caution. Lost data can lose money in many/most of hyperbeam's use cases.
 reset(StoreOrOpts) ->
@@ -382,26 +392,7 @@ reset(Store, Opts) ->
 reset(Stores, Req, Opts) ->
     admin_call(Stores, reset, Req, Opts).
 
-%% @doc Get the type of element of a given path in the store. This can be
-%% a performance killer if the store is remote etc. Use only when necessary.
-type(Path, Opts) ->
-    type(hb_opts:get(<<"store">>, [], Opts), Path, Opts).
-type(Modules, Req = #{ <<"type">> := _ }, Opts) ->
-    call_function(Modules, type, [Req, Opts]);
-type(Modules, Path, Opts) ->
-    type(Modules, #{ <<"type">> => hb_path:to_binary(Path) }, Opts).
-
-%% @doc Follow links through the store to resolve a path to its ultimate target.
-resolve(Path, Opts) ->
-    resolve(hb_opts:get(<<"store">>, [], Opts), Path, Opts).
-resolve(Modules, Req = #{ <<"resolve">> := _ }, Opts) ->
-    call_function(Modules, resolve, [Req, Opts]);
-resolve(Modules, Path, Opts) ->
-    resolve(Modules, #{ <<"resolve">> => hb_path:to_binary(Path) }, Opts).
-
-%% @doc List the keys in a group in the store. Use only in debugging.
-%% The hyperbeam model assumes that stores are built as efficient hash-based
-%% structures, so this is likely to be very slow for most stores.
+%% @doc List the keys in a group in the store.
 list(Path, Opts) ->
     list(hb_opts:get(<<"store">>, [], Opts), Path, Opts).
 list(Modules, Req = #{ <<"list">> := _ }, Opts) ->
@@ -477,7 +468,8 @@ do_call_function([Store = #{<<"access">> := Access} | Rest], Function, Args, Fai
             do_call_function(Rest, Function, Args, Failure, Error)
     end;
 do_call_function([Store = #{<<"store-module">> := Mod} | Rest], Function, Args, Failure, Error) ->
-    % Attempt to invoke the function. If it fails, try the next store.
+    % Attempt to invoke the function. If it returns an error, try the next
+    % store. If it returns a failure or raises, apply its `store-failure'.
     try invoke(Mod, Store, Function, Args) of
         ok ->
             ok;
@@ -486,13 +478,7 @@ do_call_function([Store = #{<<"store-module">> := Mod} | Rest], Function, Args, 
         {composite, _} = Result ->
             Result;
         {failure, _} = Result ->
-            do_call_function(
-                Rest,
-                Function,
-                Args,
-                strongest_failure(Failure, Result),
-                Error
-            );
+            handle_failure(Store, Rest, Function, Args, Failure, Error, Result);
         {error, not_found} ->
             do_call_function(Rest, Function, Args, Failure, Error);
         {error, _} = Result ->
@@ -505,8 +491,32 @@ do_call_function([Store = #{<<"store-module">> := Mod} | Rest], Function, Args, 
             );
         Other ->
             normalize_result(Other)
-    catch _:_:_ ->
-        do_call_function(Rest, Function, Args, Failure, Error)
+    catch Class:Reason:Stacktrace ->
+        Raised = {failure, {Class, Reason, Stacktrace}},
+        handle_failure(Store, Rest, Function, Args, Failure, Error, Raised)
+    end.
+
+%% @doc Apply a store's `store-failure' to its failure, reading it from the
+%% store message first, then from the node's options. With `skip' (the
+%% default), keep the strongest failure and try the next store. With `throw',
+%% raise the failure to the caller: an exception again as it was, and any
+%% other failure with `throw/1'.
+handle_failure(Store, Rest, Function, Args = [_, Opts], Failure, Error, Result) ->
+    OptsFailure = hb_opts:get(<<"store-failure">>, skip, Opts),
+    StoreFailure = maps:get(<<"store-failure">>, Store, OptsFailure),
+    case {hb_util:atom(StoreFailure), Result} of
+        {skip, _} ->
+            do_call_function(
+                Rest,
+                Function,
+                Args,
+                strongest_failure(Failure, Result),
+                Error
+            );
+        {throw, {failure, {Class, Reason, Stacktrace}}} ->
+            erlang:raise(Class, Reason, Stacktrace);
+        {throw, _} ->
+            throw(Result)
     end.
 
 %% @doc Invoke a store function through the normalization pipeline its store
@@ -535,14 +545,11 @@ has_processing_pipeline(Store) ->
     lists:any(fun(Key) -> is_map_key(Key, Store) end, ?PIPELINE_KEYS).
 
 %% @doc Normalize a request's keys and values to the store: the path a
-%% `read', `list', `type', `group' or `resolve' names, every key and value
-%% of a `write' or `match', and both paths of a `link'. Every other request
-%% carries no key or value and passes through.
+%% `read' or `list' names, and every key and value of a `write' or `match'.
+%% Any other request has no keys or values, so it is returned unchanged.
 to_store(Store, Function, Req, Opts)
         when Function =:= write orelse Function =:= match ->
-    to_pairs(Store, fun to_value/3, Req, Opts);
-to_store(Store, link, Req, Opts) ->
-    to_pairs(Store, fun to_key/3, Req, Opts);
+    to_pairs(Store, Req, Opts);
 to_store(Store, list, Req = #{ <<"from">> := From }, Opts) ->
     % The child a list starts from is a key, as the children it answers
     % with are: it carries no prefix.
@@ -553,9 +560,7 @@ to_store(Store, list, Req = #{ <<"from">> := From }, Opts) ->
         {ok, NormReq#{ <<"from">> => NormFrom }}
     end;
 to_store(Store, Function, Req, Opts)
-        when Function =:= read orelse Function =:= list orelse
-            Function =:= type orelse Function =:= group orelse
-            Function =:= resolve ->
+        when Function =:= read orelse Function =:= list ->
     OpKey = hb_util:bin(Function),
     maybe
         {ok, Path} ?= to_key(Store, maps:get(OpKey, Req), Opts),
@@ -565,16 +570,15 @@ to_store(_Store, _Function, Req, _Opts) ->
     {ok, Req}.
 
 %% @doc Normalize every pair of a request to the store: its keys as paths,
-%% and its values through the given function -- as paths for a `link', as
-%% values for a `write'.
-to_pairs(Store, Values, Req, Opts) ->
+%% and its values as values.
+to_pairs(Store, Req, Opts) ->
     maybe
         {ok, Pairs} ?=
             maybe_each(
                 fun({Path, Value}) ->
                     maybe
                         {ok, NormPath} ?= to_key(Store, Path, Opts),
-                        {ok, NormValue} ?= Values(Store, Value, Opts),
+                        {ok, NormValue} ?= to_value(Store, Value, Opts),
                         {ok, {NormPath, NormValue}}
                     end
                 end,
@@ -616,9 +620,9 @@ to_value(Store, Value, Opts) ->
 must_strip_prefix(Store) ->
     hb_util:bool(maps:get(<<"prefix-strip">>, Store, true)).
 
-%% @doc Normalize a store's answer from it: a read's value, the children a
-%% `list' or a composite read enumerates, and a resolved path, which regains
-%% a stripped prefix. Every other answer passes through.
+%% @doc Normalize an answer from a store: the value of a read, and the
+%% children that a `list' or a composite read returns. Any other answer is
+%% returned unchanged.
 from_store(Store, read, {ok, Value}, Opts) ->
     execute_normalizer(<<"from-value">>, Store, Value, Opts);
 from_store(Store, read, {composite, Children}, Opts) ->
@@ -626,19 +630,10 @@ from_store(Store, read, {composite, Children}, Opts) ->
         {ok, Norm} ?= from_children(Store, Children, Opts),
         {composite, Norm}
     end;
+from_store(Store = #{ <<"from-list">> := _ }, list, {ok, Children}, Opts) ->
+    execute_normalizer(<<"from-list">>, Store, Children, Opts);
 from_store(Store, list, {ok, Children}, Opts) ->
     from_children(Store, Children, Opts);
-from_store(Store, resolve, {ok, Path}, Opts) ->
-    Prefix = maps:get(<<"prefix">>, Store, <<>>),
-    maybe
-        {ok, Norm} ?= execute_normalizer(<<"from-key">>, Store, Path, Opts),
-        {ok,
-            case must_strip_prefix(Store) of
-                true -> <<Prefix/bitstring, Norm/bitstring>>;
-                false -> Norm
-            end
-        }
-    end;
 from_store(_Store, _Function, Result, _Opts) ->
     Result.
 
@@ -685,6 +680,7 @@ execute_normalizer(Setting, Store, Term, Opts) ->
             hb_ao:raw(
                 #{ <<"path">> => Path, <<"0.body">> => Term },
                 Opts#{
+                    <<"linkify-mode">> => false,
                     <<"store">> =>
                         [ S || S <- AllOptsStores, not has_processing_pipeline(S) ]
                 }
@@ -693,7 +689,9 @@ execute_normalizer(Setting, Store, Term, Opts) ->
 
 %% @doc Apply a store function, checking if the store returns a retry request or
 %% errors. If it does, attempt to start the store again and retry, up to the
-%% given maximum number of times.
+%% given maximum number of times. A store that does not export the function
+%% is skipped, not restarted. If an exception remains when the retries end, it
+%% is returned as a failure with the exception in it.
 apply_store_function(Mod, Store, Function, Args) ->
     MaxAttempts = maps:get(<<"max-retries">>, Store, ?DEFAULT_RETRIES) + 1,
     apply_store_function(Mod, Store, Function, Args, MaxAttempts).
@@ -721,7 +719,14 @@ apply_store_function(Mod, Store, Function, Args, AttemptsRemaining) ->
                 {stacktrace, {trace, Stacktrace}}
             }
         ),
-        retry(Mod, Store, Function, Args, AttemptsRemaining, {error, not_found})
+        case erlang:function_exported(Mod, Function, length(Args) + 1) of
+            true ->
+                retry(
+                    Mod, Store, Function, Args, AttemptsRemaining,
+                    {failure, {Class, Reason, Stacktrace}}
+                );
+            false -> {error, not_found}
+        end
     end.
 
 %% @doc Stop and start the store, then retry.
@@ -752,14 +757,10 @@ admin_call([Store | Rest], Function, Req, Opts) ->
         {error, _} = Error ->
             Error;
         {failure, _} = Failure ->
-            Failure;
-        {composite, _} = Composite ->
-            Composite
+            Failure
     end.
 
 admin_post_process(stop, Store) ->
-    set(Store, undefined);
-admin_post_process(reset, Store) ->
     set(Store, undefined);
 admin_post_process(_, _Store) ->
     ok.
@@ -857,8 +858,6 @@ normalize_result(not_found) -> {error, not_found};
 normalize_result(failure) -> {failure, failure};
 normalize_result(retry) -> retry;
 normalize_result(ok) -> ok;
-normalize_result(simple) -> {ok, simple};
-normalize_result(composite) -> {ok, composite};
 normalize_result(Result) -> {ok, Result}.
 
 terminal_result(undefined, undefined) ->
@@ -942,45 +941,113 @@ generate_test_suite(Suite, Stores) ->
 
 %%% Tests
 
+%% @doc Listing discovers descendants without an explicit parent row.
+implicit_children_test_() ->
+    generate_test_suite([
+        {"implicit children", fun(Store) ->
+            ok = write(Store, #{ <<"parent/child/value">> => <<"data">> }, #{}),
+            ?assertEqual({ok, [<<"child">>]}, list(Store, <<"parent">>, #{})),
+            % Reading a path with keys below it returns them, with the value of
+            % each key that has one.
+            ?assertEqual(
+                {composite, [<<"child">>]},
+                read(Store, <<"parent">>, #{})
+            ),
+            ?assertEqual(
+                {composite, [{<<"value">>, <<"data">>}]},
+                read(Store, <<"parent/child">>, #{})
+            ),
+            ?assertEqual([<<"child">>], hb_cache:list(<<"parent">>, Store)),
+            ?assertEqual(
+                {ok, []},
+                list(
+                    Store,
+                    #{ <<"list">> => <<"parent">>, <<"from">> => <<"z">> },
+                    #{}
+                )
+            ),
+            ?assertEqual({error, not_found}, list(Store, <<"missing">>, #{}))
+        end}
+    ]).
+
+%% @doc An unsupported operation leaves a store's existing data intact, and is
+%% not a failure. If a store raises, the caller gets a failure. With
+%% `store-failure' `throw', a failure is raised to the caller, whether the
+%% store raised or returned it.
+unsupported_operation_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile),
+    ok = write(Store, #{ <<"key">> => <<"value">> }, #{}),
+    Instance = find(Store),
+    Throw = #{ <<"store-failure">> => throw },
+    ?assertEqual(
+        {error, not_found},
+        match(Store, #{ <<"key">> => <<"value">> }, Throw)
+    ),
+    ?assertEqual(Instance, find(Store)),
+    ?assertEqual({ok, <<"value">>}, read(Store, <<"key">>, #{})),
+    % If a store's `list-batch-size' is not an integer, a batch list raises.
+    Fs = hb_test_utils:test_store(hb_store_fs),
+    ok = write(Fs, #{ <<"group/key">> => <<"value">> }, #{}),
+    Raising = Fs#{ <<"list-batch-size">> => <<"none">> },
+    Batch = #{ <<"list">> => <<"group">>, <<"limit">> => batch },
+    ?assertMatch({failure, {error, badarg, _}}, list(Raising, Batch, #{})),
+    % `store-failure' is read from the store message before the options.
+    ?assertError(
+        badarg,
+        list(
+            [Raising#{ <<"store-failure">> => throw }, Fs],
+            Batch,
+            #{ <<"store-failure">> => skip }
+        )
+    ),
+    % If its read raises, here on a `subindex' that is not a message, a
+    % gateway store returns a failure.
+    Gateway =
+        #{ <<"store-module">> => hb_store_gateway, <<"subindex">> => none },
+    ?assertThrow(
+        {failure, failure},
+        read(Gateway, hb_util:human_id(crypto:strong_rand_bytes(32)), Throw)
+    ),
+    stop(Store).
+
 write_req(Key, Value) ->
     #{ hb_path:to_binary(Key) => Value }.
 
-link_req(New, Existing) ->
-    #{ hb_path:to_binary(New) => hb_path:to_binary(Existing) }.
+%% @doc Ensure that keys with non-ASCII characters are listed and read as
+%% written.
+unicode_key_test(Store) ->
+    Keys = [<<"é"/utf8>>, <<"日本語"/utf8>>, <<"🚀"/utf8>>],
+    lists:foreach(
+        fun(Key) ->
+            ok = write(Store, write_req([<<"test-dir1">>, Key], Key), #{})
+        end,
+        Keys
+    ),
+    {ok, Listed} = list(Store, <<"test-dir1">>, #{}),
+    ?assertEqual(lists:sort(Keys), lists:sort(Listed)),
+    lists:foreach(
+        fun(Key) ->
+            ?assertEqual({ok, Key}, read(Store, [<<"test-dir1">>, Key], #{}))
+        end,
+        Keys
+    ).
 
-%% @doc Test path resolution dynamics.
-simple_path_resolution_test(Store) ->
-    ok = write(Store, write_req(<<"test-file">>, <<"test-data">>), #{}),
-    ok = link(Store, link_req(<<"test-link">>, <<"test-file">>), #{}),
-    ?assertEqual({ok, <<"test-data">>}, read(Store, <<"test-link">>, #{})).
-
-%% @doc Ensure that we can resolve links recursively.
-resursive_path_resolution_test(Store) ->
-    ok = write(Store, write_req(<<"test-file">>, <<"test-data">>), #{}),
-    ok = link(Store, link_req(<<"test-link">>, <<"test-file">>), #{}),
-    ok = link(Store, link_req(<<"test-link2">>, <<"test-link">>), #{}),
-    ?assertEqual({ok, <<"test-data">>}, read(Store, <<"test-link2">>, #{})).
-
-%% @doc Ensure that we can resolve links through a directory.
-hierarchical_path_resolution_test(Store) ->
-    ok = group(Store, <<"test-dir1">>, #{}),
+%% @doc Ensure that a store reads every value as it was written, including
+%% the values `group' and `link:k'.
+literal_values_test(Store) ->
     ok =
         write(
             Store,
-            write_req([<<"test-dir1">>, <<"test-file">>], <<"test-data">>),
+            #{ <<"k/group">> => <<"group">>, <<"k/link">> => <<"link:k">> },
             #{}
         ),
-    ok = link(Store, link_req(<<"test-link">>, [<<"test-dir1">>]), #{}),
-    ?assertEqual(
-        {ok, <<"test-data">>},
-        read(Store, [<<"test-link">>, <<"test-file">>], #{})
-    ).
+    ?assertEqual({ok, <<"group">>}, read(Store, <<"k/group">>, #{})),
+    ?assertEqual({ok, <<"link:k">>}, read(Store, <<"k/link">>, #{})).
 
 store_suite_test_() ->
     generate_test_suite([
-        {"simple path resolution", fun simple_path_resolution_test/1},
-        {"resursive path resolution", fun resursive_path_resolution_test/1},
-        {"hierarchical path resolution", fun hierarchical_path_resolution_test/1}
+        {"unicode key", fun unicode_key_test/1},
+        {"literal values", fun literal_values_test/1}
     ]).
 
 benchmark_suite_test_() ->
@@ -1147,7 +1214,6 @@ benchmark_list(Store, WriteOps, ListOps, GroupSize) ->
             fun() ->
                 lists:map(
                     fun({GroupID, KeyPairs}) ->
-                        ok = group(Store, GroupID, #{}),
                         lists:foreach(
                             fun({Key, Value}) ->
                                 ok =
@@ -1363,8 +1429,7 @@ benchmark_message(nested, N, TestDataSize) ->
 
 %% @doc Test that a store with a `prefix' only admits keys bearing it --
 %% writes and reads alike -- stripping the prefix ahead of invocation and
-%% falling through to later stores otherwise, and that a path resolved
-%% through it regains the prefix, as `hb_cache' reuses the resolution.
+%% falling through to later stores otherwise.
 prefix_pipeline_test() ->
     Mounted =
         (hb_test_utils:test_store(hb_store_fs, <<"pipeline-prefix">>))#{
@@ -1381,10 +1446,6 @@ prefix_pipeline_test() ->
     ?assertEqual({ok, <<"1">>}, read(StoreList, <<"mnt/inner">>, #{})),
     ?assertEqual({ok, <<"1">>}, read([Ungated], <<"inner">>, #{})),
     ?assertEqual({error, not_found}, read([Plain], <<"mnt/inner">>, #{})),
-    ?assertEqual(
-        {ok, <<"mnt/inner">>},
-        resolve(StoreList, <<"mnt/inner">>, #{})
-    ),
     ?assertEqual(
         {ok, <<"1">>},
         hb_cache:read(
@@ -1408,6 +1469,34 @@ prefix_pipeline_test() ->
     ?assertEqual({ok, <<"2">>}, read([Plain], <<"outer">>, #{})),
     ?event(testing, {unprefixed_skip_and_strip_off_passed}).
 
+%% @doc Resetting a store preserves visibility for existing readers.
+reset_shared_instance_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile),
+    % Two processes that first use a store at once find one instance of it.
+    ?assertMatch([I, I], hb_pmap:parallel_map([Store, Store], fun find/1, 2)),
+    % After its owner is killed, two Erlang processes at once find one instance.
+    #{ <<"pid">> := Owner } = find(Store),
+    exit(Owner, kill),
+    false = is_process_alive(Owner),
+    ?assertMatch([J, J], hb_pmap:parallel_map([Store, Store], fun find/1, 2)),
+    ok = write(Store, #{ <<"before">> => <<"old">> }, #{}),
+    {PID, Ref} =
+        spawn_monitor(
+            fun() ->
+                ?assertEqual({ok, <<"old">>}, read(Store, <<"before">>, #{})),
+                ok = reset(Store),
+                ok = write(Store, #{ <<"after">> => <<"new">> }, #{})
+            end
+        ),
+    receive
+        {'DOWN', Ref, process, PID, Reason} -> ?assertEqual(normal, Reason)
+    after 1000 ->
+        ?assert(false)
+    end,
+    ?assertEqual({error, not_found}, read(Store, <<"before">>, #{})),
+    ?assertEqual({ok, <<"new">>}, read(Store, <<"after">>, #{})),
+    stop(Store).
+
 %% @doc Test that lifecycle operations bypass path preprocessing for a store
 %% carrying a prefix.
 prefix_pipeline_stop_test() ->
@@ -1425,13 +1514,50 @@ prefix_pipeline_stop_test() ->
         ?assert(false)
     end.
 
+%% @doc Normalization preserves structured fields without a writable body store.
+normalize_without_body_store_test() ->
+    ID = <<"Zw5s5IwC1EPFMj0FqnBkV5GpR2P39AeJk9Oe57h9Tzs">>,
+    ?assertEqual(
+        {ok, <<"00000391500788188382", ID/binary, "ans104@1.0">>},
+        execute_normalizer(
+            <<"to-key">>,
+            #{ <<"to-key">> => <<"~match@1.0/key">> },
+            #{
+                <<"offset">> => 391500788188382,
+                <<"id">> => ID,
+                <<"commitment-device">> => <<"ans104@1.0">>
+            },
+            #{ <<"store">> => [], <<"on">> => #{} }
+        )
+    ).
+
+%% @doc Listed keys and paired values normalize as single values.
+normalize_children_test() ->
+    Opts = #{ <<"store">> => [], <<"linkify-mode">> => false },
+    lists:foreach(
+        fun({Path, Terms}) ->
+            Store = #{ <<"from-key">> => Path, <<"from-value">> => Path },
+            Scalar = fun(Term) ->
+                hb_ao:raw(#{ <<"path">> => Path, <<"0.body">> => Term }, Opts)
+            end,
+            Expected = [begin {ok, Value} = Scalar(Term), Value end || Term <- Terms],
+            ?assertEqual({ok, Expected}, from_children(Store, Terms, Opts)),
+            ?assertEqual({ok, lists:zip(Expected, Expected)},
+                from_children(Store, lists:zip(Terms, Terms), Opts))
+        end,
+        [{<<"~message@1.0/body">>, [<<"abc">>, <<0, 255>>, 17, [<<"a">>]]},
+            {<<"~message@1.0&body=fixed/body">>, [<<"abc">>]},
+            {<<"~message@1.0/set&value=constant/body">>, [<<"abc">>]},
+            {<<"~message@1.0&ao-types=integer%3D%28%22body%22%29/body">>,
+                [<<"12">>]}]
+    ).
+
 %% @doc Test that `to-key' and `to-value' rewrite a request's paths and
 %% values ahead of the store -- for writes and reads alike -- and that
-%% `from-key' and `from-value' normalize its answers: a read's value, each
-%% child a list or a composite read enumerates, and a resolved path, which
-%% regains its prefix. A path the normalization cannot decode, or an answer
-%% that fails its normalization, falls through to the next store with the
-%% caller's original request.
+%% `from-key' and `from-value' normalize its answers: the value of a read, and
+%% the children that a list or a composite read returns. A path that the
+%% normalization cannot decode, or an answer that fails its normalization,
+%% falls through to the next store with the caller's original request.
 normalize_pipeline_test() ->
     Store =
         (hb_test_utils:test_store(hb_store_fs, <<"pipeline-normalize">>))#{
@@ -1496,8 +1622,7 @@ normalize_pipeline_test() ->
             {<<"key">>, true, <<"alternate">>}]
     ),
     ?event(testing, {normalized_write_and_read_passed}),
-    % Each child a list or a composite read enumerates is encoded, and a
-    % resolved path is encoded and regains its prefix.
+    % The children that a list or a composite read returns are encoded.
     EncodedChild = hb_util:encode(<<"g/a">>),
     ?assertEqual(
         ok,
@@ -1508,13 +1633,14 @@ normalize_pipeline_test() ->
         {ok, [hb_util:encode(<<"a">>)]},
         list([Store], <<"b64/", EncodedGroup/binary>>, #{})
     ),
+    BatchStore = Store#{ <<"from-list">> => <<"~message@1.0/body">> },
     ?assertEqual(
-        {composite, [hb_util:encode(<<"a">>)]},
-        read([Store], <<"b64/", EncodedGroup/binary>>, #{})
+        {ok, [<<"a">>]},
+        list([BatchStore], <<"b64/", EncodedGroup/binary>>, #{})
     ),
     ?assertEqual(
-        {ok, <<"b64/", EncodedChild/binary>>},
-        resolve([Store], <<"b64/", EncodedChild/binary>>, #{})
+        {composite, [{hb_util:encode(<<"a">>), <<"x">>}]},
+        read([BatchStore], <<"b64/", EncodedGroup/binary>>, #{})
     ),
     % An undecodable key skips the store for writes and reads alike, so the
     % fallback both receives and serves the original request.
@@ -1682,9 +1808,6 @@ list_access_control_test() ->
     TestValue = <<"list-test-value">>,
     start(StoreList),
     ?event(testing, {list_access_test_started}),
-    GroupResult = group(StoreList, ListGroup, #{}),
-    ?assertEqual(ok, GroupResult),
-    ?event(testing, {group_created, GroupResult}),
     WriteResponse = write(StoreList, write_req([ListGroup, TestKey], TestValue), #{}),
     ?assertEqual(ok, WriteResponse),
     ListResult = list(StoreList, ListGroup, #{}),
@@ -1692,27 +1815,6 @@ list_access_control_test() ->
     ?event(testing, {list_result, ListResult, ListValue}),
     ?assertEqual({ok,[TestKey]}, ListResult),
     ?assertEqual({ok,TestValue}, ListValue).
-
-%% @doc Test make_link operations with write access
-make_link_access_test() ->
-    WriteOnlyStore =
-        (hb_test_utils:test_store(hb_store_fs, <<"link-write-only">>))#{
-            <<"access">> => [<<"write">>,<<"read">>]
-        },
-    FallbackStore = hb_test_utils:test_store(hb_store_fs, <<"link-fallback">>),
-    StoreList = [WriteOnlyStore, FallbackStore],
-    SourceKey = <<"link-source">>,
-    TargetKey = <<"link-target">>,
-    TestValue = <<"link-test-value">>,
-    start(StoreList),
-    ?event(testing, {make_link_access_test_started}),
-    ?assertEqual(ok, write(StoreList, write_req(TargetKey, TestValue), #{})),
-    LinkResult = link(StoreList, link_req(SourceKey, TargetKey), #{}),
-    ?event(testing, {make_link_result, LinkResult}),
-    ReadResult = read(StoreList, SourceKey, #{}),
-    ?event(testing, {read_linked_value, ReadResult}),
-    ?assertEqual({ok, TestValue}, ReadResult),
-    ?assertEqual(ok, LinkResult).
 
 %% Prevent stores with access property to return local scope if they are defined as remote.
 get_store_scope_access_test() ->

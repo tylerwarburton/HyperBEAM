@@ -36,6 +36,9 @@
     | {string | token | binary, binary()}.
 -type sh_decimal() :: {decimal, {integer(), integer()}}.
 
+%% Refuse integers with more than this many digits; 100 covers 256-bit values.
+-define(MAX_INTEGER_DIGITS, 100).
+
 -define(IS_LC_ALPHA(C),
     (C =:= $a) or (C =:= $b) or (C =:= $c) or (C =:= $d) or (C =:= $e) or
         (C =:= $f) or (C =:= $g) or (C =:= $h) or (C =:= $i) or (C =:= $j) or
@@ -173,23 +176,34 @@ parse_dictionary(<<>>) ->
 parse_dictionary(<<C, R/bits>>) when ?IS_ALPHA(C)
         or ?IS_DIGIT(C) or (C =:= $*) or (C =:= $%) or (C =:= $_) or (C =:= $-) 
         or (C =:= $.) ->
-    parse_dict_key(R, [], <<C>>).
+    parse_dict_key(R, {[], #{}}, <<C>>).
 
 parse_dict_key(<<$=, $(, R0/bits>>, Acc, K) ->
     {Item, R} = parse_inner_list(R0, []),
-    parse_dict_before_sep(R, lists:keystore(K, 1, Acc, {K, Item}));
+    parse_dict_before_sep(R, dict_member(K, Item, Acc));
 parse_dict_key(<<$=, R0/bits>>, Acc, K) ->
     {Item, R} = parse_item1(R0),
-    parse_dict_before_sep(R, lists:keystore(K, 1, Acc, {K, Item}));
+    parse_dict_before_sep(R, dict_member(K, Item, Acc));
 parse_dict_key(<<C, R/bits>>, Acc, K) when
         ?IS_ALPHA(C) or ?IS_DIGIT(C) or
         (C =:= $_) or (C =:= $-) or (C =:= $.) or (C =:= $*) or (C =:= $%) ->
     parse_dict_key(R, Acc, <<K/binary, C>>);
 parse_dict_key(<<$;, R0/bits>>, Acc, K) ->
-    {Params, R} = parse_before_param(R0, []),
-    parse_dict_before_sep(R, lists:keystore(K, 1, Acc, {K, {item, true, Params}}));
+    {Params, R} = parse_before_param(R0, {[], #{}}),
+    parse_dict_before_sep(R, dict_member(K, {item, true, Params}, Acc));
 parse_dict_key(R, Acc, K) ->
-    parse_dict_before_sep(R, lists:keystore(K, 1, Acc, {K, {item, true, []}})).
+    parse_dict_before_sep(R, dict_member(K, {item, true, []}, Acc)).
+
+%% @doc Keep the first position and last value of each member.
+dict_member(K, Item, {Keys, Items}) ->
+    case is_map_key(K, Items) of
+        true -> {Keys, Items#{K => Item}};
+        false -> {[K | Keys], Items#{K => Item}}
+    end.
+
+%% @doc Return members in their first-seen order with their last value.
+order_members({Keys, Items}) ->
+    [{K, maps:get(K, Items)} || K <- lists:reverse(Keys)].
 
 %% @doc Parse a binary SF dictionary before a separator.
 parse_dict_before_sep(<<$\s, R/bits>>, Acc) ->
@@ -199,7 +213,7 @@ parse_dict_before_sep(<<$\t, R/bits>>, Acc) ->
 parse_dict_before_sep(<<C, R/bits>>, Acc) when C =:= $, ->
     parse_dict_before_member(R, Acc);
 parse_dict_before_sep(<<>>, Acc) ->
-    Acc.
+    order_members(Acc).
 
 %% @doc Parse a binary SF dictionary before a member.
 parse_dict_before_member(<<$\s, R/bits>>, Acc) ->
@@ -220,7 +234,7 @@ parse_item(Bin) ->
 parse_item1(Bin) ->
     case parse_bare_item(Bin) of
         {Item, <<$;, R/bits>>} ->
-            {Params, Rest} = parse_before_param(R, []),
+            {Params, Rest} = parse_before_param(R, {[], #{}}),
             {{item, Item, Params}, Rest};
         {Item, Rest} ->
             {{item, Item, []}, Rest}
@@ -264,7 +278,7 @@ parse_list_before_member(R, Acc) ->
 parse_inner_list(<<$\s, R/bits>>, Acc) ->
     parse_inner_list(R, Acc);
 parse_inner_list(<<$), $;, R0/bits>>, Acc) ->
-    {Params, R} = parse_before_param(R0, []),
+    {Params, R} = parse_before_param(R0, {[], #{}}),
     {{list, lists:reverse(Acc), Params}, R};
 parse_inner_list(<<$), R/bits>>, Acc) ->
     {{list, lists:reverse(Acc), []}, R};
@@ -279,20 +293,20 @@ parse_before_param(<<C, R/bits>>, Acc) when ?IS_LC_ALPHA(C) or (C =:= $*) ->
     parse_param(R, Acc, <<C>>).
 
 parse_param(<<$;, R/bits>>, Acc, K) ->
-    parse_before_param(R, lists:keystore(K, 1, Acc, {K, true}));
+    parse_before_param(R, dict_member(K, true, Acc));
 parse_param(<<$=, R0/bits>>, Acc, K) ->
     case parse_bare_item(R0) of
         {Item, <<$;, R/bits>>} ->
-            parse_before_param(R, lists:keystore(K, 1, Acc, {K, Item}));
+            parse_before_param(R, dict_member(K, Item, Acc));
         {Item, R} ->
-            {lists:keystore(K, 1, Acc, {K, Item}), R}
+            {order_members(dict_member(K, Item, Acc)), R}
     end;
 parse_param(<<C, R/bits>>, Acc, K) when
     ?IS_LC_ALPHA(C) or ?IS_DIGIT(C) or
         (C =:= $_) or (C =:= $-) or (C =:= $.) or (C =:= $*) ->
     parse_param(R, Acc, <<K/binary, C>>);
 parse_param(R, Acc, K) ->
-    {lists:keystore(K, 1, Acc, {K, true}), R}.
+    {order_members(dict_member(K, true, Acc)), R}.
 
 %% @doc Parse an integer or decimal.
 parse_bare_item(<<$-, R/bits>>) -> parse_number(R, 0, <<$->>);
@@ -316,6 +330,9 @@ parse_bare_item(<<>>) ->
     {{binary, <<>>}, <<>>}.
 
 %% @doc Parse an integer or decimal binary.
+parse_number(<<C, _/bits>>, L, _Acc) when
+        ?IS_DIGIT(C), L >= ?MAX_INTEGER_DIGITS ->
+    throw(integer_too_long);
 parse_number(<<C, R/bits>>, L, Acc) when ?IS_DIGIT(C) ->
     parse_number(R, L + 1, <<Acc/binary, C>>);
 parse_number(<<$., R/bits>>, L, Acc) ->
@@ -326,34 +343,13 @@ parse_number(R, _L, Acc) ->
 %% @doc Parse a decimal binary.
 parse_decimal(<<C, R/bits>>, L1, L2, IntAcc, FracAcc) when ?IS_DIGIT(C) ->
     parse_decimal(R, L1, L2 + 1, IntAcc, <<FracAcc/binary, C>>);
-parse_decimal(R, L1, L2, IntAcc, FracAcc0) when L1 =< 12, L2 >= 1, L2 =< 3 ->
+parse_decimal(R, L1, L2, IntAcc, FracAcc0) when
+        L1 >= 1, L1 =< 12, L2 >= 1, L2 =< 3 ->
     %% While not strictly required this gives a more consistent representation.
-    FracAcc =
-        case FracAcc0 of
-            <<$0>> -> <<>>;
-            <<$0, $0>> -> <<>>;
-            <<$0, $0, $0>> -> <<>>;
-            <<A, B, $0>> -> <<A, B>>;
-            <<A, $0, $0>> -> <<A>>;
-            <<A, $0>> -> <<A>>;
-            _ -> FracAcc0
-        end,
-    Mul =
-        case byte_size(FracAcc) of
-            3 -> 1000;
-            2 -> 100;
-            1 -> 10;
-            0 -> 1
-        end,
-    Int = binary_to_integer(IntAcc),
-    Frac =
-        case FracAcc of
-            <<>> -> 0;
-            %% Mind the sign.
-            _ when Int < 0 -> -binary_to_integer(FracAcc);
-            _ -> binary_to_integer(FracAcc)
-        end,
-    {{decimal, {Int * Mul + Frac, -byte_size(FracAcc)}}, R}.
+    FracAcc = string:trim(FracAcc0, trailing, "0"),
+    % The sign and the digits without the point are the base: -0.05 is {-5, -2}.
+    Base = binary_to_integer(<<IntAcc/binary, FracAcc/binary>>),
+    {{decimal, {Base, -byte_size(FracAcc)}}, R}.
 
 %% @doc Parse a string binary.
 parse_string(<<$\\, $", R/bits>>, Acc) ->
@@ -564,76 +560,52 @@ bare_item({token, Token}) ->
     Token;
 bare_item({binary, Binary}) ->
     [$:, base64:encode(Binary), $:];
-bare_item({decimal, {Base, Exp}}) when Exp >= 0 ->
-    Mul =
-        case Exp of
-            0 -> 1;
-            1 -> 10;
-            2 -> 100;
-            3 -> 1000;
-            4 -> 10000;
-            5 -> 100000;
-            6 -> 1000000;
-            7 -> 10000000;
-            8 -> 100000000;
-            9 -> 1000000000;
-            10 -> 10000000000;
-            11 -> 100000000000;
-            12 -> 1000000000000
-        end,
-    MaxLenWithSign =
-        if
-            Base < 0 -> 13;
-            true -> 12
-        end,
-    Bin = integer_to_binary(Base * Mul),
-    true = byte_size(Bin) =< MaxLenWithSign,
-    [Bin, <<".0">>];
-bare_item({decimal, {Base, -1}}) ->
-    Int = Base div 10,
-    Frac = abs(Base) rem 10,
-    [integer_to_binary(Int), $., integer_to_binary(Frac)];
-bare_item({decimal, {Base, -2}}) ->
-    Int = Base div 100,
-    Frac = abs(Base) rem 100,
-    [integer_to_binary(Int), $., integer_to_binary(Frac)];
-bare_item({decimal, {Base, -3}}) ->
-    Int = Base div 1000,
-    Frac = abs(Base) rem 1000,
-    [integer_to_binary(Int), $., integer_to_binary(Frac)];
+%% A decimal with fewer than three fractional digits is scaled to three.
+bare_item({decimal, {Base, Exp}}) when Exp > -3 ->
+    bare_item({decimal, {Base * 10, Exp - 1}});
 bare_item({decimal, {Base, Exp}}) ->
-    Div = exp_div(Exp),
-    Int0 = Base div Div,
-    true = abs(Int0) < 1000000000000,
-    Frac0 = abs(Base) rem Div,
-    DivFrac = Div div 1000,
-    Frac1 = Frac0 div DivFrac,
-    {Int, Frac} =
-        if
-            (Frac0 rem DivFrac) > (DivFrac div 2) ->
-                case Frac1 of
-                    999 when Int0 < 0 -> {Int0 - 1, 0};
-                    999 -> {Int0 + 1, 0};
-                    _ -> {Int0, Frac1 + 1}
-                end;
-            true ->
-                {Int0, Frac1}
+    % Round to thousandths, half to even.
+    Div = exp_div(Exp + 3),
+    Thousandths =
+        case {abs(Base) div Div, abs(Base) rem Div} of
+            {Q, Rem} when 2 * Rem > Div; 2 * Rem =:= Div, Q rem 2 =:= 1 ->
+                Q + 1;
+            {Q, _} ->
+                Q
         end,
+    Int = Thousandths div 1000,
+    true = Int < 1000000000000,
+    % Pad the fraction to three digits, then drop its trailing zeros.
+    <<$1, Frac/binary>> = integer_to_binary(1000 + Thousandths rem 1000),
     [
+        if
+            Base < 0, Thousandths > 0 -> $-;
+            true -> <<>>
+        end,
         integer_to_binary(Int),
         $.,
-        if
-            Frac < 10 -> [$0, $0, integer_to_binary(Frac)];
-            Frac < 100 -> [$0, integer_to_binary(Frac)];
-            true -> integer_to_binary(Frac)
+        case string:trim(Frac, trailing, "0") of
+            <<>> -> $0;
+            Digits -> Digits
         end
     ];
 bare_item(Integer) when is_integer(Integer) ->
-    integer_to_binary(Integer);
+    case is_integer_too_long(Integer) of
+        true -> throw(integer_too_long);
+        false -> integer_to_binary(Integer)
+    end;
 bare_item(true) ->
     <<"?1">>;
 bare_item(false) ->
     <<"?0">>.
+
+%% @doc Whether an integer has more than `?MAX_INTEGER_DIGITS' decimal digits.
+%% 10^100 lies between 2^332 and 2^333: compare against those first, so an
+%% enormous integer is refused without a decimal conversion.
+is_integer_too_long(Integer) when abs(Integer) < (1 bsl 332) -> false;
+is_integer_too_long(Integer) when abs(Integer) >= (1 bsl 333) -> true;
+is_integer_too_long(Integer) ->
+    byte_size(integer_to_binary(abs(Integer))) > ?MAX_INTEGER_DIGITS.
 
 exp_div(0) -> 1;
 exp_div(N) -> 10 * exp_div(N + 1).
@@ -655,17 +627,63 @@ escape_chars(<<$\\, R/bits>>, Acc) -> escape_chars(R, [$\\, $\\ | Acc]);
 escape_chars(<<$", R/bits>>, Acc) -> escape_chars(R, [$", $\\ | Acc]);
 escape_chars(<<C, R/bits>>, Acc) -> escape_chars(R, [C | Acc]).
 
+%% @doc Reject parameter names that cannot be serialized as RFC 9651 keys.
+validate_param_key(<<C, R/bits>>) when ?IS_LC_ALPHA(C) or (C =:= $*) ->
+    validate_param_key1(R).
+validate_param_key1(<<C, R/bits>>) when
+        ?IS_LC_ALPHA(C) or ?IS_DIGIT(C) or
+        (C =:= $_) or (C =:= $-) or (C =:= $.) or (C =:= $*) ->
+    validate_param_key1(R);
+validate_param_key1(<<>>) ->
+    ok.
+
 params(Params) ->
     [
         case Param of
-            {Key, true} -> [$;, Key];
-            {Key, Value} -> [$;, Key, $=, bare_item(Value)]
+            {Key, true} ->
+                ok = validate_param_key(Key),
+                [$;, Key];
+            {Key, Value} ->
+                ok = validate_param_key(Key),
+                [$;, Key, $=, bare_item(Value)]
         end
     ||
         Param <- Params
     ].
 
 %%% Tests
+
+parse_dictionary_duplicates_test() ->
+    ?assertEqual(
+        [
+            {<<"z">>, {item, true, [{<<"p">>, 3}]}},
+            {<<"a">>, {list, [{item, 4, []}], []}},
+            {<<"m">>, {item, 5, []}},
+            {<<"b">>, {item, true, []}}
+        ],
+        parse_dictionary(
+            <<"z=1, a=2, m, b=0, z;p=3, a=(4), m=5, b">>
+        )
+    ).
+
+parse_dictionary_scaling_test() ->
+    Measure =
+        fun(N) ->
+            Pairs = [
+                {<<"key", (integer_to_binary(I))/binary>>, {item, I, []}}
+            || I <- lists:seq(1, N)],
+            Bin = iolist_to_binary(dictionary(Pairs)),
+            erlang:garbage_collect(),
+            {reductions, Before} = process_info(self(), reductions),
+            Parsed = parse_dictionary(Bin),
+            {reductions, After} = process_info(self(), reductions),
+            ?assertEqual(Pairs, Parsed),
+            After - Before
+        end,
+    % Eight times the input must not require quadratic list traversal.
+    Small = Measure(512),
+    Large = Measure(4096),
+    ?assert(Large < 16 * Small).
 
 to_dictionary_test() ->
     {ok, SfDictionary} = to_dictionary(#{
@@ -790,6 +808,11 @@ to_list_test() ->
             }
         ]}
     ),
+    % Decimals keep their sign and leading fractional zeros, not trailing zeros.
+    ?assertEqual(
+        <<"1.05, -0.05, 1.5">>,
+        iolist_to_binary(list(parse_list(<<"1.05, -0.05, 1.500">>)))
+    ),
     ok.
 
 to_list_depth_test() ->
@@ -797,3 +820,29 @@ to_list_depth_test() ->
     {too_deep, _} = to_list([1,2,3, #{ foo => bar } ]),
     {too_deep, _} = to_list([1,2,3, [#{ foo => bar }] ]),
     ok.
+
+%% @doc Parameter names must follow the structured-fields key grammar.
+serialize_param_keys_test() ->
+    lists:foreach(
+        fun(Key) ->
+            ?assertEqual(
+                <<"?1;", Key/binary>>,
+                iolist_to_binary(item({item, true, [{Key, true}]}))
+            ),
+            ?assertEqual(
+                <<"?1;", Key/binary, "=\"v\"">>,
+                iolist_to_binary(item({item, true, [{Key, {string, <<"v">>}}]}))
+            )
+        end,
+        [<<"a">>, <<"*">>, <<"a0_-.*">>]
+    ),
+    lists:foreach(
+        fun(Key) ->
+            ?assertError(function_clause, item({item, true, [{Key, true}]})),
+            ?assertError(
+                function_clause,
+                item({item, true, [{Key, {string, <<"v">>}}]})
+            )
+        end,
+        [<<>>, <<"A">>, <<"0a">>, <<"a%">>, <<"a/b">>, <<"x\r\nx-injected">>]
+    ).

@@ -15,7 +15,7 @@
 %%% available for reading instantly (`optimistically'), even before the
 %%% transaction is dispatched.
 -module(dev_bundler).
--export([tx/3, item/3, ensure_server/1]).
+-export([device_info/1, tx/3, item/3, ensure_server/1]).
 -export([get_state/0, get_state/1]).
 
 -include("include/hb.hrl").
@@ -30,12 +30,25 @@
 
 %%% Public interface.
 
+%% @doc Export `tx' and `item' as keys; the server functions are not keys.
+device_info(_) -> #{ exports => [<<"tx">>, <<"item">>] }.
+
 %% @doc An alias for `item/3'.
+-spec tx(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ id := binary(), timestamp := integer(), _ => _ }}
+    | {error, #{ _ => _ }}.
 tx(Base, Req, Opts) ->
     item(Base, Req, Opts).
 
 %% @doc Implements an `up.arweave.net'-compatible endpoint for
 %% bundling messages.
+-spec item(
+    #{ _ => _ },
+    #{ 'bundler-subject' => binary(), _ => _ },
+    #{ _ => _ }
+) ->
+    {ok, #{ id := binary(), timestamp := integer(), _ => _ }}
+    | {error, #{ _ => _ }}.
 item(_Base, Req, Opts) ->
     ServerPID = ensure_server(Opts),
     ItemToProcess =
@@ -46,9 +59,12 @@ item(_Base, Req, Opts) ->
     case verify_message(ItemToProcess, Opts) of
         {ok, Item} ->
             ItemID = hb_message:id(Item, signed, Opts),
+            % Size the item for its bundle before it is written anywhere, so
+            % an item that cannot be bundled is refused with nothing cached
+            % or indexed.
+            BundledSize = bundled_item_size(Item, Opts),
             case cache_item(Item, Opts) of
                 ok ->
-                    BundledSize = bundled_item_size(Item, Opts),
                     {ok, Metering} =
                         hb_device_load:reference(<<"metering@1.0">>, Opts),
                     Metering:consume(<<"arweave-bytes">>, BundledSize, Opts),
@@ -72,11 +88,7 @@ item(_Base, Req, Opts) ->
                             {reason, Reason}
                         }
                     ),
-                    {error, #{
-                        <<"status">> => 500,
-                        <<"error">> => <<"cache-write-failed">>,
-                        <<"details">> => error_to_bin(Reason)
-                    }}
+                    {error, Reason}
             end;
         {error, Reason} ->
             {error, #{
@@ -87,9 +99,21 @@ item(_Base, Req, Opts) ->
     end.
 
 %% @doc Verify the subject by extracting committed fields and checking signatures.
+%% The item is the subject with its signed ANS-104 commitments alone: an item
+%% in a bundle carries its ANS-104 signature and no other, so a subject with
+%% no such commitment is unsigned, and the item's ID is its ANS-104 ID.
 %% Returns {ok, Item} or {error, Reason}.
 verify_message(Req, Opts) ->
-    case hb_message:with_only_committed(Req, Opts) of
+    ANS104 =
+        hb_message:with_commitments(
+            #{
+                <<"commitment-device">> => <<"ans104@1.0">>,
+                <<"committer">> => '_'
+            },
+            Req,
+            Opts
+        ),
+    case hb_message:with_only_committed(ANS104, Opts) of
         {ok, Item} ->
             case hb_message:signers(Item, Opts) of
                 [] ->
@@ -125,14 +149,23 @@ error_to_bin({error, Reason}) -> error_to_bin(Reason);
 error_to_bin(Reason) ->
     binary:replace(hb_util:bin(Reason), <<"_">>, <<"-">>, [global]).
 
-%% @doc Cache an item.
-%% Returns ok or {error, Reason}.
+%% @doc Cache an item. Returns ok, or {error, Msg} with a 500 status and the
+%% type and details of the failure: an exception of the write, or the badmatch
+%% of a write that returns anything but ok.
 cache_item(Item, Opts) ->
     try
-        dev_bundler_cache:write_item(Item, Opts)
+        ok = dev_bundler_cache:write_item(Item, Opts),
+        % Commit the item to disk before the upload is answered.
+        ok = hb_store:flush(hb_opts:get(store, no_viable_store, Opts), Opts)
     catch
         Type:ExceptionReason ->
-            {error, {Type, ExceptionReason}}
+            {error, #{
+                <<"status">> => 500,
+                <<"error">> => <<"cache-write-failed">>,
+                <<"type">> => hb_util:bin(Type),
+                <<"details">> =>
+                    hb_util:bin(hb_format:term(ExceptionReason, Opts))
+            }}
     end.
 
 %% @doc Queue an item, optionally blocking until its bundle is complete.
@@ -180,12 +213,22 @@ server_address(Opts) ->
 
 %% @doc Return the PID of the bundler server. If the server is not running,
 %% it is started and registered with the name returned by `server_name/1'.
+%% The items it recovers are listed before it starts, so an item that a
+%% request caches once it has started is queued by that request alone.
 ensure_server(Opts) ->
     Name = server_name(Opts),
-    hb_name:singleton(
-        Name,
-        fun() -> init(Opts) end
-    ).
+    case hb_name:lookup(Name) of
+        PID when is_pid(PID) -> PID;
+        undefined ->
+            ItemIDs = dev_bundler_cache:list_item_ids(Opts),
+            % Bundles use the configured identity, or the node key by default.
+            {ok, ServerOpts} =
+                case hb_opts:get(bundler_identity, not_found, Opts) of
+                    not_found -> {ok, hb_http_server:with_node_committer(Opts)};
+                    Identity -> hb_opts:as(Identity, Opts)
+                end,
+            hb_name:singleton(Name, fun() -> init(ItemIDs, ServerOpts) end)
+    end.
 
 %% @doc Return the current bundler server state for tests.
 get_state() ->
@@ -203,7 +246,7 @@ get_state(Opts) ->
     end.
 
 %% @doc Initialize the bundler server.
-init(Opts) ->
+init(ItemIDs, Opts) ->
     NumWorkers = hb_opts:get(bundler_workers, ?DEFAULT_NUM_WORKERS, Opts),
     Workers = lists:map(
         fun(_) ->
@@ -224,7 +267,7 @@ init(Opts) ->
         bundles = #{},
         opts = Opts
     },
-    dev_bundler_recovery:recover_unbundled_items(self(), Opts),
+    dev_bundler_recovery:recover_unbundled_items(self(), ItemIDs, Opts),
     dev_bundler_recovery:recover_bundles(self(), Opts),
     server(assign_tasks(InitialState), Opts).
 
@@ -704,7 +747,9 @@ nested_bundle_test_parallel() ->
     end.
 
 %% @doc End-to-end bundler test for a nested dataitem where the parent
-%% has bundle=false. The chile is posted on its own first.
+%% has bundle=false. The child is posted on its own first: it is signed with
+%% `httpsig@1.0' alone, so the bundler refuses it, and a plain data item
+%% takes its slot.
 nested_unbundled_bundle_child_posted_test_parallel() ->
     run_nested_unbundled_bundle_test(child_posted).
 
@@ -802,7 +847,11 @@ run_nested_unbundled_bundle_test(Variant) ->
     end.
 
 post_first_item(Node, child_posted, Child, ClientOpts) ->
-    post_structured_item(Node, Child, ClientOpts);
+    ?assertMatch(
+        {error, #{ <<"status">> := 400, <<"details">> := <<"unsigned-item">> }},
+        post_structured_item(Node, Child, ClientOpts)
+    ),
+    post_data_item(Node, new_data_item(1, 10), ClientOpts);
 post_first_item(Node, child_not_posted, _Child, ClientOpts) ->
     post_data_item(Node, new_data_item(1, 10), ClientOpts).
 
@@ -875,7 +924,10 @@ unsigned_dataitem_test_parallel() ->
                 <<"error">> := <<"invalid-item">>,
                 <<"details">> := <<"unsigned-item">>
             }},
-            Response)
+            Response),
+        % The server functions are not keys, so a client cannot start a server.
+        ?assertEqual({error, not_found},
+            hb_http:get(Node, <<"/~bundler@1.0/ensure-server">>, ClientOpts))
     after
         %% Always cleanup, even if test fails
         stop_test_servers(ServerHandle, NodeOpts)
@@ -969,7 +1021,7 @@ dispatch_blocking_test() ->
         Item4 = new_data_item(4, 10),
         {Time4, {ok, _}} =
             timer:tc(fun() -> post_data_item(Node, Item4, ClientOpts) end),
-        %% Assert that the 4th item takes no longer than twice the slowest of
+        %% Assert that the 4th item takes at most twice the slowest of
         %% the first 3. This verifies that we aren't blocking on the tx
         %% bundle dispatching.
         Slowest = lists:max([Time1, Time2, Time3]),
@@ -1038,6 +1090,7 @@ recover_respects_max_items_test_parallel() ->
 complete_task_sequence_test_parallel() ->
     Anchor = rand:bytes(32),
     Price = 12345,
+    Zone = ar_wallet:new(),
     {ServerHandle, NodeOpts} = hb_mock_server:start_arweave_gateway(#{
         price => {200, integer_to_binary(Price)},
         tx_anchor => {200, hb_util:encode(Anchor)}
@@ -1045,6 +1098,9 @@ complete_task_sequence_test_parallel() ->
     try
         Opts = NodeOpts#{
             <<"priv-wallet">> => ar_wallet:new(),
+            <<"identities">> =>
+                #{ <<"zone">> => #{ <<"priv-wallet">> => Zone } },
+            <<"bundler-identity">> => <<"zone">>,
             <<"store">> => hb_test_utils:test_store(),
             <<"bundler-max-items">> => 2,
             <<"retry-base-delay-ms">> => 100,
@@ -1064,6 +1120,11 @@ complete_task_sequence_test_parallel() ->
         State = get_state(Opts),
         ?assertNotEqual(undefined, State),
         ?assertNotEqual(timeout, State),
+        % The server signs bundles with the wallet of the configured identity.
+        ?assertEqual(
+            hb_opts:address(#{ <<"priv-wallet">> => Zone }),
+            hb_opts:address(State#state.opts)
+        ),
         Workers = State#state.workers,
         IdleWorkers = [
             PID
@@ -1086,7 +1147,7 @@ await_bundle_test_parallel() ->
     {ServerHandle, NodeOpts} = hb_mock_server:start_arweave_gateway(#{
         chunk => fun(_Req) ->
             Parent ! {chunk_started, self()},
-            receive release_chunk -> ok after 1000 -> ok end,
+            receive release_chunk -> ok end,
             {200, <<"OK">>}
         end,
         price => {200, integer_to_binary(Price)},
@@ -1119,8 +1180,6 @@ await_bundle_test_parallel() ->
         ChunkHandler =
             receive
                 {chunk_started, PID} -> PID
-            after 1000 ->
-                error(await_bundle_chunk_not_started)
             end,
         receive
             {await_bundle_result, _EarlyResult} ->
@@ -1132,8 +1191,6 @@ await_bundle_test_parallel() ->
         Result =
             receive
                 {await_bundle_result, AwaitResult} -> AwaitResult
-            after 2000 ->
-                error(await_bundle_result_timeout)
             end,
         ?assertMatch(
             {ok, #{
@@ -1587,16 +1644,40 @@ invalid_item_test_parallel() ->
         TamperedItem = Item#tx{data = <<"tampereddata">>},
         StructuredItem = hb_message:convert(
             TamperedItem, <<"structured@1.0">>, <<"ans104@1.0">>, TestOpts),
+        % The node refuses the item when it arrives: its commitment does not
+        % verify.
         PostResult = post_data_item(Node, TamperedItem, ClientOpts),
-        ?assertMatch({error, #{
-            <<"status">> := 400,
-            <<"error">> := <<"invalid-item">>,
-            <<"details">> := <<"signature-verification-failed">>}}, PostResult),
+        ?assertMatch({error, #{ <<"status">> := 400 }}, PostResult),
         DirectResult = dev_bundler:item(#{}, StructuredItem, TestOpts),
         ?assertMatch({error, #{
             <<"status">> := 400,
             <<"error">> := <<"invalid-item">>,
             <<"details">> := <<"signature-verification-failed">>}}, DirectResult),
+        % An item with two ANS-104 commitments cannot be sized for its bundle
+        % format: the node refuses it, and it must not be in the item index.
+        Signed1 =
+            hb_message:commit(
+                hb_message:uncommitted(StructuredItem),
+                #{ <<"priv-wallet">> => hb:wallet() },
+                #{ <<"commitment-device">> => <<"ans104@1.0">> }
+            ),
+        Signed2 =
+            hb_message:commit(
+                hb_message:uncommitted(Signed1),
+                #{ <<"priv-wallet">> => hb:wallet() },
+                #{ <<"commitment-device">> => <<"ans104@1.0">> }
+            ),
+        Unsigned1 = hb_message:uncommitted(Signed1),
+        TwoSigned =
+            Unsigned1#{
+                <<"commitments">> =>
+                    hb_maps:merge(
+                        hb_maps:get(<<"commitments">>, Signed1),
+                        hb_maps:get(<<"commitments">>, Signed2)
+                    )
+            },
+        ?assertThrow(_, dev_bundler:item(#{}, TwoSigned, TestOpts)),
+        ?assertEqual([], dev_bundler_cache:list_item_ids(TestOpts)),
         ok
     after
         stop_test_servers(ServerHandle, NodeOpts)

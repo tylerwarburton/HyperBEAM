@@ -53,12 +53,12 @@ function charge(base, assignment)
     -- deposit to restore this balance.
     ao.event({ "Debit request validated: ", { assignment = assignment } })
     base.balance = base.balance or {}
-    base.balance[request.account] =
-        (base.balance[request.account] or 0) - request.quantity
+    base.balance[string.lower(request.account)] =
+        (base.balance[string.lower(request.account)] or 0) - request.quantity
 
     -- Increment the balance of the recipient account.
-    base.balance[request.recipient] =
-        (base.balance[request.recipient] or 0) + request.quantity
+    base.balance[string.lower(request.recipient)] =
+        (base.balance[string.lower(request.recipient)] or 0) + request.quantity
 
     ao.event("debug_charge", { "Charge processed: ", { balances = base.balance } })
     return "ok", base

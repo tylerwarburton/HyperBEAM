@@ -15,6 +15,44 @@
 run_test() ->
     skip.
 
+%% @doc Each entry point parses binary paths and lists of steps alike.
+request_paths_test_() ->
+    Opts = #{ <<"store">> => hb_test_utils:test_store(), <<"hashpath">> => ignore },
+    Base = #{ <<"a">> => #{ <<"b">> => 7 }, <<"k">> => #{ <<"q">> => 4 },
+        <<"k=7">> => 9, <<"a/b">> => 8, <<"(subpath)">> => 5 },
+    {ok, ID} = hb_cache:write(Base, Opts),
+    {ok, ReqID} = hb_cache:write(#{ <<"path">> => <<"a/b">> }, Opts),
+    [
+        {hb_util:list(hb_util:bin(Path)), fun() ->
+            Singleton = case is_binary(Path) of
+                true -> <<ID/binary, "/", Path/binary>>;
+                false -> [ID | Path]
+            end,
+            lists:foreach(fun(Resolve) ->
+                ?assertEqual({ok, Expected}, Resolve())
+            end, [
+                fun() -> hb_ao:resolve(Base, Path, Opts) end,
+                fun() -> hb_ao:resolve(Base, #{ <<"path">> => Path }, Opts) end,
+                fun() -> hb_ao:resolve_many([Base, Path], Opts) end,
+                fun() -> hb_ao:resolve_many([Base, #{ <<"path">> => Path }], Opts) end,
+                fun() -> hb_ao:resolve(Singleton, Opts) end,
+                fun() -> {ok, hb_ao:get(Path, Base, Opts)} end
+            ])
+        end}
+    || {Path, Expected} <- [
+        {<<"a/b">>, 7}, {[<<"a">>, <<"b">>], 7},
+        {<<"k=7/q=4">>, 4}, {[<<"k=7">>, <<"q=4">>], 4},
+        {<<"k%3d7">>, 9}, {[<<"k%3d7">>], 9},
+        {<<"a%2fb">>, 8}, {[<<"a/b">>], 8},
+        {<<"a~message@1.0/b">>, 7}, {[<<"a~message@1.0">>, <<"b">>], 7},
+        {<<"set&x+integer=7/x">>, 7}, {[<<"set&x+integer=7">>, <<"x">>], 7},
+        {<<"(", ReqID/binary, ")">>, 7}, {[<<"(", ReqID/binary, ")">>], 7},
+        {<<"%28subpath%29">>, 5}, {[<<"%28subpath%29">>], 5},
+        {<<"set&x=%28subpath%29/x">>, <<"(subpath)">>},
+        {<<"set&x%3dy/x%3dy">>, true},
+        {[<<"set&x%3dy">>, <<"x%3dy">>], true}
+    ] ].
+
 %% @doc Run each test in the file with each set of options. Start and reset
 %% the store for each test.
 suite_test_() ->
@@ -51,6 +89,8 @@ test_suite() ->
             fun resolve_path_element_test/1},
         {resolve_binary_key, "resolve binary key",
             fun resolve_binary_key_test/1},
+        {resolve_capitalised_key, "resolve capitalised key",
+            fun resolve_capitalised_key_test/1},
         {key_to_binary, "key to binary",
             fun key_to_binary_test/1},
         {key_from_id_device_with_args, "key from id device with args",
@@ -60,6 +100,8 @@ test_suite() ->
         {device_with_default_handler_function,
             "device with default handler function",
             fun device_with_default_handler_function_test/1},
+        {error_strategy, "error strategy",
+            fun error_strategy_test/1},
         {basic_get, "basic get",
             fun basic_get_test/1},
         {get_with_denormalized_key, "get with denormalized key",
@@ -182,8 +224,10 @@ test_opts() ->
                 set_new_messages,
                 resolve_from_multiple_keys,
                 resolve_path_element,
+                resolve_capitalised_key,
                 device_with_default_handler_function,
                 device_with_handler_function,
+                error_strategy,
                 denormalized_device_name,
                 get_with_device,
                 get_as_with_device,
@@ -210,6 +254,8 @@ test_opts() ->
             skip => [
                 % Skip tests that assert behaviors of the management stages
                 % that raw mode explicitly skips.
+                resolve_capitalised_key,
+                error_strategy,
                 step_hook,
                 paranoid_input_verification,
                 paranoid_result_verification
@@ -218,6 +264,101 @@ test_opts() ->
     ].
 
 %%% Standalone test vectors
+
+%% @doc Cache addresses do not become receipts on the shared patch. The resolver
+%% constructs the caller's receipt from the original inputs on every return.
+hashpath_cached_patch_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(),
+        <<"attested-store">> => hb_test_utils:test_store(),
+        <<"cache-control">> => [<<"always">>]
+    },
+    Base = #{
+        <<"device">> => <<"test-device@1.0">>,
+        <<"counter">> => 1,
+        <<"other">> => <<"retained">>
+    },
+    Req = #{ <<"path">> => <<"vary-overlay">> },
+    {ok, Result} = hb_ao:resolve(Base, Req, Opts),
+    {ok, Context} = hb_ao:resolve(Base, Req, Opts#{
+        <<"cache-control">> => [<<"only-if-cached">>],
+        <<"return-context">> => true
+    }),
+    Patch = maps:get(<<"varied-result">>, Context),
+    ?assertEqual(2, hb_maps:get(<<"counter">>, Patch, undefined, Opts)),
+    ?assertNot(hb_maps:is_key(<<"other">>, Patch, Opts)),
+    ?assertNot(maps:is_key(<<"hashpath">>, hb_private:from_message(Patch))),
+    ?assertEqual(hb_private:reset(Result),
+        hb_private:reset(maps:get(<<"result">>, Context))).
+
+%% @doc A public hashpath field is a varied input, not private metadata that
+%% the computation cache can omit from its address.
+hashpath_request_input_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(),
+        <<"attested-store">> => hb_test_utils:test_store(),
+        <<"cache-control">> => [<<"always">>]
+    },
+    Base = #{ <<"device">> => <<"test-device@1.0">> },
+    FirstReq = #{
+        <<"path">> => <<"vary-unspecified">>,
+        <<"hashpath">> => hb_message:id(#{ <<"value">> => 1 }, all, Opts)
+    },
+    SecondReq = FirstReq#{
+        <<"hashpath">> => hb_message:id(#{ <<"value">> => 2 }, all, Opts)
+    },
+    % A literal key cannot masquerade as the ID of a different request.
+    ?assertNotEqual(hb_path:hashpath(Base, FirstReq, Opts),
+        hb_path:hashpath(Base,
+            #{ <<"path">> => hb_message:id(FirstReq, all, Opts) }, Opts)),
+    {ok, _} = hb_ao:resolve(Base, FirstReq, Opts),
+    ?assertMatch({error, #{ <<"status">> := 504 }},
+        hb_ao:resolve(Base, SecondReq,
+            Opts#{ <<"cache-control">> => [<<"only-if-cached">>] })),
+    {ok, Result} = hb_ao:resolve(Base, SecondReq, Opts),
+    ?assertEqual(SecondReq,
+        hb_private:reset(hb_ao:get(<<"request">>, Result, Opts))),
+    ?assert(hb_hashpath:verify_all(hb_path:hashpath(Result, Opts), Opts)).
+
+%% @doc Reset and abnormal statuses remove the receipt and its result binding.
+%% Ignoring hashpaths preserves the device's result without adding a receipt.
+hashpath_reset_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(),
+        <<"cache-control">> => [<<"no-cache">>, <<"no-store">>]
+    },
+    Base = #{ <<"child">> => #{ <<"value">> => 7 } },
+    {ok, Result} = hb_ao:resolve(Base, <<"child">>, Opts),
+    Container = #{ <<"result">> => Result },
+    {ok, Ignored} = hb_ao:resolve(Container, <<"result">>,
+        Opts#{ <<"hashpath">> => ignore }),
+    % The invocation removes the loaded child's unsigned commitment.
+    ?assertEqual(hb_message:uncommitted(Result, Opts), Ignored),
+    % An execution that ignores its hashpath does not commit to its inputs.
+    BaseHook = fun(_Base, Req, _Opts) ->
+        {ok, Req#{ <<"body">> => maps:get(<<"base">>, Req) }}
+    end,
+    {ok, Varied} = hb_ao:resolve(Container, <<"result">>, Opts#{
+        <<"hashpath">> => ignore,
+        <<"on">> => #{ <<"step">> => #{ <<"device">> => #{ step => BaseHook } } }
+    }),
+    ?assertEqual(hb_message:uncommitted_deep(Container, Opts), Varied),
+    {ok, Reset} = hb_ao:resolve(Container, <<"result">>,
+        Opts#{ <<"hashpath">> => reset }),
+    Hook = fun(_Base, Req, _Opts) -> {ok, Req#{ <<"status">> => error }} end,
+    {error, Failed} = hb_ao:resolve(Container, <<"result">>, Opts#{
+        <<"on">> => #{ <<"step">> => #{ <<"device">> => #{ step => Hook } } }
+    }),
+    ?assertEqual(hb_private:reset(Result), hb_private:reset(Reset)),
+    ?assertEqual(hb_private:reset(hb_message:uncommitted(Result, Opts)),
+        hb_private:reset(Failed)),
+    lists:foreach(
+        fun(Msg) ->
+            ?assertEqual(#{}, maps:with([<<"hashpath">>, <<"hashpath-result">>],
+                hb_private:from_message(Msg)))
+        end,
+        [Reset, Failed]
+    ).
 
 %% @doc Ensure that we can read a device from the cache then execute it. By 
 %% extension, this will also allow us to load a device from Arweave due to the
@@ -305,7 +446,7 @@ load_device_test() ->
     Wallet = ar_wallet:new(),
     Opts = #{
         <<"trusted-device-signers">> =>
-            [hb:address(), hb_util:human_id(ar_wallet:to_address(Wallet))],
+            [hb:address(), hb_test_utils:committer(Wallet)],
         <<"store">> => Store = hb_test_utils:test_store(hb_store_fs),
         <<"priv-wallet">> => Wallet
     },
@@ -318,13 +459,14 @@ untrusted_load_device_test() ->
     TrustedWallet = ar_wallet:new(),
     Opts = #{
         <<"trusted-device-signers">> =>
-            [hb:address(), hb_util:human_id(ar_wallet:to_address(TrustedWallet))],
+            [hb:address(), hb_test_utils:committer(TrustedWallet)],
         <<"store">> => Store = hb_test_utils:test_store(hb_store_fs),
         <<"priv-wallet">> => UntrustedWallet
     },
     hb_store:reset(Store),
-    ?assertThrow(
-        {error, {device_not_loadable, _, _}},
+    % `exec_dummy_device' fails to match the error that the resolution returns.
+    ?assertError(
+        {badmatch, {error, #{ <<"error">> := <<"device-not-loadable">> }}},
         exec_dummy_device(Opts)
     ).
 
@@ -354,7 +496,10 @@ no_trusted_device_signers_skips_gateway_test() ->
 
 resolve_simple_test(Opts) ->
     Res = hb_ao:resolve(#{ <<"a">> => <<"RESULT">> }, <<"a">>, Opts),
-    ?assertEqual({ok, <<"RESULT">>}, Res).
+    ?assertEqual({ok, <<"RESULT">>}, Res),
+    % A key linking to a message the node does not hold reads as the default.
+    Link = {link, <<"ao:", (hb_util:human_id(<<0:256>>))/binary>>, #{}},
+    ?assertEqual(default, hb_ao:get(<<"a">>, #{ <<"a">> => Link }, default, Opts)).
 
 singleton_id_base_test() ->
     Opts = #{
@@ -368,14 +513,35 @@ singleton_id_base_test() ->
     ),
     MissingID = hb_util:human_id(<<0:256>>),
     ?assertMatch(
-        {error, #{ <<"status">> := 404 }},
+        {error, not_found},
         hb_ao:resolve(<<"/", MissingID/binary, "/keys">>, Opts)
+    ).
+
+direct_id_key_resolution_test() ->
+    Store = hb_test_utils:test_store(),
+    Opts =
+        #{
+            <<"store">> => Store,
+            <<"cache-control">> => [<<"no-cache">>, <<"no-store">>],
+            <<"spawn-worker">> => false
+        },
+    hb_store:reset(Store),
+    {ok, ID} = hb_cache:write(#{ <<"value">> => <<"kept">> }, Opts),
+    ?assertEqual(
+        {ok, <<"kept">>},
+        hb_ao:resolve(<<"ao:", ID/binary>>, <<"value">>, Opts)
     ).
 
 resolve_id_test(Opts) ->
     ?assertMatch(
         ID when byte_size(ID) == 43,
         hb_ao:get(<<"id">>, #{ <<"test_key">> => <<"1">> }, Opts)
+    ),
+    % `ID' on a message with a literal `id' key gives the ID that `id' gives.
+    Msg = #{ <<"test_key">> => <<"1">>, <<"id">> => <<"literal">> },
+    ?assertEqual(
+        hb_ao:get(<<"id">>, Msg, Opts),
+        hb_ao:get(<<"ID">>, Msg, Opts)
     ).
 
 resolve_key_twice_test(Opts) ->
@@ -395,10 +561,6 @@ resolve_path_element_test(Opts) ->
     ?assertEqual(
         {ok, [<<"test_path">>]},
         hb_ao:resolve(#{ <<"path">> => [<<"test_path">>] }, <<"path">>, Opts)
-    ),
-    ?assertEqual(
-        {ok, [<<"a">>]},
-        hb_ao:resolve(#{ <<"Path">> => [<<"a">>] }, <<"Path">>, Opts)
     ).
 
 key_to_binary_test(Opts) ->
@@ -410,6 +572,15 @@ resolve_binary_key_test(Opts) ->
     ?assertEqual(
         {ok, <<"RESULT">>},
         hb_ao:resolve(#{ a => <<"RESULT">> }, <<"a">>, Opts)
+    ).
+
+%% @doc The vary step gives a device the keys of its inputs in lowercase, so a
+%% key that is read with capitals finds the message's key, and a `Device' key is
+%% in lowercase before the device is chosen. Raw mode does not vary.
+resolve_capitalised_key_test(Opts) ->
+    ?assertEqual(
+        {ok, [<<"a">>]},
+        hb_ao:resolve(#{ <<"Path">> => [<<"a">>] }, <<"Path">>, Opts)
     ),
     ?assertEqual(
         {ok, <<"1">>},
@@ -418,6 +589,17 @@ resolve_binary_key_test(Opts) ->
                 <<"Test-Header">> => <<"1">>
             },
             <<"Test-Header">>,
+            Opts
+        )
+    ),
+    ?assertEqual(
+        {ok, <<"integer=(\"a\")">>},
+        hb_ao:resolve(
+            #{ <<"Device">> => <<"structured@1.0">> },
+            #{
+                <<"path">> => <<"encode-types">>,
+                <<"body">> => #{ <<"a">> => <<"integer">> }
+            },
             Opts
         )
     ).
@@ -456,7 +638,7 @@ generate_device_with_keys_using_args() ->
 %% @doc Create a simple test device that implements the default handler.
 gen_default_device() ->
     #{
-        info =>
+        device_info =>
             fun() ->
                 #{
                     default =>
@@ -474,7 +656,7 @@ gen_default_device() ->
 %% @doc Create a simple test device that implements the handler key.
 gen_handler_device() ->
     #{
-        info =>
+        device_info =>
             fun() ->
                 #{
                     handler =>
@@ -562,6 +744,23 @@ device_with_default_handler_function_test(Opts) ->
     ?assertEqual(
         {ok, <<"DEFAULT">>},
         hb_ao:resolve(Msg, <<"any_random_key">>, Opts)
+    ).
+
+%% @doc A device call that raises is an error status, under an error strategy
+%% other than `throw'.
+error_strategy_test(Opts) ->
+    Msg =
+        #{
+            <<"device">> =>
+                #{ <<"fail">> => fun(_Base, _Req, _Opts) -> error(bad) end }
+        },
+    ?assertMatch(
+        {failure, #{ <<"class">> := error, <<"exception">> := bad }},
+        hb_ao:resolve(
+            Msg,
+            <<"fail">>,
+            Opts#{ <<"error-strategy">> => <<"continue">> }
+        )
     ).
 
 basic_get_test(Opts) ->
@@ -763,8 +962,21 @@ deep_set_with_device_test(Opts) ->
 
 device_exports_test(Opts) ->
 	Msg = #{ <<"device">> => dev_message },
-	?assert(hb_device:is_exported(Msg, dev_message, info, Opts)),
 	?assert(hb_device:is_exported(Msg, dev_message, set, Opts)),
+	?assertEqual(
+        not_found,
+        hb_ao:get(<<"module_info">>, #{ <<"a">> => 1 }, Opts)
+    ),
+    % A device's `device_info' gives its options to the kernel. It is never a
+    % key of the device.
+    ?assertEqual(
+        not_found,
+        hb_ao:get(
+            <<"device-info">>,
+            #{ <<"device">> => #{ device_info => fun(_) -> #{} end } },
+            Opts
+        )
+    ),
 	?assert(
         hb_device:is_exported(
             Msg,
@@ -774,15 +986,14 @@ device_exports_test(Opts) ->
         )
     ),
 	Dev = #{
-		info => fun() -> #{ exports => [set] } end,
+		device_info => fun() -> #{ exports => [set] } end,
 		set => fun(_, _) -> {ok, <<"SET">>} end
 	},
 	Req = #{ <<"device">> => Dev },
-	?assert(hb_device:is_exported(Req, Dev, info, Opts)),
 	?assert(hb_device:is_exported(Req, Dev, set, Opts)),
 	?assert(not hb_device:is_exported(Req, Dev, not_exported, Opts)),
     Dev2 = #{
-        info =>
+        device_info =>
             fun() ->
                 #{
                     exports => [test1, test2],
@@ -815,7 +1026,7 @@ device_excludes_test(Opts) ->
     % sets excludes to [set], such that the message can be modified using the 
     % default handler.
     Dev = #{
-        <<"info">> =>
+        <<"device_info">> =>
             fun() ->
                 #{
                     excludes => [set],
@@ -835,9 +1046,10 @@ device_inheritance_test(Opts) ->
     % precedence order of matching keys is correct:
     %     The local device > the inherited device > the global default device*
     % Note that we only fallback to the global device in this case because the
-    % inherited device does not specify a further `default' key in its `info'.
+    % inherited device does not specify a further `default' key in its
+    % `device_info'.
     Dev = #{
-        info =>
+        device_info =>
             fun() ->
                 #{
                     default => <<"test-device@1.0">>
@@ -863,11 +1075,19 @@ denormalized_device_name_test(Opts) ->
     Msg = #{ <<"device">> => Dev },
     ?assertEqual(
         Dev,
-        hb_maps:without([<<"priv">>], hb_ao:get(device, Msg, Opts), Opts)
+        hb_maps:without(
+            [<<"commitments">>, <<"priv">>],
+            hb_ao:get(device, Msg, Opts),
+            Opts
+        )
     ),
     ?assertEqual(
         Dev,
-        hb_maps:without([<<"priv">>], hb_ao:get(<<"device">>, Msg, Opts), Opts)
+        hb_maps:without(
+            [<<"commitments">>, <<"priv">>],
+            hb_ao:get(<<"device">>, Msg, Opts),
+            Opts
+        )
     ),
     ?assertEqual(
         {ok, Dev, maps:get(test_func, Dev)},
@@ -879,7 +1099,7 @@ denormalized_key_test(Opts) ->
         #{
             device =>
                 #{
-                    info =>
+                    device_info =>
                         fun() ->
                             #{
                                 exports => [<<"test-key">>]
@@ -898,6 +1118,12 @@ denormalized_key_test(Opts) ->
     ?assertEqual(
         {ok, <<"TEST VALUE">>},
         hb_ao:resolve(Msg, <<"test-key">>, Opts)
+    ),
+    % Map device resolves canonical hyphenated binary key without atom conversion.
+    HyphenMsg = #{ device => #{ <<"my-fn">> => fun(_) -> {ok, <<"HYPHEN">>} end } },
+    ?assertEqual(
+        {ok, <<"HYPHEN">>},
+        hb_ao:resolve(HyphenMsg, <<"my-fn">>, Opts)
     ).
 
 list_transform_test(Opts) ->
@@ -925,8 +1151,8 @@ start_as_with_parameters_test(Opts) ->
         <<"device">> => <<"test-device@1.0">>,
         <<"test_func">> => #{ <<"test_key">> => <<"MESSAGE">> }
     },
-    ?assertEqual(
-        {ok, <<"GOOD FUNCTION">>},
+    ?assertMatch(
+        {ok, #{ <<"test_key">> := <<"MESSAGE">> }},
         hb_ao:resolve_many(
             [
                 {as, <<"message@1.0">>, Msg},
@@ -953,7 +1179,7 @@ load_as_test(Opts) ->
         {ok, <<"MESSAGE">>},
         hb_ao:resolve_many(
             [
-                {as, <<"message@1.0">>, #{ <<"path">> => <<ID/binary>> }},
+                {as, <<"message@1.0">>, <<"ao:", ID/binary>>},
                 <<"test_func">>,
                 <<"test_key">>
             ],
@@ -1083,6 +1309,7 @@ step_hook_test(InitOpts) ->
                 }
         },
     Msg = #{
+        <<"device">> => <<"test-device@1.0">>,
         <<"a">> =>
             #{
                 <<"b">> =>
@@ -1096,7 +1323,7 @@ step_hook_test(InitOpts) ->
         {ok, <<"1">>},
         hb_ao:resolve(
             Msg,
-            #{ <<"path">> => <<"a/b/c">> },
+            #{ <<"path">> => <<"load/a/b/c">> },
             Opts
         )
     ),
@@ -1124,14 +1351,50 @@ paranoid_message_verification_test(RawOpts) ->
     Opts = paranoid_opts(RawOpts),
     Base = hb_message:normalize_commitments(#{ <<"a">> => 1 }, Opts),
     ?assert(hb_message:paranoid_verify(Base, Opts)),
-    ?assertThrow(_, hb_message:paranoid_verify(Base#{ <<"a">> => 2 }, Opts)).
+    ?assertThrow(_, hb_message:paranoid_verify(Base#{ <<"a">> => 2 }, Opts)),
+    % Verify loaded children and link commitments without loading link targets.
+    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Link = {link, <<"ao:", ID/binary>>, #{}},
+    ?assertEqual({error, not_found}, hb_cache:read(ID, Opts)),
+    ?assert(hb_message:paranoid_verify(Link, Opts)),
+    Linked = hb_message:normalize_commitments(
+        #{ <<"child">> => Base, <<"reference">> => Link },
+        Opts
+    ),
+    ?assert(hb_message:paranoid_verify(Linked, Opts)),
+    ?assert(hb_message:paranoid_verify({ok, Linked}, Opts)),
+    ?assert(hb_message:paranoid_verify([Link, Linked], Opts)),
+    ?assertEqual(true, hb_message:deep_verify([Link, Linked], Opts)),
+    ?assertMatch(
+        {false, <<"1/child">>, _},
+        hb_message:deep_verify(
+            [Linked#{ <<"child">> => Base#{ <<"a">> => 2 } }],
+            Opts#{ <<"paranoid-verify">> => false }
+        )
+    ),
+    ?assertThrow(
+        {paranoid_verification_failure, default, <<"child">>, _, _},
+        hb_message:paranoid_verify(
+            Linked#{ <<"child">> => Base#{ <<"a">> => 2 } },
+            Opts
+        )
+    ),
+    ?assertThrow(
+        {paranoid_verification_failure, default, <<>>, _, _},
+        hb_message:paranoid_verify(Linked#{ <<"reference">> => <<"changed">> }, Opts)
+    ),
+    ?assertMatch(
+        {ok, _},
+        hb_cache:write(Linked, Opts#{ <<"paranoid-verify">> => [cache_write] })
+    ),
+    ?assertEqual({error, not_found}, hb_cache:read(ID, Opts)).
 
 paranoid_input_verification_test(RawOpts) ->
-    Opts = paranoid_opts(RawOpts),
-    % Test that the input and base messages are verified prior to execution.
-    Base = hb_message:normalize_commitments(#{ <<"a">> => 1 }, Opts),
+    Opts = (paranoid_opts(RawOpts))#{ <<"priv-wallet">> => ar_wallet:new() },
+    % Signed inputs are preserved by Vary and verified before execution.
+    Base = hb_message:commit(#{ <<"a">> => 1 }, Opts),
     Request =
-        hb_message:normalize_commitments(
+        hb_message:commit(
             #{ <<"path">> => <<"keys">>, <<"a">> => 1 },
             Opts
         ),
@@ -1140,9 +1403,9 @@ paranoid_input_verification_test(RawOpts) ->
 
 paranoid_result_verification_test(RawOpts) ->
     % Test that the result message is verified after execution.
-    Opts = paranoid_opts(RawOpts),
+    Opts = (paranoid_opts(RawOpts))#{ <<"priv-wallet">> => ar_wallet:new() },
     Base =
-        hb_message:normalize_commitments(
+        hb_message:commit(
             #{ <<"device">> => <<"test-device@1.0">>, <<"a">> => 1 },
             Opts
         ),

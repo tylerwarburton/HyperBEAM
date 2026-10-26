@@ -1,19 +1,24 @@
 %%% @doc An Arweave path manifest resolution device. Follows the v1 schema:
 %%% https://specs.ar.io/?tx=lXLd0OPwo-dJLB_Amz5jgIeDhiOkjXuM3-r0H_aiNj0
 -module(dev_manifest).
--export([index/3, info/0, request/3]).
+-export([index/3, device_info/0, request/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %% @doc Use the `route/4' function as the handler for all requests, aside
 %% from `keys' and `set', which are handled by the default resolver.
-info() ->
+device_info() ->
     #{
         default => fun route/4,
         excludes => [keys, set, committers]
     }.
 
 %% @doc Return the fallback index page when the manifest itself is requested.
+-spec index(
+    #{ index => #{ path => binary(), _ => _ }, paths => #{ _ => _ }, _ => _ },
+    #{ _ => _ },
+    #{ _ => _ }
+) -> {ok, _} | {error, not_found}.
 index(M1, M2, Opts) ->
     ?event(debug_manifest, {index_request, {base, M1}, {request, M2}}, Opts),
     case route(<<"index">>, M1, M2, Opts) of
@@ -25,6 +30,12 @@ index(M1, M2, Opts) ->
     end.
 
 %% @doc Route a request to the associated data via its manifest.
+-spec route(
+    binary(),
+    #{ paths => #{ _ => _ }, index => #{ path => binary(), _ => _ }, _ => _ },
+    #{ _ => _ },
+    #{ _ => _ }
+) -> {ok, _} | {error, not_found}.
 route(<<"index">>, M1, M2, Opts) ->
     ?event({manifest_index, M1, M2}),
     case manifest(M1, <<>>, Opts) of
@@ -50,9 +61,13 @@ route(<<"index">>, M1, M2, Opts) ->
                 not_found ->
                     ?event({manifest_path_not_found, <<"index/path">>}),
                     {error, not_found};
+                % No manifest path can be named `index': this clause owns that key.
+                <<"index">> ->
+                    ?event({manifest_path_not_found, <<"index/path">>}),
+                    {error, not_found};
                 _ ->
                     ?event({manifest_path, Path}),
-                    route(Path, M1, M2, Opts)
+                    route(Path, M1, M2, Opts#{ <<"manifest-404">> => error })
             end;
         {error, not_found} ->
             ?event(manifest_not_parsed),
@@ -86,6 +101,9 @@ route(Key, M1, M2, Opts) ->
 %% @doc Implement the `on/request' hook for the `manifest@1.0' device, finding
 %% requests for legacy (non-device-tagged) manifests and casting them to
 %% `manifest@1.0' before execution. Allowing `/ID/path` style access for old data.
+-spec request(#{ _ => _ }, #{ body := [_], _ => _ }, #{ _ => _ }) ->
+    {ok, #{ body := [_], _ => _ }}
+    | {error, #{ status := integer(), body := binary() }}.
 request(Base, Req, Opts) ->
     ?event({on_req_manifest_detector, {base, Base}, {req, Req}}),
     maybe
@@ -134,12 +152,22 @@ request(Base, Req, Opts) ->
 load(Msg, _Opts) when is_map(Msg) -> {ok, Msg};
 load(List, _Opts) when is_list(List) -> skip;
 load({as, _, _}, _Opts) -> skip;
+load({resolve, _}, _Opts) -> skip;
 load(ID, Opts) when ?IS_ID(ID) ->
     case hb_cache:read(ID, Opts) of
         {ok, Msg} -> load(Msg, Opts);
         _ ->
             ?event(debug_maybe_cast_manifest, {message_load_failed, {id, ID}}),
             {error, not_found}
+    end;
+load(URI, Opts) when is_binary(URI) ->
+    case hb_uri:maybe_from(URI, Opts) of
+        {ok, Msg} when is_map(Msg) -> {ok, Msg};
+        {ok, _} -> skip;
+        {error, not_found} ->
+            ?event(debug_maybe_cast_manifest, {message_load_failed, {uri, URI}}),
+            {error, not_found};
+        Error -> Error
     end;
 load(Msg, Opts) when ?IS_LINK(Msg) ->
     try load(hb_cache:ensure_loaded(Msg, Opts), Opts)
@@ -218,7 +246,7 @@ decode_manifest(JSON, Path, Opts) ->
 %% structured) manifest.
 linkify(#{ <<"id">> := ID }, Opts) when is_binary(ID) ->
     LinkOptsBase = (maps:with([<<"store">>], Opts))#{ <<"scope">> => [local, remote]},
-    {link, ID, LinkOptsBase#{ <<"type">> => <<"link">>, <<"lazy">> => false }};
+    {link, <<"ao:", ID/binary>>, LinkOptsBase};
 linkify(Manifest, Opts) when is_map(Manifest) ->
     hb_maps:map(
         fun(_Key, Val) -> linkify(Val, Opts) end,
@@ -293,6 +321,11 @@ resolve_test_parallel() ->
     ?assertMatch(
         {ok, #{ <<"body">> := <<"Page 2">>}}, 
         hb_http:get(Node, << LegacyManifestID/binary, "/nested/page2" >>, Opts)),
+    % A legacy manifest given by an `ao:' URI is cast in the same way.
+    ?assertMatch(
+        {ok, #{ <<"body">> := <<"Page 1">> }},
+        hb_http:get(Node, << "/ao:", LegacyManifestID/binary, "/index" >>, Opts)
+    ),
     ok.
 
 manifest_default_fallback_test_parallel() ->
@@ -303,6 +336,27 @@ manifest_default_fallback_test_parallel() ->
     ?assertMatch(
         {ok, #{ <<"body">> := <<"Page 1">> }},
         hb_http:get(Node, << ManifestID/binary, "/invalid_path" >>, Opts)
+    ),
+    % A manifest whose index path is missing is not found: no second fallback.
+    {ok, DanglingID} =
+        hb_cache:write(
+            #{
+                <<"device">> => <<"manifest@1.0">>,
+                <<"body">> =>
+                    hb_json:encode(#{
+                        <<"index">> => #{ <<"path">> => <<"gone">> },
+                        <<"paths">> => #{}
+                    })
+            },
+            Opts
+        ),
+    Self = self(),
+    spawn(fun() ->
+        Self ! {res, hb_http:get(Node, << DanglingID/binary, "/invalid_path" >>, Opts)}
+    end),
+    ?assertMatch(
+        {error, not_found},
+        receive {res, R} -> R after 5000 -> timeout end
     ),
     ok.
 

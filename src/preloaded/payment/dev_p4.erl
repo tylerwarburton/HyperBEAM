@@ -33,21 +33,38 @@
 %%% the charge must be applied to the ledger, whereas the `pre' type is used to
 %%% check whether the charge would succeed before execution.
 -module(dev_p4).
+-specification("../../../specs/p4@1.0.md").
 -export([request/3, response/3, balance/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
-%%% The default list of routes that should not be charged for.
+%%% The default list of routes that should not be charged for. Each template
+%%% is a regular expression that matches from the start of the path.
 -define(DEFAULT_NON_CHARGABLE_ROUTES, [
-    #{ <<"template">> => <<"/~p4@1.0/balance">> },
-    #{ <<"template">> => <<"/~p4@1.0/topup">> },
-    #{ <<"template">> => <<"/~meta@1.0/*">> }
+    #{ <<"template">> => <<"^/~p4@1\\.0/balance$">> },
+    #{ <<"template">> => <<"^/~p4@1\\.0/topup$">> },
+    #{ <<"template">> => <<"^/~meta@1\\.0">> }
 ]).
+
+%% The private key that p4's hooks give on their pricing requests.
+-define(HOOK_PRIV, #{ <<"hook-caller">> => <<"kernel">> }).
 
 %% @doc Estimate the cost of a transaction and decide whether to proceed with
 %% a request. The default behavior if `pricing-device' or `p4_balances' are
 %% not set is to proceed, so it is important that a user initialize them.
+%% Only the node's request hook may call this key; a direct call is refused.
+-spec request(
+    #{ 'pricing-device' => binary(), 'ledger-device' => binary(), _ => _ },
+    #{ request := #{ _ => _ }, body := [_], _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ body := [_], _ => _ }} | {error, _}.
 request(State, Raw, NodeMsg) ->
+    case is_hook_caller(Raw, NodeMsg) of
+        true -> admit_request(State, Raw, NodeMsg);
+        false -> refuse_caller()
+    end.
+
+admit_request(State, Raw, NodeMsg) ->
     PricingDevice = hb_ao:get(<<"pricing-device">>, State, false, NodeMsg),
     LedgerDevice = hb_ao:get(<<"ledger-device">>, State, false, NodeMsg),
     Messages = hb_ao:get(<<"body">>, Raw, NodeMsg#{ <<"hashpath">> => ignore }),
@@ -70,10 +87,12 @@ request(State, Raw, NodeMsg) ->
         {true, true} ->
             PricingMsg = State#{ <<"device">> => PricingDevice },
             LedgerMsg = State#{ <<"device">> => LedgerDevice },
+            Signers = hb_message:signers(Request, NodeMsg),
             PricingReq = #{
                 <<"path">> => <<"estimate">>,
                 <<"request">> => Request,
-                <<"body">> => Messages
+                <<"body">> => Messages,
+                <<"priv">> => ?HOOK_PRIV
             },
             ?event({p4_pricing_request, {devmsg, PricingMsg}, {req, PricingReq}}),
             case hb_ao:resolve(PricingMsg, PricingReq, NodeMsg) of
@@ -88,20 +107,28 @@ request(State, Raw, NodeMsg) ->
                     % The device has estimated the cost of the request to be
                     % zero, so we proceed.
                     {ok, Raw#{ <<"body">> => Messages }};
+                {ok, _} when length(Signers) > 1 ->
+                    % The request has multiple signers, so there is no single
+                    % account to charge. We don't proceed.
+                    {error, #{
+                        <<"status">> => 422,
+                        <<"body">> =>
+                            <<"Cannot charge a request with multiple signers.">>
+                    }};
                 {ok, Price} ->
                     % The device has estimated the cost of the request. We check
                     % the user's balance to see if they have enough funds to
                     % service the request.
-                    LedgerReq = #{
+                    BalanceReq = #{
                         <<"path">> => <<"balance">>,
                         <<"target">> =>
-                            case hb_message:signers(Request, NodeMsg) of
+                            case Signers of
                                 [Signer] -> Signer;
-                                [] -> <<"unknown">>;
-                                Multiple -> Multiple
+                                [] -> <<"unknown">>
                             end,
                         <<"request">> => Request
                     },
+                    LedgerReq = ledger_request(LedgerDevice, BalanceReq),
                     ?event(payment, {p4_pre_pricing_estimate, Price}),
                     case hb_ao:resolve(LedgerMsg, LedgerReq, NodeMsg) of
                         {ok, Sufficient} when
@@ -168,8 +195,20 @@ request(State, Raw, NodeMsg) ->
             end
     end.
 
-%% @doc Postprocess the request after it has been fulfilled.
+%% @doc Postprocess the request after it has been fulfilled. Only the node's
+%% response hook may call this key; a direct call is refused.
+-spec response(
+    #{ 'pricing-device' => binary(), 'ledger-device' => binary(), _ => _ },
+    #{ request := #{ _ => _ }, body := _, _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ body := _, _ => _ }} | {error, _}.
 response(State, RawResponse, NodeMsg) ->
+    case is_hook_caller(RawResponse, NodeMsg) of
+        true -> charge_response(State, RawResponse, NodeMsg);
+        false -> refuse_caller()
+    end.
+
+charge_response(State, RawResponse, NodeMsg) ->
     PricingDevice = hb_ao:get(<<"pricing-device">>, State, false, NodeMsg),
     LedgerDevice = hb_ao:get(<<"ledger-device">>, State, false, NodeMsg),
     Response =
@@ -191,7 +230,8 @@ response(State, RawResponse, NodeMsg) ->
             PricingReq = #{
                 <<"path">> => <<"price">>,
                 <<"request">> => Request,
-                <<"body">> => Response
+                <<"body">> => Response,
+                <<"priv">> => ?HOOK_PRIV
             },
             ?event({post_pricing_request, PricingReq}),
             PricingRes =
@@ -214,8 +254,9 @@ response(State, RawResponse, NodeMsg) ->
                     % so we proceed to charge the user's account. We sign the
                     % request with the node's private key, as it is the node
                     % that is performing the charge, not the user.
-                    LedgerReq =
-                        hb_message:commit(
+                    ChargeReq =
+                        ledger_request(
+                            LedgerDevice,
                             #{
                                 <<"path">> => <<"charge">>,
                                 <<"quantity">> => Price,
@@ -226,20 +267,23 @@ response(State, RawResponse, NodeMsg) ->
                                     end,
                                 <<"recipient">> =>
                                     case hb_opts:get(p4_recipient, undefined, NodeMsg) of
-                                        Addr when ?IS_ID(Addr) ->
-                                            hb_util:human_id(Addr);
+                                        Addr when is_binary(Addr) ->
+                                            hb_committer:uri(Addr, NodeMsg);
                                         _ ->
                                             case hb_opts:get(operator, undefined, NodeMsg) of
                                                 undefined ->
                                                     <<"unknown">>;
-                                                Operator->
-                                                    hb_util:human_id(Operator)
+                                                Operator ->
+                                                    hb_committer:uri(
+                                                        Operator,
+                                                        NodeMsg
+                                                    )
                                             end
                                     end,
                                 <<"request">> => Request
-                            },
-                            NodeMsg
+                            }
                         ),
+                    LedgerReq = hb_message:commit(ChargeReq, NodeMsg),
                     ?event(payment,
                         {post_charge,
                             {msg, LedgerMsg},
@@ -269,6 +313,7 @@ response(State, RawResponse, NodeMsg) ->
 %% A node may run several request hooks, so the P4 handler has to be selected
 %% rather than assumed to be the only entry. P4 handlers carry a
 %% `ledger-device'.
+-spec balance(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, _} | {error, _}.
 balance(_, Req, NodeMsg) ->
     case p4_handler(hb_hook:find(<<"request">>, NodeMsg), NodeMsg) of
         not_found ->
@@ -290,6 +335,36 @@ balance(_, Req, NodeMsg) ->
             end
     end.
 
+%% @doc A hook-only key runs only when the node's lifecycle hook calls it. The
+%% server marks the hook request in a private key. A request over HTTP cannot
+%% carry private keys.
+is_hook_caller(Raw, NodeMsg) ->
+    hb_private:get(<<"hook-caller">>, Raw, NodeMsg) =:= <<"kernel">>.
+
+refuse_caller() ->
+    {error, #{
+        <<"status">> => 401,
+        <<"body">> => <<"Unauthorized caller.">>
+    }}.
+
+%% @doc Prepare a request for the ledger. A `lua@5.3a' ledger reads an
+%% Arweave committer as its address, so we convert the accounts in the request
+%% to that form.
+ledger_request(<<"lua@5.3a">>, Req) ->
+    maps:map(
+        fun(Key, Account)
+                when Key =:= <<"target">>;
+                    Key =:= <<"account">>;
+                    Key =:= <<"recipient">> ->
+            hb_util:committer_address(Account);
+           (_Key, Value) ->
+            Value
+        end,
+        Req
+    );
+ledger_request(_LedgerDevice, Req) ->
+    Req.
+
 %% @doc Pick the P4 handler out of the request hook list.
 p4_handler([], _NodeMsg) ->
     not_found;
@@ -305,7 +380,8 @@ p4_handler(Handlers, NodeMsg) ->
     end.
 
 %% @doc The node operator may elect to make certain routes non-chargable, using
-%% the `routes' syntax also used to declare routes in `router@1.0'.
+%% the `routes' syntax also used to declare routes in `router@1.0'. The routes
+%% are matched against the path of the request without its query.
 is_chargable_req(Req, NodeMsg) ->
     NonChargableRoutes =
         hb_opts:get(
@@ -313,6 +389,8 @@ is_chargable_req(Req, NodeMsg) ->
             ?DEFAULT_NON_CHARGABLE_ROUTES,
             NodeMsg
         ),
+    [Path | _] =
+        binary:split(hb_maps:get(<<"path">>, Req, <<>>, NodeMsg), <<"?">>),
     Matches =
         hb_ao:raw(
             #{
@@ -321,7 +399,7 @@ is_chargable_req(Req, NodeMsg) ->
             },
             Req#{
                 <<"path">> => <<"match">>,
-                <<"route-path">> => hb_maps:get(<<"path">>, Req, no_path, NodeMsg)
+                <<"route-path">> => Path
             },
             NodeMsg
         ),
@@ -366,12 +444,12 @@ faff_test() ->
        test_opts(
             #{
                 <<"faff-allow-list">> =>
-                    [hb_util:human_id(ar_wallet:to_address(GoodWallet))]
+                    [hb_test_utils:committer(GoodWallet)]
             }
         )
     ),
     Req = #{
-        <<"path">> => <<"/greeting">>,
+        <<"path">> => <<"//greeting">>,
         <<"greeting">> => <<"Hello, world!">>
     },
     GoodSignedReq = hb_message:commit(Req, #{ <<"priv-wallet">> => GoodWallet }),
@@ -381,13 +459,22 @@ faff_test() ->
     {ok, Res} = hb_http:get(Node, GoodSignedReq, #{}),
     ?event(payment, {res, Res}),
     ?assertEqual(<<"Hello, world!">>, Res),
-    ?assertMatch({error, _}, hb_http:get(Node, BadSignedReq, #{})).
+    ?assertMatch({error, _}, hb_http:get(Node, BadSignedReq, #{})),
+    % A free route inside the path does not make a request free.
+    ?assertMatch(
+        {error, <<"Node will not service", _/binary>>},
+        hb_http:get(
+            Node,
+            Req#{ <<"path">> => <<"//greeting/~meta@1.0/info">> },
+            #{}
+        )
+    ).
 
 %% @doc Test P4 in the middle of a request hook pipeline.
 multi_request_hook_test() ->
     Parent = self(),
     Wallet = ar_wallet:new(),
-    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Address = hb_test_utils:committer(Wallet),
     PassThrough = #{
         <<"device">> => #{
             <<"request">> => fun(_, HookReq, _) -> {ok, HookReq} end
@@ -471,7 +558,37 @@ non_chargable_route_test() ->
     BadSignedReq3 = hb_message:commit(Req3, #{ <<"priv-wallet">> => Wallet }),
     Res3 = hb_http:get(Node, BadSignedReq3, #{}),
     ?event({res3, Res3}),
-    ?assertMatch({error, _}, Res3).
+    ?assertMatch({error, _}, Res3),
+    % A free route in the query does not make a request free.
+    ?assertMatch(
+        {error, #{ <<"status">> := 402 }},
+        hb_http:get(Node, <<"/~scheduler@1.0?x=/~meta@1.0/a/b">>, #{})
+    ),
+    % A wallet that signs twice is one signer, and its balance is too low.
+    ?assertMatch(
+        {error, #{ <<"status">> := 402 }},
+        hb_http:get(
+            Node,
+            hb_message:commit(
+                BadSignedReq3,
+                #{ <<"priv-wallet">> => Wallet },
+                #{ <<"device">> => <<"httpsig@1.0">>, <<"bundle">> => true }
+            ),
+            #{}
+        )
+    ),
+    % A request signed by two wallets has no single account to charge.
+    ?assertMatch(
+        {error, #{ <<"status">> := 422 }},
+        hb_http:get(
+            Node,
+            hb_message:commit(
+                BadSignedReq3,
+                #{ <<"priv-wallet">> => ar_wallet:new() }
+            ),
+            #{}
+        )
+    ).
 
 %% @doc Ensure that Lua scripts can be used as pricing and ledger devices. Our
 %% scripts come in two components:
@@ -487,18 +604,18 @@ hyper_token_ledger_test_() ->
 hyper_token_ledger() ->
     % Create the wallets necessary and read the files containing the scripts.
     HostWallet = ar_wallet:new(),
-    HostAddress = hb_util:human_id(HostWallet),
+    HostAddress = hb:address(HostWallet),
     OperatorWallet = ar_wallet:new(),
-    OperatorAddress = hb_util:human_id(OperatorWallet),
+    OperatorAddress = hb:address(OperatorWallet),
     AliceWallet = ar_wallet:new(),
-    AliceAddress = hb_util:human_id(AliceWallet),
+    AliceAddress = hb:address(AliceWallet),
     BobWallet = ar_wallet:new(),
-    BobAddress = hb_util:human_id(BobWallet),
+    BobAddress = hb:address(BobWallet),
     LedgerName =
         <<"ledger-",
             (integer_to_binary(erlang:unique_integer([positive])))/binary
         >>,
-    LedgerPath = <<"/", LedgerName/binary, "~node-process@1.0">>,
+    LedgerPath = <<"/~node-process@1.0/", LedgerName/binary>>,
     {ok, TokenScript} = file:read_file("scripts/hyper-token.lua"),
     {ok, ProcessScript} = file:read_file("scripts/hyper-token-p4.lua"),
     {ok, ClientScript} = file:read_file("scripts/hyper-token-p4-client.lua"),
@@ -530,7 +647,7 @@ hyper_token_ledger() ->
                 <<"p4-non-chargable-routes">> =>
                     [
                         #{
-                            <<"template">> => <<"/*~node-process@1.0/*">>
+                            <<"template">> => <<"/~node-process@1.0/*">>
                         }
                     ],
                 <<"on">> => #{
@@ -566,7 +683,7 @@ hyper_token_ledger() ->
     % To start, we attempt a request from Bob, which should fail because he
     % has no tokens.
     Req = #{
-        <<"path">> => <<"/greeting">>,
+        <<"path">> => <<"//greeting">>,
         <<"greeting">> => <<"Hello, world!">>
     },
     SignedReq = hb_message:commit(Req, #{ <<"priv-wallet">> => BobWallet }),

@@ -751,7 +751,7 @@ include_source_files(Entries) ->
 %% @doc Add test-only compile flags when packaging for `device test'.
 test_compile_opts(Opts) ->
     case hb_maps:get(<<"test">>, Opts, false, Opts) of
-        true -> [{d, 'TEST'}];
+        true -> [{d, 'TEST'} | hb_maps:get(<<"erl-defines">>, Opts, [], Opts)];
         _ -> []
     end.
 
@@ -792,6 +792,7 @@ impl_message(Pkg, SpecID, _Opts) ->
         <<"implements-device">> => SpecID,
         <<"module-name">> => atom_to_binary(ModName, utf8),
         <<"requires-otp-release">> => OtpRel,
+        <<"requires-ao-runtime-version">> => ?AO_RUNTIME_VERSION,
         <<"body">> => Archive
     },
     case maps:get(requires_system_architecture, Pkg, undefined) of

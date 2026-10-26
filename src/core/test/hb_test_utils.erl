@@ -5,7 +5,7 @@
 -export([suite_with_opts/2, run/4, assert_throws/4]).
 -export([assert_hashpath_reply/3]).
 -export([assert_manifest_response/4, assert_manifest_response/5, has_committed_keys/2]).
--export([test_store/0, test_store/1, test_store/2]).
+-export([test_store/0, test_store/1, test_store/2, committer/1]).
 -export([benchmark/1, benchmark/2, benchmark/3, benchmark_iterations/2]).
 -export([benchmark_print/2, benchmark_print/3, benchmark_print/4]).
 -export([compare_events/3, compare_events/4, compare_events/5]).
@@ -33,6 +33,10 @@ test_store(Mod, Tag) ->
         >>,
     filelib:ensure_dir(binary_to_list(TestDir)),
     #{ <<"store-module">> => Mod, <<"name">> => TestDir }.
+
+%% @doc Return the URI of the committer of an Arweave wallet's key.
+committer(Wallet) ->
+    hb_committer:uri(hb_util:human_id(ar_wallet:to_address(Wallet))).
 
 %% @doc Run each test in a suite with each set of options. Start and reset
 %% the store(s) for each test. Expects suites to be a list of tuples with

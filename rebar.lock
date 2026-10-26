@@ -11,7 +11,7 @@
  {<<"ddskerl">>,{pkg,<<"ddskerl">>,<<"0.4.2">>},1},
  {<<"elmdb">>,
   {git,"https://github.com/permaweb/elmdb-rs.git",
-       {ref,"acd8c95e9d4466a8bb77082b6eed17d6220835df"}},
+       {ref,"94f6d305a6c337dabbeb4eb8358c74fc93f146fd"}},
   0},
  {<<"eqwalizer_support">>,
   {git_subdir,"https://github.com/whatsapp/eqwalizer.git",

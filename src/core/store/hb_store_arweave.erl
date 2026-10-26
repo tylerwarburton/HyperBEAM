@@ -5,9 +5,9 @@
 %%% before it has indexed the weave itself.
 -module(hb_store_arweave).
 %%% Store API:
--export([scope/0, scope/1, type/3, read/3, start/3]).
+-export([scope/0, scope/1, read/3, start/3]).
 %%% Unused Store API:
--export([resolve/3, write/3, link/3, group/3]).
+-export([write/3]).
 %%% Indexing API:
 -export([store_from_opts/1, write_offset/5, read_chunks/3]).
 -export([read_offset/3, read_index_offset/2]).
@@ -45,31 +45,8 @@ scope() -> remote.
 scope(#{ <<"scope">> := Scope }) -> Scope;
 scope(_) -> scope().
 
-%% @doc Resolve a key path in the Arweave store, ignoring other paths.
-resolve(_Store, #{ <<"resolve">> := ID }, _NodeOpts) when ?IS_ID(ID) ->
-    {ok, ID};
-resolve(_Store, #{ <<"resolve">> := _ID }, _NodeOpts) ->
-    {error, not_found}.
-
 %% @doc Unsupported.
 write(_, _, _) -> {error, not_found}.
-
-%% @doc Unsupported.
-link(_, _, _) -> {error, not_found}.
-
-%% @doc Unsupported.
-group(_, _, _) -> {error, not_found}.
-
-%% @doc Get the type of the data at the given key. We potentially cache the
-%% result, so that we don't have to read the data from the GraphQL route
-%% multiple times.
-type(StoreOpts, #{ <<"type">> := ID }, _NodeOpts) when ?IS_ID(ID) ->
-    case read_index_offset(StoreOpts, ID) of
-        {ok, _Offset} -> {ok, simple};
-        not_found -> {error, not_found}
-    end;
-type(_Store, #{ <<"type">> := _ID }, _NodeOpts) ->
-    {error, not_found}.
 
 %% @doc Read the offset of the data at the given key.
 read_offset(StoreOpts, ID, Opts) ->
@@ -106,9 +83,9 @@ read_offset_path(StoreOpts = #{ <<"index-store">> := IndexStore }, Path) ->
         {ok, Res} when is_map(Res) ->
             {ok, Res#{
                 <<"version">> => maps:get(<<"version">>, Res, 2),
-                <<"codec-device">> =>
+                <<"codec">> =>
                     maps:get(
-                        <<"codec-device">>,
+                        <<"codec">>,
                         Res,
                         <<"ans104@1.0">>
                     )
@@ -118,7 +95,7 @@ read_offset_path(StoreOpts = #{ <<"index-store">> := IndexStore }, Path) ->
                 hb_store_arweave_offset:decode(OffsetBinary),
             {ok, #{
                 <<"version">> => Version,
-                <<"codec-device">> => CodecName,
+                <<"codec">> => CodecName,
                 <<"start">> => StartOffset,
                 <<"length">> => Length
             }};
@@ -127,14 +104,14 @@ read_offset_path(StoreOpts = #{ <<"index-store">> := IndexStore }, Path) ->
     end.
 
 %% @doc Find the offset of a message from the nodes serving the `~arweave@2.9'
-%% routes, adding it to the local index so that they are asked once per message.
-%% The response gives the start of the item alongside the lengths of its header
-%% and data segments: an item with no header inside the weave's data tree is a
-%% transaction, one with a header is an ANS-104 item, and the two lengths sum to
-%% the span that the loader reads. Pending transactions report offsets relative
-%% to themselves, so only confirmed items are indexed.
+%% routes. The response gives the start of the item alongside the lengths of its
+%% header and data segments: an item with no header inside the weave's data tree
+%% is a transaction, one with a header is an ANS-104 item, and the two lengths
+%% sum to the span that the loader reads. Pending transactions report offsets
+%% relative to themselves, so only confirmed items are found. The offset is not
+%% added to the local index here: `do_read/3' adds it once a read at it succeeds.
 read_remote_offset(
-        StoreOpts = #{ <<"index-store">> := _, <<"remote-index">> := true },
+        #{ <<"index-store">> := _, <<"remote-index">> := true },
         ID,
         Opts
     ) ->
@@ -152,30 +129,45 @@ read_remote_offset(
             #{
                 <<"offset">> := StartOffset,
                 <<"header-length">> := HeaderLength,
-                <<"content-length">> := DataLength
+                <<"data-length">> := DataLength
             }} when is_integer(StartOffset) ->
             CodecName =
                 case HeaderLength of
                     0 -> <<"tx@1.0">>;
                     _ -> <<"ans104@1.0">>
                 end,
-            write_offset(
-                StoreOpts,
-                ID,
-                CodecName,
-                StartOffset,
-                HeaderLength + DataLength
-            ),
-            read_index_offset(StoreOpts, ID);
+            % Give the offset as the local index would give it once stored.
+            {Version, CodecName, StartOffset, Length} =
+                hb_store_arweave_offset:decode(
+                    hb_store_arweave_offset:encode(
+                        CodecName,
+                        StartOffset,
+                        HeaderLength + DataLength
+                    )
+                ),
+            {ok, #{
+                <<"version">> => Version,
+                <<"codec">> => CodecName,
+                <<"start">> => StartOffset,
+                <<"length">> => Length
+            }};
         _ ->
             not_found
     end;
 read_remote_offset(_, _, _) -> not_found.
 
 %% @doc Read the data at the given key, reading the `local-store' first if
-%% available.
-read(StoreOpts, #{ <<"read">> := ID }, _NodeOpts) when ?IS_ID(ID) ->
-    case hb_store_remote_node:read_local_cache(StoreOpts, ID, StoreOpts) of
+%% available. The reads use the node's options, overridden by the options in
+%% the store's message. `force-message' is removed, as with it the
+%% `~arweave@2.9' reads return messages, not data, and `store-module', as in
+%% `hb_store_remote_node:read/3'.
+read(StoreOpts, #{ <<"read">> := ID }, NodeOpts) when ?IS_ID(ID) ->
+    Opts =
+        maps:without(
+            [<<"store-module">>, <<"force-message">>],
+            hb_util:deep_merge(NodeOpts, StoreOpts, NodeOpts)
+        ),
+    case hb_store_remote_node:read_local_cache(StoreOpts, ID, Opts) of
         {ok, Message} ->
             ?event(
                 arweave_offsets,
@@ -183,7 +175,7 @@ read(StoreOpts, #{ <<"read">> := ID }, _NodeOpts) when ?IS_ID(ID) ->
             ),
             {ok, Message};
         _ ->
-            case do_read(StoreOpts, ID, StoreOpts) of
+            case do_read(StoreOpts, ID, Opts) of
                 not_found -> {error, not_found};
                 Result -> Result
             end
@@ -199,7 +191,7 @@ do_read(StoreOpts, ID, Opts) ->
         {ok,
             #{
                 <<"version">> := Version,
-                <<"codec-device">> := CodecName,
+                <<"codec">> := CodecName,
                 <<"start">> := StartOffset,
                 <<"length">> := Length
             }} ->
@@ -210,6 +202,7 @@ do_read(StoreOpts, ID, Opts) ->
                 end,
             case Loaded of
                 {ok, Message} ->
+                    keep_offset(StoreOpts, ID, CodecName, StartOffset, Length),
                     hb_store_remote_node:maybe_cache(StoreOpts, Message),
                     ?event(
                         arweave_offsets,
@@ -248,34 +241,43 @@ do_read(StoreOpts, ID, Opts) ->
             not_found
     end.
 
+%% @doc Add the offset that a read succeeded at to the local index, unless the
+%% index holds it already. Offsets from the `remote-index' nodes enter the index
+%% only here, so a read that fails at one leaves no entry, and the next read
+%% asks the nodes again.
+keep_offset(StoreOpts, ID, CodecName, StartOffset, Length) ->
+    case read_index_offset(StoreOpts, ID) of
+        not_found -> write_offset(StoreOpts, ID, CodecName, StartOffset, Length);
+        _ -> ok
+    end.
+
 %% @doc Load an ANS-104 item from the given start offset and length.
 %% Returns an `ok' tuple with the deserialized item, or an `error' tuple with
 %% the reason. The `StartOffset` is the precise starting byte of the item _header_,
 %% not the data segment. The `Length` covers the full size of the item, including
 %% header. The `ExpectedID` is verified against the deserialized item's ID to
-%% guard against stale offsets (e.g. after a reorg).
+%% guard against stale offsets (e.g. after a reorg). The ID is the hash of the
+%% signature alone, so the signature must verify too. Both checks run on the
+%% bytes read, before the codec unbundles any items that they hold.
 load_item(ExpectedID, StartOffset, Length, Opts) ->
     hb_prometheus:measure_and_report(
         fun() ->
-            case read_chunks(StartOffset, Length, Opts) of
-                {ok, SerializedItem} ->
-                    Item =
-                        ar_bundles:deserialize(SerializedItem),
-                    case hb_util:encode(Item#tx.id) of
-                        ExpectedID ->
-                            {ok, hb_message:convert(
-                                Item,
-                                <<"structured@1.0">>,
-                                <<"ans104@1.0">>,
-                                Opts
-                            )};
-                        ActualID ->
-                            {error,
-                                {id_mismatch,
-                                    ExpectedID, ActualID}}
-                    end;
-                {error, Reason} ->
-                    {error, Reason}
+            maybe
+                {ok, SerializedItem} ?= read_chunks(StartOffset, Length, Opts),
+                Item = ar_bundles:deserialize_item_wrapper(SerializedItem),
+                ActualID = hb_util:encode(Item#tx.id),
+                true ?=
+                    ActualID =:= ExpectedID
+                        orelse {error, {id_mismatch, ExpectedID, ActualID}},
+                true ?=
+                    ar_bundles:verify_item(Item)
+                        orelse {error, unverifiable_item},
+                {ok, hb_message:convert(
+                    Item,
+                    <<"structured@1.0">>,
+                    <<"ans104@1.0">>,
+                    Opts
+                )}
             end
         end,
         hb_store_arweave_chunk_fetch_duration_seconds,
@@ -329,16 +331,17 @@ load_tx(ID, StartOffset, Length, Opts) ->
                         <<"tx@1.0">>,
                         Opts)};
                 _ ->
-                    case read_chunks(StartOffset, Length, Opts) of
-                        {ok, Data} ->
-                            {ok, hb_message:convert(
-                                TXHeader#tx{data = Data},
-                                <<"structured@1.0">>,
-                                <<"tx@1.0">>,
-                                Opts
-                            )};
-                        {error, Reason} ->
-                            {error, Reason}
+                    maybe
+                        {ok, Data} ?= read_chunks(StartOffset, Length, Opts),
+                        TX = TXHeader#tx{data = Data},
+                        % The data must be the data that the signature covers.
+                        true ?= ar_tx:verify(TX) orelse {error, data_mismatch},
+                        {ok, hb_message:convert(
+                            TX,
+                            <<"structured@1.0">>,
+                            <<"tx@1.0">>,
+                            Opts
+                        )}
                     end
             end
         end,
@@ -478,6 +481,32 @@ write_read_tx_test() ->
     ok = write_offset(Opts, ID, <<"tx@1.0">>, StartOffset, Size),
     {ok, Bundle} = read(Opts, #{ <<"read">> => ID }, Opts),
     ?assert(hb_message:verify(Bundle, all, #{})),
+    % A read with the `force-message' of an HTTP request runs the node's
+    % `http-client-receipt' hook.
+    Self = self(),
+    Receipt =
+        fun(_, Req, _) ->
+            Self ! receipt,
+            {ok, Req}
+        end,
+    {ok, _} =
+        read(
+            Opts,
+            #{ <<"read">> => ID },
+            #{
+                <<"store">> => [hb_test_utils:test_store()],
+                <<"force-message">> => true,
+                <<"priv-wallet">> => ar_wallet:new(),
+                <<"on">> => #{
+                    <<"http-client-receipt">> =>
+                        #{ <<"device">> => #{ http_client_receipt => Receipt } }
+                }
+            }
+        ),
+    ?assertEqual(
+        receipt,
+        receive receipt -> receipt after 5000 -> 'missing-receipt' end
+    ),
     {ok, Child} =
         hb_ao:resolve(
             Bundle,
@@ -532,26 +561,49 @@ write_read_fake_bundle_tx_test() ->
     ok = write_offset(Opts, ID, <<"tx@1.0">>, StartOffset, Size),
     {ok, TX} = read(Opts, #{ <<"read">> => ID }, Opts),
     ?assert(hb_message:verify(TX, all, #{})),
+    % A form of the ID with other spare bits in its last character raises.
+    OtherForm = <<"cGNURX2IUt98VKVIeXSfYe6eulNwPEqijaQfvatzd_p">>,
+    ?assertError(
+        {badmatch, ID},
+        read(Opts, #{ <<"read">> => OtherForm }, Opts)
+    ),
     ok.
 
 %% @doc A node with no offset index of its own finds the offsets of an Arweave
 %% transaction and an ANS-104 item from its routes, serving the item over HTTP
-%% and retaining both offsets for subsequent reads.
+%% and retaining each offset once a read at it succeeds.
 remote_index_test() ->
     Local =
         #{
             <<"store-module">> => hb_store_arweave,
             <<"index-store">> => [hb_test_utils:test_store()]
         },
-    Store = Local#{ <<"remote-index">> => true },
     TXID = <<"bndIwac23-s0K11TLC1N7z472sLGAkiOdhds87ZywoE">>,
     ItemID = <<"1R5QEtX53Z_RRQJwzFWf40oXiPW2FibErT_h02pu8MU">>,
+    % The store sends its offset requests to a node that holds both offsets.
+    Index = Local#{ <<"index-store">> => [hb_test_utils:test_store()] },
+    ok = write_offset(Index, TXID, <<"tx@1.0">>, 363524457275638, 8387),
+    ok = write_offset(Index, ItemID, <<"ans104@1.0">>, 195193803403756, 1364),
+    IndexNode = hb_http_server:start_node(#{ <<"store">> => [Index] }),
+    Route =
+        #{
+            <<"template">> => <<"^/~arweave@2.9/raw">>,
+            <<"node">> => #{ <<"prefix">> => IndexNode }
+        },
+    Store =
+        Local#{
+            <<"remote-index">> => true,
+            <<"routes">> => [Route | hb_opts:get(routes, [], #{})]
+        },
     ?assertEqual(not_found, read_offset(Local, TXID, #{})),
     ?assertMatch(
-        {ok, #{ <<"codec-device">> := <<"tx@1.0">>, <<"length">> := 8387 }},
-        read_offset(Store, TXID, #{})
+        {ok, #{ <<"codec">> := <<"tx@1.0">>, <<"length">> := 8387 }},
+        read_offset(Store, TXID, Store)
     ),
-    % The offset is retained, so the routes are asked once per message.
+    % The offset is retained once a read at it succeeds, so the routes are
+    % asked once per message.
+    ?assertEqual(not_found, read_offset(Local, TXID, #{})),
+    ?assertMatch({ok, _}, read(Store, #{ <<"read">> => TXID }, #{})),
     ?assertMatch({ok, #{ <<"length">> := 8387 }}, read_offset(Local, TXID, #{})),
     Node = hb_http_server:start_node(#{ <<"store">> => [Store] }),
     {ok, Msg} = hb_http:get(Node, <<"/", ItemID/binary>>, #{}),

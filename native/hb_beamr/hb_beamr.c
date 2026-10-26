@@ -69,8 +69,11 @@ static void wasm_driver_stop(ErlDrvData raw) {
         DRV_DEBUG("Deleted WASM instance");
         wasm_module_delete(proc->module);
         DRV_DEBUG("Deleted WASM module");
+        wasm_extern_vec_delete(&proc->externs);
+        wasm_importtype_vec_delete(&proc->imports);
         wasm_store_delete(proc->store);
         DRV_DEBUG("Deleted WASM store");
+        wasm_engine_delete(proc->engine);
     }
     DRV_DEBUG("Freeing proc");
     driver_free(proc);
@@ -127,12 +130,21 @@ static void wasm_driver_output(ErlDrvData raw, char *buff, ErlDrvSizeT bufflen) 
             return;
         }
         // Extract the function name and the args from the Erlang term and generate the wasm_val_vec_t
-        char* function_name = driver_alloc(MAXATOMLEN);
+        // Size the name buffer from the term, so a name longer than a fixed
+        // buffer cannot write past its end.
+        int name_type, name_size;
+        ei_get_type(buff, &index, &name_type, &name_size);
+        char* function_name = driver_alloc(name_size + 1);
         ei_decode_string(buff, &index, function_name);
         DRV_DEBUG("Function name: %s", function_name);
         proc->current_function = function_name;
 
         DRV_DEBUG("Decoding args. Buff: %p. Index: %d", buff, index);
+        // Record how many arguments the request gave, so the call can be
+        // refused if it is not the number the function's signature takes.
+        int args_type, args_arity;
+        ei_get_type(buff, &index, &args_type, &args_arity);
+        proc->current_args_length = args_arity;
         proc->current_args = decode_list(buff, &index);
 
         driver_async(proc->port, NULL, wasm_execute_function, proc, NULL);
@@ -172,7 +184,10 @@ static void wasm_driver_output(ErlDrvData raw, char *buff, ErlDrvSizeT bufflen) 
         long ptr, size;
         int type;
         ei_decode_tuple_header(buff, &index, &arity);
-        ei_decode_long(buff, &index, &ptr);
+        if(ei_decode_long(buff, &index, &ptr) != 0) {
+            send_error(proc, "Write request out of bounds");
+            return;
+        }
         ei_get_type(buff, &index, &type, &size);
         long size_l = (long)size;
         char* wasm_binary;
@@ -181,7 +196,8 @@ static void wasm_driver_output(ErlDrvData raw, char *buff, ErlDrvSizeT bufflen) 
         long size_bytes = size_l / 8;
         DRV_DEBUG("Write received. Ptr: %ld. Bytes: %ld", ptr, size_bytes);
         long memory_size = get_memory_size(proc);
-        if(ptr + size_bytes > memory_size) {
+        if(res != 0 || ptr < 0 || size_bytes < 0 ||
+                ptr > memory_size - size_bytes) {
             DRV_DEBUG("Write request out of bounds.");
             send_error(proc, "Write request out of bounds");
             return;
@@ -196,17 +212,21 @@ static void wasm_driver_output(ErlDrvData raw, char *buff, ErlDrvSizeT bufflen) 
         msg[0] = ERL_DRV_ATOM;
         msg[1] = atom_ok;
         erl_drv_output_term(proc->port_term, msg, 2);
+        driver_free(msg);
     }
     else if (strcmp(command, "read") == 0) {
         DRV_DEBUG("Read received");
         long ptr, size;
         ei_decode_tuple_header(buff, &index, &arity);
-        ei_decode_long(buff, &index, &ptr);
-        ei_decode_long(buff, &index, &size);
+        if(ei_decode_long(buff, &index, &ptr) != 0 ||
+                ei_decode_long(buff, &index, &size) != 0) {
+            send_error(proc, "Read request out of bounds");
+            return;
+        }
         long size_l = (long)size;
         long memory_size = get_memory_size(proc);
         DRV_DEBUG("Read received. Ptr: %ld. Size: %ld. Memory size: %ld", ptr, size_l, memory_size);
-        if(ptr + size_l > memory_size) {
+        if(ptr < 0 || size_l < 0 || ptr > memory_size - size_l) {
             DRV_DEBUG("Read request out of bounds.");
             send_error(proc, "Read request out of bounds");
             return;
@@ -230,6 +250,8 @@ static void wasm_driver_output(ErlDrvData raw, char *buff, ErlDrvSizeT bufflen) 
         msg[msg_index++] = 2;
         
         int msg_res = erl_drv_output_term(proc->port_term, msg, msg_index);
+        driver_free(msg);
+        driver_free(out_binary);
         DRV_DEBUG("Read response sent: %d", msg_res);
     }
     else if (strcmp(command, "size") == 0) {
@@ -246,6 +268,22 @@ static void wasm_driver_output(ErlDrvData raw, char *buff, ErlDrvSizeT bufflen) 
         msg[msg_index++] = ERL_DRV_TUPLE;
         msg[msg_index++] = 2;
         erl_drv_output_term(proc->port_term, msg, msg_index);
+        driver_free(msg);
+    }
+    else if (strcmp(command, "grow") == 0) {
+        DRV_DEBUG("Grow received");
+        long pages;
+        ei_decode_long(buff, &index, &pages);
+        if(!wasm_runtime_enlarge_memory(proc->instance->inst_comm_rt, pages)) {
+            DRV_DEBUG("Grow request failed.");
+            send_error(proc, "Grow request failed");
+            return;
+        }
+        ErlDrvTermData* msg = driver_alloc(sizeof(ErlDrvTermData) * 2);
+        msg[0] = ERL_DRV_ATOM;
+        msg[1] = atom_ok;
+        erl_drv_output_term(proc->port_term, msg, 2);
+        driver_free(msg);
     }
     else {
         DRV_DEBUG("Unknown command: %s", command);

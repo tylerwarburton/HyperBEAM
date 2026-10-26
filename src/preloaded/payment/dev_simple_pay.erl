@@ -14,18 +14,23 @@
 %%%    subrequest, the two initiating apply messages are not counted towards the
 %%%    message count price.
 %%% 
-%%% The device's ledger is stored in the node message at `simple_pay_ledger',
-%%% and can be topped-up by either the operator, or an external device. The 
-%%% price is specified in the node message at `simple_pay_price'.
+%%% The node keeps the device's balances in a `lib_volatile_ledger', which
+%%% starts from the balances in the node message at `simple_pay_ledger' and
+%%% applies one charge or top-up at a time. The operator can top up balances.
+%%% When the node's VM restarts, the balances return to `simple_pay_ledger'.
+%%% The price is specified in the node message at `simple_pay_price'.
 %%% This device acts as both a pricing device and a ledger device, by p4's
 %%% definition.
 -module(dev_simple_pay).
+-device_libraries([lib_volatile_ledger, lib_meta, lib_process]).
 -export([estimate/3, charge/3, balance/3, topup/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %% @doc Estimate the cost of the request, using the rules outlined in the
 %% moduledoc.
+-spec estimate(#{ _ => _ }, #{ request => #{ _ => _ }, _ => _ }, #{ _ => _ }) ->
+    {ok, non_neg_integer()}.
 estimate(_Base, EstimateReq, NodeMsg) ->
     Req =
         hb_ao:get(
@@ -73,7 +78,7 @@ estimate(_Base, EstimateReq, NodeMsg) ->
 
 %% @doc If the request is for the `apply@1.0' device, we should price the
 %% inner request in addition to the price of the outer request.
-apply_price([{as, Device, Msg} | Rest], NodeMsg) ->
+apply_price([{as, Device, Msg} | Rest], NodeMsg) when is_map(Msg) ->
     apply_price([Msg#{ <<"device">> => Device } | Rest], NodeMsg);
 apply_price(
         [Req = #{ <<"device">> := <<"apply@1.0">> }, #{ <<"path">> := Path } | Rest],
@@ -102,6 +107,13 @@ apply_price(Seq, _) ->
 price_from_routes(UserRequest, NodeMsg) ->
     RouterOpts = hb_opts:get(<<"router-opts">>, #{}, NodeMsg),
     Routes = hb_maps:get(<<"offered">>, RouterOpts, [], NodeMsg),
+    % Match the path without its query, as `dev_p4' matches its non-chargable
+    % routes.
+    RoutePath =
+        case hb_maps:get(<<"path">>, UserRequest, no_path, NodeMsg) of
+            no_path -> no_path;
+            Path -> hd(binary:split(hb_util:bin(Path), <<"?">>))
+        end,
     MatchRes =
         hb_ao:resolve(
             #{
@@ -110,8 +122,7 @@ price_from_routes(UserRequest, NodeMsg) ->
             },
             UserRequest#{
                 <<"path">> => <<"match">>,
-                <<"route-path">> =>
-                    hb_maps:get(<<"path">>, UserRequest, no_path, NodeMsg)
+                <<"route-path">> => RoutePath
             },
             NodeMsg
         ),
@@ -136,33 +147,53 @@ price_from_count(Messages, NodeMsg) ->
 %% @doc Preprocess a request by checking the ledger and charging the user. We 
 %% can charge the user at this stage because we know statically what the price
 %% will be
+-spec charge(
+    #{ _ => _ },
+    #{ request => #{ _ => _ }, quantity => non_neg_integer(), _ => _ },
+    #{ _ => _ }
+) ->
+    {ok, boolean()}
+    | {error, #{ status := integer(), body := binary(), _ => _ }}.
 charge(_, RawReq, NodeMsg) ->
     ?event(payment, {charge, RawReq}),
+    % Only the node may charge: p4 signs its charge with the node's key. The
+    % charge reads only the keys that the node signed, so the node's receipt
+    % over a `hashpath' or a result it pushed for a caller does not charge.
+    case lib_meta:authorized(hb_opts:committer(NodeMsg), RawReq, NodeMsg) of
+        {ok, Charge} -> do_charge(Charge, NodeMsg);
+        {error, not_authorized} ->
+            {error, #{
+                <<"status">> => 403,
+                <<"body">> => <<"Charge not made by the node.">>
+            }}
+    end.
+
+%% @doc Debit the signer of the request's `request' by its `quantity'.
+do_charge(RawReq, NodeMsg) ->
     Req =
         hb_ao:get(
             <<"request">>,
             RawReq,
+            #{},
             NodeMsg#{ <<"hashpath">> => ignore }
         ),
     case hb_message:signers(Req, NodeMsg) of
         [] ->
             ?event(payment, {charge, {error, <<"No signers">>}}),
-            {ok, false};
+            {error, #{
+                <<"status">> => 400,
+                <<"body">> => <<"No signers in charge.">>
+            }};
         [Signer] ->
-            UserBalance = get_balance(Signer, NodeMsg),
             Price = hb_ao:get(<<"quantity">>, RawReq, 0, NodeMsg),
+            NewBalance = debit(Signer, Price, NodeMsg),
+            UserBalance = NewBalance + Price,
             ?event(payment,
                 {charge,
                     {user, Signer},
                     {balance, UserBalance},
                     {price, Price}
                 }),
-            {ok, _} =
-                set_balance(
-                    Signer,
-                    NewBalance = UserBalance - Price,
-                    NodeMsg
-                ),
             case NewBalance >= 0 of
                 true ->
                     {ok, true};
@@ -195,118 +226,128 @@ charge(_, RawReq, NodeMsg) ->
     end.
 
 %% @doc Get the balance of a user in the ledger.
+-spec balance(
+    #{ _ => _ },
+    #{ request => #{ _ => _ }, target => binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, integer()}.
 balance(_, RawReq, NodeMsg) ->
+    Req =
+        hb_ao:get(
+            <<"request">>,
+            RawReq,
+            RawReq,
+            NodeMsg#{ <<"hashpath">> => ignore }
+        ),
     Target =
-        case
-            hb_ao:get(
-                <<"request">>,
-                RawReq,
-                NodeMsg#{ <<"hashpath">> => ignore }
-            )
-        of
-            not_found ->
-                case hb_message:signers(RawReq, NodeMsg) of
-                    [] -> hb_ao:get(<<"target">>, RawReq, undefined, NodeMsg);
-                    [Signer] -> Signer
+        case hb_ao:get(<<"target">>, RawReq, undefined, NodeMsg) of
+            undefined ->
+                case hb_message:signers(Req, NodeMsg) of
+                    [] -> undefined;
+                    [Signer | _] -> Signer
                 end;
-            Req -> hd(hb_message:signers(Req, NodeMsg))
+            Explicit -> hb_committer:uri(Explicit, NodeMsg)
         end,
     {ok, get_balance(Target, NodeMsg)}.
 
-%% @doc Adjust a user's balance, normalizing their wallet ID first.
-set_balance(Signer, Amount, NodeMsg) ->
-    LiveNodeMsg = latest_node_msg(NodeMsg),
-    NormSigner = hb_util:human_id(Signer),
-    Ledger = hb_opts:get(simple_pay_ledger, #{}, LiveNodeMsg),
-    ?event(payment,
-        {modifying_balance,
-            {user, NormSigner},
-            {amount, Amount},
-            {ledger_before, Ledger}
-        }
-    ),
-    hb_http_server:set_opts(
-        #{},
-        NewMsg = LiveNodeMsg#{
-            <<"simple-pay-ledger">> =>
-                hb_ao:set(
-                    Ledger,
-                    NormSigner,
-                    Amount,
-                    LiveNodeMsg
-                )
-        }
-    ),
-    {ok, NewMsg}.
+%% @doc Debit a user's balance, keyed by their committer, and return the new
+%% balance. A negative amount credits the user.
+debit(Signer, Amount, NodeMsg) ->
+    lib_volatile_ledger:debit(
+        ledger(NodeMsg),
+        Signer,
+        Amount,
+        NodeMsg
+    ).
 
-%% @doc Refresh the node message before mutating the ledger.
-latest_node_msg(NodeMsg) ->
-    case hb_opts:get(http_server, no_server_ref, NodeMsg) of
-        no_server_ref ->
-            NodeMsg;
-        _ ->
-            try hb_http_server:get_opts(NodeMsg) of
-                no_node_msg -> NodeMsg;
-                CurrentNodeMsg -> CurrentNodeMsg
-            catch
-                _:_ -> NodeMsg
+%% @doc The node's ledger of balances, starting from `simple_pay_ledger'.
+ledger(NodeMsg) ->
+    #{
+        <<"name">> => <<"simple-pay@1.0">>,
+        <<"balances">> =>
+            maps:fold(
+                fun(Account, Balance, Balances) ->
+                    Balances#{ hb_committer:uri(Account, NodeMsg) => Balance }
+                end,
+                #{},
+                hb_opts:get(simple_pay_ledger, #{}, NodeMsg)
+            )
+    }.
+
+%% @doc Get the balance of a user in the ledger. A request with no signer and
+%% no `target' gives no user, and has a balance of 0.
+get_balance(undefined, _NodeMsg) -> 0;
+get_balance(Signer, NodeMsg) ->
+    lib_volatile_ledger:balance(
+        ledger(NodeMsg),
+        Signer,
+        NodeMsg
+    ).
+
+%% @doc Top up the user's balance in the ledger. We read the `amount' and the
+%% `recipient' only from the keys that the operator signed.
+-spec topup(
+    #{ _ => _ },
+    #{ amount => integer(), recipient => binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, integer()} | {error, binary() | map()}.
+topup(_, Req, NodeMsg) ->
+    ?event({topup, {req, Req}, {node_msg, NodeMsg}}),
+    case lib_meta:authorized(lib_meta:role(operator, NodeMsg), Req, NodeMsg) of
+        {error, _} -> {error, <<"Unauthorized">>};
+        {ok, Signed} ->
+            Amount = hb_ao:get(<<"amount">>, Signed, 0, NodeMsg),
+            case is_integer(Amount) andalso Amount > 0 of
+                false -> {error, <<"Top-up amount must be positive.">>};
+                true ->
+                    Recipient =
+                        hb_committer:uri(
+                            hb_ao:get(<<"recipient">>, Signed, undefined, NodeMsg),
+                            NodeMsg
+                        ),
+                    % The top-up's unsigned ID is its nonce, so the ledger
+                    % applies each signed top-up once.
+                    case
+                        lib_volatile_ledger:debit(
+                            ledger(NodeMsg),
+                            Recipient,
+                            -Amount,
+                            hb_message:id(Signed, NodeMsg),
+                            NodeMsg
+                        )
+                    of
+                        {error, already_applied} ->
+                            {error, #{
+                                <<"status">> => 409,
+                                <<"body">> => <<"Top-up already applied.">>
+                            }};
+                        NewBalance ->
+                            ?event(payment,
+                                {topup,
+                                    {amount, Amount},
+                                    {recipient, Recipient},
+                                    {balance, NewBalance}
+                                }),
+                            {ok, NewBalance}
+                    end
             end
     end.
 
-%% @doc Get the balance of a user in the ledger.
-get_balance(Signer, NodeMsg) ->
-    NormSigner = hb_util:human_id(Signer),
-    Ledger = hb_opts:get(simple_pay_ledger, #{}, NodeMsg),
-    hb_ao:get(NormSigner, Ledger, 0, NodeMsg).
-
-%% @doc Top up the user's balance in the ledger.
-topup(_, Req, NodeMsg) ->
-    ?event({topup, {req, Req}, {node_msg, NodeMsg}}),
-    case is_operator(Req, NodeMsg) of
-        false -> {error, <<"Unauthorized">>};
-        true ->
-            Amount = hb_ao:get(<<"amount">>, Req, 0, NodeMsg),
-            Recipient = hb_ao:get(<<"recipient">>, Req, undefined, NodeMsg),
-            CurrentBalance = get_balance(Recipient, NodeMsg),
-            ?event(payment,
-                {topup,
-                    {amount, Amount},
-                    {recipient, Recipient},
-                    {balance, CurrentBalance},
-                    {expected_new_balance, CurrentBalance + Amount}
-                }),
-            {ok, NewNodeMsg} =
-                set_balance(
-                    Recipient,
-                    CurrentBalance + Amount,
-                    NodeMsg
-                ),
-            % Briefly wait for the ledger to be updated.
-            receive after 100 -> ok end,
-            {ok, get_balance(Recipient, NewNodeMsg)}
-    end.
-
-%% @doc Check if the request is from the operator.
+%% @doc Check if the request is from the operator, as `meta@1.0' finds it.
 is_operator(Req, NodeMsg) ->
-    is_operator(Req, NodeMsg, hb_opts:get(operator, undefined, NodeMsg)).
-
-is_operator(Req, NodeMsg, OperatorAddr) when ?IS_ID(OperatorAddr) ->
-    Signers = hb_message:signers(Req, NodeMsg),
-    HumanOperatorAddr = hb_util:human_id(OperatorAddr),
-    lists:any(
-        fun(Signer) ->
-            HumanOperatorAddr =:= hb_util:human_id(Signer)
-        end,
-        Signers
-    );
-is_operator(_, _, _) ->
-    false.
+    {ok, IsOperator} =
+        hb_ao:resolve(
+            #{ <<"device">> => <<"meta@1.0">> },
+            #{ <<"path">> => <<"is-operator">>, <<"body">> => Req },
+            NodeMsg#{ <<"hashpath">> => ignore }
+        ),
+    IsOperator.
 
 %%% Tests
 
 test_opts(Ledger) ->
     Wallet = ar_wallet:new(),
-    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Address = hb_test_utils:committer(Wallet),
     ProcessorMsg =
         #{
             <<"device">> => <<"p4@1.0">>,
@@ -329,8 +370,10 @@ test_opts(Ledger) ->
 
 get_balance_and_top_up_test() ->
     ClientWallet = ar_wallet:new(),
-    ClientAddress = hb_util:human_id(ar_wallet:to_address(ClientWallet)),
-    {HostAddress, HostWallet, Opts} = test_opts(#{ ClientAddress => 100 }),
+    ClientAddress = hb_test_utils:committer(ClientWallet),
+    % The ledger keys the client lowercase, as a config file loads it.
+    {HostAddress, HostWallet, Opts} =
+        test_opts(#{ hb_util:lowercase_key(ClientAddress) => 100 }),
     Node = hb_http_server:start_node(Opts),
     ?event({host_address, HostAddress}),
     ?event({client_address, ClientAddress}),
@@ -365,6 +408,35 @@ get_balance_and_top_up_test() ->
     % not have generated a charge in itself. The top-up did not generate a charge
     % because it is the operator that performed it, and not a user.
     ?assertEqual(180, NewBalance),
+    % A node with no `operator' takes a top-up signed by its own wallet.
+    ?assertEqual(
+        {ok, 100},
+        hb_http:post(
+            hb_http_server:start_node(#{ <<"priv-wallet">> => HostWallet }),
+            <<"/~simple-pay@1.0/topup">>,
+            hb_message:commit(
+                #{ <<"amount">> => 100, <<"recipient">> => ClientAddress },
+                Opts#{ <<"priv-wallet">> => HostWallet }
+            ),
+            Opts
+        )
+    ),
+    % A charge of a negative quantity is refused, even from the operator.
+    ?assertMatch(
+        {error, #{ <<"status">> := 400, <<"key">> := <<"quantity">> }},
+        hb_http:post(
+            Node,
+            hb_message:commit(
+                #{
+                    <<"path">> => <<"/~simple-pay@1.0/charge">>,
+                    <<"quantity">> => -1000,
+                    <<"request">> => Req
+                },
+                Opts#{ <<"priv-wallet">> => HostWallet }
+            ),
+            Opts
+        )
+    ),
     {ok, Res2} =
         hb_http:get(
             Node,
@@ -374,11 +446,73 @@ get_balance_and_top_up_test() ->
             ),
             Opts
         ),
-    ?assertEqual(180, Res2).
+    ?assertEqual(180, Res2),
+    % A query parameter does not change the amount that the operator signed.
+    ?assertEqual(
+        {ok, 280},
+        hb_http:post(
+            Node,
+            <<"/~simple-pay@1.0/topup?amount+integer=1">>,
+            hb_message:commit(
+                #{ <<"amount">> => 100, <<"recipient">> => ClientAddress },
+                Opts#{ <<"priv-wallet">> => HostWallet }
+            ),
+            Opts
+        )
+    ),
+    % A top-up to the client's Arweave address credits its committer's account.
+    ?assertEqual(
+        {ok, 380},
+        hb_http:post(
+            Node,
+            hb_message:commit(
+                #{
+                    <<"path">> => <<"/~simple-pay@1.0/topup">>,
+                    <<"amount">> => 100,
+                    <<"recipient">> =>
+                        hb_util:human_id(ar_wallet:to_address(ClientWallet))
+                },
+                Opts#{ <<"priv-wallet">> => HostWallet }
+            ),
+            Opts
+        )
+    ),
+    % A balance whose `target' is that address reads its committer's account.
+    ?assertEqual(
+        {ok, 380},
+        hb_http:get(
+            Node,
+            hb_message:commit(
+                #{
+                    <<"path">> => <<"/~simple-pay@1.0/balance">>,
+                    <<"target">> =>
+                        hb_util:human_id(ar_wallet:to_address(ClientWallet))
+                },
+                Opts#{ <<"priv-wallet">> => HostWallet }
+            ),
+            Opts
+        )
+    ),
+    % A client's direct charge is refused, whatever request it carries.
+    ?assertMatch(
+        {error, #{ <<"status">> := 403 }},
+        hb_http:post(
+            Node,
+            hb_message:commit(
+                #{
+                    <<"path">> => <<"/~simple-pay@1.0/charge">>,
+                    <<"quantity">> => 10,
+                    <<"request">> => Req
+                },
+                Opts#{ <<"priv-wallet">> => ClientWallet }
+            ),
+            Opts
+        )
+    ).
 
 apply_price_test() ->
     ClientWallet = ar_wallet:new(),
-    ClientAddress = hb_util:human_id(ar_wallet:to_address(ClientWallet)),
+    ClientAddress = hb_test_utils:committer(ClientWallet),
     ClientOpts = #{ <<"priv-wallet">> => ClientWallet },
     {HostAddress, _HostWallet, Opts} =
         test_opts(#{ ClientAddress => 100 }),

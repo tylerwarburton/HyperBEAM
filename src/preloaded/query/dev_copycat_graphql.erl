@@ -24,7 +24,7 @@ graphql(Base, Req, Opts) ->
         {ok, Query} ->
             Node = maps:get(<<"node">>, Opts, undefined),
             OpName =
-                case hb_maps:get(<<"operationName">>, Req, undefined, Opts) of
+                case hb_maps:get(<<"operationname">>, Req, undefined, Opts) of
                     Name when is_binary(Name) -> Name;
                     _ -> undefined
                 end,
@@ -58,7 +58,7 @@ index_graphql(Total, Query, Vars, Node, OpName, Opts) ->
         ParsedMsgs =
             lists:filtermap(
                 fun(NodeStruct) ->
-                    Struct = hb_maps:get(<<"node">>, NodeStruct, not_found, Opts),
+                    Struct = hb_ao:get(<<"node">>, NodeStruct, not_found, Opts),
                     try
                         {ok, ParsedMsg} =
                             hb_client_gateway:result_to_message(
@@ -275,7 +275,11 @@ default_query(Parts) ->
 %% @doc Run node for testing
 run_test_node() ->
     Store = hb_test_utils:test_store(),
-    Opts = #{ <<"store">> => Store, <<"priv-wallet">> => ar_wallet:new() },
+    Opts = #{
+        <<"store">> => Store,
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"ans104-trust-gql">> => true
+    },
     Node = hb_http_server:start_node(Opts),
     {Node ,Opts}. 
 %% @doc Basic test to test copycat device

@@ -3,7 +3,7 @@
 %%% `offset', `id' and `commitment-device', not the indexed messages themselves.
 %%% `offset' is a weave byte position, `-1' for an unknown position, or
 %%% `infinity' for a pending position. `id' identifies a signed commitment;
-%%% `commitment-device' names its device. Unknown IDs and devices are empty
+%%% `commitment-device' is its device. Unknown IDs and devices are empty
 %%% binaries. Store pipelines supply this representation independently of
 %%% how a store encodes its entries.
 %%%
@@ -13,18 +13,22 @@
 %%%              messages, each with an additional `member' cursor.
 %%%     all:     Match the base's pairs in stores of local scope. Return the
 %%%              distinct nonempty IDs of the resulting entries.
+%%%     check:   Test request predicates against the base message, without
+%%%              reading the index. Return a boolean. Uses the node's computed
+%%%              paths and its `match@1.0' cache-write handlers; only requested
+%%%              fields are evaluated. An empty predicate list returns true.
 %%%     <key>:   As `all', matching only the base's value at the requested key.
 %%%              Device keys and `set', `remove', `id', `verify' are reserved.
 %%% '''
 %%% Templates exclude private keys and top-level commitments. Structured
 %%% values are converted to TABM and the top-level `ao-types' field is removed;
-%%% top-level scalar types are not distinguished by matching. Other public keys,
-%%% including `device', are predicates.
+%%% the types of top-level literals are not distinguished by matching. Other
+%%% public keys, including `device', are predicates.
 %%% The request may add `predicates': a list of messages with `name' and
 %%% `values'. Values within each predicate are ORed; predicates and the base's
 %%% pairs are ANDed. An empty values list matches nothing. Ordinary template
 %%% values, including lists, retain their literal meaning.
-%%% With no base pairs or request predicates, there are no matches.
+%%% Index lookups with no base pairs or request predicates return no matches.
 %%% With predicates but no index stores, `locate' returns `not_found'.
 %%%
 %%% Entries are ordered by offset, then ID. At an offset, groups with known
@@ -33,7 +37,7 @@
 %%% entry at the same offset. The commitment device is metadata, not an
 %%% additional equality or ordering field.
 %%%
-%%% All three matching forms accept request keys `direction' (`asc' by default
+%%% Index lookups accept request keys `direction' (`asc' by default
 %%% or `desc'), `limit' (a nonnegative integer; omitted means all), `from'
 %%% (inclusive), `after' (exclusive, taking precedence over `from'), and `to'
 %%% (exclusive). Without bounds, traversal starts at `-1' ascending or
@@ -53,10 +57,10 @@
 %%%
 %%% Indexed pairs comprise the body's public fields without its commitments,
 %%% plus values computed with only the indexed ID's commitment present.
-%%% `match-paths' maps names to paths resolved on the
+%%% `match-paths' maps each name to a path resolved on the
 %%% body; `match-all-paths' indexes each list element under its configured name
-%%% (a non-list result contributes one value). Successfully resolved names
-%%% replace the corresponding body fields. Node options take precedence over
+%%% (a non-list result contributes one value). A name that resolves replaces
+%%% the body field of the same name. Node options take precedence over
 %%% the handler's configuration. Defaults are an empty `match-paths' and a
 %%% `match-all-paths' message mapping `committer' to `committers~message@1.0'.
 %%% Computations use raw AO-Core resolution: `KEY~DEVICE' selects a device;
@@ -68,26 +72,32 @@
 %%% setting, a locally supplied `store' takes its place; with neither local
 %%% option, the global `match-index' applies. The selected value may be a store
 %%% message or list, `false' for no index, or `true' to use the node's `store'.
-%%% Each alternative names a group `~match@1.0/<normalized-name>=<value-path>'.
-%%% The value path is a binary's hashpath or a nested message's uncommitted ID.
-%%% Writes have empty values and entry keys with an additional `path' naming
-%%% the group. `hb_store' applies prefix handling and `to-key' to these keys.
+%%% The group of each alternative is
+%%% `~match@1.0/<normalized-name>=<value-path>', with the name escaped as a
+%%% single path component. The value path is a binary's hashpath or a nested
+%%% message's uncommitted ID.
+%%% Writes have empty values and entry keys with an additional `path' that
+%%% gives the group. `hb_store' applies prefix handling and `to-key' to these
+%%% keys.
 %%% The encoder also receives binary group paths and pathless entry messages
 %%% for list bounds. List results pass through `from-key' to become entries.
+%%% A `from-list' pipeline can decode the entire batch instead, using `entries'
+%%% for native keys or `members' for packed rows.
 %%% Reads merge all configured stores using ordered, inclusive batch listing.
-%%% Local reads are bounded by `match-batch-size' (default 256, minimum 2);
-%%% remote stores retain their physical batch policy.
+%%% Stores determine batch sizes: LMDB uses its `list-batch-size' setting;
+%%% ArLMDB uses its physical batch policy.
 %%% While entries remain beyond a cursor, a batch must include at least one
 %%% of them; a batch containing only the cursor is treated as exhausted.
 %%%
 %%% Default pipelines are `~match@1.0/key' and `~match@1.0/entry'; explicit
-%%% store pipelines override them. These adapter keys use the base's `body',
-%%% or the base itself if it has no `body':
+%%% store pipelines override them. `key' and `entry' use the base's `body',
+%%% or the base itself if it has no `body'; batch adapters take a `body' list:
 %%% ```
 %%%     key:    Encode an entry as a native binary key, joined to its `path'
 %%%             when present. A binary group path passes through unchanged.
 %%%     entry:  Decode a native key, or normalize an entry message's offset
 %%%             and supply empty `id' and `commitment-device' when absent.
+%%%     entries: Decode a list of native keys in one call.
 %%% '''
 %%% Native keys concatenate the offset, the 43-byte base64url signed ID, and
 %%% the variable-length device name. Nonnegative offsets occupy 20 zero-padded
@@ -103,6 +113,8 @@
 %%%              `path'. IDs and devices are not encoded.
 %%%     member:  Decode a complete binary row into an entry with empty ID and
 %%%              device. The row must contain exactly the configured bits.
+%%%     members: Decode a list of rows, assigning the request's optional
+%%%              `commitment-device' (empty by default) to each entry.
 %%% '''
 %%% A row contains leading bits of SHA-256(`~match@1.0/<name>'), leading bits
 %%% of the base64url-decoded value path, then the unsigned offset. `row' maps
@@ -110,7 +122,10 @@
 %%% `member' maps that maximum to `infinity'. The pipeline must supply any
 %%% known commitment device, for example with `/set&commitment-device=ans104@1.0'.
 -module(dev_match).
--export([info/0, all/3, index/3, locate/3, row/3, member/3, entry/3, key/3]).
+-specification("../../../specs/match@1.0.md").
+-export([device_info/0]).
+-export([all/3, index/3, locate/3, row/3, member/3, entry/3, key/3]).
+-export([entries/3, members/3, check/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -124,10 +139,12 @@
 -define(DEFAULT_ALL_PATHS,
     #{ <<"committer">> => <<"committers~message@1.0">> }
 ).
+%% The most rows that a `members' request decodes.
+-define(MAX_MEMBERS, 1000).
 
-%% @doc Default all non-message@1.0 and device keys to match a single key in the
-%% index.
-info() ->
+%% @doc Default all keys other than `message@1.0' and device keys to match a
+%% single key in the index.
+device_info() ->
     #{
         excludes => [<<"set">>, <<"remove">>, <<"id">>, <<"verify">>],
         default => fun match/4
@@ -170,7 +187,7 @@ store(Opts) ->
 group(Name, Value, Opts) ->
     <<
         ?PREFIX/binary,
-        (hb_ao:normalize_key(Name))/binary, "=",
+        (hb_escape:encode_path_component(hb_ao:normalize_key(Name)))/binary, "=",
         (value_path(Value, Opts))/binary
     >>.
 
@@ -212,6 +229,10 @@ digits(Other) ->
 entry(Base, _Req, Opts) ->
     {ok, parse(hb_maps:get(<<"body">>, Base, Base, Opts))}.
 
+%% @doc Decode a batch of native keys without repeating pipeline setup.
+entries(Base, _Req, Opts) ->
+    {ok, [parse(Key) || Key <- hb_maps:get(<<"body">>, Base, [], Opts)]}.
+
 %% @doc An encoded key or decoded fields as an entry message.
 parse(#{ <<"offset">> := At } = Match) ->
     #{ <<"offset">> := Offset } = cursor(At),
@@ -228,7 +249,7 @@ parse(Offset, <<ID:43/binary, Device/binary>>) ->
 parse(Offset, ID) ->
     #{ <<"offset">> => Offset, <<"id">> => ID, <<"commitment-device">> => <<>> }.
 
-%% @doc The position of a key: its offset and ID. An empty ID names an
+%% @doc The position of a key: its offset and ID. An empty ID is an
 %% offset boundary, closing the offset when reading down.
 position(desc, #{ <<"offset">> := Offset, <<"id">> := <<>> }) ->
     {Offset, ?LAST_ID};
@@ -238,7 +259,7 @@ position(_Direction, #{ <<"offset">> := Offset, <<"id">> := ID }) ->
 %%% Writing the index.
 
 %% @doc Write the message in the request's `body' under each of its pairs,
-%% per ID the request names, at the offset of its `priv/offset': a weave
+%% per ID the request gives, at the offset of its `priv/offset': a weave
 %% offset, `infinity', or `-1' when it carries none. A node without stores
 %% of the index, or with none that takes the keys, writes nothing. Only the
 %% kernel's `cache-write' hook is served: it marks its request in a private
@@ -297,11 +318,6 @@ index_message(Handler, Req, IDs, Stores, Opts) ->
                     )
             ]
         ),
-    Groups = lists:uniq([Group || #{ <<"path">> := Group } <- maps:keys(Keys)]),
-    lists:foreach(
-        fun(Group) -> hb_store:group(Stores, Group, Opts) end,
-        Groups
-    ),
     case hb_store:write(Stores, Keys, Opts) of
         ok -> {ok, Req};
         {error, not_found} -> {ok, Req};
@@ -312,10 +328,12 @@ index_message(Handler, Req, IDs, Stores, Opts) ->
 %% private keys; the value each path of `match-paths' resolves to; and each
 %% element of the list each path of `match-all-paths' resolves to.
 pairs(Handler, Msg, Opts) ->
-    Single = resolved(<<"match-paths">>, #{}, Handler, Msg, Opts),
+    pairs(Handler, Msg, all, Opts).
+pairs(Handler, Msg, Names, Opts) ->
+    Single = resolved(<<"match-paths">>, #{}, Handler, Msg, Names, Opts),
     All =
         resolved(
-            <<"match-all-paths">>, ?DEFAULT_ALL_PATHS, Handler, Msg, Opts
+            <<"match-all-paths">>, ?DEFAULT_ALL_PATHS, Handler, Msg, Names, Opts
         ),
     Own =
         hb_maps:without(
@@ -323,7 +341,12 @@ pairs(Handler, Msg, Opts) ->
             hb_message:uncommitted(hb_private:reset(Msg)),
             Opts
         ),
-    hb_maps:to_list(Own, Opts) ++ Single ++
+    OwnPairs = case Names of
+        all -> hb_maps:to_list(Own, Opts);
+        _ -> template(hb_maps:with(Names, Own, Opts),
+            Opts#{ <<"linkify-mode">> => discard })
+    end,
+    OwnPairs ++ Single ++
         [
             {Name, Element}
         ||
@@ -331,18 +354,19 @@ pairs(Handler, Msg, Opts) ->
             Element <- elements(List)
         ].
 
-%% @doc The pairs a map of paths names, each the value its path resolves to
-%% on the message. The node's options hold the map, else the hook's handler
+%% @doc The pairs that a map of paths gives, each the value its path resolves to
+%% on the message. The node's options give the map, else the hook's handler
 %% message, else the default.
 %% A computed key may select its device with `KEY~DEVICE'. Without `~DEVICE',
 %% indexing attempts to load each message's device, subject to the node's
 %% trust settings.
-resolved(Key, Default, Handler, Msg, Opts) ->
+resolved(Key, Default, Handler, Msg, Names, Opts) ->
     Paths = hb_opts:get(Key, hb_maps:get(Key, Handler, Default, Opts), Opts),
     [
         {hb_ao:normalize_key(Name), Value}
     ||
         {Name, Path} <- hb_maps:to_list(Paths, Opts),
+        Names =:= all orelse lists:member(hb_ao:normalize_key(Name), Names),
         {ok, Value} <-
             [case binary:split(Path, <<"~">>) of
                 [Part, Device] -> hb_ao:raw(Device, Msg, #{ <<"path">> => Part }, Opts);
@@ -367,6 +391,27 @@ match(Key, Base, Req, Opts) ->
 %% @doc Match the base pairs and request predicates, returning their IDs.
 all(Base, Req, Opts) ->
     ids(Base, Req, Opts).
+
+%% @doc Test only the requested predicates, with the same computed pairs as
+%% indexing. The caller selects the candidate's commitments before checking.
+check(Base, Req, Opts) ->
+    Names = [hb_ao:normalize_key(hb_maps:get(<<"name">>, P, Opts))
+        || P <- hb_maps:get(<<"predicates">>, Req, [], Opts)],
+    Handlers = case [H || H <- hb_hook:find(<<"cache-write">>, Opts),
+            hb_maps:get(<<"device">>, H, undefined, Opts) =:= <<"match@1.0">>] of
+        [] -> [#{}];
+        Found -> Found
+    end,
+    Present = [group(Name, hb_message:convert(hb_cache:ensure_loaded(Value, Opts), tabm,
+        Opts#{ <<"linkify-mode">> => discard }), Opts)
+        || Handler <- Handlers,
+        {Name, Value} <- pairs(Handler, Base, Names, Opts)],
+    {ok, lists:all(
+        fun(Alternatives) ->
+            lists:any(fun(Path) -> lists:member(Path, Present) end, Alternatives)
+        end,
+        groups(#{}, Req, Opts)
+    )}.
 
 %% @doc Unique IDs matching the base pairs and request predicates, within the
 %% request bounds. Only local-scope index stores are read; entries without
@@ -425,7 +470,7 @@ groups(Base, Req, Opts) ->
             Name <- [hb_maps:get(<<"name">>, Predicate, not_found, Opts)]
         ].
 
-%% @doc The pairs a base message names: every key but its commitments and
+%% @doc The pairs of a base message: every key but its commitments and
 %% private keys, in the wire form the index is written from.
 template(Base, Opts) ->
     hb_maps:to_list(
@@ -543,15 +588,33 @@ step(Direction, Groups, Cursor, Exclusive, Opts) ->
         end
     end.
 
-%% @doc Each group's next key with its pages as read, in order.
-next_keys(_Direction, [], _Cursor, _Exclusive, _Opts) ->
-    {ok, []};
-next_keys(Direction, [{Group, Pages} | Rest], Cursor, Exclusive, Opts) ->
+%% @doc Align groups before reading further predicates. A group advancing
+%% past an earlier one leads the next seek; their pages remain reusable.
+next_keys(Direction, Groups, Cursor, Exclusive, Opts) ->
+    next_keys(Direction, Groups, Cursor, Exclusive, [], Opts).
+
+next_keys(_Direction, [], _Cursor, _Exclusive, Acc, _Opts) ->
+    {ok, lists:reverse(Acc)};
+next_keys(Direction, [{Group, Pages} | Rest], Cursor, Exclusive, Acc, Opts) ->
     maybe
         {ok, Key, Read} ?=
             next_key(Direction, Group, Pages, Cursor, Exclusive, Opts),
-        {ok, Others} ?= next_keys(Direction, Rest, Cursor, Exclusive, Opts),
-        {ok, [{Group, Key, Read} | Others]}
+        % No intersection precedes this offset. IDs may still be unrestricted.
+        {From, Exclude} =
+            case {maps:get(<<"offset">>, Key), maps:get(<<"offset">>, Cursor)} of
+                {At, Prev} when Direction =:= asc, At > Prev;
+                        Direction =:= desc, At < Prev ->
+                    {cursor(At), false};
+                _ -> {Cursor, Exclusive}
+            end,
+        case Acc =/= [] andalso From =/= Cursor of
+            true ->
+                {next, From, [{Group, Read} |
+                    [{G, P} || {G, _K, P} <- lists:reverse(Acc)]] ++ Rest};
+            false ->
+                next_keys(Direction, Rest, From, Exclude,
+                    [{Group, Key, Read} | Acc], Opts)
+        end
     end.
 
 %% @doc The keys carrying an ID.
@@ -600,7 +663,7 @@ from_cursor(Direction, Group, Page, Cursor, Exclusive, Store, Opts) ->
             {ok, Left};
         _ ->
             maybe
-                {ok, Read} ?= page(Direction, Group, Cursor, Store, Opts),
+                {ok, Read} ?= page(Direction, Group, Cursor, Exclusive, Store, Opts),
                 {ok, lists:dropwhile(Behind, Read)}
             end
     end.
@@ -639,20 +702,15 @@ first_of(desc, Heads) ->
 
 %% @doc One store's page of a group's keys from the cursor, in the
 %% direction: the batch the store finds without further work. A batch
-%% holding nothing past the cursor ends the store's part, so a store's
-%% batch must hold a key past it while any remains. A store without the
+%% with nothing past the cursor ends the store's part, so a store's
+%% batch must contain a key past it while any remains. A store without the
 %% group has none.
-page(Direction, Group, Cursor, Store, Opts) ->
-    Limit =
-        case hb_store:scope([Store], local) of
-            [] -> batch;
-            _ -> max(2, hb_util:int(hb_opts:get(match_batch_size, 256, Opts)))
-        end,
+page(Direction, Group, Cursor, Exclusive, Store, Opts) ->
     Request =
         #{
             <<"list">> => Group,
-            <<"from">> => from(Direction, Cursor),
-            <<"limit">> => Limit,
+            <<"from">> => from(Direction, Cursor, Exclusive),
+            <<"limit">> => batch,
             <<"direction">> => Direction
         },
     case hb_store:list([Store], Request, Opts) of
@@ -681,14 +739,17 @@ resume_offset_row(Rows, Request, Cursor, Store, Opts) ->
             end
     end.
 
-%% @doc The key a store's page is read from: a cursor naming no ID stands
+%% @doc The key a store's page is read from: a cursor with no ID stands
 %% for every key of its offset, so reading down it closes with the byte
-%% above every ID.
-from(desc, #{ <<"id">> := <<>> } = Cursor) ->
+%% above every ID. Exclusive offset bounds seek past all IDs at that offset.
+from(asc, #{ <<"id">> := <<>> } = Cursor, true) ->
     Cursor#{ <<"id">> => ?LAST_ID, <<"commitment-device">> => <<>> };
-from(desc, #{ <<"commitment-device">> := <<>> } = Cursor) ->
+from(desc, #{ <<"id">> := <<>> } = Cursor, true) -> Cursor;
+from(desc, #{ <<"id">> := <<>> } = Cursor, _Exclusive) ->
+    Cursor#{ <<"id">> => ?LAST_ID, <<"commitment-device">> => <<>> };
+from(desc, #{ <<"commitment-device">> := <<>> } = Cursor, _Exclusive) ->
     Cursor#{ <<"commitment-device">> => ?LAST_ID };
-from(_Direction, Cursor) -> Cursor.
+from(_Direction, Cursor, _Exclusive) -> Cursor.
 
 %%% The rows of a published index.
 
@@ -715,7 +776,10 @@ row(#{ <<"offset">> := Offset }, {_, _, OffsetBits}) ->
         _ -> <<Max:OffsetBits>>
     end;
 row(Body, {KeyBits, ValueBits, _OffsetBits}) ->
-    [Name, ValuePath] = binary:split(Body, <<"=">>),
+    % A value path contains no `=', so the name ends at the last one.
+    {At, 1} = lists:last(binary:matches(Body, <<"=">>)),
+    <<Escaped:At/binary, "=", ValuePath/binary>> = Body,
+    Name = hb_escape:decode_path_component(Escaped),
     <<KeyHash:KeyBits/bitstring, _/bitstring>> =
         crypto:hash(sha256, <<?PREFIX/binary, Name/binary>>),
     <<ValueHash:ValueBits/bitstring, _/bitstring>> = hb_util:decode(ValuePath),
@@ -737,6 +801,41 @@ member(Base, Req, Opts) ->
                 {error, {'invalid-row', Row}}
         end
     end.
+
+%% @doc Decode a batch of packed rows, retaining its configured device. A batch
+%% gives a non-zero `offset-size' and has at most `?MAX_MEMBERS' rows.
+members(Base, Req, Opts) ->
+    case {sizes(Req, Opts), hb_maps:get(<<"body">>, Base, [], Opts)} of
+        {{_, _, 0}, _} ->
+            {error,
+                #{
+                    <<"status">> => 400,
+                    <<"body">> => <<"Offset size is 0.">>
+                }
+            };
+        {_, Rows} when length(Rows) > ?MAX_MEMBERS ->
+            {error,
+                #{
+                    <<"status">> => 400,
+                    <<"body">> => <<"Too many rows.">>
+                }
+            };
+        _ -> decode_members(Base, Req, Opts)
+    end.
+
+decode_members(Base, Req, Opts) ->
+    Device = hb_maps:get(<<"commitment-device">>, Req, <<>>, Opts),
+    lists:foldr(
+        fun(Row, Acc) ->
+            maybe
+                {ok, Rest} ?= Acc,
+                {ok, Entry} ?= member(#{ <<"body">> => Row }, Req, Opts),
+                {ok, [Entry#{ <<"commitment-device">> := Device } | Rest]}
+            end
+        end,
+        {ok, []},
+        hb_maps:get(<<"body">>, Base, [], Opts)
+    ).
 
 %% @doc The widths of a row's fields, from the request.
 sizes(Req, Opts) ->
@@ -763,10 +862,12 @@ body(Base, Opts) ->
 test_opts() ->
     Store =
         (hb_test_utils:test_store(hb_store_lmdb))#{
-            <<"capacity">> => ?TEST_CAPACITY
+            <<"capacity">> => ?TEST_CAPACITY,
+            <<"list-batch-size">> => 2
         },
     hb_store:start([Store]),
-    #{ <<"store">> => [Store], <<"match-index">> => [Store] }.
+    #{ <<"store">> => [Store],
+        <<"match-index">> => [Store#{ <<"from-list">> => <<"~match@1.0/entries">> }] }.
 
 %% @doc Cache a message at an offset, answering its ID.
 cache(Msg, Offset, Opts) ->
@@ -828,7 +929,7 @@ weave_order_test() ->
         )
     ),
     Normalized =
-        [ S#{ <<"from-key">> =>
+        [ (maps:remove(<<"from-list">>, S))#{ <<"from-key">> =>
             <<"~bits@1.0/from=offset:160,id:344,commitment-device:_",
                 "/~match@1.0/entry/set&source=pipeline">> }
         || S <- store(Opts) ],
@@ -957,7 +1058,6 @@ weave_order_test() ->
     lists:foreach(
         fun({Name, Value}) ->
             Group = group(Name, Value, Opts),
-            hb_store:group(Stores, Group, Opts),
             ok = hb_store:write(
                 Stores, #{ <<Group/binary, "/", (digits(5))/binary>> => <<>> },
                 Opts
@@ -979,9 +1079,9 @@ weave_order_test() ->
     ?assertEqual(
         lists:reverse(Shared), matches(Mixed, Desc, MixedOpts)
     ),
-    ?assertEqual(Shared, matches(Asymmetric, Asc, MixedOpts)),
+    ?assertEqual(Shared, matches(Asymmetric, Asc#{ <<"from">> => 0 }, MixedOpts)),
     ?assertEqual(
-        lists:reverse(Shared), matches(Asymmetric, Desc, MixedOpts)
+        lists:reverse(Shared), matches(Asymmetric, Desc#{ <<"from">> => 7 }, MixedOpts)
     ),
     ?assertEqual(Shared, matches(Mixed, Asc#{ <<"predicates">> => [N([0, 1])] }, MixedOpts)),
     ?assertEqual(
@@ -992,13 +1092,51 @@ weave_order_test() ->
     LiteralID = Cache(Literal, 9),
     ?assertEqual([{9, LiteralID}], matches(Literal, #{}, Opts)).
 
+%% @doc Reject a candidate before reading further predicates, retaining the
+%% advancing group's page. Predicate ordering does not change the intersection.
+alignment_test() ->
+    Opts = (test_opts())#{ <<"priv-wallet">> => ar_wallet:new() },
+    Cache = fun(Msg, Offset) ->
+        Signed = hb_message:commit(Msg, Opts),
+        cache(Signed, Offset, Opts),
+        [ID] = ids(Signed, Opts),
+        ID
+    end,
+    [_, _, Matched] = [Cache(Msg, Offset)
+        || {Offset, Msg} <- [{1, #{ <<"a">> => 1, <<"c">> => 1 }},
+            {2, #{ <<"b">> => 1, <<"c">> => 1 }},
+            {3, #{ <<"a">> => 1, <<"b">> => 1, <<"c">> => 1 }}]],
+    [A, B, C] = [#{ <<"name">> => Name, <<"values">> => [1] }
+        || Name <- [<<"a">>, <<"b">>, <<"c">>]],
+    Groups = [{Paths, [{{Path, Store}, unread}
+        || Path <- Paths, Store <- store(Opts)]}
+        || Paths <- groups(#{}, #{ <<"predicates">> => [A, B, C] }, Opts)],
+    {next, #{ <<"offset">> := 2 }, [BRead, ARead, CUnread]} =
+        next_keys(asc, Groups, cursor(-1), false, Opts),
+    ?assertEqual(lists:last(Groups), CUnread),
+    ?assertEqual(element(1, lists:nth(2, Groups)), element(1, BRead)),
+    ?assertEqual(element(1, hd(Groups)), element(1, ARead)),
+    lists:foreach(
+        fun(Predicates) ->
+            lists:foreach(
+                fun(Direction) ->
+                    ?assertEqual([{3, Matched}], matches(#{},
+                        #{ <<"predicates">> => Predicates,
+                            <<"direction">> => Direction }, Opts))
+                end,
+                [asc, desc]
+            )
+        end,
+        [[A, B, C], [A, C, B], [B, A, C], [B, C, A], [C, A, B], [C, B, A]]
+    ).
+
 %% @doc Each signed ID is indexed under its own committer, and a
-%% `match-all-paths' map in the node's options names the pair over the
+%% `match-all-paths' map in the node's options gives the pair over the
 %% hook's handler message's.
 paths_test() ->
     Opts = test_opts(),
     Wallets = [ar_wallet:new(), ar_wallet:new()],
-    Addresses = [ hb_util:human_id(ar_wallet:to_address(W)) || W <- Wallets ],
+    Addresses = [ hb_test_utils:committer(W) || W <- Wallets ],
     Signed =
         lists:foldl(
             fun(Wallet, Msg) ->
@@ -1036,7 +1174,8 @@ paths_test() ->
     ),
     Named =
         Opts#{
-            <<"match-paths">> => #{ <<"computed">> => <<"test-func">> },
+            <<"match-paths">> => #{ <<"computed">> => <<"test-func">>,
+                <<"number">> => <<"c~message@1.0">> },
             <<"match-all-paths">> => #{ signer => <<"committers">> },
             <<"on">> => #{
                 <<"cache-write">> => #{
@@ -1051,13 +1190,14 @@ paths_test() ->
     Second =
         hb_message:commit(
             #{
-                <<"c">> => <<"d">>, <<"signer">> => <<"untrusted">>,
+                <<"c">> => 7, <<"signer">> => <<"untrusted">>,
                 <<"device">> => <<"test-device@1.0">>
             },
             Opts#{ <<"priv-wallet">> => Wallet }
         ),
     cache(Second, 2, Named),
     SecondIDs = ids(Second, Opts),
+    {ok, CachedSecond} = hb_cache:read(hd(SecondIDs), Named),
     ?assertMatch(
         [{2, _}], matches(#{ <<"computed">> => <<"GOOD FUNCTION">> }, #{}, Named)
     ),
@@ -1067,6 +1207,20 @@ paths_test() ->
     {ok, [CommitterID]} = hb_cache:match(#{ <<"committer">> => Address }, Named),
     ?assertEqual(
         Address, hb_util:deep_get([CommitterID, <<"committer">>], Commitments, Opts)
+    ),
+    lists:foreach(
+        fun({Name, Values, Expected}) ->
+            ?assertEqual({ok, Expected}, hb_ao:raw(
+                <<"match@1.0">>, CachedSecond,
+                #{ <<"path">> => <<"check">>, <<"predicates">> =>
+                    [#{ <<"name">> => Name, <<"values">> => Values }] }, Named
+            ))
+        end,
+        [{<<"computed">>, [<<"absent">>, <<"GOOD FUNCTION">>], true},
+         {<<"signer">>, [Address], true},
+         {<<"signer">>, [<<"untrusted">>], false},
+         {<<"number">>, [7], true},
+         {<<"c">>, [7], true}, {<<"c">>, [], false}]
     ).
 
 %% @doc A group's path hashes to the row prefix of a published index, a key
@@ -1108,6 +1262,12 @@ row_test() ->
         {ok, #{ <<"offset">> => 5, <<"id">> => <<>>,
             <<"commitment-device">> => <<>> }},
         Normalize(<<"member">>, Row)
+    ),
+    {ok, Entry} = Normalize(<<"member">>, Row),
+    ?assertEqual({ok, [Entry, Entry]}, Normalize(<<"members">>, [Row, Row])),
+    ?assertEqual(
+        {error, {'invalid-row', <<0>>}},
+        Normalize(<<"members">>, [Row, <<0>>])
     ).
 
 %% @doc A request over HTTP loses its private keys, so it is not the kernel.

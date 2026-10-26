@@ -34,7 +34,6 @@
   const clearFilterValue = "Clear";
   const hopHeaders = new Set([
     "cache-control",
-    "codec-device",
     "content-digest",
     "content-length",
     "content-type",
@@ -163,9 +162,11 @@
         out["."] = unquote(member);
         return;
       }
-      const rawKey = member.slice(0, eq).trim();
-      const valuePart = splitOutsideQuotes(member.slice(eq + 1), ";")[0].trim();
-      out[decodeAoKey(rawKey)] = unquote(valuePart);
+      const type = member.slice(0, eq).trim();
+      const keys = member.slice(eq + 1).trim().replace(/^\(|\)$/g, "");
+      splitOutsideQuotes(keys, " ").forEach((key) => {
+        out[unquote(key)] = type;
+      });
     });
     return out;
   }

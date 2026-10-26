@@ -12,6 +12,7 @@
 -module(rsa_pss).
 
 -include_lib("public_key/include/public_key.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 %% API
 -export([sign/3]).
@@ -177,16 +178,21 @@ verify_legacy({digest, Digest}, DigestType, Signature, PublicKey=#'RSAPublicKey'
 %%%-------------------------------------------------------------------
 
 %% @private
+dp(B, PrivateKey = #'RSAPrivateKey'{prime1=P}) when is_integer(P) ->
+    % If the key has its primes, compute with them (CRT) in OpenSSL, which
+    % checks the result before it returns it.
+    public_key:encrypt_private(B, PrivateKey, [{rsa_padding, rsa_no_padding}]);
 dp(B, #'RSAPrivateKey'{modulus=N, privateExponent=E}) ->
-    crypto:mod_pow(B, E, N).
+    crypto:mod_pow(B, binary:encode_unsigned(E), binary:encode_unsigned(N)).
 
 %% @private
 ep(B, #'RSAPublicKey'{modulus=N, publicExponent=E}) ->
-    crypto:mod_pow(B, E, N).
+    crypto:mod_pow(B, binary:encode_unsigned(E), binary:encode_unsigned(N)).
 
 %% @private
 int_to_bit_size(I) ->
-    int_to_bit_size(I, 0).
+    <<First, Rest/binary>> = binary:encode_unsigned(I),
+    int_to_bit_size(First, byte_size(Rest) * 8).
 
 %% @private
 int_to_bit_size(0, B) ->
@@ -195,14 +201,10 @@ int_to_bit_size(I, B) ->
     int_to_bit_size(I bsr 1, B + 1).
 
 %% @private
+int_to_byte_size(0) ->
+    0;
 int_to_byte_size(I) ->
-    int_to_byte_size(I, 0).
-
-%% @private
-int_to_byte_size(0, B) ->
-    B;
-int_to_byte_size(I, B) ->
-    int_to_byte_size(I bsr 8, B + 1).
+    byte_size(binary:encode_unsigned(I)).
 
 %% @private
 mgf1(DigestType, Seed, Len) ->
@@ -235,3 +237,23 @@ pad_to_key_size(Bytes, Data) when byte_size(Data) < Bytes ->
     pad_to_key_size(Bytes, << 0, Data/binary >>);
 pad_to_key_size(_Bytes, Data) ->
     Data.
+
+%%% Tests.
+
+%% @doc Integer sizes include zero and both sides of every bit boundary.
+integer_sizes_test() ->
+    ?assertEqual(0, int_to_bit_size(0)),
+    ?assertEqual(0, int_to_byte_size(0)),
+    lists:foreach(
+        fun(Bits) ->
+            Power = 1 bsl Bits,
+            lists:foreach(
+                fun({I, ExpectedBits}) ->
+                    ?assertEqual(ExpectedBits, int_to_bit_size(I)),
+                    ?assertEqual((ExpectedBits + 7) div 8, int_to_byte_size(I))
+                end,
+                [{Power - 1, Bits}, {Power, Bits + 1}, {Power + 1, Bits + 1}]
+            )
+        end,
+        lists:seq(1, 4097)
+    ).

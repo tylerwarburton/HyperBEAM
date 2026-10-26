@@ -54,16 +54,8 @@ cache_path_to_graph(Store, GraphOpts, RootKeys, Opts) ->
 traverse_store(Store, Path, Parent, Graph, Opts) ->
     % Get the path and check if we've already visited it
     JoinedPath = hb_path:to_binary(Path),
-    ResolvedPath =
-        case hb_link:is_link_key(JoinedPath) of
-            true ->
-                ?event({is_link_key, {path, Path}, {res_path, JoinedPath}}),
-                {ok, ResolvedLink} = hb_store:resolve(Store, JoinedPath, Opts),
-                {ok, Link} = hb_store:read(Store, ResolvedLink, Opts),
-                ?event({resolved_link, {read, Link}}),
-                hb_util:ok(hb_store:resolve(Store, Link, Opts));
-            false -> hb_util:ok(hb_store:resolve(Store, Path, Opts))
-        end,
+    % A value that is a link to a message is drawn as the message.
+    {ResolvedPath, Node} = read_link(Store, JoinedPath, 32, Opts),
     ?event({traverse_store, {path, Path}, {joined_path, JoinedPath}, {resolved_path, ResolvedPath}, {parent, Parent}}),
     % Skip if we've already processed this node
     case hb_maps:get(visited, Graph, #{}, Opts) of
@@ -73,15 +65,25 @@ traverse_store(Store, Path, Parent, Graph, Opts) ->
             Graph1 = Graph#{visited => hb_maps:put(JoinedPath, true, hb_maps:get(visited, Graph, #{}, Opts), Opts)},
             % ?event({traverse_store, {key, Key}, {graph1, Graph1}}),
             % Process node based on its type
-            case hb_store:type(Store, ResolvedPath, Opts) of
-                {ok, simple} ->
+            case Node of
+                {ok, _} ->
                     process_simple_node(Store, Path, Parent, ResolvedPath, JoinedPath, Graph1, Opts);
-                {ok, composite} ->
+                {composite, _} ->
                     process_composite_node(Store, Path, Parent, ResolvedPath, JoinedPath, Graph1, Opts);
                 _ ->
-                    ?event({unknown_node_type, {path, Path}, {type, hb_store:type(Store, Path, Opts)}}),
+                    ?event({unknown_node_type, {path, Path}, {read, Node}}),
                     Graph1
             end
+    end.
+
+%% @doc Read a path, following up to `Hops' `ao:<ID>' values to the IDs that
+%% they name. Returns the last path read and the store's answer for it.
+read_link(Store, Path, Hops, Opts) ->
+    case hb_store:read(Store, Path, Opts) of
+        {ok, <<"ao:", ID/binary>>} when ?IS_ID(ID), Hops > 0 ->
+            ?event({resolved_link, {path, Path}, {id, ID}}),
+            read_link(Store, ID, Hops - 1, Opts);
+        Read -> {Path, Read}
     end.
 
 %% @doc Process a simple (leaf) node
@@ -102,10 +104,6 @@ process_simple_node(_Store, _Key, Parent, ResolvedPath, JoinedPath, Graph, Opts)
     end.
 
 %% @doc Process a composite (directory) node
-process_composite_node(_Store, <<"data">>, _Parent, _ResolvedPath, _JoinedPath, Graph, _Opts) ->
-    % Data is a special case: It contains every binary item in the store.
-    % We don't need to render it.
-    Graph;
 process_composite_node(Store, _Key, Parent, ResolvedPath, JoinedPath, Graph, Opts) ->
     % Add the node to the graph
     Graph1 = add_node(Graph, ResolvedPath, "lightcoral", Opts),

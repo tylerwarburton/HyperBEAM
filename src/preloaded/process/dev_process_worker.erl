@@ -41,14 +41,12 @@ compute_group(Base, Req, Opts) ->
             ProcID
     end.
 
-%% @doc Return `true' if the requested compute result is already cached.
-compute_cached(ProcID, not_found, Opts) ->
-    case dev_process_cache:latest(ProcID, Opts) of
-        {ok, _Slot, _Msg} -> true;
-        _ -> false
-    end;
+%% @doc Return `true' if no slot is selected or its result is already cached.
+compute_cached(_ProcID, not_found, _Opts) ->
+    % `now' selects the slot before joining its process group.
+    true;
 compute_cached(ProcID, RawSlot, Opts) ->
-    case dev_process_cache:read(ProcID, hb_util:int(RawSlot), Opts) of
+    case lib_process_cache:read(ProcID, hb_util:int(RawSlot), Opts) of
         {ok, _Msg} -> true;
         _ -> false
     end.
@@ -121,7 +119,7 @@ await(Worker, GroupName, Base, Req, Opts) ->
         false -> 
             hb_persistent:default_await(Worker, GroupName, Base, Req, Opts);
         true ->
-            TargetSlot = hb_ao:get(<<"slot">>, Req, any, Opts),
+            TargetSlot = dev_process:target_slot(Req, Opts),
             ?event({awaiting_compute, 
                 {worker, Worker},
                 {group, GroupName},
@@ -129,7 +127,7 @@ await(Worker, GroupName, Base, Req, Opts) ->
             }),
             receive
                 {resolved, _, GroupName, {slot, RecvdSlot}, Res}
-                        when RecvdSlot == TargetSlot orelse TargetSlot == any ->
+                        when RecvdSlot == TargetSlot ->
                     ?event(debug_compute, {notified_of_resolution,
                         {target, TargetSlot},
                         {group, GroupName}
@@ -160,12 +158,15 @@ notify_compute(GroupName, SlotToNotify, Res, Opts) ->
     notify_compute(GroupName, SlotToNotify, Res, Opts, 0).
 notify_compute(GroupName, SlotToNotify, Res, Opts, Count) ->
     ?event({notifying_of_computed_slot, {group, GroupName}, {slot, SlotToNotify}}),
+    % A request gives its slot as `dev_process:target_slot/2' reads it: with
+    % `compute', or else with `slot'.
     receive
-        {resolve, Listener, GroupName, #{ <<"slot">> := SlotToNotify }, _ListenerOpts} ->
+        {resolve, Listener, GroupName, #{ <<"compute">> := SlotToNotify }, _ListenerOpts} ->
             send_notification(Listener, GroupName, SlotToNotify, Res),
             notify_compute(GroupName, SlotToNotify, Res, Opts, Count + 1);
         {resolve, Listener, GroupName, Msg, _ListenerOpts}
-                when is_map(Msg) andalso not is_map_key(<<"slot">>, Msg) ->
+                when map_get(<<"slot">>, Msg) =:= SlotToNotify
+                    andalso not is_map_key(<<"compute">>, Msg) ->
             send_notification(Listener, GroupName, SlotToNotify, Res),
             notify_compute(GroupName, SlotToNotify, Res, Opts, Count + 1)
     after 0 ->
@@ -192,10 +193,10 @@ test_init() ->
     application:ensure_all_started(hb),
     ok.
 
-info_test() ->
+device_info_test() ->
     test_init(),
     M1 = hb_process_test_vectors:wasm_process(<<"test/aos-2-pure-xs.wasm">>),
-    Res = hb_device:info(M1, #{}),
+    Res = hb_device:device_info(M1, #{}),
     Grouper = hb_maps:get(grouper, Res, undefined, #{}),
     ?assert(is_function(Grouper, 3)),
     {module, Mod} = erlang:fun_info(Grouper, module),
@@ -204,8 +205,8 @@ info_test() ->
 grouper_test() ->
     test_init(),
     M1 = hb_process_test_vectors:aos_process(),
-    M2 = #{ <<"path">> => <<"compute">>, <<"v">> => 1 },
-    M3 = #{ <<"path">> => <<"compute">>, <<"v">> => 2 },
+    M2 = #{ <<"path">> => <<"compute">>, <<"slot">> => 1 },
+    M3 = #{ <<"path">> => <<"compute">>, <<"slot">> => 2 },
     M4 = #{ <<"path">> => <<"not-compute">>, <<"v">> => 3 },
     G1 = hb_persistent:group(M1, M2, #{ <<"process-workers">> => true }),
     G2 = hb_persistent:group(M1, M3, #{ <<"process-workers">> => true }),
@@ -237,7 +238,7 @@ grouper_skips_when_slot_cached_test() ->
     % Write slot 5 into the cache. The same request now has a result
     % available and the grouper should step out of the queue.
     {ok, _} =
-        dev_process_cache:write(
+        lib_process_cache:write(
             ProcessGroup,
             5,
             #{ <<"hello">> => <<"cached">> },

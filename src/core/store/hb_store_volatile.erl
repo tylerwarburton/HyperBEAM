@@ -5,19 +5,18 @@
 %%% cache, not for instances where an `ok` from the `write` function should
 %%% imply data persistence.
 %%%
-%%% Each entry is stored as `{Path, {raw, Bin} | {link, Target} | group}`.
-%%% Group membership is discovered by a lexicographic range scan over the
-%%% `Path ++ "/"` prefix, mirroring the LMDB and FS store layouts. An
-%%% explicit `group` marker is inserted at every ancestor path so that
-%%% `type/3` stays a single lookup.
+%%% Each entry is stored as `{Path, {raw, Bin} | group}`. Group membership is
+%%% discovered by a lexicographic range scan over the `Path ++ "/"` prefix,
+%%% mirroring the LMDB and FS store layouts. An explicit `group` marker is
+%%% inserted at every ancestor path, so that a single lookup tells whether a
+%%% path has keys below it.
 -module(hb_store_volatile).
 -export([start/3, stop/3, reset/3, scope/0, scope/1]).
--export([write/3, read/3, list/3, type/3, link/3, group/3, resolve/3]).
+-export([write/3, read/3, list/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -define(ROOT_GROUP, <<"/">>).
--define(MAX_REDIRECTS, 32).
 
 %% @doc Start the ETS-backed store and return the store instance message.
 start(StoreOpts = #{ <<"name">> := Name }, _Req, _Opts) ->
@@ -96,10 +95,9 @@ reset_store(Opts) ->
     ok.
 
 %% @doc Write one or more entries. Request maps are folded into individual
-%% writes. Any raw/link entry at an ancestor path is converted to a group
-%% marker (raw/link entries have no descendants, so no subtree purge is
-%% needed). If the target key previously held a group, its descendants are
-%% deleted first.
+%% writes. Any raw entry at an ancestor path is converted to a group marker
+%% (raw entries have no descendants, so no subtree purge is needed). If the
+%% target key is a group, its descendants are deleted first.
 write(Opts, Req, _NodeOpts) when is_map(Req) ->
     maps:fold(
         fun(Path, Value, ok) ->
@@ -111,53 +109,22 @@ write(Opts, Req, _NodeOpts) when is_map(Req) ->
         Req
     ).
 
-%% @doc Read a value, following links when needed. Group paths return
-%% `{composite, Children}` with the immediate child names.
+%% @doc Read a value. Group paths return `{composite, Children}`: their
+%% immediate children, each with its value if it has one.
 read(Opts, #{ <<"read">> := RawKey }, _NodeOpts) ->
-    read_resolved(Opts, resolve_path(Opts, RawKey), 0).
-
-read_resolved(_Opts, _Key, Depth) when Depth > ?MAX_REDIRECTS ->
-    {error, not_found};
-read_resolved(Opts, Key, Depth) ->
+    Key = hb_path:to_binary(RawKey),
     case lookup_entry(Opts, Key) of
         {raw, Value} ->
             ?event(store_volatile, {hit, {key, Key}}),
             {ok, Value};
         group ->
             ?event(store_volatile, {hit, {key, Key}}),
-            {composite, immediate_children(Opts, Key)};
-        {link, Link} ->
-            ?event(store_volatile, {hit, {key, Key}}),
-            read_resolved(Opts, hb_path:to_binary(Link), Depth + 1);
+            Table = table(Opts),
+            Children = immediate_children(Opts, Key),
+            {composite, [ child(Table, Key, Name) || Name <- Children ]};
         _ ->
             ?event(store_volatile, {miss, {key, Key}}),
             {error, not_found}
-    end.
-
-%% @doc Resolve a path segment-by-segment, following any links encountered
-%% at intermediate positions.
-resolve(Opts, #{ <<"resolve">> := Key }, _NodeOpts) ->
-    {ok, resolve_path(Opts, Key)}.
-
-resolve_path(Opts, Key) ->
-    resolve_path(
-        Opts,
-        <<>>,
-        hb_path:term_to_path_parts(hb_path:to_binary(Key), Opts),
-        0
-    ).
-
-resolve_path(_Opts, CurrPath, [], _Depth) ->
-    hb_path:to_binary(CurrPath);
-resolve_path(_Opts, CurrPath, _Rest, Depth) when Depth > ?MAX_REDIRECTS ->
-    hb_path:to_binary(CurrPath);
-resolve_path(Opts, CurrPath, [Next | Rest], Depth) ->
-    PathPart = join_path(CurrPath, Next),
-    case lookup_entry(Opts, PathPart) of
-        {link, Link} ->
-            resolve_path(Opts, hb_path:to_binary(Link), Rest, Depth + 1);
-        _ ->
-            resolve_path(Opts, PathPart, Rest, Depth)
     end.
 
 %% @doc List immediate child names under a group path.
@@ -170,66 +137,21 @@ list_path(Opts, Path, Req) ->
     case lookup_entry(Opts, Path) of
         group ->
             Children = immediate_children(Opts, Path),
-            {ok, hb_store_utils:apply_list_bounds(Children, Req)};
-        {link, Link} ->
-            list_path(Opts, hb_path:to_binary(Link), Req);
-        nil when Path =:= ?ROOT_GROUP ->
-            %% Empty store at root — no entries here; return `not_found`
-            %% rather than `{ok, []}` so a chained store can serve the
-            %% request.
-            {error, not_found};
-        nil ->
-            %% Not at this exact path; try resolving intermediate-segment
-            %% links. If resolution yields the same path, it's truly absent.
-            case resolve_path(Opts, Path) of
-                Path -> {error, not_found};
-                Resolved -> list_path(Opts, Resolved, Req)
-            end;
+            {ok, hb_store_utils:apply_list_bounds(Children, Req, Opts)};
         _ ->
+            % A path with a value has no children to list. An empty
+            % store returns `not_found` for the root too, so that a chained
+            % store can serve the request.
             {error, not_found}
     end.
 
-%% @doc Determine the item type at a path.
-type(Opts, #{ <<"type">> := RawKey }, _NodeOpts) ->
-    type_path(Opts, RawKey).
-
-type_path(Opts, RawKey) ->
-    Key = resolve_path(Opts, RawKey),
-    case lookup_entry(Opts, Key) of
-        {raw, _} -> {ok, simple};
-        group -> {ok, composite};
-        {link, Link} -> type_path(Opts, hb_path:to_binary(Link));
-        _ -> {error, not_found}
+%% @doc Return a listed child with its value if it has one, or its name if
+%% it is a group.
+child(Table, Path, Name) ->
+    case lookup_entry(Table, next_group_path(Path, Name)) of
+        {raw, Value} -> {Name, Value};
+        _ -> Name
     end.
-
-%% @doc Ensure a group exists at the given path. Idempotent on existing
-%% groups; converts a raw/link entry to an empty group.
-group(Opts, #{ <<"group">> := RawKey }, _NodeOpts) ->
-    Key = hb_path:to_binary(RawKey),
-    Table = table(Opts),
-    case lookup_entry(Table, Key) of
-        group -> ok;
-        _ -> put_entry(Opts, Key, group)
-    end,
-    ok.
-
-%% @doc Create or replace one or more links. Request maps are folded; each
-%% `New => Existing` pair installs a link at New targeting Existing.
-link(Opts, Req, _NodeOpts) when is_map(Req) ->
-    maps:fold(
-        fun(New, Existing, ok) ->
-            link_path(Opts, New, Existing);
-           (_New, _Existing, Error) ->
-            Error
-        end,
-        ok,
-        Req
-    ).
-
-link_path(_Opts, Same, Same) ->
-    ok;
-link_path(Opts, RawNew, RawExisting) ->
-    put_entry(Opts, RawNew, {link, hb_path:to_binary(RawExisting)}).
 
 %% @doc Install an entry at Key, purging any prior group subtree and
 %% ensuring ancestor group markers exist.
@@ -246,11 +168,6 @@ table(Opts) ->
     #{ <<"ets-table">> := Table } = hb_store:find(Opts),
     Table.
 
-join_path(<<>>, Next) ->
-    hb_path:to_binary(Next);
-join_path(CurrPath, Next) ->
-    hb_path:to_binary([CurrPath, Next]).
-
 lookup_entry(Opts, Key) when is_map(Opts) ->
     lookup_entry(table(Opts), Key);
 lookup_entry(Table, Key) ->
@@ -260,8 +177,8 @@ lookup_entry(Table, Key) ->
     end.
 
 %% @doc Walk ancestor paths from root to parent, inserting a `group` marker
-%% via unconditional `ets:insert/2` at each. A raw or link entry sitting at
-%% an intermediate path is converted to a group — those entry types have no
+%% via unconditional `ets:insert/2` at each. A raw entry sitting at an
+%% intermediate path is converted to a group — such an entry has no
 %% descendants, so no subtree purge is required.
 ensure_parent_groups(Table, Key) ->
     case filename:dirname(Key) of
@@ -287,7 +204,7 @@ next_group_path(?ROOT_GROUP, Next) ->
 next_group_path(CurrentGroup, Next) ->
     hb_path:to_binary([CurrentGroup, Next]).
 
-%% @doc If `Key` currently holds a `group` marker, delete all descendants
+%% @doc If `Key` currently has a `group` marker, delete all descendants
 %% (entries whose path starts with `<<Key/binary, $/>>`).
 maybe_delete_subtree(Table, Key) ->
     case lookup_entry(Table, Key) of
@@ -448,62 +365,31 @@ list_test() ->
 list_dedup_test() ->
     S = hb_test_utils:test_store(?MODULE, <<"list-dedup-test">>),
     hb_store:start(S),
-    ok = hb_store:link(S,
-        #{ <<"a/link">> => <<"target1">> }, #{}),
-    ok = hb_store:link(S,
-        #{ <<"a/link">> => <<"target2">> }, #{}),
+    ok = hb_store:write(S, #{ <<"a/key">> => <<"value1">> }, #{}),
+    ok = hb_store:write(S, #{ <<"a/key">> => <<"value2">> }, #{}),
     {ok, Children} = hb_store:list(S, <<"a">>, #{}),
-    ?assertEqual([<<"link">>], lists:usort(Children)),
-    ok = hb_store:stop(S).
-
-list_with_link_test() ->
-    S = hb_test_utils:test_store(?MODULE, <<"list-with-link-test">>),
-    hb_store:start(S),
-    ok = hb_store:write(S, #{ <<"real/child">> => <<"v">> }, #{}),
-    ok = hb_store:link(S, #{ <<"alias">> => <<"real">> }, #{}),
-    {ok, Children} = hb_store:list(S, <<"alias">>, #{}),
-    ?assertEqual([<<"child">>], Children),
-    ok = hb_store:stop(S).
-
-overwrite_link_to_raw_test() ->
-    S = hb_test_utils:test_store(?MODULE, <<"overwrite-link-to-raw-test">>),
-    hb_store:start(S),
-    ok = hb_store:link(S, #{ <<"p/x">> => <<"target">> }, #{}),
-    ok = hb_store:write(S, #{ <<"p/x">> => <<"val">> }, #{}),
-    ?assertEqual({ok, <<"val">>}, hb_store:read(S, <<"p/x">>, #{})),
+    ?assertEqual([<<"key">>], Children),
     ok = hb_store:stop(S).
 
 overwrite_group_to_raw_test() ->
     S = hb_test_utils:test_store(?MODULE, <<"overwrite-group-to-raw-test">>),
     hb_store:start(S),
     ok = hb_store:write(S, #{ <<"g/child">> => <<"v">> }, #{}),
-    ?assertEqual({ok, composite}, hb_store:type(S, <<"g">>, #{})),
     ok = hb_store:write(S, #{ <<"g">> => <<"raw">> }, #{}),
-    ?assertEqual({ok, simple}, hb_store:type(S, <<"g">>, #{})),
+    ?assertEqual({ok, <<"raw">>}, hb_store:read(S, <<"g">>, #{})),
     ?assertEqual({error, not_found}, hb_store:read(S, <<"g/child">>, #{})),
-    ok = hb_store:group(S, <<"g">>, #{}),
-    {ok, Empty} = hb_store:list(S, <<"g">>, #{}),
-    ?assertEqual([], Empty),
-    ok = hb_store:stop(S).
-
-overwrite_group_to_link_test() ->
-    S = hb_test_utils:test_store(?MODULE, <<"overwrite-group-to-link-test">>),
-    hb_store:start(S),
-    ok = hb_store:write(S, #{ <<"g/child">> => <<"v">> }, #{}),
-    ok = hb_store:write(S, #{ <<"other/x">> => <<"w">> }, #{}),
-    ok = hb_store:link(S, #{ <<"g">> => <<"other">> }, #{}),
-    ?assertEqual({error, not_found}, hb_store:read(S, <<"g/child">>, #{})),
-    {ok, Children} = hb_store:list(S, <<"g">>, #{}),
-    ?assertEqual([<<"x">>], Children),
     ok = hb_store:stop(S).
 
 implicit_group_conversion_test() ->
     S = hb_test_utils:test_store(?MODULE, <<"implicit-group-conversion-test">>),
     hb_store:start(S),
     ok = hb_store:write(S, #{ <<"a">> => <<"raw_val">> }, #{}),
-    ?assertEqual({ok, simple}, hb_store:type(S, <<"a">>, #{})),
+    ?assertEqual({ok, <<"raw_val">>}, hb_store:read(S, <<"a">>, #{})),
     ok = hb_store:write(S, #{ <<"a/b">> => <<"child_val">> }, #{}),
-    ?assertEqual({ok, composite}, hb_store:type(S, <<"a">>, #{})),
+    ?assertEqual(
+        {composite, [{<<"b">>, <<"child_val">>}]},
+        hb_store:read(S, <<"a">>, #{})
+    ),
     {ok, Children} = hb_store:list(S, <<"a">>, #{}),
     ?assertEqual([<<"b">>], Children),
     ok = hb_store:stop(S).

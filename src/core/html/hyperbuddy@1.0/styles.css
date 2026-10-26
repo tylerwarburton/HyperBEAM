@@ -102,6 +102,30 @@ p {
     color: #000000;
 }
 
+#details:empty {
+    display: none;
+}
+
+#details {
+    display: grid;
+    grid-template-columns: max-content auto;
+    align-items: baseline;
+    gap: 12px 24px;
+    max-width: 720px;
+    margin: 0;
+}
+
+#details dt {
+    color: rgb(143, 143, 143);
+}
+
+#details dd {
+    margin: 0;
+    font-family: "Roboto Mono", monospace;
+    color: #000000;
+    overflow-wrap: anywhere;
+}
+
 @keyframes dotsBlink {
     0% {
         opacity: 0;
@@ -136,6 +160,14 @@ p {
     }
 
     #error-text {
+        color: #fafafa;
+    }
+
+    #details dt {
+        color: rgb(180, 180, 180);
+    }
+
+    #details dd {
         color: #fafafa;
     }
 

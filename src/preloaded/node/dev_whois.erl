@@ -3,17 +3,24 @@
 -module(dev_whois).
 %%% Device API
 -export([node/3, echo/3]).
-%%% Public utilities
--export([ensure_host/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %% @doc Return the calculated host information for the requester.
+-spec echo(#{ _ => _ }, #{ 'ao-peer' => binary(), _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }}.
 echo(_, Req, Opts) ->
-    {ok, hb_maps:get(<<"ao-peer">>, Req, <<"unknown">>, Opts)}.
+    {ok, #{
+        <<"ao-result">> => <<"body">>,
+        <<"body">> => hb_maps:get(<<"ao-peer">>, Req, <<"unknown">>, Opts),
+        <<"content-type">> => <<"text/plain">>,
+        <<"x-content-type-options">> => <<"nosniff">>
+    }}.
 
 %% @doc Return the host information for the node. Sets the `host' key in the
 %% node message if it is not already set.
+-spec node(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, binary()} | {error, _}.
 node(_, _, Opts) ->
     case ensure_host(Opts) of
         {ok, NewOpts} ->
@@ -30,8 +37,15 @@ ensure_host(Opts) ->
             case bootstrap_node_echo(Opts) of
                 {ok, Host} ->
                     % Set the host information in the persisted node message.
-                    hb_http_server:set_opts(NewOpts = Opts#{ <<"node-host">> => Host }),
-                    {ok, NewOpts};
+                    hb_http_server:update_opts(
+                        fun(NodeMsg) ->
+                            hb_http_server:set_opts(
+                                NodeMsg#{ <<"node-host">> => Host }
+                            )
+                        end,
+                        Opts
+                    ),
+                    {ok, Opts#{ <<"node-host">> => Host }};
                 Error ->
                     Error
             end;
@@ -62,7 +76,13 @@ find_self_test() ->
             <<"host-bootstrap-node">> => BoostrapNode,
             <<"http-client">> => httpc
         }),
+    NodeMsg = hb_http_server:get_opts(),
     ?event({nodes, {peer, PeerNode}, {bootstrap, BoostrapNode}}),
     {ok, ReceivedPeerHost} = hb_http:get(PeerNode, <<"/~whois@1.0/node">>, #{}),
     ?event({find_self_test, ReceivedPeerHost}),
-    ?assertEqual(<<"127.0.0.1:", (hb_util:bin(Port))/binary>>, ReceivedPeerHost).
+    ?assertEqual(<<"127.0.0.1:", (hb_util:bin(Port))/binary>>, ReceivedPeerHost),
+    % Only `node-host' changes in the node message.
+    ?assertEqual(
+        NodeMsg,
+        maps:remove(<<"node-host">>, hb_http_server:get_opts())
+    ).

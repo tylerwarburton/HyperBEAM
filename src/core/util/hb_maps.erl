@@ -313,7 +313,8 @@ get_with_typed_link_test() ->
     Bin = <<"123">>,
     Opts = #{},
     {ok, Location} = hb_cache:write(Bin, Opts),
-    Map = #{ 1 => 1, 2 => {link, Location, #{ <<"type">> => integer }}, 3 => 3 },
+    LinkOpts = #{ <<"type">> => <<"integer">>, <<"lazy">> => true },
+    Map = #{ 1 => 1, 2 => {link, Location, LinkOpts}, 3 => 3 },
     ?assertEqual(123, get(2, Map, undefined)).
 
 resolve_on_link_test() ->
@@ -351,7 +352,8 @@ fold_with_typed_link_test() ->
     Bin = <<"123">>,
     Opts = #{},
     {ok, Location} = hb_cache:write(Bin, Opts),
-    Map = #{ 1 => 1, 2 => {link, Location, #{ <<"type">> => integer }}, 3 => 3 },
+    LinkOpts = #{ <<"type">> => <<"integer">>, <<"lazy">> => true },
+    Map = #{ 1 => 1, 2 => {link, Location, LinkOpts}, 3 => 3 },
     ?assertEqual(127, fold(fun(_, V, Acc) -> V + Acc end, 0, Map)).
 
 filter_passively_loads_test() ->

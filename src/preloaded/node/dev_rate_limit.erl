@@ -26,11 +26,11 @@
 %%% option can be used to specify the minimum balance that users will hit. Any
 %%% further requests are rejected but do not diminish their balance further.
 -module(dev_rate_limit).
+-device_libraries([lib_volatile_ledger]).
 -export([request/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
--define(LOOKUP_TIMEOUT, 1000).
 -define(DEFAULT_MAX, 1_000).
 -define(DEFAULT_MIN, -1_000).
 -define(DEFAULT_REQS, 1000).
@@ -40,6 +40,11 @@
 %% 429 status code and response if the limit is exceeded. The response includes
 %% a `retry-after' header that indicates the number of seconds the client should
 %% wait before making the next request.
+-spec request(#{ _ => _ }, #{ request := #{ _ => _ }, _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }}
+    | {error,
+        #{ status := integer(), reason := binary(), body := binary(), _ => _ }
+    }.
 request(_, Msg, Opts) ->
     ?event(rate_limit, {request, {msg, Msg}}),
     Reference = request_reference(hb_maps:get(<<"request">>, Msg, #{}, Opts), Opts),
@@ -85,123 +90,40 @@ request(_, Msg, Opts) ->
             {ok, Msg}
     end.
 
-%% @doc The singleton ID of the rate limiter server. This allows us to run
-%% multiple rate limiters on the same node if needed, each with its own
-%% configuration, but with all of the callers sharing the same rate limiter
-%% server.
-server_id(Opts) ->
-    {?MODULE, hb_util:human_id(hb_opts:get(priv_wallet, undefined, Opts))}.
-
-%% @doc Determine the reference of the caller. Presently only the `ip` form
-%% may be used to identify the caller.
-request_reference(Msg, Opts) -> hb_private:get(<<"ip">>, Msg, Opts).
-
-%% @doc Check if the caller is limited according to the current state of the
-%% rate limiter server.
-is_limited(Reference, Opts) ->
-    PID = ensure_rate_limiter_started(Opts),
-    PID ! {request, self(), Reference},
-    receive
-        {incremented, Balance} when Balance > 0 -> false;
-        {incremented, Balance} when Balance =< 0 -> {true, Balance}
-    after ?LOOKUP_TIMEOUT ->
-        ?event(warning, {rate_limit_timeout, restarting}),
-        hb_name:unregister(server_id(Opts)),
-        is_limited(Reference, Opts)
-    end.
-
-%% @doc Ensure that the rate limiter server is started and return the PID of
-%% the server. In the event of two instanteous spawns, one of the new processes
-%% will fail with an error and the other will succeed. The effect to the caller
-%% is the same: A rate limiter is available to query.
-ensure_rate_limiter_started(Opts) ->
-    ServerID = server_id(Opts),
-    hb_name:singleton(
-        ServerID,
-        fun() -> start_server(ServerID, Opts) end
-    ).
-
-start_server(ServerID, Opts) ->
-    % Exit the process if we cannot register the server ID.
+%% @doc The ledger of the rate limiter's balances on the node. Every caller
+%% starts with `rate_limit_max', and recharges `rate_limit_requests' every
+%% `rate_limit_period' seconds. The first caller's options configure the
+%% ledger, and all callers share it.
+ledger(Opts) ->
     Reqs = hb_opts:get(rate_limit_requests, ?DEFAULT_REQS, Opts),
     Period = hb_opts:get(rate_limit_period, ?DEFAULT_PERIOD, Opts),
     Max = hb_opts:get(rate_limit_max, ?DEFAULT_MAX, Opts),
     Min = hb_opts:get(rate_limit_min, ?DEFAULT_MIN, Opts),
     Exempt = hb_opts:get(rate_limit_exempt, [], Opts),
+    #{
+        <<"name">> => <<"rate-limit@1.0">>,
+        <<"balances">> => #{ Ref => infinity || Ref <- Exempt },
+        <<"default">> => Max,
+        <<"recharge">> => Reqs / (Period * 1000),
+        <<"max">> => Max,
+        <<"min">> => Min
+    }.
+
+%% @doc Determine the reference of the caller. Presently only the `ip` form
+%% may be used to identify the caller.
+request_reference(Msg, Opts) -> hb_private:get(<<"ip">>, Msg, Opts).
+
+%% @doc Debit the caller's balance by one request, and check whether it is
+%% limited.
+is_limited(Reference, Opts) ->
+    Balance = lib_volatile_ledger:debit(ledger(Opts), Reference, 1, Opts),
     ?event(
-        rate_limit,
-        {started_rate_limiter,
-            {server_id, ServerID},
-            {reqs, Reqs},
-            {period, Period},
-            {max, Max},
-            {min, Min},
-            {exempt, Exempt}
-        }
+        rate_limit_short,
+        {rate_limit_debited, {target, Reference}, {balance, Balance}}
     ),
-    server_loop(
-        #{
-            reqs => Reqs,
-            period => Period,
-            max => Max,
-            min => Min,
-            peers => #{ Ref => infinity || Ref <- Exempt }
-        }
-    ).
-
-%% @doc The main loop of the rate limiter server. Only responds to two messages:
-%% - `{request, Self, Reference}': Debit the account of the given reference by 1.
-%% - `{balance, PID, Reference}': Return the current balance of the given reference.
-%% The `balance` call is not presently used, but seems sensible to have.
-server_loop(State) ->
-    receive
-        {request, PID, Reference} ->
-            NewState = debit(Reference, 1, State, Now = erlang:system_time(millisecond)),
-            Balance = account_balance(Reference, NewState, Now),
-            ?event(
-                rate_limit_short,
-                {rate_limit_debited, {target, Reference}, {balance, Balance}}
-            ),
-            PID ! {incremented, Balance},
-            server_loop(NewState);
-        {balance, PID, Reference} ->
-            PID ! {balance, account_balance(Reference, State)},
-            server_loop(State)
-    end.
-
-%% @doc Debit the account of the given reference by the given quantity.
-debit(Ref, Amount, State = #{ peers := Peers, min := Min }, Now) ->
-    case account_balance(Ref, State, Now) of
-        infinity -> State;
-        Balance ->
-            State#{
-                peers =>
-                    Peers#{
-                        Ref =>
-                            #{
-                                balance => max(Min, Balance - Amount),
-                                last => Now
-                            }
-                    }
-            }
-    end.
-
-%% @doc Calculate the current balance for a user, including unused capacity
-%% accrued since the last interaction.
-account_balance(Reference, State) ->
-    account_balance(Reference, State, erlang:system_time(millisecond)).
-account_balance(
-        Reference,
-        #{ max := Max, reqs := Reqs, period := Period, peers := Peers },
-        Time
-    ) ->
-    case maps:get(Reference, Peers, not_found) of
-        infinity -> infinity;
-        not_found -> Max;
-        #{ balance := Balance, last := LastInteraction } ->
-            RechargeRate = Reqs / (Period * 1000),
-            RechargedSinceLast = (Time - LastInteraction) * RechargeRate,
-            min(Max, Balance + RechargedSinceLast)
+    case Balance > 0 of
+        true -> false;
+        false -> {true, Balance}
     end.
 
 %%% Tests
@@ -222,17 +144,17 @@ rate_limit_test() ->
     ServerNode = hb_http_server:start_node(ServerOpts),
     ?assertMatch(
         {ok, _},
-        hb_http:get(ServerNode, <<"id">>, #{})
+        hb_http:get(ServerNode, <<"//id">>, #{})
     ),
     ?debug_wait(100),
     ?assertMatch(
         {ok, _},
-        hb_http:get(ServerNode, <<"id">>, #{})
+        hb_http:get(ServerNode, <<"//id">>, #{})
     ),
     ?debug_wait(100),
     ?assertMatch(
         {error, #{ <<"status">> := 429 }},
-        hb_http:get(ServerNode, <<"id">>, #{})
+        hb_http:get(ServerNode, <<"//id">>, #{})
     ).
 
 rate_limit_reset_test() ->
@@ -251,11 +173,11 @@ rate_limit_reset_test() ->
             }
     },
     ServerNode = hb_http_server:start_node(ServerOpts),
-    ?assertMatch({ok, _}, hb_http:get(ServerNode, <<"id">>, #{})),
-    ?assertMatch({ok, _}, hb_http:get(ServerNode, <<"id">>, #{})),
+    ?assertMatch({ok, _}, hb_http:get(ServerNode, <<"//id">>, #{})),
+    ?assertMatch({ok, _}, hb_http:get(ServerNode, <<"//id">>, #{})),
     ?assertMatch(
         {error, #{ <<"status">> := 429 }},
-        hb_http:get(ServerNode, <<"id">>, #{})
+        hb_http:get(ServerNode, <<"//id">>, #{})
     ),
     timer:sleep(1_000),
-    ?assertMatch({ok, _}, hb_http:get(ServerNode, <<"id">>, #{})).
+    ?assertMatch({ok, _}, hb_http:get(ServerNode, <<"//id">>, #{})).

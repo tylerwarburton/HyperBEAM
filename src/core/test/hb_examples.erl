@@ -18,7 +18,7 @@ relay_with_payments_test_() ->
 relay_with_payments() ->
     HostWallet = ar_wallet:new(),
     ClientWallet = ar_wallet:new(),
-    ClientAddress = hb_util:human_id(ar_wallet:to_address(ClientWallet)),
+    ClientAddress = hb_test_utils:committer(ClientWallet),
     % Start a node with the simple-pay device enabled.
     ProcessorMsg =
         #{
@@ -29,7 +29,7 @@ relay_with_payments() ->
     HostNode =
         hb_http_server:start_node(
             #{
-                <<"operator">> => ar_wallet:to_address(HostWallet),
+                <<"operator">> => hb_test_utils:committer(HostWallet),
                 <<"on">> => #{
                     <<"request">> => ProcessorMsg,
                     <<"response">> => ProcessorMsg
@@ -74,7 +74,7 @@ paid_wasm_test_() ->
 paid_wasm() ->
     HostWallet = ar_wallet:new(),
     ClientWallet = ar_wallet:new(),
-    ClientAddress = hb_util:human_id(ar_wallet:to_address(ClientWallet)),
+    ClientAddress = hb_test_utils:committer(ClientWallet),
     ProcessorMsg =
         #{
             <<"device">> => <<"p4@1.0">>,
@@ -92,7 +92,7 @@ paid_wasm() ->
 				],
                 <<"simple-pay-ledger">> => #{ ClientAddress => 100 },
                 <<"simple-pay-price">> => 10,
-                <<"operator">> => ar_wallet:to_address(HostWallet),
+                <<"operator">> => hb_test_utils:committer(HostWallet),
                 <<"on">> => #{
                     <<"request">> => ProcessorMsg,
                     <<"response">> => ProcessorMsg
@@ -132,7 +132,7 @@ bundler_dynamic_metering_test_() ->
 bundler_dynamic_metering() ->
     HostWallet = ar_wallet:new(),
     UploaderWallet = ar_wallet:new(),
-    UploaderAddress = hb_util:human_id(ar_wallet:to_address(UploaderWallet)),
+    UploaderAddress = hb_test_utils:committer(UploaderWallet),
     Item = bundle_payment_item(),
     ItemSize = byte_size(ar_bundles:serialize(Item)),
     Rate = 2,
@@ -162,7 +162,7 @@ bundler_dynamic_metering() ->
                 <<"arweave-bytes">> => Rate,
                 <<"beam-reductions">> => 0
             },
-            <<"operator">> => ar_wallet:to_address(HostWallet),
+            <<"operator">> => hb_test_utils:committer(HostWallet),
             <<"on">> => #{
                 <<"request">> => ProcessorMsg,
                 <<"response">> => ProcessorMsg
@@ -201,11 +201,9 @@ bundler_completion_payment_hook() ->
     UploaderWallet = ar_wallet:new(),
     MessageReleaseWallet = ar_wallet:new(),
     BundleReleaseWallet = ar_wallet:new(),
-    UploaderAddress = hb_util:human_id(ar_wallet:to_address(UploaderWallet)),
-    MessageReleaseAddress =
-        hb_util:human_id(ar_wallet:to_address(MessageReleaseWallet)),
-    BundleReleaseAddress =
-        hb_util:human_id(ar_wallet:to_address(BundleReleaseWallet)),
+    UploaderAddress = hb_test_utils:committer(UploaderWallet),
+    MessageReleaseAddress = hb_test_utils:committer(MessageReleaseWallet),
+    BundleReleaseAddress = hb_test_utils:committer(BundleReleaseWallet),
     InitialBalance = 100,
     UploadFee = 10,
     MessageReleaseAmount = 3,
@@ -235,7 +233,7 @@ bundler_completion_payment_hook() ->
             <<"bundler-max-items">> => 1,
             <<"simple-pay-price">> => 0,
             <<"simple-pay-ledger">> => #{ UploaderAddress => InitialBalance },
-            <<"operator">> => ar_wallet:to_address(HostWallet),
+            <<"operator">> => hb_test_utils:committer(HostWallet),
             <<"router-opts">> => #{
                 <<"offered">> => [
                     #{
@@ -307,7 +305,7 @@ bundler_completion_payment_hook() ->
 
 %% @doc Route an awaited bundle upload across two bundlers in serial. The first
 %% bundler's wallet is unfunded on the Arweave node, so its upload is rejected
-%% and it holds the awaited request open while retrying; the router gives up on
+%% and it keeps the awaited request open while retrying; the router gives up on
 %% it (a short receive timeout) and falls through to the second, funded bundler.
 %% We confirm the outcome by reading the completed bundle from the second
 %% bundler's cache and checking that it was signed by the second bundler.
@@ -355,7 +353,10 @@ bundler_routing_fallback() ->
             hb_http:post(Router, UploadReq, #{}),
         {ok, Bundle} = hb_cache:read(BundleID, SecondOpts),
         Loaded = hb_cache:ensure_all_loaded(Bundle, SecondOpts),
-        ?assertEqual([SecondAddress], hb_message:signers(Loaded, SecondOpts))
+        ?assertEqual(
+            [hb_test_utils:committer(SecondWallet)],
+            hb_message:signers(Loaded, SecondOpts)
+        )
     after
         hb_mock_server:stop(ServerHandle)
     end.
@@ -372,7 +373,7 @@ bundler_route_peer_opts(Wallet, GatewayOpts) ->
 
 %% @doc Build the routing node that relays bundle uploads to peers in order. Each
 %% peer is given a short receive timeout so the router gives up on the unfunded
-%% first bundler (which holds the awaited request open while it retries) and
+%% first bundler (which keeps the awaited request open while it retries) and
 %% falls through to the second.
 bundler_route_router_opts(FirstBundler, SecondBundler) ->
     PeerOpts =
@@ -553,7 +554,7 @@ create_schedule_aos2_test_disabled() ->
     % Scheduler	Specifies the scheduler unit by Wallet Address or Name, and can
     %   be referenced by a recent Scheduler-Location.	1-1	{ADDRESS}
     % Cron-Interval	An interval at which a particular Cron Message is recevied by the process,
-    %   in the format X-Y, where X is a scalar value, and Y is milliseconds,
+    %   in the format X-Y, where X is a number, and Y is milliseconds,
     %   seconds, minutes, hours, days, months, years, or blocks	0-n	1-second
     % Cron-Tag-{Name}	defines tags for Cron Messages at set intervals,
     %   specifying relevant metadata.	0-1	
@@ -631,9 +632,9 @@ relay_schedule_ans104_test() ->
     RelayWallet = ar_wallet:new(),
     ?event(debug_test,
         {wallets,
-            {scheduler, hb_util:human_id(SchedulerWallet)},
-            {compute, hb_util:human_id(ComputeWallet)},
-            {relay, hb_util:human_id(RelayWallet)}
+            {scheduler, hb:address(SchedulerWallet)},
+            {compute, hb:address(ComputeWallet)},
+            {relay, hb:address(RelayWallet)}
         }
     ),
     Scheduler =
@@ -642,10 +643,10 @@ relay_schedule_ans104_test() ->
                 <<"on">> => #{
                     <<"start">> => #{
                         <<"device">> => <<"location@1.0">>,
-                        <<"path">> => <<"node">>,
+                        <<"path">> => <<"//node">>,
                         <<"method">> => <<"POST">>,
                         <<"target">> => <<"self">>,
-                        <<"require-codec">> => <<"ans104@1.0">>,
+                        <<"commitment-device">> => <<"ans104@1.0">>,
                         <<"hook">> => #{
                             <<"result">> => <<"ignore">>,
                             <<"commit-request">> => true
@@ -657,10 +658,12 @@ relay_schedule_ans104_test() ->
             }
         ),
     ?event(debug_test, {scheduler, Scheduler}),
+    % The compute node contacts the scheduler on `localhost' to push.
     Compute =
         hb_http_server:start_node(
             #{
                 <<"priv-wallet">> => ComputeWallet,
+                <<"hosts-block-internal">> => false,
                 <<"store">> =>
                     [
                         hb_test_utils:test_store(),
@@ -699,11 +702,11 @@ relay_schedule_ans104_test() ->
             <<"routes">> =>
                 [
                     #{
-                        <<"template">> => <<"^/push">>,
+                        <<"template">> => <<"^//push">>,
                         <<"strategy">> => <<"Nearest">>,
                         <<"nodes">> => [
                             #{
-                                <<"wallet">> => hb_util:human_id(SchedulerWallet),
+                                <<"wallet">> => hb:address(SchedulerWallet),
                                 <<"prefix">> => Scheduler
                             }
                         ]
@@ -713,7 +716,7 @@ relay_schedule_ans104_test() ->
                         <<"strategy">> => <<"Nearest">>,
                         <<"nodes">> => [
                             #{
-                                <<"wallet">> => hb_util:human_id(ComputeWallet),
+                                <<"wallet">> => hb:address(ComputeWallet),
                                 <<"prefix">> => Compute
                             }
                         ]
@@ -730,9 +733,9 @@ relay_schedule_ans104_test() ->
         }),
     ?event(debug_test,
         {nodes,
-            {scheduler, {url, Scheduler}, {wallet, hb_util:human_id(SchedulerWallet)}},
-            {compute, {url, Compute}, {wallet, hb_util:human_id(ComputeWallet)}},
-            {relay, {url, Relay}, {wallet, hb_util:human_id(RelayWallet)}}
+            {scheduler, {url, Scheduler}, {wallet, hb:address(SchedulerWallet)}},
+            {compute, {url, Compute}, {wallet, hb:address(ComputeWallet)}},
+            {relay, {url, Relay}, {wallet, hb:address(RelayWallet)}}
         }
     ),
     ClientOpts =
@@ -748,7 +751,7 @@ relay_schedule_ans104_test() ->
                 <<"device">> => <<"process@1.0">>,
                 <<"execution-device">> => <<"test-device@1.0">>,
                 <<"push-device">> => <<"push@1.0">>,
-                <<"scheduler">> => hb_util:human_id(SchedulerWallet),
+                <<"scheduler">> => hb:address(SchedulerWallet),
                 <<"scheduler-device">> => <<"scheduler@1.0">>,
                 <<"type">> => <<"Process">>,
                 <<"module">> => <<"URgYpPQzvxxfYQtjrIQ116bl3YBfcImo3JEnNo8Hlrk">>
@@ -760,11 +763,8 @@ relay_schedule_ans104_test() ->
     ScheduleRes =
         hb_http:post(
             Relay,
-            Process#{
-                <<"path">> => <<"push">>,
-                <<"codec-device">> => <<"ans104@1.0">>
-            },
-            ClientOpts
+            Process#{ <<"path">> => <<"//push">> },
+            ClientOpts#{ <<"http-codec">> => <<"ans104@1.0">> }
         ),
     ?event(debug_test, {post_result, ScheduleRes}),
     ?assertMatch({ok, #{ <<"status">> := 200, <<"slot">> := 0 }}, ScheduleRes),

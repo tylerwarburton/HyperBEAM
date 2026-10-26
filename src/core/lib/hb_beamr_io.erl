@@ -9,7 +9,7 @@
 %%% in the C/WASM-side.
 
 -module(hb_beamr_io).
--export([size/1, read/3, write/3]).
+-export([size/1, grow/2, read/3, write/3]).
 -export([read_string/2, write_string/2]).
 -export([malloc/2, free/2]).
 -include("include/hb.hrl").
@@ -24,6 +24,15 @@ size(WASM) when is_pid(WASM) ->
     receive
         {execution_result, Size} ->
             {ok, Size}
+    end.
+
+%% @doc Grow the Beamr instance's native memory by a number of 64 KiB pages.
+grow(WASM, 0) when is_pid(WASM) -> ok;
+grow(WASM, Pages) when is_pid(WASM) andalso is_integer(Pages) ->
+    hb_beamr:wasm_send(WASM, {command, term_to_binary({grow, Pages})}),
+    receive
+        ok -> ok;
+        {error, Error} -> {error, Error}
     end.
 
 %% @doc Write a binary to the Beamr instance's native memory at a given offset.
@@ -129,7 +138,7 @@ free(WASM, Ptr) when is_pid(WASM) andalso is_integer(Ptr) ->
 size_test() ->
     WASMPageSize = 65536,
     File1Pages = 1,
-    File2Pages = 193,
+    File2Pages = 192,
     {ok, File} = file:read_file("test/test-print.wasm"),
     {ok, WASM, _Imports, _Exports} = hb_beamr:start(File),
     ?assertEqual({ok, WASMPageSize * File1Pages}, hb_beamr_io:size(WASM)),
@@ -169,7 +178,7 @@ malloc_test() ->
     % Check that we can allocate memory inside the bounds of the WASM module.
     ?assertMatch({ok, _}, malloc(WASM, 100)),
     % Check that we can safely handle out-of-bounds allocations.
-    % The WASM module has a maximum of 259 pages (16MB) of memory, so we
+    % The WASM module has a maximum of 258 pages (16MB) of memory, so we
     % should not be able to allocate more than that.
     ?assertMatch({error, _}, malloc(WASM, 128 * 1024 * 1024)).
 

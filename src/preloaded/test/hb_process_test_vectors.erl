@@ -91,6 +91,27 @@ aos_process(Opts, Stack) ->
         Opts#{ <<"priv-wallet">> => Wallet }
     ).
 
+%% @doc Generate a process whose execution device is `lua@5.3a', running
+%% the given Lua script. A slot that runs a script function returning the
+%% status `error' is the smallest execution returning `{error, _}': the
+%% other executors either always succeed or fail with an exception.
+lua_process(Script, Opts) ->
+    Wallet = hb_opts:get(priv_wallet, hb:wallet(), Opts),
+    hb_message:commit(
+        hb_maps:merge(
+            hb_message:uncommitted(base_process(Opts), Opts),
+            #{
+                <<"execution-device">> => <<"lua@5.3a">>,
+                <<"module">> => #{
+                    <<"content-type">> => <<"application/lua">>,
+                    <<"body">> => Script
+                }
+            },
+            Opts
+        ),
+        Opts#{ <<"priv-wallet">> => Wallet }
+    ).
+
 %% @doc Generate a device that has a stack of two `dev_test's for 
 %% execution. This should generate a message state has doubled 
 %% `Already-Seen' elements for each assigned slot.
@@ -100,7 +121,7 @@ test_process(Opts) ->
     Wallet = hb:wallet(),
     hb_message:commit(
         hb_maps:merge(
-            base_process(Opts),
+            hb_message:uncommitted(base_process(Opts), Opts),
             #{
                 <<"execution-device">> => <<"stack@1.0">>,
                 <<"device-stack">> => [<<"test-device@1.0">>, <<"test-device@1.0">>]
@@ -207,6 +228,34 @@ get_scheduler_slot_test_parallel() ->
         hb_ao:resolve(Base, Req, Opts)
     ).
 
+%% @doc Scheduler errors retain their details through latest-state requests.
+now_scheduler_error_test_() ->
+    [
+        {integer_to_list(Status) ++ ": " ++ binary_to_list(Path), fun() ->
+            Opts = test_opts(#{ <<"hashpath">> => ignore }),
+            Process = base_process(Opts),
+            Error = {error, #{
+                <<"status">> => Status,
+                <<"reason">> => <<"Schedule unavailable.">>,
+                <<"process">> => hb_message:id(Process, signed, Opts)
+            }},
+            Base = #{
+                <<"device">> => <<"process@1.0">>,
+                <<"process">> => Process,
+                <<"scheduler-device">> => #{
+                    <<"slot">> => fun(_, _, _) -> Error end
+                }
+            },
+            SchedulerError = hb_ao:resolve(Base, <<"slot/current">>, Opts),
+            ?assertMatch({error, #{ <<"status">> := Status }}, SchedulerError),
+            ?assertEqual(
+                SchedulerError,
+                hb_ao:resolve(Base, #{ <<"path">> => Path }, Opts)
+            )
+        end}
+     || Status <- [404, 409, 422, 502], Path <- [<<"now">>, <<"compute">>]
+    ].
+
 recursive_path_resolution_test_parallel() ->
     Opts = test_opts(),
     Base = base_process(Opts),
@@ -292,7 +341,7 @@ wasm_compute_from_id_test_parallel() ->
     schedule_wasm_call(Base, <<"fac">>, [5.0], Opts),
     BaseID = hb_message:id(Base, all, Opts),
     Req = #{ <<"path">> => <<"compute">>, <<"slot">> => 0 },
-    {ok, Res} = hb_ao:resolve(BaseID, Req, Opts),
+    {ok, Res} = hb_ao:resolve(<<"ao:", BaseID/binary>>, Req, Opts),
     ?event(process_compute, {computed_message, {res, Res}}),
     ?assertEqual([120.0], hb_ao:get(<<"results/output">>, Res, Opts)).
 
@@ -315,7 +364,7 @@ http_wasm_process_by_id_test_parallel() ->
     InitRes =
         hb_http:post(
             Node,
-            << "/schedule" >>,
+            << "//schedule" >>,
             Proc,
             Opts
         ),
@@ -393,12 +442,11 @@ aos_state_access_via_http_test_parallel_() ->
             <<"port">> => 10000 + rand:uniform(10000),
             <<"priv-wallet">> => Wallet,
             <<"cache-control">> => <<"always">>,
-            <<"store">> => hb_test_utils:test_store(),
-            <<"force-signed-requests">> => true
+            <<"store">> => hb_test_utils:test_store()
         })),
         Proc = aos_process(Opts),
         ProcID = hb_util:human_id(hb_message:id(Proc, all, Opts)),
-        {ok, _InitRes} = hb_http:post(Node, <<"/schedule">>, Proc, Opts),
+        {ok, _InitRes} = hb_http:post(Node, <<"//schedule">>, Proc, Opts),
         Req = 
             hb_message:commit(
                 #{
@@ -490,16 +538,26 @@ aos_state_patch_test_parallel_() ->
 restore_test_parallel_() -> {timeout, 30, fun do_test_restore/0}.
 
 do_test_restore() ->
-    % Init the process and schedule 3 messages:
+    % Init the process and schedule 4 messages:
     % 1. Set variables in Lua.
-    % 2. Return the variable.
-    % Execute the first computation, then the second as a disconnected process.
+    % 2. A message whose data is not the JSON its content-type claims.
+    % 3. Return the variable.
+    % Execute the first computation, then the third as a disconnected process.
     Opts = test_opts(#{
         <<"process-cache-frequency">> => 1
     }),
     Base = aos_process(Opts),
     schedule_aos_call(Base, <<"X = 42">>, Opts),
     schedule_aos_call(Base, <<"X = 1337">>, Opts),
+    schedule_test_message(
+        Base,
+        <<"NOT JSON">>,
+        #{
+            <<"content-type">> => <<"application/json">>,
+            <<"data">> => <<"hello">>
+        },
+        Opts
+    ),
     schedule_aos_call(Base, <<"return X">>, Opts),
     % Compute the first message.
     {ok, _} =
@@ -511,11 +569,19 @@ do_test_restore() ->
     {ok, ResultB} =
         hb_ao:resolve(
             Base,
-            #{ <<"path">> => <<"compute">>, <<"slot">> => 2 },
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 3 },
             Opts
         ),
     ?event({result_b, ResultB}),
-    ?assertEqual(<<"1337">>, hb_ao:get(<<"results/data">>, ResultB, Opts)).
+    ?assertEqual(<<"1337">>, hb_ao:get(<<"results/data">>, ResultB, Opts)),
+    % The JSON slot's results hold `type error', and the slot after it goes on.
+    {ok, ResultA} =
+        hb_ao:resolve(
+            Base,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 2 },
+            Opts
+        ),
+    ?assertEqual(<<"error">>, hb_ao:get(<<"results/type">>, ResultA, Opts)).
 
 now_results_test_parallel_() ->
     {timeout, 30, fun() ->
@@ -525,6 +591,85 @@ now_results_test_parallel_() ->
         schedule_aos_call(Base, <<"return 2+2">>, Opts),
         ?assertEqual({ok, <<"4">>}, hb_ao:resolve(Base, <<"now/results/data">>, Opts))
     end}.
+
+%% @doc A slot whose execution returns an error is skipped: the error
+%% becomes the slot's results over the state before the slot, the slot is
+%% stored, and computing carries on to the next slot from that state.
+error_slot_is_skipped_test_parallel() ->
+    Opts = test_opts(),
+    Base =
+        lua_process(
+            <<
+                """
+                function inc(base)
+                    base.count = (base.count or 0) + 1
+                    base.t = base.t or {}
+                    base.t[base.count * 2] = "v"
+                    return base
+                end
+                function fail(base)
+                    return "error", "The process failed."
+                end
+                function throw(base)
+                    error("The process failed.")
+                end
+                function text(base)
+                    return "x"
+                end
+                """
+            >>,
+            Opts
+        ),
+    schedule_test_message(Base, <<"inc">>, #{ <<"path">> => <<"inc">> }, Opts),
+    schedule_test_message(Base, <<"inc">>, #{ <<"path">> => <<"inc">> }, Opts),
+    schedule_test_message(Base, <<"fail">>, #{ <<"path">> => <<"fail">> }, Opts),
+    schedule_test_message(Base, <<"inc">>, #{ <<"path">> => <<"inc">> }, Opts),
+    schedule_test_message(Base, <<"text">>, #{ <<"path">> => <<"text">> }, Opts),
+    schedule_test_message(Base, <<"throw">>, #{ <<"path">> => <<"throw">> }, Opts),
+    % The later slot computes from the state before the erroring slot.
+    {ok, Res} =
+        hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 3 }, Opts),
+    ?assertEqual(3, hb_ao:get(<<"count">>, Res, Opts)),
+    % The state from Lua has the binary keys that the cache writes.
+    ?assertEqual(
+        #{ <<"2">> => <<"v">>, <<"4">> => <<"v">>, <<"6">> => <<"v">> },
+        hb_maps:get(<<"t">>, Res, not_found, Opts)
+    ),
+    % The erroring slot is stored with the error as its results.
+    {ok, ErrSlot} =
+        hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 2 }, Opts),
+    ?assertEqual(<<"error">>, hb_ao:get(<<"results/type">>, ErrSlot, Opts)),
+    ?assertEqual(2, hb_ao:get(<<"count">>, ErrSlot, Opts)),
+    % A slot whose result is not a message is stored as an error.
+    {ok, TextSlot} =
+        hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 4 }, Opts),
+    ?assertEqual(<<"error">>, hb_ao:get(<<"results/type">>, TextSlot, Opts)),
+    % An error that the script raises and does not catch is a failure, so the
+    % slot is not stored.
+    ?assertMatch(
+        {failure, _},
+        hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 5 }, Opts)
+    ),
+    % A compute server that does not answer is a failure of this node, not an
+    % error of the process, so the slot is not stored.
+    Delegated =
+        hb_message:commit(
+            hb_maps:merge(
+                hb_message:uncommitted(base_process(Opts), Opts),
+                #{ <<"execution-device">> => <<"delegated-compute@1.0">> },
+                Opts
+            ),
+            Opts
+        ),
+    schedule_test_message(Delegated, <<"one">>, Opts),
+    ?assertMatch(
+        {failure, _},
+        hb_ao:resolve(
+            Delegated,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 0 },
+            Opts#{ <<"delegated-compute-peer">> => <<"http://localhost:1">> }
+        )
+    ).
 
 prior_results_accessible_test_parallel_() ->
     {timeout, 30, fun() ->

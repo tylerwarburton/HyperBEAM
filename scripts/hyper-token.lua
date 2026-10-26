@@ -24,8 +24,9 @@
 --- of zero balances during the evaluation of the first assignment of the process.
 --- When the token receives a `credit-notice' message, it will interpret it as a
 --- deposit from the sending ledger and update its record of its own balance with
---- the sending ledger.
---- 
+--- the sending ledger. Keys are lowercase in `structured@1.0' form, so
+--- `balance' and `ledgers' are keyed by the lowercase form of each address.
+---
 --- Atop the standard token transfer messages, the sub-ledger API allows for
 --- `transfer' messages to specify a `route' field, which is a list of ledger
 --- IDs that the transfer should be routed through in order to reach a
@@ -390,7 +391,8 @@ local function register_peer(base, request)
     end
     
     -- Add to known ledgers
-    base.ledgers[request.from] = base.ledgers[request.from] or 0
+    base.ledgers[string.lower(request.from)] =
+        base.ledgers[string.lower(request.from)] or 0
 
     return "ok", base
 end
@@ -404,7 +406,7 @@ local function is_from_trusted_ledger(base, request)
     end
 
     -- We trust any ledger that is already registered in the `ledgers' map.
-    if base.ledgers and (base.ledgers[request.from] ~= nil) then
+    if base.ledgers and (base.ledgers[string.lower(request.from)] ~= nil) then
         return true, base
     end
 
@@ -436,7 +438,7 @@ local function ensure_initialized(base, assignment)
     ao.event({ "Ledgers before initialization: ", base.ledgers })
 
     for _, ledger in ipairs(base.ledgers) do
-        base.ledgers[ledger] = 0
+        base.ledgers[string.lower(ledger)] = 0
     end
     ao.event({ "Ledgers after initialization: ", base.ledgers })
 
@@ -583,7 +585,7 @@ local function debit_balance(base, request)
 
     -- Ensure that the source has the required funds.
     -- Check 1: The source balance is present in the ledger.
-    local source_balance = base.balance[source]
+    local source_balance = base.balance[string.lower(source)]
 
     if not source_balance then
         return "error", log_result(base, "error", {
@@ -621,7 +623,7 @@ local function debit_balance(base, request)
     end
 
     ao.event({ "Deducting funds:", { request = request } })
-    base.balance[source] = source_balance - request.quantity
+    base.balance[string.lower(source)] = source_balance - request.quantity
     ao.event({ "Balances after deduction:",
         { balances = base.balance, ledgers = base.ledgers } }
     )
@@ -691,8 +693,8 @@ function transfer(base, assignment)
         -- another user. We credit the recipient's balance, or the sub-ledger's
         -- balance if the request has a `route' key.
         local direct_recipient = request.route or request.recipient
-        base.balance[direct_recipient] =
-            (base.balance[direct_recipient] or 0) + quantity
+        base.balance[string.lower(direct_recipient)] =
+            (base.balance[string.lower(direct_recipient)] or 0) + quantity
         base = send(base, {
             action = "Credit-Notice",
             target = direct_recipient,
@@ -792,8 +794,8 @@ _G["credit-notice"] = function (base, assignment)
     end
 
     -- Credit the recipient's balance.
-    base.balance[request.recipient] =
-        (base.balance[request.recipient] or 0) + quantity
+    base.balance[string.lower(request.recipient)] =
+        (base.balance[string.lower(request.recipient)] or 0) + quantity
     
     return "ok", log_result(base, "ok", {
         message = "Credit-Notice processed successfully.",
@@ -801,7 +803,7 @@ _G["credit-notice"] = function (base, assignment)
         to_ledger = request.sender,
         to_user = request.recipient,
         quantity = quantity,
-        balance = base.balance[request.recipient]
+        balance = base.balance[string.lower(request.recipient)]
     })
 end
 
@@ -814,7 +816,7 @@ function register(raw_base, assignment)
         return "ok", base
     end
 
-    if base.ledgers[request.from] then
+    if base.ledgers[string.lower(request.from)] then
         ao.event({ "Ledger already registered. Ignoring registration request." })
         base.results = {
             message = "Ledger already registered."

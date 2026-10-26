@@ -619,18 +619,18 @@ api_test_() ->
                 fun() ->
                     ok = write(
                         #{},
-                        #{ <<"data/the_data_item">> => <<"the_data">> },
+                        #{ <<"the_data_item">> => <<"the_data">> },
                         #{}
                     ),
                     ok =
                         link(
                             #{},
-                            #{ <<"top_level/level1/item">> => <<"data/the_data_item">> },
+                            #{ <<"top_level/level1/item">> => <<"the_data_item">> },
                             #{}
                         ),
 
                     ?assertEqual(
-                        {ok, <<"data/the_data_item">>},
+                        {ok, <<"the_data_item">>},
                         resolve(
                             #{},
                             #{ <<"resolve">> => <<"top_level/level1/item">> },

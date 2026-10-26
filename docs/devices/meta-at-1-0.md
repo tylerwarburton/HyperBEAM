@@ -16,8 +16,8 @@ Retrieves or modifies the node's configuration message (often referred to as `No
     *   **Action:** Returns the current node configuration message.
     *   **Response:** A message map containing the node's settings. Sensitive keys (like private wallets) are filtered out. Dynamically generated keys like the node's public `address` are added if a wallet is configured.
 *   **`POST /~meta@1.0/info`**
-    *   **Action:** Updates the node's configuration message. Requires the request to be signed by the node's configured `operator` key/address.
-    *   **Request Body:** A message map containing the configuration keys and values to update.
+    *   **Action:** Updates the node's configuration message. The configured `admin` must sign `type: node-message` and the configuration fields to apply. Unsigned fields are ignored, including extensions of signed submessages.
+    *   **Request Body:** A message map containing `type: node-message` and the configuration keys and values to update.
     *   **Response:** Confirmation message indicating success or failure.
     *   **Note:** Once a node's configuration is marked as `initialized = permanent`, it cannot be changed via this method.
 
@@ -28,6 +28,7 @@ While the `info` key is the primary interaction point, the `NodeMsg` managed by 
 *   `port`: HTTP server port.
 *   `priv_wallet` / `key_location`: Path to the node's Arweave key file.
 *   `operator`: The address designated as the node operator (defaults to the address derived from `priv_wallet`).
+*   `admin`: The address allowed to update the node configuration (defaults to `operator`). Both roles accept an address or a list of addresses; `unclaimed` denies access.
 *   `initialized`: Status indicating if the node setup is temporary or permanent.
 *   `preprocessor` / `postprocessor`: Optional messages defining pre/post-processing logic for requests.
 *   `routes`: Routing table used by [`dev_router`](../resources/source-code/dev_router.md).
@@ -43,6 +44,9 @@ While the `info` key is the primary interaction point, the `NodeMsg` managed by 
 The [`dev_meta.erl`](../resources/source-code/dev_meta.md) module also contains helper functions used internally or callable from other Erlang modules:
 
 *   `is_operator(<RequestMsg>, <NodeMsg>) -> boolean()`: Checks if the signer of `RequestMsg` matches the configured `operator` in `NodeMsg`.
+*   `lib_meta:is_authorized(Type, Role, Msg, Opts)`: Verifies the role's signatures, requires their committed `type` to equal `Type`, and returns `{ok, OnlySignedKeysByRole}` or `{error, not_authorized}`. HTTP authorization uses the original singleton before path parsing. Authorization failures return HTTP 403, with a friendly page for browser requests.
+
+Cache writes require the `operator` role and the signed type `cache-write`. Their body must be signed. Batch writes use `write-type: batch`.
 
 ## Pre/Post-Processing Hooks
 

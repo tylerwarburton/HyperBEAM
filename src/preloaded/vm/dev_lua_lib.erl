@@ -13,9 +13,9 @@
 %%% the first term is typically the status, and the second term is the result.
 -module(dev_lua_lib).
 %%% Library functions. Each exported function is _automatically_ added to the
-%%% Lua environment, except for the `install/3' function, which is used to
-%%% install the library in the first place.
--export([get/3, resolve/3, set/3, event/3, install/3]).
+%%% Lua environment, except for the `install/3' and `reinstall/3' functions,
+%%% which install the library in a new Lua state and in a restored one.
+-export([get/3, resolve/3, set/3, event/3, install/3, reinstall/3]).
 -include("include/hb.hrl").
 
 %%% The set of devices that must be included in the device sandbox for an
@@ -31,6 +31,38 @@
 
 %% @doc Install the library into the given Lua environment.
 install(Base, State, Opts) ->
+    % Initialize the AO-Core resolver.
+    BaseAOTable =
+        case luerl:get_table_keys_dec([ao], State) of
+            {ok, nil, _} ->
+                ?event(no_ao_table),
+                #{};
+            {ok, ExistingTable, _} ->
+                % The table keeps its functions, which `dev_lua:decode/2' drops.
+                ?event({existing_ao_table, ExistingTable}),
+                ExistingTable
+        end,
+    ?event({base_ao_table, BaseAOTable}),
+    {ok, State2} =
+        luerl:set_table_keys_dec(
+            [ao],
+            BaseAOTable,
+            State
+        ),
+    set_functions(Base, State2, Opts).
+
+%% @doc Set the library functions again in the `ao' table of a Lua state
+%% restored from a snapshot. The functions are closures of the module that
+%% installed them, which is not loaded when another build of this device wrote
+%% the snapshot. A state whose `ao' cannot be indexed has no library to set.
+reinstall(Base, State, Opts) ->
+    case luerl:get_table_keys_dec([ao, get], State) of
+        {ok, _, _} -> set_functions(Base, State, Opts);
+        {lua_error, _, _} -> {ok, State}
+    end.
+
+%% @doc Set the library functions in the `ao' table of the given Lua state.
+set_functions(Base, State, Opts) ->
     % Compute the device-name allowlist for the Lua sandbox. When the
     % caller provides a `device-sandbox' field, only those names plus
     % the minimal-AO-Core set are admissible; otherwise we leave the
@@ -52,27 +84,10 @@ install(Base, State, Opts) ->
         end,
     ?event({adding_ao_core_resolver, {device_sandbox, AdmissibleNames}}),
     ExecOpts =
-        Opts#{
+        #{
             <<"admissible-devices">> => AdmissibleNames,
             <<"hashpath">> => ignore
         },
-    % Initialize the AO-Core resolver.
-    BaseAOTable =
-        case luerl:get_table_keys_dec([ao], State) of
-            {ok, nil, _} ->
-                ?event(no_ao_table),
-                #{};
-            {ok, ExistingTable, _} ->
-                ?event({existing_ao_table, ExistingTable}),
-                dev_lua:decode(ExistingTable, Opts)
-        end,
-    ?event({base_ao_table, BaseAOTable}),
-    {ok, State2} =
-        luerl:set_table_keys_dec(
-            [ao],
-            dev_lua:encode(BaseAOTable, Opts),
-            State
-        ),
     {
         ok,
         lists:foldl(
@@ -82,28 +97,49 @@ install(Base, State, Opts) ->
                         [ao, FuncName],
                         fun(RawArgs, ImportState) ->
                             ?event(lua_import, {calling_import, {func, FuncName}}),
-                            % Decode the arguments from the Lua environment.
+                            % Get the node message of the invocation from the
+                            % private data of the Lua state.
+                            ImportOpts =
+                                luerl:get_private(<<"node-message">>, ImportState),
+                            % Decode the arguments from the Lua environment. A
+                            % table key that `hb_ao:normalize_key/2' has no
+                            % clause for, such as `1.5', is a bad argument,
+                            % which `pcall' catches. Other errors can depend on
+                            % this node, and are raised.
                             Args =
-                                lists:map(
-                                    fun(Arg) ->
-                                        dev_lua:decode(
-                                            luerl:decode(Arg, ImportState),
-                                            Opts
+                                try
+                                    lists:map(
+                                        fun(Arg) ->
+                                            dev_lua:decode(
+                                                luerl:decode(Arg, ImportState),
+                                                ImportOpts
+                                            )
+                                        end,
+                                        RawArgs
+                                    )
+                                catch
+                                    error:function_clause ->
+                                        luerl_lib:badarg_error(
+                                            FuncName,
+                                            RawArgs,
+                                            ImportState
                                         )
-                                    end,
-                                    RawArgs
-                                ),
+                                end,
                             % Call the function with the decoded arguments.
                             {Res, ResState} =
-                                Func(Args, ImportState, ExecOpts),
+                                Func(
+                                    Args,
+                                    ImportState,
+                                    maps:merge(ImportOpts, ExecOpts)
+                                ),
                             % Encode the response for return to Lua
-                            return(Res, ResState, Opts)
+                            return(Res, ResState, ImportOpts)
                         end,
                         StateIn
                     ),
                 StateOut
             end,
-            State2,
+            State,
             ?LIBRARY_FUNCTIONS
         )
     }.
@@ -132,29 +168,41 @@ resolve([SingletonMsg], ExecState, ExecOpts) ->
     ParsedMsgs = hb_singleton:from(SingletonMsg, ExecOpts),
     ?event({parsed_msgs_to_resolve, ParsedMsgs}),
     resolve({many, ParsedMsgs}, ExecState, ExecOpts);
-resolve([Base, Path], ExecState, ExecOpts) when is_binary(Path) ->
-    PathParts = hb_path:term_to_path_parts(Path, ExecOpts),
-    resolve({many, [Base] ++ PathParts}, ExecState, ExecOpts);
 resolve(Msgs, ExecState, ExecOpts) when is_list(Msgs) ->
     resolve({many, Msgs}, ExecState, ExecOpts);
 resolve({many, Msgs}, ExecState, ExecOpts) ->
-    MaybeAsMsgs = lists:map(fun convert_as/1, Msgs),
+    % The messages are what the device executes; private keys in them are
+    % caller input from Lua.
+    MaybeAsMsgs = lists:map(fun convert_as/1, hb_private:reset(Msgs)),
     try hb_ao:resolve_many(MaybeAsMsgs, ExecOpts) of
         {Status, Res} ->
             ?event({resolved_msgs, {status, Status}, {res, Res}, {exec_opts, ExecOpts}}),
-            {[Status, Res], ExecState}
+            Key = case Msgs of [] -> undefined; _ -> lists:last(Msgs) end,
+            {[Status, committers(Key, Res)], ExecState}
     catch
         Error ->
             ?event(lua_error, {ao_core_resolver_error, Error}),
             {[<<"error">>, Error], ExecState}
     end.
 
-%% @doc A wrapper for `hb_ao''s `get' functionality.
+%% @doc A wrapper for `hb_ao''s `get' functionality. A key that the message
+%% does not have gives Lua's `nil'.
 get([Key, Base], ExecState, ExecOpts) ->
     ?event({ao_core_get, {base, Base}, {key, Key}}),
-    NewRes = hb_ao:get(convert_as(Key), convert_as(Base), ExecOpts),
+    NewRes =
+        committers(
+            Key,
+            hb_ao:get(convert_as(Key), convert_as(Base), nil, ExecOpts)
+        ),
     ?event({ao_core_get_result, {result, NewRes}}),
     {[NewRes], ExecState}.
+
+%% @doc Convert the `committers' of a message to the form that Lua reads. Each
+%% Arweave committer is given as its address.
+committers(<<"committers">>, Committers) when is_list(Committers) ->
+    lists:map(fun hb_util:committer_address/1, Committers);
+committers(_Key, Res) ->
+    Res.
 
 %% @doc Converts any `as' terms from Lua to their HyperBEAM equivalents.
 convert_as([<<"as">>, Device, RawMsg]) ->
@@ -162,7 +210,10 @@ convert_as([<<"as">>, Device, RawMsg]) ->
 convert_as(Other) ->
     Other.
 
-%% @doc Wrapper for `hb_ao''s `set' functionality.
+%% @doc Wrapper for `hb_ao''s `set' functionality. Setting a key to Lua's `nil'
+%% removes it.
+set([Base, Key, nil], ExecState, ExecOpts) ->
+    set([Base, Key, unset], ExecState, ExecOpts);
 set([Base, Key, Value], ExecState, ExecOpts) ->
     ?event({ao_core_set, {base, Base}, {key, Key}, {value, Value}}),
     NewRes = hb_ao:set(Base, Key, Value, ExecOpts),

@@ -2,17 +2,24 @@
 %%% reached. This is useful for certain types of stacks that need various
 %%% execution passes to be completed in sequence across devices.
 -module(dev_multipass).
--export([info/1]).
+-specification("../../../specs/multipass@1.0.md").
+-export([device_info/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
-info(_M1) ->
+device_info(_M1) ->
     #{
         handler => fun handle/4
     }.
 
 %% @doc Forward the keys function to the message device, handle all others
 %% with deduplication. We only act on the first pass.
+-spec handle(
+    binary(),
+    #{ passes => integer(), pass => integer(), _ => _ },
+    #{ _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }} | {pass, #{ _ => _ }}.
 handle(<<"keys">>, M1, _M2, Opts) ->
     hb_ao:raw(<<"message@1.0">>, <<"keys">>, M1, #{}, Opts);
 handle(<<"set">>, M1, M2, Opts) ->

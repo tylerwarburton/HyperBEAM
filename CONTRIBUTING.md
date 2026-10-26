@@ -56,16 +56,17 @@ few basic rules that are widely established and represent the core `canon` of th
 codebase. As of time of {{`git blame`}}, there is highest consensus around the
 following:
 
-- Always use `-` over `_` in binary key names.
-    - Why: In general we try to follow the HTTP semantics RFC 9110, so all keys
-      should be HTTP-Header-Case. This is the style that has been used for Arweave
-      data protocols since inception, so to avoid confusion we maintain it in
-      HyperBEAM. 
+- Always use `-` over `_` in binary key names, and write keys in lowercase.
+    - Why: In general we try to follow the HTTP semantics RFC 9110. Header names
+      are case-insensitive, and over-the-wire they are lower-case in HTTP/2+.
     - Nuances:
-        - One weirdness we inherit from HTTP-land is that headers are actually
-          case-insensitive, despite the use of capitals in header descriptions,
-          over-the-wire they are lower-case in HTTP/2+. AO-Core shoots for the
-          same semantics for consistency.
+        - AO-Core is agnostic to the case of keys. `structured@1.0` lowercases
+          every key (the ASCII capitals `A`-`Z` only), and devices receive
+          their inputs in `structured@1.0` form, so a device sees lowercase
+          keys. `message@1.0` lowercases a requested key before it looks it up.
+          Keys that become the same key hold their values as a list, as
+          repeated HTTP headers do. ANS-104 and TX items keep the tag names
+          that were signed in `original-tags`.
         - In device key resolutions that have multiple words (for example:
           `i_like(Base, Req, Opts) -> {ok, <<"Turtles!">>}.`) you may be tempted
           to call `~device@1.0/i_like`. Don't. Instead call `/i-like`.

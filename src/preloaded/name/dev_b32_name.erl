@@ -1,17 +1,20 @@
 %%% @doc Allows Arweave message IDs to be used via their base32 encoding as
 %%% subdomains on a HyperBEAM node.
 -module(dev_b32_name).
--export([info/1]).
+-specification("../../../specs/b32-name@1.0.md").
+-export([device_info/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
-info(_Opts) ->
+device_info(_Opts) ->
     #{
         default => fun get/4,
         excludes => [<<"keys">>, <<"set">>]
     }.
 
 %% @doc Try to resolve 52char subdomain back to its original TX ID
+-spec get(binary(), #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, binary()} | {error, not_found}.
 get(Key, _, _HookMsg, _Opts) ->
     ?event({resolve_52char, {key, Key}}),
     case decode(Key) of
@@ -144,6 +147,32 @@ test_subdomain_matches_path_id() ->
             },
             Opts
         )
+    ),
+    % A stored address that refers to the message matches it as well.
+    Address = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ok = hb_cache:link(ID1, Address, Opts),
+    ?assertMatch(
+        {ok, 1},
+        hb_http:get(
+            hb_http_server:start_node(Opts),
+            #{
+                <<"path">> => <<Address/binary, "/a">>,
+                <<"host">> => subdomain(Address, Opts)
+            },
+            Opts
+        )
+    ),
+    % A key in the first path part takes the keys of the request.
+    ?assertMatch(
+        {ok, #{ <<"x">> := <<"5">> }},
+        hb_http:get(
+            hb_http_server:start_node(Opts),
+            #{
+                <<"path">> => <<"set?x=5">>,
+                <<"host">> => subdomain(ID1, Opts)
+            },
+            Opts
+        )
     ).
 
 %% @doc Validate the behavior when a subdomain and primary path ID match. Both
@@ -184,6 +213,10 @@ test_manifest_subdomain_matches_path_id() ->
 test_manifest_subdomain_does_not_match_path_id() ->
     TestPath = <<"/1rTy7gQuK9lJydlKqCEhtGLp2WWG-GOrVo5JdiCmaxs">>,
     Opts = manifest_opts(),
+    {ok, _} = hb_test_utils:preload(
+        Opts,
+        <<"test/arbundles.js/ans104-item-ed25519.bin">>
+    ),
     Subdomain = <<"4nuojs5tw6xtfjbq47dqk6ak7n6tqyr3uxgemkq5z5vmunhxphya">>,
     Node = hb_http_server:start_node(Opts),
     assert_manifest(Node, TestPath, Subdomain, <<"image/png">>, <<137, "PNG">>, Opts).

@@ -1,6 +1,6 @@
 %%% @doc A device that renders a REPL-like interface for AO-Core via HTML.
 -module(dev_hyperbuddy).
--export([info/1, format/3, return_file/2, return_error/2]).
+-export([device_info/1, format/3, return_file/2]).
 -export([metrics/3, events/3]).
 -export([throw/3]).
 -include_lib("include/hb.hrl").
@@ -10,7 +10,7 @@
 %% `hyperbuddy-serve' key of the node message will be served as static files.
 %% Each filename must point to a path relative to the HyperBEAM instance's
 %% build subdirectory as follows: `priv/html/hyperbuddy@1.0'.
-info(Opts) ->
+device_info(Opts) ->
     ServedRoutes = hb_opts:get(<<"hyperbuddy-serve">>, #{}, Opts),
     #{
         default => fun serve/4,
@@ -34,6 +34,8 @@ info(Opts) ->
     }.
 
 %% @doc The main HTML page for the REPL device.
+-spec metrics(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ body := binary(), _ => _ }}.
 metrics(_, Req, Opts) ->
     case hb_opts:get(prometheus, not hb_features:test(), Opts) of
         true ->
@@ -57,7 +59,7 @@ metrics(_, Req, Opts) ->
                     RawHeaderMap,
 					Opts
                 ),
-            % Prometheus names its exposition format in a `version' parameter.
+            % Prometheus states its exposition format in a `version' parameter.
             % `0.0.4' is not a valid structured-field value, so the parameter is
             % dropped and the bare media type served.
             {ok,
@@ -70,9 +72,13 @@ metrics(_, Req, Opts) ->
             {ok, #{ <<"body">> => <<"Prometheus metrics disabled.">> }}
     end.
 
-%% @doc Return the current event counters as a message.
+%% @doc Return the current event counters in the reply's body.
+-spec events(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, #{ _ => _ }}.
 events(_, _Req, _Opts) ->
-    {ok, hb_event:counters()}.
+    {ok, #{
+        <<"ao-result">> => <<"body">>,
+        <<"body">> => hb_event:counters()
+    }}.
 
 %% @doc Employ HyperBEAM's internal pretty printer to format a message.
 %% 
@@ -96,18 +102,40 @@ events(_, _Req, _Opts) ->
 %% ```
 %% `resolve-links' sets the link depth to resolve. It defaults to the node's
 %% `debug-resolve-links' option; `true' resolves all levels.
+-spec format(
+    #{ _ => _ },
+    #{
+        format => [binary()] | binary(),
+        'truncate-keys' => integer() | infinity,
+        'resolve-links' => integer() | boolean(),
+        _ => _
+    },
+    #{ _ => _ }
+) ->
+    {ok, #{ body := binary(), _ => _ }}
+    | {error, #{ status := integer(), body := binary() }}.
 format(Base, Req, Opts) ->
     % Find the scope of the environment that should be printed.
     Scope =
-        lists:map(
-            fun hb_util:bin/1,
-            case hb_maps:get(<<"format">>, Req, <<"base">>, Opts) of
-                <<"all">> -> [<<"base">>, <<"request">>, <<"node">>];
-                Messages when is_list(Messages) -> Messages;
-                SingleScope -> [SingleScope]
-            end
-        ),
+        case maps:get(<<"format">>, Req, <<"base">>) of
+            <<"all">> -> [<<"base">>, <<"request">>, <<"node">>];
+            Messages when is_list(Messages) -> Messages;
+            SingleScope -> [SingleScope]
+        end,
     ?event(debug_format, {using_scope, Scope}),
+    case lists:member(<<"node">>, Scope) andalso
+            hb_opts:get(mode, prod, Opts) =/= debug of
+        true ->
+            {error, #{
+                <<"status">> => 403,
+                <<"body">> => <<"Node formatting requires debug mode.">>
+            }};
+        false ->
+            format(Base, Req, Opts, Scope)
+    end.
+
+%% @doc Format the permitted environment components.
+format(Base, Req, Opts, Scope) ->
     CombinedMsg =
         hb_maps:with(
             Scope,
@@ -124,23 +152,13 @@ format(Base, Req, Opts) ->
         true ->
             CombinedMsg
         end,
-    ResolveLinksValue =
-        hb_maps:get(
+    ResolveLinks =
+        maps:get(
             <<"resolve-links">>,
             Req,
-            hb_opts:get(debug_resolve_links, false, Opts),
-            Opts
+            hb_opts:get(debug_resolve_links, false, Opts)
         ),
-    ResolveLinks =
-        case hb_util:safe_int(ResolveLinksValue) of
-            {ok, Depth} -> Depth;
-            {error, invalid} -> hb_util:bool(ResolveLinksValue)
-        end,
-    TruncateKeys =
-        case hb_maps:get(<<"truncate-keys">>, Req, infinity, Opts) of
-            infinity -> infinity;
-            MaxKeys -> hb_util:int(MaxKeys)
-        end,
+    TruncateKeys = maps:get(<<"truncate-keys">>, Req, infinity),
     ?event(debug_format, {using_truncation, TruncateKeys}),
     {ok,
         #{
@@ -160,6 +178,8 @@ format(Base, Req, Opts) ->
     }.
 
 %% @doc Test key for validating the behavior of the `500` HTTP response.
+-spec throw(#{ _ => _ }, #{ _ => _ }, #{ mode => atom(), _ => _ }) ->
+    {error, binary()}.
 throw(_Msg, _Req, Opts) ->
     case hb_opts:get(mode, prod, Opts) of
         prod -> {error, <<"Forced-throw unavailable in `prod` mode.">>};
@@ -167,14 +187,15 @@ throw(_Msg, _Req, Opts) ->
     end.
 
 %% @doc Serve a file from the priv directory. Only serves files that are explicitly
-%% listed in the `routes' field of the `info/1' return value.
+%% listed in the `routes' field of the `device_info/1' return value.
+-spec serve(term(), #{ _ => _ }, #{ _ => _ }, map()) -> term().
 serve(<<"keys">>, M1, _M2, Opts) ->
     hb_ao:raw(<<"message@1.0">>, <<"keys">>, M1, #{}, Opts);
 serve(<<"set">>, M1, M2, Opts) ->
     hb_ao:raw(<<"message@1.0">>, <<"set">>, M1, M2, Opts);
 serve(Key, _, _, Opts) ->
     ?event({hyperbuddy_serving, Key}),
-    ServeRoutes = hb_maps:get(serve, info(Opts), #{}, Opts),
+    ServeRoutes = hb_maps:get(serve, device_info(Opts), #{}, Opts),
     case hb_maps:find(Key, ServeRoutes, Opts) of
         {ok, Filename} -> return_file(<<"hyperbuddy@1.0">>, Filename, #{});
         error -> {error, not_found}
@@ -183,20 +204,42 @@ serve(Key, _, _, Opts) ->
 %% @doc Read a file from disk and serve it as a static HTML page.
 return_file(Device, Name) ->
     return_file(Device, Name, #{}).
+return_file(Device, <<"404.html">>, Template) ->
+    return_file(
+        Device,
+        <<"error.html">>,
+        maps:merge(hb_ao_errors:page(404, #{}, #{}), Template)
+    );
 return_file(Device, Name, Template) ->
     hb_http_server:static(Device, Name, Template, #{}).
 
-%% @doc Return an error page, with the `{{error}}` template variable replaced.
-return_error(Error, Opts) when not is_map(Error) ->
-    return_error(#{ <<"body">> => Error }, Opts);
-return_error(ErrorMsg, Opts) ->
-    return_file(
-        <<"hyperbuddy@1.0">>,
-        <<"500.html">>,
-        #{ <<"error">> => hb_format:error(ErrorMsg, Opts) }
-    ).
-
 %%% Tests
+
+node_format_requires_debug_test() ->
+    Base = #{ <<"device">> => <<"hyperbuddy@1.0">>, <<"body">> => <<"base">> },
+    Opts = #{ <<"mode">> => prod, <<"config-marker">> => <<"node-marker">> },
+    lists:foreach(
+        fun(Scope) ->
+            ?assertMatch({error, #{ <<"status">> := 403 }}, hb_ao:resolve(
+                Base, #{ <<"path">> => <<"format">>, <<"format">> => Scope }, Opts
+            ))
+        end,
+        [<<"node">>, <<"all">>, [<<"base">>, <<"node">>]]
+    ),
+    lists:foreach(
+        fun(Scope) ->
+            ?assertMatch({ok, _}, hb_ao:resolve(
+                Base, #{ <<"path">> => <<"format">>, <<"format">> => Scope }, Opts
+            ))
+        end,
+        [<<"base">>, <<"request">>]
+    ),
+    {ok, #{ <<"body">> := Debug }} = hb_ao:resolve(
+        Base, #{ <<"path">> => <<"format">>, <<"format">> => <<"node">> },
+        Opts#{ <<"mode">> => debug, <<"priv-test">> => <<"private-marker">> }
+    ),
+    ?assertNotEqual(nomatch, binary:match(Debug, <<"node-marker">>)),
+    ?assertEqual(nomatch, binary:match(Debug, <<"private-marker">>)).
 
 return_templated_file_test() ->
     {ok, #{ <<"body">> := Body }} =

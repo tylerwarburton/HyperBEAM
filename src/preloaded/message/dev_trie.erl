@@ -14,7 +14,8 @@
 %%% `{00, 11, 01, 10}`, which is why each node in a radix-4 trie can have at-most
 %%% 4 children!)
 -module(dev_trie).
--export([info/0, keys/2, set/3, get/3, get/4]).
+-specification("../../../specs/trie@1.0.md").
+-export([device_info/0, keys/2, keys/3, set/3, get/3, get_key/4]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 
@@ -33,12 +34,14 @@
     <<"hashpath">>
 ]).
 
-info() ->
+device_info() ->
     #{
-        default => fun get/4,
+        default => fun get_key/4,
         reserved => ?RESERVED_KEYS
      }.
 
+keys(Trie, _Req, Opts) ->
+    keys(Trie, Opts).
 keys(Trie, Opts) ->
     collect_keys(Trie, <<>>, Opts, []).
 
@@ -75,17 +78,29 @@ collect_keys(TrieNode, Prefix, Opts, Acc) ->
 
 %% @doc Get the value associated with a key from a trie represented in a base
 %% message.
-get(Key, Trie, Req, Opts) ->
+-spec get_key(binary(), #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, _} | {error, not_found | binary()}.
+get_key(Key, Trie, Req, Opts) ->
     get(Trie, Req#{<<"key">> => Key}, Opts).
+-spec get(#{ _ => _ }, #{ key := binary(), _ => _ }, #{ _ => _ }) ->
+    {ok, _} | {error, not_found | binary()}.
 get(TrieNode, Req, Opts) ->
     case hb_maps:find(<<"key">>, Req, Opts) of
         error -> {error, <<"'key' parameter is required for trie lookup.">>};
-        {ok, Key} -> retrieve(TrieNode, Key, Opts)
+        {ok, Key} ->
+            % A key is stored lowercase, as keys are in `structured@1.0' form.
+            case retrieve(TrieNode, hb_util:lowercase_key(Key), Opts) of
+                {error, not_found} -> {error, not_found};
+                Value -> {ok, Value}
+            end
     end.
 
-%% @doc Set keys and their values in the trie.
+%% @doc Set keys and their values in the trie, and `device' on the message.
+-spec set(#{ _ => _ }, #{ path => binary(), _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }}.
 set(Trie, Req, Opts) ->
-    Insertable = hb_maps:without([<<"path">>], Req, Opts),
+    % A request is caller input, so its private keys are not trie data.
+    Insertable = hb_private:reset(hb_maps:without([<<"path">>], Req, Opts)),
     KeyVals = hb_maps:to_list(Insertable, Opts),
     {ok, do_set(Trie, KeyVals, Opts)}.
 do_set(Trie, [], Opts) ->
@@ -94,10 +109,12 @@ do_set(Trie, [], Opts) ->
         hb_message:commit(
             Uncommitted,
             Opts,
-            #{ <<"type">> => <<"hmac-sha256">> }
+            #{ <<"type">> => <<"unsigned">> }
         ),
     {ok, _} = hb_cache:write(CommittedTrie, Opts),
     CommittedTrie;
+do_set(Trie, [{<<"device">>, Device} | KeyVals], Opts) ->
+    do_set(Trie#{<<"device">> => Device}, KeyVals, Opts);
 do_set(Trie, [{Key, Val} | KeyVals], Opts) ->
     NewTrie = insert(Trie, Key, Val, Opts),
     do_set(NewTrie, KeyVals, Opts).
@@ -122,7 +139,7 @@ insert(TrieNode, Key, Val, Opts, KeyPrefixSizeAcc) ->
             case bit_size(KeySuffix) > 0 of
                 true ->
                     % Implicit leaf node creation!
-                    TrieNode#{KeySuffix => Val};
+                    add_edge(TrieNode, KeySuffix, Val);
                 false ->
                     TrieNode#{<<"node-value">> => Val}
             end;
@@ -152,10 +169,11 @@ insert(TrieNode, Key, Val, Opts, KeyPrefixSizeAcc) ->
                             >> = KeySuffix,
                             TrieNode#{
                                 EdgeLabel =>
-                                    #{
-                                        <<"node-value">> => SubTrie,
-                                        KeySuffixSuffix => Val
-                                    }
+                                    add_edge(
+                                        #{<<"node-value">> => SubTrie},
+                                        KeySuffixSuffix,
+                                        Val
+                                    )
                             }
                     end;
                 true ->
@@ -189,20 +207,43 @@ insert(TrieNode, Key, Val, Opts, KeyPrefixSizeAcc) ->
             case bit_size(KeySuffixSuffix) > 0 of
                 true ->
                     NewTrie#{
-                        EdgeLabelPrefix => #{
-                            EdgeLabelSuffix => SubTrie,
-                            % Implicit leaf node!
-                            KeySuffixSuffix => Val
-                        }
+                        EdgeLabelPrefix =>
+                            add_edge(
+                                add_edge(#{}, EdgeLabelSuffix, SubTrie),
+                                KeySuffixSuffix,
+                                Val
+                            )
                     };
                 false ->
                     NewTrie#{
-                        EdgeLabelPrefix => #{
-                            EdgeLabelSuffix => SubTrie,
-                            <<"node-value">> => Val
-                        }
+                        EdgeLabelPrefix =>
+                            add_edge(
+                                #{<<"node-value">> => Val},
+                                EdgeLabelSuffix,
+                                SubTrie
+                            )
                     }
             end
+    end.
+
+%% @doc Split edge labels before metadata or private prefixes.
+add_edge(TrieNode, Label, Value) ->
+    case edge_prefix_size(Label, 8) of
+        Size when Size =:= bit_size(Label) ->
+            TrieNode#{Label => Value};
+        Size ->
+            <<Prefix:Size/bitstring, Suffix/bitstring>> = Label,
+            TrieNode#{Prefix => #{Suffix => Value}}
+    end.
+
+%% @doc Find the longest prefix that can be stored as a public trie edge.
+edge_prefix_size(Label, N) ->
+    case hb_private:is_private(Label) orelse lists:member(Label, ?RESERVED_KEYS) of
+        true ->
+            Size = bit_size(Label) - N,
+            <<Prefix:Size/bitstring, _/bitstring>> = Label,
+            edge_prefix_size(Prefix, N);
+        false -> bit_size(Label)
     end.
 
 retrieve(TrieNode, Key, Opts) ->
@@ -277,10 +318,14 @@ longest_prefix_match(Key, EdgeLabels, N) ->
     longest_prefix_match({<<>>, 0}, Key, EdgeLabels, N).
 longest_prefix_match(Best, _Key, [], _N) -> Best;
 longest_prefix_match({BestLabel, BestSize}, Key, [EdgeLabel | EdgeLabels], N) ->
-    case bitwise_lcp(Key, EdgeLabel, N) of
-        Size when Size > BestSize ->
-            longest_prefix_match({EdgeLabel, Size}, Key, EdgeLabels, N);
-        _ ->
+    Size = bitwise_lcp(Key, EdgeLabel, N),
+    <<Prefix:Size/bitstring, _/bitstring>> = EdgeLabel,
+    % Keep shared edges outside the metadata and private namespaces.
+    MatchSize = edge_prefix_size(Prefix, N),
+    case MatchSize > BestSize of
+        true ->
+            longest_prefix_match({EdgeLabel, MatchSize}, Key, EdgeLabels, N);
+        false ->
             longest_prefix_match({BestLabel, BestSize}, Key, EdgeLabels, N)
     end.
 
@@ -440,6 +485,8 @@ basic_retrievability_test() ->
     {ok, Path} = hb_cache:write(Trie, Opts),
     ?event(debug_trie, {basic_retrievability_test, {trie, Trie}}),
     ?assertEqual(31337, hb_ao:get(<<"car">>, Trie, Opts)),
+    % A key is read as `structured@1.0' reads keys: in lowercase.
+    ?assertEqual(31337, hb_ao:get(<<"Car">>, Trie, Opts)),
     ?assertEqual(90210, hb_ao:get(<<"card">>, Trie, Opts)),
     ?assertEqual(666, hb_ao:get(<<"cardano">>, Trie, Opts)),
     ?assertEqual(8675309, hb_ao:get(<<"carmex">>, Trie, Opts)),
@@ -453,6 +500,106 @@ basic_retrievability_test() ->
     ?assertEqual(not_found, hb_ao:get(<<"cardan">>, Trie, Opts)),
     ?assertEqual(not_found, hb_ao:get(<<"cardana">>, Trie, Opts)),
     ?assertEqual(not_found, hb_ao:get(<<"carm">>, Trie, Opts)).
+
+device_prefix_test() ->
+    Opts = test_opts(),
+    ?assertEqual(
+        {ok, <<"1">>},
+        hb_ao:resolve(
+            <<"/~trie@1.0/set&a=1/set&deviceaa=2/set&bb=3/a">>,
+            Opts
+        )
+    ),
+    KeyVals = [
+        {<<"a">>, 1}, {<<"deviceaa">>, 2}, {<<"devicebb">>, 3},
+        {<<"d">>, 4}, {<<"de">>, 5}, {<<"dev">>, 6},
+        {<<"deviceaab">>, 7}, {<<"bb">>, 8}
+    ],
+    lists:foreach(
+        fun(Entries) ->
+            Trie = lists:foldl(
+                fun({Key, Value}, Acc) -> hb_ao:set(Acc, #{Key => Value}, Opts) end,
+                #{ <<"device">> => <<"trie@1.0">> },
+                Entries
+            ),
+            ?assertEqual(<<"trie@1.0">>, hb_maps:get(<<"device">>, Trie, Opts)),
+            % `set' of `device' changes it on the message, not in the trie.
+            ?assertEqual(
+                <<"message@1.0">>,
+                hb_maps:get(
+                    <<"device">>,
+                    hb_ao:set(Trie, <<"device">>, <<"message@1.0">>, Opts),
+                    Opts
+                )
+            ),
+            {ok, ID} = hb_cache:write(Trie, Opts),
+            {ok, Loaded} = hb_cache:read(ID, Opts),
+            lists:foreach(
+                fun({Key, Value}) ->
+                    ?assertEqual(Value, hb_ao:get(Key, Loaded, Opts))
+                end,
+                Entries
+            ),
+            ?assert(verify_nodes(Loaded, Opts))
+        end,
+        [KeyVals, lists:reverse(KeyVals)]
+    ).
+
+reserved_edge_labels_test_() ->
+    [
+        {timeout, 60, fun() ->
+            Opts = test_opts(),
+            Entries = lists:zip(Keys, lists:seq(1, length(Keys))),
+            lists:foldl(
+                fun({Key, Value}, {Trie, Expected}) ->
+                    New = hb_ao:set(Trie, #{Key => Value}, Opts),
+                    % `set' reads a key as `structured@1.0' does: in lowercase.
+                    NextExpected =
+                        Expected#{hb_util:lowercase_key(Key) => Value},
+                    {ok, ID} = hb_cache:write(New, Opts),
+                    {ok, Loaded} = hb_cache:read(ID, Opts),
+                    lists:foreach(
+                        fun(Check) ->
+                            ?assertEqual(
+                                lists:sort(maps:keys(NextExpected)),
+                                lists:sort(hb_ao:keys(Check, Opts))
+                            ),
+                            maps:foreach(
+                                fun(K, V) ->
+                                    ?assertEqual(V, hb_ao:get(K, Check, Opts))
+                                end,
+                                NextExpected
+                            ),
+                            ?assert(verify_nodes(Check, Opts)),
+                            ?assertEqual(
+                                <<"trie@1.0">>,
+                                hb_maps:get(<<"device">>, Check, Opts)
+                            )
+                        end,
+                        [New, Loaded]
+                    ),
+                    {Loaded, NextExpected}
+                end,
+                {#{<<"device">> => <<"trie@1.0">>}, #{}},
+                Entries ++ [{K, V + 100} || {K, V} <- Entries]
+            )
+        end}
+    ||
+        Label <- ?RESERVED_KEYS ++ [<<"privAAAA">>, <<"Priv">>],
+        Prefix <- [<<"AA">>, <<"AAbb">>],
+        Order <- [[1, 2, 3], [1, 3, 2], [2, 1, 3],
+            [2, 3, 1], [3, 1, 2], [3, 2, 1]],
+        BaseKeys <- [[
+            <<Prefix/binary, "other">>,
+            <<Prefix/binary, Label/binary, "AA">>,
+            <<Prefix/binary, Label/binary, "BB">>
+        ]],
+        Keys <- [[lists:nth(N, BaseKeys) || N <- Order] ++ [
+            <<Prefix/binary, Label/binary>>,
+            <<Prefix/binary, "pri">>,
+            Prefix
+        ]]
+    ].
 
 basic_key_collection_test() ->
     Opts = test_opts(),

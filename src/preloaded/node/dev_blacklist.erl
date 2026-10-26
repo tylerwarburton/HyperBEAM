@@ -44,6 +44,11 @@
      <<"/~hyperbuddy@1.0/bundle.js">>]).
 
 %% @doc Hook handler: block requests that involve blacklisted IDs.
+-spec request(
+    #{ _ => _ },
+    #{ request := #{ path => binary(), _ => _ }, _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }} | {error, #{ _ => _ }} | {blocked_txid, binary()}.
 request(_Base, HookReq, Opts) ->
     ?event({hook_req, HookReq}),
     case hb_opts:get(blacklist_providers, false, Opts) of
@@ -90,6 +95,8 @@ is_match(Msg, Opts) ->
                         [] -> {ok, Msg1};
                         [ID|_] -> {blocked_txid, ID}
                     end;
+                continue ->
+                    {ok, Msg};
                 {error, Msg1} ->
                     {error, Msg1}
             end;
@@ -160,6 +167,7 @@ execute_provider(Provider, Opts) ->
     ?event({execute_provider, {provider, Provider}}),
     case hb_cache:ensure_loaded(Provider, Opts) of
         Bin when is_binary(Bin) -> hb_ao:resolve(#{ <<"path">> => Bin }, Opts);
+        Msg when is_map(Msg) -> hb_ao:resolve(Msg, Opts);
         Msgs when is_list(Msgs) -> hb_ao:resolve_many(Msgs, Opts)
     end.
 
@@ -206,10 +214,27 @@ trim_ascii_right(Bin, Len) ->
 %% @doc Collect all IDs found as elements of a given message.
 collect_ids(Msg, Opts) -> lists:usort(collect_ids(Msg, [], Opts)).
 collect_ids(Bin, Acc, _Opts) when ?IS_ID(Bin) -> [hb_util:human_id(Bin) | Acc];
+collect_ids(<<Scheme:2/binary, ":", Rest/binary>>, Acc, _Opts)
+        when Scheme =:= <<"ao">>; Scheme =:= <<"ni">> ->
+    % The binary is an `ao:' URI or a `ni:' name. We percent-decode it as
+    % `hb_singleton' decodes the path of an `ao:' URI, then collect every ID
+    % that it contains, wherever it appears. A URI that cannot be decoded
+    % cannot be read either, so we scan it as it is.
+    Decoded =
+        case catch uri_string:unquote(Rest) of
+            DecodedBin when is_binary(DecodedBin) -> DecodedBin;
+            _ -> Rest
+        end,
+    lists:foldl(
+        fun collect_path_id/2,
+        Acc,
+        re:split(Decoded, <<"[^A-Za-z0-9_-]+">>, [{return, binary}])
+    );
 collect_ids(Bin, Acc, _Opts) when is_binary(Bin) -> Acc;
 collect_ids({as, _, Msg}, Acc, Opts) -> collect_ids(Msg, Acc, Opts);
-collect_ids({link, Path, _}, Acc, _Opts) ->
-    collect_path_id(Path, Acc);
+collect_ids({resolve, Msgs}, Acc, Opts) -> collect_ids(Msgs, Acc, Opts);
+collect_ids({link, Path, _}, Acc, Opts) ->
+    collect_path_id(Path, collect_ids(Path, Acc, Opts));
 collect_ids(Msg, Acc, Opts) when is_map(Msg) ->
     Acc1 = collect_ids(maps:get(<<"path">>, Msg, undefined), Acc, Opts),
     Acc2 = collect_commitment_ids(maps:get(<<"commitments">>, Msg, #{}), Acc1, Opts),
@@ -256,7 +281,10 @@ insert_ids([ID | IDs], Value, Table, Opts) when ?IS_ID(ID) ->
         _ -> insert_ids(IDs, Value, Table, Opts)
     end.
 
-%% @doc Ensure the cache table exists.
+%% @doc Ensure the cache table exists. While the blacklist loads, `halt' waits
+%% for it up to `blacklist-timeout', then gives 503, and `continue' returns
+%% `continue': the request is served without a check, as the table may not
+%% exist yet.
 ensure_cache_table(Msg, Opts) ->
     %% Options: 
     %% - continue: Don't wait for blacklist to be initialized
@@ -286,8 +314,8 @@ ensure_cache_table(Msg, Opts) ->
                     refresh_loop(Opts)
                 end
             ),
-            case FallbackMode of 
-                continue -> {ok, Msg};
+            case hb_util:atom(FallbackMode) of
+                continue -> continue;
                 halt ->
                     IsInitialized = 
                         hb_util:wait_until(
@@ -334,8 +362,7 @@ refresh_loop(Opts) ->
 
 %% @doc Calculate the name of the cache table given the `Opts`.
 cache_table_name(Opts) ->
-    Wallet = hb_opts:get(priv_wallet, hb:wallet(), Opts),
-    Address = hb_util:human_id(Wallet),
+    Address = hb_opts:address(hb:wallet(), Opts),
     binary_to_atom(<<"~blacklist@1.0/cache/", Address/binary>>).
 
 %%% Tests
@@ -402,6 +429,62 @@ basic_test() ->
             }},
         hb_http:get(Node, SignedID1, Opts1)
     ),
+    % A blocked ID inside a parenthesized path part is blocked too.
+    ?assertMatch(
+        {error, #{ <<"status">> := 451 }},
+        hb_http:get(Node, <<"/(/", SignedID1/binary, ")/body">>, Opts1)
+    ),
+    % A blocked ID inside an `ao:' URI or a `ni:' name is blocked too, whether
+    % it is given as a path part or as the value of a link.
+    lists:foreach(
+        fun(Req) ->
+            ?assertMatch(
+                {error, #{ <<"status">> := 451 }},
+                hb_http:get(Node, Req, Opts1)
+            )
+        end,
+        [
+            <<"/ao:", SignedID1/binary, "/body">>,
+            <<"/ni:%2f%2f%2fsha-256;", SignedID1/binary>>,
+            #{
+                <<"path">> => <<"/x/body">>,
+                <<"x">> => <<"ao:", SignedID1/binary>>
+            }
+        ]
+    ),
+    % A provider given as a message is read as well.
+    MsgProviderNode =
+        hb_http_server:start_node(
+            Opts1#{
+                <<"priv-wallet">> => ar_wallet:new(),
+                <<"blacklist-providers">> => [#{ <<"path">> => BlacklistID }]
+            }
+        ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 451 }},
+        hb_http:get(MsgProviderNode, SignedID1, Opts1)
+    ),
+    % A binary `blacklist-fallback', as a config file gives it, is read. With
+    % `continue', a request is served while the blacklist loads, also before
+    % its table exists: the test process takes the name of the process that
+    % loads the blacklist, so the table is not created.
+    Wallet = ar_wallet:new(),
+    Table = cache_table_name(#{ <<"priv-wallet">> => Wallet }),
+    ok = hb_name:register(Table, self()),
+    ?assertMatch(
+        {ok, <<"test-3">>},
+        hb_http:get(
+            hb_http_server:start_node(
+                Opts1#{
+                    <<"priv-wallet">> => Wallet,
+                    <<"blacklist-fallback">> => <<"continue">>
+                }
+            ),
+            <<"/", UnsignedID3/binary, "/body">>,
+            Opts1
+        )
+    ),
+    hb_name:unregister(Table),
     ok.
 
 %% @doc Ensure that the default provider does not block any requests.
@@ -457,7 +540,7 @@ blacklist_from_external_http_test() ->
         #{
             <<"store">> => RootStore,
             <<"priv-wallet">> => ar_wallet:new(),
-            <<"relay-block-internal">> => false,
+            <<"hosts-block-internal">> => false,
             <<"blacklist-providers">> =>
                 [<<
                     "/~relay@1.0/call?relay-method=GET&relay-path=",
@@ -541,7 +624,7 @@ provider_failure_resilience_test() ->
 %% @doc Test that the blacklist cache is refreshed periodically.
 refresh_periodically_test() ->
     {ok, #{
-        opts := Opts0 = #{ <<"store">> := Store },
+        opts := Opts0,
         signed1 := SignedID1,
         unsigned3 := UnsignedID3
     }} = setup_test_env(),
@@ -552,7 +635,7 @@ refresh_periodically_test() ->
         },
     BlacklistMsg = hb_message:commit(InitialBlacklist, Opts0),
     {ok, InitialBlacklistID} = hb_cache:write(BlacklistMsg, Opts0),
-    ok = hb_store:link(Store, #{ <<"mutable">> => InitialBlacklistID }, Opts0),
+    ok = hb_cache:link(InitialBlacklistID, <<"mutable">>, Opts0),
     UpdatedBlacklist =
         #{
             <<"data-protocol">> => <<"content-policy">>,
@@ -560,7 +643,7 @@ refresh_periodically_test() ->
         },
     UpdatedBlacklistMsg = hb_message:commit(UpdatedBlacklist, Opts0),
     {ok, UpdatedBlacklistID} = hb_cache:write(UpdatedBlacklistMsg, Opts0),
-    ok = hb_store:link(Store, #{ <<"mutable">> => InitialBlacklistID }, Opts0),
+    ok = hb_cache:link(InitialBlacklistID, <<"mutable">>, Opts0),
     Opts1 = Opts0#{
         <<"blacklist-providers">> => [<<"/~cache@1.0/read?read=mutable">>],
         <<"blacklist-refresh-frequency">> => 1
@@ -574,7 +657,7 @@ refresh_periodically_test() ->
         {ok, <<"test-3">>},
         hb_http:get(Node, <<"/", UnsignedID3/binary, "/body">>, Opts1)
     ),
-    ok = hb_store:link(Store, #{ <<"mutable">> => UpdatedBlacklistID }, Opts0),
+    ok = hb_cache:link(UpdatedBlacklistID, <<"mutable">>, Opts0),
     ?assertMatch(
         {ok, <<"test-3">>},
         hb_http:get(Node, <<"/", UnsignedID3/binary, "/body">>, Opts1)

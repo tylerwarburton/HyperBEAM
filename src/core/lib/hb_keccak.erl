@@ -2,6 +2,7 @@
 -export([sha3_256/1]).
 -export([keccak_256/1]).
 -export([key_to_ethereum_address/1]).
+-export([address_to_checksum_address/1]).
 -include_lib("eunit/include/eunit.hrl").
 
 -on_load(init/0).
@@ -33,6 +34,11 @@ key_to_ethereum_address(Key) when is_binary(Key) ->
 	
 	ChecksumAddress = hash_to_checksum_address(Last40, HashHex),
 	ChecksumAddress.
+
+%% @doc Checksum an Ethereum address given as `0x' and 40 hex characters.
+address_to_checksum_address(<<"0x", Hex:40/binary>>) ->
+	Last40 = hb_util:to_lower(Hex),
+	hash_to_checksum_address(Last40, hb_util:to_hex(hb_keccak:keccak_256(Last40))).
 
 hash_to_checksum_address(Last40, Hash) when
 	is_binary(Last40),

@@ -8,6 +8,7 @@
 
 %% @doc Resolve either a message at an Arweave offset, or a direct key from the
 %% base message if the key is not an integer.
+-spec get(binary(), #{ _ => _ }, #{ _ => _ }, map()) -> term().
 get(Key, Base, _Request, Opts) ->
     case parse(Key) of
         {ok, StartOffset, Length} ->
@@ -89,6 +90,8 @@ unit(Base, <<"y">>) when Base > 0 -> unit(Base * 1000, <<"z">>).
 load_item_at_offset(ExplicitOffset, Length, Opts) when is_integer(Length) ->
     maybe
         {ok, _ChunkJSON, FirstChunk} ?= chunk_from_offset(ExplicitOffset, Opts),
+        {ok, HeaderChunk} ?=
+            header_chunk(ExplicitOffset, infinity, FirstChunk, Opts),
         ?event(
             arweave_offset_lookup,
             {loaded_explicit_offset,
@@ -97,7 +100,7 @@ load_item_at_offset(ExplicitOffset, Length, Opts) when is_integer(Length) ->
             },
             Opts
         ),
-        load_item_from_data_size(ExplicitOffset, Length, FirstChunk, Opts)
+        load_item_from_data_size(ExplicitOffset, Length, HeaderChunk, Opts)
     end;
 load_item_at_offset(TargetOffset, undefined, Opts) ->
     maybe
@@ -179,10 +182,9 @@ load_item_from_header(StartOffset, HeaderSize, HeaderTX, DataSize, Opts) ->
 chunk_from_offset(StartOffset, Opts) ->
     case dev_arweave:get_chunk(StartOffset + 1, Opts) of
         {ok, ChunkJSON} ->
-            ChunkSize = hb_util:int(maps:get(<<"chunk_size">>, ChunkJSON)),
             AbsEnd = hb_util:int(maps:get(<<"absolute_end_offset">>, ChunkJSON)),
             Chunk = hb_util:decode(maps:get(<<"chunk">>, ChunkJSON)),
-            ChunkStart = AbsEnd - ChunkSize + 1,
+            ChunkStart = AbsEnd - byte_size(Chunk) + 1,
             Skip = (StartOffset + 1) - ChunkStart,
             {ok, ChunkJSON, binary:part(Chunk, Skip, byte_size(Chunk) - Skip)};
         Error ->
@@ -236,9 +238,22 @@ bundle_start_offset(ChunkJSON) ->
 
 message_from_offset(TargetOffset, BundleStartOffset, KnownOffset, KnownChunk, Opts) ->
     maybe
+        {ok, _ChunkJSON, BundleChunk} ?=
+            chunk_from_offset(BundleStartOffset, Opts),
+        % A member contains the target only if the header ends at or before the
+        % target, so a longer header gives `not_found` without reading the rest
+        % of it. `bundle_header/4` refuses a chunk too short to contain the item
+        % count.
+        ClaimedSize = ar_bundles:bundle_header_size(BundleChunk),
+        true ?=
+            ClaimedSize =:= invalid_bundle_header
+                orelse ClaimedSize =< TargetOffset - BundleStartOffset
+                orelse {error, not_found},
         {ok, HeaderSize, BundleIndex} ?=
             lib_arweave_common:bundle_header(
                 BundleStartOffset,
+                infinity,
+                BundleChunk,
                 Opts
             ),
         {ok, ItemStartOffset, ItemSize} ?=
@@ -271,11 +286,13 @@ maybe_nested_item(
     maybe
         {ok, FirstChunk} ?=
             item_chunk(ItemStartOffset, KnownOffset, KnownChunk, Opts),
+        {ok, HeaderChunk} ?=
+            header_chunk(ItemStartOffset, ItemSize, FirstChunk, Opts),
         maybe_nested_item(
             TargetOffset,
             ItemStartOffset,
             ItemSize,
-            FirstChunk,
+            HeaderChunk,
             KnownOffset,
             KnownChunk,
             Opts
@@ -295,13 +312,14 @@ maybe_nested_item(
         {ok, HeaderSize, HeaderTX} ?= deserialize_header(FirstChunk),
         true ?= TargetOffset >= ItemStartOffset + HeaderSize,
         true ?= ar_tx:type(HeaderTX) =/= binary,
-        message_from_offset(
-            TargetOffset,
-            ItemStartOffset + HeaderSize,
-            KnownOffset,
-            KnownChunk,
-            Opts
-        )
+        {ok, _, _, _} ?=
+            message_from_offset(
+                TargetOffset,
+                ItemStartOffset + HeaderSize,
+                KnownOffset,
+                KnownChunk,
+                Opts
+            )
     else
         false -> {ok, ItemStartOffset, ItemSize, FirstChunk};
         {error, not_found} -> {ok, ItemStartOffset, ItemSize, FirstChunk};
@@ -317,6 +335,26 @@ item_chunk(ItemStartOffset, _KnownOffset, _KnownChunk, Opts) ->
         {ok, _ChunkJSON, FirstChunk} -> {ok, FirstChunk};
         Error -> Error
     end.
+
+%% @doc Read on into the next chunk when an item runs past its first chunk and
+%% its header does not decode from that chunk alone.
+header_chunk(ItemStartOffset, ItemSize, FirstChunk, Opts)
+        when byte_size(FirstChunk) < ItemSize ->
+    case deserialize_header(FirstChunk) of
+        {ok, _HeaderSize, _HeaderTX} ->
+            {ok, FirstChunk};
+        {error, _} ->
+            maybe
+                {ok, _ChunkJSON, NextChunk} ?=
+                    chunk_from_offset(
+                        ItemStartOffset + byte_size(FirstChunk),
+                        Opts
+                    ),
+                {ok, <<FirstChunk/binary, NextChunk/binary>>}
+            end
+    end;
+header_chunk(_ItemStartOffset, _ItemSize, FirstChunk, _Opts) ->
+    {ok, FirstChunk}.
 
 %% @doc Locate the bundle member containing the given offset.
 find_bundle_member(TargetOffset, ItemStartOffset, _BundleIndex, Opts)
@@ -360,11 +398,73 @@ parse_offset_test() ->
     ?assertEqual(error, parse(<<"65t3aueqg2rkyk7c7csh7g3262xwkz5v5d7xtzit3rlpxjaa6ezq">>)),
     ok.
 
+%% @doc A 1 KB item whose first 32 bytes claim a huge bundle item count must
+%% not drive an unbounded header read: the bytes before the target offset
+%% bound the header, so the lookup gives `not_found` without fetching any
+%% chunk past it.
+offset_header_bound_test() ->
+    ItemSize = 1000,
+    AbsEnd = 1000000,
+    % The first 32 bytes claim 50,000 items, a 3 MB header, from a 1 KB item.
+    Item = <<50000:256/little, 0:((ItemSize - 32) * 8)>>,
+    % The chunk has the proofs that an Arweave node gives: the item is the
+    % data of a transaction, the only one in its block.
+    {Root, Tree} =
+        ar_merkle:generate_tree([{ar_tx:generate_chunk_id(Item), ItemSize}]),
+    {TXRoot, TXTree} = ar_merkle:generate_tree([{Root, ItemSize}]),
+    Chunk =
+        hb_json:encode(
+            #{
+                <<"chunk">> => hb_util:encode(Item),
+                <<"chunk_size">> => ItemSize,
+                <<"absolute_end_offset">> => AbsEnd,
+                <<"data_path">> =>
+                    hb_util:encode(ar_merkle:generate_path(Root, 0, Tree)),
+                <<"tx_path">> =>
+                    hb_util:encode(ar_merkle:generate_path(TXRoot, 0, TXTree))
+            }
+        ),
+    {ok, Gateway, Handle} =
+        hb_mock_server:start(
+            [{"/chunk/[...]", chunk, fun(_Req) -> {200, Chunk} end}]
+        ),
+    Opts =
+        #{
+            <<"routes">> =>
+                [
+                    #{
+                        <<"template">> => <<"/arweave">>,
+                        <<"node">> =>
+                            #{
+                                <<"match">> => <<"^/arweave">>,
+                                <<"with">> => Gateway,
+                                <<"opts">> =>
+                                    #{
+                                        <<"http-client">> => httpc,
+                                        <<"protocol">> => http2
+                                    }
+                            }
+                    }
+                ]
+        },
+    Res =
+        hb_ao:resolve(
+            #{ <<"device">> => <<"arweave@2.9">> },
+            hb_util:bin(AbsEnd - 1),
+            Opts
+        ),
+    Fetches = length(hb_mock_server:get_requests(Handle, chunk)),
+    hb_mock_server:stop(Handle),
+    % The item's chunk is read to find its start and its header; a bounded
+    % read stops there, while an unbounded one fetches the claimed 3 MB.
+    ?assert(Fetches =< 2),
+    ?assertEqual({error, not_found}, Res).
+
 offset_item_cases_test() ->
     Opts = #{},
     Png = #{ <<"content-type">> => <<"image/png">> },
     Jpeg = #{ <<"content-type">> => <<"image/jpeg">> },
-    %% Each case fetches a live item from arweave.net; running the five
+    %% Each case fetches a live item from arweave.net; running the six
     %% cases in parallel cuts the wall time to roughly the slowest fetch.
     Cases =
         [
@@ -376,7 +476,9 @@ offset_item_cases_test() ->
             {<<"160399273000000">>, 498852, Png},
             %% A megabyte reference to the item, occurring in the middle.
             {<<"160399273m">>, 498852, Png},
-            {<<"384600234780716">>, 856691, Jpeg}
+            {<<"384600234780716">>, 856691, Jpeg},
+            %% An item whose header runs past the end of its first chunk.
+            {<<"376836294221800">>, 480, #{}}
         ],
     hb_pmap:parallel_map(
         Cases,
@@ -399,7 +501,12 @@ offset_nested_item_test() ->
         ),
     {ItemStartOffset, _ItemSize} =
         bundle_message_offset_from_tx(TXID, [1, 2], Opts),
-    assert_offset_matches(hb_util:bin(ItemStartOffset + 1), Expected, Opts).
+    assert_offset_matches(hb_util:bin(ItemStartOffset + 1), Expected, Opts),
+    % The last byte of item 1's bundle index gives item 1.
+    {FirstMemberOffset, _} = bundle_message_offset_from_tx(TXID, [1, 1], Opts),
+    {ok, Bundle} =
+        hb_http:get(Node, <<"/~arweave@2.9/tx=", TXID/binary, "/1">>, Opts),
+    assert_offset_matches(hb_util:bin(FirstMemberOffset - 1), Bundle, Opts).
 
 assert_offset_item(Path, DataSize, Tags, Opts) ->
     {ok, Item} = hb_ao:resolve(#{ <<"device">> => <<"arweave@2.9">> }, Path, Opts),
@@ -427,7 +534,7 @@ assert_offset_matches(Path, Expected, Opts) ->
     TX = hb_message:convert(Item, <<"ans104@1.0">>, <<"structured@1.0">>, Opts),
     ?assert(hb_message:verify(Item, all, Opts)),
     ?assertEqual(
-        hb_message:id(Expected, signed, Opts),
+        hb_message:id(Expected, hb_message:signers(Item, Opts), Opts),
         hb_message:id(Item, signed, Opts)
     ),
     ?assertEqual(ExpectedTX#tx.data_size, TX#tx.data_size),

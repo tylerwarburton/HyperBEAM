@@ -6,7 +6,7 @@
 %%%
 %%% The `application/json' format is a legacy format that is not recommended for
 %%% new integrations of the AO protocol.
--module(dev_scheduler_formats).
+-module(lib_scheduler_formats).
 -export([assignments_to_bundle/4, assignments_to_aos2/4]).
 -export([aos2_to_assignments/3, aos2_to_assignment/2]).
 -export([aos2_normalize_types/1]).
@@ -26,17 +26,19 @@ assignments_to_bundle(ProcID, Assignments, More, TimeInfo, RawOpts) ->
         <<"continues">> => hb_util:atom(More),
         <<"timestamp">> => hb_util:int(Timestamp),
         <<"block-height">> => hb_util:int(Height),
-        <<"block-hash">> => hb_util:human_id(Hash),
+        <<"block-hash">> => Hash,
         <<"assignments">> =>
             hb_message:normalize_commitments(
                 hb_maps:from_list(
                     lists:map(
                         fun(Assignment) ->
                             {
-                                hb_ao:get(
-                                    <<"slot">>,
-                                    Assignment,
-                                    Opts#{ <<"hashpath">> => ignore }
+                                hb_ao:normalize_key(
+                                    hb_ao:get(
+                                        <<"slot">>,
+                                        Assignment,
+                                        Opts#{ <<"hashpath">> => ignore }
+                                    )
                                 ),
                                 Assignment
                             }
@@ -67,7 +69,7 @@ assignments_to_aos2(ProcID, Assignments, More, RawOpts) ->
                     <<"has_next_page">> => More,
                     <<"timestamp">> => list_to_binary(integer_to_list(Timestamp)),
                     <<"block-height">> => list_to_binary(integer_to_list(Height)),
-                    <<"block-hash">> => hb_util:human_id(Hash)
+                    <<"block-hash">> => Hash
                 },
             <<"edges">> =>
                 lists:map(
@@ -150,7 +152,6 @@ aos2_to_assignments(ProcID, Body, RawOpts) ->
     assignments_to_bundle(ProcID, ParsedAssignments, false, TimeInfo, Opts).
 
 %% @doc Create and normalize an assignment from an AOS2-style JSON structure.
-%% NOTE: This method is destructive to the verifiability of the assignment.
 aos2_to_assignment(A, RawOpts) ->
     Opts = format_opts(RawOpts),
     % Unwrap the node if it is provided. Handle GraphQL-style responses with edges.
@@ -165,11 +166,7 @@ aos2_to_assignment(A, RawOpts) ->
     ?event({node, Node}),
     AssignmentData = hb_maps:get(<<"assignment">>, Node, undefined, Opts),
     ?event({assignment_data, AssignmentData}),
-    {ok, Assignment} =
-        hb_client_gateway:result_to_message(
-            aos2_normalize_data(AssignmentData),
-            Opts
-        ),
+    {ok, Assignment} = aos2_to_message(AssignmentData, Opts),
     ?event({result_assignment, Assignment}),
     NormalizedAssignment = aos2_normalize_types(Assignment),
     {ok, Message} =
@@ -192,13 +189,29 @@ aos2_to_assignment(A, RawOpts) ->
                         )
                 end;
             Body ->
-                hb_client_gateway:result_to_message(
-                    aos2_normalize_data(Body),
-                    Opts
-                )
+                aos2_to_message(Body, Opts)
         end,
     ?event({message, Message}),
     NormalizedAssignment#{ <<"body">> => Message }.
+
+%% @doc Read the original by ID when the legacy SU's JSON cannot verify.
+aos2_to_message(JSON, Opts) ->
+    Result =
+        try hb_client_gateway:result_to_message(aos2_normalize_data(JSON), Opts)
+        catch throw:{invalid_field, anchor, _} -> {error, unverifiable_item}
+        end,
+    case Result of
+        {error, unverifiable_item} ->
+            ID = hb_maps:get(<<"id">>, JSON, Opts),
+            {ok, Cached} = hb_cache:read(ID, Opts),
+            Msg = hb_message:with_commitments(ID, Cached, Opts),
+            true = hb_message:signers(Msg, Opts) =/= [],
+            true = hb_message:verify(
+                Msg, #{ <<"ids">> => [ID] }, Opts
+            ),
+            hb_message:with_only_committed(Msg, Opts);
+        _ -> Result
+    end.
 
 %% @doc The `hb_client_gateway' module expects all JSON structures to at least
 %% have a `data' field. This function ensures that.
@@ -208,22 +221,13 @@ aos2_normalize_data(JSONStruct) ->
         _ -> JSONStruct#{ <<"data">> => <<>> }
     end.
 
-%% @doc Normalize an AOS2 formatted message to ensure that all field NAMES and
-%% types are correct. This involves converting field names to integers and
-%% specific field names to their canonical form.
-%% NOTE: This will result in a message that is not verifiable! It is, however,
-%% necessary for gaining compatibility with the AOS2-style scheduling API.
-aos2_normalize_types(Msg = #{ <<"timestamp">> := TS }) when is_binary(TS) ->
-    aos2_normalize_types(Msg#{ <<"timestamp">> => hb_util:int(TS) });
+%% @doc Add the slot and missing block hash for the AOS2-style scheduling API,
+%% retaining signed field values.
 aos2_normalize_types(Msg = #{ <<"nonce">> := Nonce })
         when is_binary(Nonce) and not is_map_key(<<"slot">>, Msg) ->
     aos2_normalize_types(
         Msg#{ <<"slot">> => hb_util:int(Nonce) }
     );
-aos2_normalize_types(Msg = #{ <<"epoch">> := DS }) when is_binary(DS) ->
-    aos2_normalize_types(Msg#{ <<"epoch">> => hb_util:int(DS) });
-aos2_normalize_types(Msg = #{ <<"slot">> := Slot }) when is_binary(Slot) ->
-    aos2_normalize_types(Msg#{ <<"slot">> => hb_util:int(Slot) });
 aos2_normalize_types(Msg) when not is_map_key(<<"block-hash">>, Msg) ->
     ?event({missing_block_hash, Msg}),
     aos2_normalize_types(Msg#{ <<"block-hash">> => hb_util:encode(<<0:256>>) });

@@ -59,7 +59,7 @@
 %%%     `Input-Prefix': The prefix that the device should use for its outputs
 %%%     and inputs.
 %%%
-%%%     `Output-Prefix': The device that was previously executed.
+%%%     `Output-Prefix': The prefix that the device should use for its outputs.
 %%%
 %%% All counters used by the stack are initialized to 1.
 %%%
@@ -97,14 +97,15 @@
 %%% In this example, the `device' key is mutated a number of times, but the
 %%% resulting HashPath remains correct and verifiable.
 -module(dev_stack).
--export([info/2, router/4, prefix/3, input_prefix/3, output_prefix/3]).
+-specification("../../../specs/stack@1.0.md").
+-export([device_info/2, router/4, prefix/3, input_prefix/3, output_prefix/3]).
 %%% Test exports
 -export([generate_append_device/1]).
 -include_lib("eunit/include/eunit.hrl").
 
 -include("include/hb.hrl").
 
-info(Msg, Opts) ->
+device_info(Msg, Opts) ->
     hb_maps:merge(
         #{
             handler => fun router/4,
@@ -117,20 +118,37 @@ info(Msg, Opts) ->
     ).
 
 %% @doc Return the default prefix for the stack.
+-spec prefix(
+    #{ 'output-prefix' => binary(), _ => _ },
+    #{ _ => _ },
+    #{ _ => _ }
+) -> binary().
 prefix(Base, _Req, Opts) ->
     hb_ao:get(<<"output-prefix">>, {as, <<"message@1.0">>, Base}, <<"">>, Opts).
 
 %% @doc Return the input prefix for the stack.
+-spec input_prefix(
+    #{ 'input-prefix' => binary(), _ => _ },
+    #{ _ => _ },
+    #{ _ => _ }
+) -> binary().
 input_prefix(Base, _Req, Opts) ->
     hb_ao:get(<<"input-prefix">>, {as, <<"message@1.0">>, Base}, <<"">>, Opts).
 
 %% @doc Return the output prefix for the stack.
+-spec output_prefix(
+    #{ 'output-prefix' => binary(), _ => _ },
+    #{ _ => _ },
+    #{ _ => _ }
+) -> binary().
 output_prefix(Base, _Req, Opts) ->
     hb_ao:get(<<"output-prefix">>, {as, <<"message@1.0">>, Base}, <<"">>, Opts).
 
 %% @doc The device stack key router. Sends the request to `resolve_stack',
 %% except for `set/2' which is handled by the default implementation in
 %% `dev_message'.
+-spec router(binary(), #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, _} | {error, _}.
 router(<<"keys">>, Base, Request, Opts) ->
 	?event({keys_called, {base, Base}, {req, Request}}),
 	hb_ao:raw(<<"message@1.0">>, <<"keys">>, Base, #{}, Opts);
@@ -166,11 +184,11 @@ router(Base, Request, Opts) ->
 %% 		keyInDevice executed on DeviceName against Base.
 transformer_message(Base, Opts) ->
 	?event({creating_transformer, {for, Base}}),
-    BaseInfo = info(Base, Opts),
+    BaseInfo = device_info(Base, Opts),
 	{ok, 
 		Base#{
 			<<"device">> => #{
-				info =>
+				device_info =>
 					fun() ->
                         hb_maps:merge(
                             BaseInfo,
@@ -200,16 +218,14 @@ transform(Base, Key, Opts) ->
         StackMsg ->
 			% Find the requested key in the device stack.
             % TODO: Should we use `as dev_message` here? After the first transform
-            % of a fold (for example), the message is no longer a stack, so its 
+            % of a fold (for example), the message is not a stack, so its
             % `GET' behavior may be different.
             NormKey = hb_ao:normalize_key(Key),
 			case hb_ao:resolve(StackMsg, #{ <<"path">> => NormKey }, Opts) of
 				{ok, DevMsg} ->
 					% Set the:
 					% - Device key to the device we found.
-					% - Device-Stack-Previous key to the device we are replacing.
                     % - The prefixes for the device.
-                    % - The prior prefixes for later restoration.
 					?event({activating_device, DevMsg}),
 					hb_ao:raw(
                         <<"message@1.0">>,
@@ -231,26 +247,6 @@ transform(Base, Key, Opts) ->
                                     {as, <<"message@1.0">>, Base},
                                     undefined,
                                     Opts
-                                ),
-                            <<"previous-device">> =>
-                                hb_ao:get(
-                                    <<"device">>,
-                                    {as, <<"message@1.0">>, Base},
-                                    Opts
-                                ),
-                            <<"previous-input-prefix">> =>
-                                hb_ao:get(
-                                    <<"input-prefix">>,
-                                    {as, <<"message@1.0">>, Base},
-                                    undefined,
-                                    Opts
-                                ),
-                            <<"previous-output-prefix">> =>
-                                hb_ao:get(
-                                    <<"output-prefix">>,
-                                    {as, <<"message@1.0">>, Base},
-                                    undefined,
-                                    Opts
                                 )
 						},
                         Opts
@@ -267,6 +263,20 @@ resolve_fold(Base, Request, Opts) ->
 	{ok, InitDevMsg} = hb_maps:find(<<"device">>, Base, Opts),
     StartingPassValue =
         hb_ao:get(<<"pass">>, {as, <<"message@1.0">>, Base}, unset, Opts),
+    StartingInputPrefix =
+        hb_ao:get(
+            <<"input-prefix">>,
+            {as, <<"message@1.0">>, Base},
+            unset,
+            Opts
+        ),
+    StartingOutputPrefix =
+        hb_ao:get(
+            <<"output-prefix">>,
+            {as, <<"message@1.0">>, Base},
+            unset,
+            Opts
+        ),
     PreparedMessage = hb_ao:set(Base, <<"pass">>, 1, Opts),
     case resolve_fold(PreparedMessage, Request, 1, Opts) of
         {ok, Raw} when not is_map(Raw) ->
@@ -278,22 +288,9 @@ resolve_fold(Base, Request, Opts) ->
                 Result,
                 #{
                     <<"device">> => InitDevMsg,
-                    <<"input-prefix">> =>
-                        hb_ao:get(
-                            <<"previous-input-prefix">>,
-                            {as, <<"message@1.0">>, Result},
-                            undefined,
-                            Opts
-                        ),
-                    <<"output-prefix">> =>
-                        hb_ao:get(
-                            <<"previous-output-prefix">>,
-                            {as, <<"message@1.0">>, Result},
-                            undefined,
-                            Opts
-                        ),
+                    <<"input-prefix">> => StartingInputPrefix,
+                    <<"output-prefix">> => StartingOutputPrefix,
                     <<"device-key">> => unset,
-                    <<"device-stack-previous">> => unset,
                     <<"pass">> => StartingPassValue
                 },
                 Opts
@@ -329,6 +326,11 @@ resolve_fold(Base, Request, DevNum, Opts) ->
 				{error, Info} ->
 					?event({result, error, {dev, DevNum}, Info}),
 					maybe_error(Base, Request, DevNum, Info, Opts);
+				% A failure of the node running the stack is not a result of
+				% the computation, so it is passed on as it arrived.
+				{failure, Failure} ->
+					?event({result, failure, {dev, DevNum}, Failure}),
+					{failure, Failure};
 				Unexpected ->
 					?event({result, unexpected, {dev, DevNum}, Unexpected}),
 					maybe_error(
@@ -379,9 +381,10 @@ increment_pass(Message, Opts) ->
     ).
 
 maybe_error(Base, Request, DevNum, Info, Opts) ->
-    case hb_opts:get(error_strategy, throw, Opts) of
+    case hb_opts:get(error_strategy, stop, Opts) of
         stop ->
-			{error, {stack_call_failed, Base, Request, DevNum, Info}};
+			% The caller gets the device's error alone.
+			{error, Info};
         throw ->
 			erlang:raise(
                 error,
@@ -443,7 +446,7 @@ transform_external_call_device_test() ->
 			#{
 				<<"make-cool">> =>
 					#{
-						info =>
+						device_info =>
 							fun() ->
 								#{
 									handler =>
@@ -617,7 +620,12 @@ output_prefix_test() ->
     ?assertMatch(1,
         hb_ao:get(<<"out1/example">>, {as, <<"message@1.0">>, Ex2Res}, #{})),
     ?assertMatch(1,
-        hb_ao:get(<<"out2/example">>, {as, <<"message@1.0">>, Ex2Res}, #{})).
+        hb_ao:get(<<"out2/example">>, {as, <<"message@1.0">>, Ex2Res}, #{})),
+    % The fold adds only the devices' outputs to the base's keys.
+    ?assertEqual(
+        lists:sort([<<"out1">>, <<"out2">> | hb_maps:keys(Base, #{})]),
+        lists:sort(hb_ao:keys(Ex2Res, #{}))
+    ).
 
 input_and_output_prefixes_test() ->
     Base =

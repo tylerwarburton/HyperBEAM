@@ -70,7 +70,6 @@ HyperBEAM uses a `config.flat` file for configuration when running as a release.
     ```
     port: 10001
     priv_key_location: /path/to/your/wallet.json
-    # Add other configurations as needed
     ```
     Ensure the `priv_key_location` points to the correct path of your Arweave wallet key file.
 

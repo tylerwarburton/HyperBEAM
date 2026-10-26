@@ -33,7 +33,7 @@ end
 function ao_resolve()
     local status, res =
         ao.resolve({
-            path = "/hello",
+            path = "//hello",
             hello = "Hello, AO world!"
         })
     return res
@@ -160,4 +160,36 @@ function inc(base, req, opts)
     base.count = base.count or 0
     base.count = base.count + 1
     return base
+end
+--- @function ao_get_as_missing
+--- @error the library call into the node throws, as the message it reads
+--- is not on this node
+function ao_get_as_missing()
+    return ao.get("data", {"as", "message@1.0",
+        "ao:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"})
+end
+--- @function ao_set_float_key
+--- @return the values of `pcall` of a library call whose argument has a key
+--- with no normalized form, a bad argument of the script
+function ao_set_float_key()
+    return { pcall(ao.set, {}, { [1.5] = "x" }) }
+end
+--- @function ao_set_nil
+--- @return the type of what `ao.get` gives for a key that `ao.set` sets to
+--- nil
+function ao_set_nil()
+    return type(ao.get("a", ao.set({ a = 1 }, "a", nil)))
+end
+--- @function commitment_count
+--- @return the number of commitments of the message that the function is
+--- called on
+function commitment_count(base)
+    local count = 0
+    for _ in pairs(base.commitments or {}) do count = count + 1 end
+    return count
+end
+--- @function float_key_result
+--- @return a table with a float key, which has no AO-Core form
+function float_key_result()
+    return { [1.5] = "x" }
 end

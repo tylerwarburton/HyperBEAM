@@ -10,7 +10,7 @@
 %%%     name   = any bytes except `:' and `,'; `_' alone is padding
 %%%     size   = a positive decimal bit count | "_"
 %%% '''
-%%% For example, `_:77,start:49+integer,length:34+integer' names the two
+%%% For example, `_:77,start:49+integer,length:34+integer' decodes the two
 %%% trailing fields of a 160-bit row and discards its leading 77 bits, and
 %%% `repeat(start:64+integer,end:64+integer)' reads a body as consecutive
 %%% 128-bit records, decoding to the list of their messages in order. A
@@ -25,7 +25,7 @@
 %%% keeps the last field's value). `integer' fields decode as unsigned
 %%% big-endian integers of their bit size; `float' fields as IEEE floats of
 %%% 16, 32 or 64 bits; `atom' fields as the atom whose UTF-8 name fills the
-%%% field, at byte-multiple sizes; `enum' fields as the member named by the
+%%% field, at byte-multiple sizes; `enum' fields as the member given by the
 %%% field's unsigned integer value, zero-indexed, returned as a binary;
 %%% untyped fields decode as bitstrings, byte-aligned only when their size
 %%% is a multiple of eight. A final untyped field may use `_' to take
@@ -47,9 +47,14 @@
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
-%% @doc Decode the base message's body into a message of the fields named by
+%% @doc Decode the base message's body into a message of the fields in
 %% the format given as the key's argument, or into a list of such messages
 %% for a `repeat(...)' format.
+-spec from(
+    #{ body => bitstring() },
+    #{ from => binary() },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ } | [#{ _ => _ }]} | {error, _}.
 from(Base, Req, Opts) ->
     maybe
         {ok, Body} ?= find_body(Base, Opts),
@@ -94,6 +99,8 @@ decode_records(Fields, Record, Body, Records) ->
     end.
 
 %% @doc Return the leading N bits of the base message's body.
+-spec take(#{ body => bitstring() }, #{ take => pos_integer() }, #{ _ => _ }) ->
+    {ok, bitstring()} | {error, _}.
 take(Base, Req, Opts) ->
     maybe
         {ok, Body} ?= find_body(Base, Opts),
@@ -197,7 +204,10 @@ enum_field(Name, Size, Members) ->
             sized_field(
                 Name,
                 Size,
-                {enum, binary:split(Names, <<",">>, [global])}
+                % A tuple makes each record's member lookup constant-time.
+                {enum, list_to_tuple(
+                    binary:split(Names, <<",">>, [global])
+                )}
             );
         _ ->
             {error, {'invalid-format-type', <<"enum(", Members/binary>>}}
@@ -242,9 +252,10 @@ typed({enum, Members}, Bits) ->
     {ok, Index} = typed(integer, Bits),
     maybe
         true ?=
-            Index < length(Members)
-                orelse {error, {'invalid-enum-value', Index, Members}},
-        {ok, lists:nth(Index + 1, Members)}
+            Index < tuple_size(Members)
+                orelse {error,
+                    {'invalid-enum-value', Index, tuple_to_list(Members)}},
+        {ok, element(Index + 1, Members)}
     end.
 
 %%% Tests
@@ -427,13 +438,13 @@ from_repeat_enum_test() ->
 from_malformed_repeat_format_test() ->
     lists:foreach(
         fun(Format) ->
+            % The format is given as a key of the request, because a path
+            % with an unbalanced `(' is refused before the device can read it.
             ?assertMatch(
                 {error, _},
                 hb_ao:resolve(
-                    #{
-                        <<"path">> => <<"~bits@1.0/from=", Format/binary>>,
-                        <<"body">> => <<0>>
-                    },
+                    #{ <<"device">> => <<"bits@1.0">>, <<"body">> => <<0>> },
+                    #{ <<"path">> => <<"from">>, <<"from">> => Format },
                     #{}
                 )
             )

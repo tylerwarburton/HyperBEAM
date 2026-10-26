@@ -8,21 +8,18 @@
 %% Key features include:
 %% <ul>
 %%   <li>Asynchronous writes with batched transactions for performance</li>
-%%   <li>Automatic link resolution for creating symbolic references between keys</li>
-%%   <li>Group support for organizing hierarchical data structures</li>
 %%   <li>Prefix-based key listing for directory-like navigation</li>
 %%   <li>Process-local caching of database handles for efficiency</li>
 %% </ul>
 %%
 %% The module implements a dual-flush strategy: writes are accumulated in memory
 %% and flushed either after an idle timeout or when explicitly requested during
-%% read operations that encounter cache misses.
+%% list operations.
 -module(hb_store_lmdb).
 
 %% Public API exports
--export([start/3, stop/3, scope/0, scope/1, reset/3]).
+-export([start/3, stop/3, flush/3, scope/0, scope/1, reset/3]).
 -export([read/3, write/3, list/3, match/3]).
--export([group/3, link/3, type/3, resolve/3]).
 
 %% Test framework and project includes
 -include_lib("eunit/include/eunit.hrl").
@@ -30,8 +27,11 @@
 
 %% Configuration constants with reasonable defaults
 -define(DEFAULT_SIZE, 2 * 1024 * 1024 * 1024 * 1024). % 2TiB default database size
--define(DEFAULT_BATCH_SIZE, 5_000).             % Flush keys on every read or 
+-define(DEFAULT_BATCH_SIZE, 5_000).             % Flush keys on every list or
                                                 % every 5,000 write operations.
+-define(DEFAULT_FLUSH_EVERY, 1_000).            % Commit buffered writes at
+                                                % least every second.
+-define(MAX_KEY_SIZE, 511).                     % LMDB's key size limit, bytes.
 
 %% @doc Start the LMDB storage system for a given database configuration.
 %%
@@ -61,9 +61,12 @@ start(Opts = #{ <<"name">> := DataDir }, _Req, _NodeOpts) ->
                 batch_size,
                 hb_util:int(maps:get(<<"batch-size">>, Opts, ?DEFAULT_BATCH_SIZE))
             },
-            no_mem_init,
-            no_sync
+            no_mem_init
         ] ++
+        case maps:get(<<"sync">>, Opts, false) of
+            true -> [];
+            false -> [no_sync]
+        end ++
         case maps:get(<<"read-ahead">>, Opts, true) of
             true -> [];
             false -> [no_readahead]
@@ -83,9 +86,38 @@ start(Opts = #{ <<"name">> := DataDir }, _Req, _NodeOpts) ->
     % Create the LMDB environment with specified size limit
     {ok, Env} = elmdb:env_open(DataDirPath, EnvOpts),
     {ok, DBInstance} = elmdb:db_open(Env, [create]),
-    {ok, #{ <<"env">> => Env, <<"db">> => DBInstance }};
+    Instance = #{ <<"env">> => Env, <<"db">> => DBInstance },
+    start_flusher(Opts, Instance),
+    {ok, Instance};
 start(_Store, _Req, _NodeOpts) ->
     {error, {badarg, <<"StoreOpts must be a map">>}}.
+
+%% @doc Start the store's flusher, one process per store, which commits the
+%% writes that `elmdb' holds in memory every `flush-every' milliseconds, so that
+%% a crash of the node loses at most the writes of the last interval. A
+%% `flush-every' of 0 starts none, and a read-only store has no writes.
+start_flusher(Opts = #{ <<"name">> := DataDir }, Instance) ->
+    FlushEvery =
+        hb_util:int(maps:get(<<"flush-every">>, Opts, ?DEFAULT_FLUSH_EVERY)),
+    case maps:get(<<"read-only">>, Opts, false) orelse FlushEvery == 0 of
+        true -> ok;
+        false ->
+            hb_name:singleton(
+                {?MODULE, DataDir},
+                fun() -> flusher(Instance, FlushEvery) end
+            ),
+            ok
+    end.
+
+%% @doc Commit the store's buffered writes every `FlushEvery' milliseconds,
+%% until the store stops.
+flusher(Instance, FlushEvery) ->
+    receive
+        stop -> ok
+    after FlushEvery ->
+        commit(Instance),
+        flusher(Instance, FlushEvery)
+    end.
 
 %% @doc Ensure that the database directory exists.
 ensure_dir(DataDirPath) ->
@@ -93,70 +125,22 @@ ensure_dir(DataDirPath) ->
     % dummy one, else the final directory will not be created.
     filelib:ensure_dir(filename:join(DataDirPath, "dummy.mdb")).
 
-%% @doc Determine whether a key represents a simple value or composite group.
-%%
-%% This function reads the value associated with a key and examines its content
-%% to classify the entry type. Keys storing the literal binary "group" are
-%% considered composite (directory-like) entries, while all other values are
-%% treated as simple key-value pairs.
-%%
-%% This classification is used by higher-level HyperBeam components to understand
-%% the structure of stored data and provide appropriate navigation interfaces.
-%%
-%% @param Opts Database configuration map
-%% @param KeyReq Request of the form `#{<<"type">> => Key}`.
-%% @returns `{ok, composite}` for group entries, `{ok, simple}` for regular
-%%          values, or `{error, not_found}`.
-type(Opts, #{ <<"type">> := Key }, _NodeOpts) ->
-    KeyBin =
-        case is_binary(Key) of
-            true -> Key;
-            false -> hb_path:to_binary(Key)
-        end,
-    case read_resolved(Opts, KeyBin) of
-        {ok, _ResolvedKey, <<"group">>} -> {ok, composite};
-        {ok, _ResolvedKey, _Value} -> {ok, simple};
-        not_found -> {error, not_found}
-    end.
-
-%% @doc Write a key-value pair to the database asynchronously.
-%%
-%% Request maps are folded into individual writes and each entry is sent to the
-%% database server process immediately without waiting for the write to be
-%% committed to disk. The server accumulates writes in a transaction that is
-%% periodically flushed based on timing constraints or explicit flush requests.
-%%
-%% The asynchronous nature provides better performance for write-heavy workloads
-%% while the batching strategy ensures data consistency and reduces I/O overhead.
-%% However, recent writes may not be immediately visible to readers until the
-%% next flush occurs.
-%%
-%% @param Opts Database configuration map
-%% @param Req Either a request map of `Path => Value` pairs or an internal
-%%            `Path, Value` pair used while folding that map.
-%% @returns `ok` immediately on success, or an error tuple on failure
-write(#{ <<"read-only">> := true }, _Req, _NodeOpts) when is_map(_Req) ->
+%% @doc Write a request map of `Path => Value' pairs to the database as one
+%% batch. `elmdb' refuses the whole batch if a key is empty or longer than
+%% `?MAX_KEY_SIZE' bytes, and a read-only store refuses every write.
+write(#{ <<"read-only">> := true }, _Req, _NodeOpts) ->
     {error, not_found};
-write(Opts, Req, _NodeOpts) when is_map(Req) ->
-    maps:fold(
-        fun(Path, Value, ok) when is_binary(Path) ->
-            write(Opts, Path, Value);
-           (Path, Value, ok) ->
-            write(Opts, hb_path:to_binary(Path), Value);
-           (_Path, _Value, Error) ->
-            Error
-        end,
-        ok,
-        Req
-    );
-write(#{ <<"read-only">> := true }, _PathParts, _Value) ->
-    {error, not_found};
-write(Opts, PathParts, Value) when is_list(PathParts) ->
-    write(Opts, hb_store_utils:to_path(PathParts), Value);
-write(Opts, Path, Value) ->
+write(Opts, Req, _NodeOpts) ->
     #{ <<"db">> := DBInstance } = find_env(Opts),
-    ?event_debug({elmdb_write, {db, DBInstance}, {path, Path}, {value, Value}}),
-    case elmdb:put(DBInstance, Path, Value) of
+    Pairs =
+        maps:fold(
+            fun(Path, Value, Acc) when is_binary(Path) -> [{Path, Value} | Acc];
+               (Path, Value, Acc) -> [{hb_path:to_binary(Path), Value} | Acc]
+            end,
+            [],
+            Req
+        ),
+    case elmdb:put_batch(DBInstance, Pairs) of
         ok -> ok;
         {error, Type, Description} ->
             ?event(
@@ -166,51 +150,40 @@ write(Opts, Path, Value) ->
                     {description, Description}
                 }
             ),
-            retry
+            case Type of
+                % The database failed to commit earlier writes and refuses
+                % more. A restart would accept this one without committing it.
+                transaction_error -> {error, Type};
+                % `elmdb' refuses a batch with an empty or long key every time.
+                validation_error -> {error, Type};
+                _ -> retry
+            end
     end.
 
-%% @doc Read a value from the database by key, with automatic link resolution.
-%%
-%% This function attempts to read a value directly from the committed database.
-%% If the key is not found, it resolves links in the path and retries the read.
-%%
-%% The function automatically handles link resolution: if a stored value begins
-%% with the "link:" prefix, it extracts the target key and recursively reads
-%% from that location instead. This creates a symbolic link mechanism that
-%% allows multiple keys to reference the same underlying data.
-%%
-%% Link resolution is transparent to the caller and can chain through multiple
-%% levels of indirection, though care should be taken to avoid circular
-%% references.
+%% @doc Read a value from the database by key. If the key has no value, but
+%% has keys below it, we return those keys, each with its value if it has
+%% one.
 %%
 %% @param Opts Database configuration map
 %% @param PathReq Request of the form `#{<<"read">> => Path}`.
-%% @returns `{ok, Value}` on success, `{composite, Keys}` for groups, or
-%%          `{error, not_found}` on failure
+%% @returns `{ok, Value}` on success, `{composite, Children}` for a key with
+%%          keys below it, or `{error, not_found}` on failure
 read(Opts, #{ <<"read">> := Path }, _NodeOpts) when is_binary(Path) ->
     read_result(Opts, Path);
 read(Opts, #{ <<"read">> := Path }, _NodeOpts) ->
     read_result(Opts, hb_path:to_binary(Path)).
 
-%% A single `read_prefix' over the bare `Path' (no trailing slash) returns the
-%% marker row (key == `Path') alongside every descendant in one cursor scan, so
-%% the marker that classifies the entry — value, link, or group — arrives in the
-%% same seek as the children. Only a genuine miss (the key is absent and must be
-%% reached through an intermediate link) falls through to the resolver.
 read_result(Opts, Path) ->
     EnvOpts = ensure_env(Opts),
     StartTime = erlang:monotonic_time(),
     Result = 
-        case read_prefix_rows(EnvOpts, Path) of
-            {ok, Rows} ->
-                case prefix_read_result(EnvOpts, Path, Rows) of
-                    {error, not_found} -> read_prefix_miss(EnvOpts, Path);
-                    R -> R
-                end;
+        case read_key(EnvOpts, Path) of
+            {ok, Value} ->
+                {ok, Value};
+            {composite, Children} ->
+                {composite, Children};
             not_found ->
-                read_prefix_miss(EnvOpts, Path);
-            {error, _} = Error ->
-                Error;
+                {error, not_found};
             {error, Type, _} ->
                 {error, Type}
         end,
@@ -220,102 +193,25 @@ read_result(Opts, Path) ->
             {composite, _} -> hit;
             {error, not_found} -> miss;
             not_found -> miss;
-            _ -> unknown
+            _ -> error
         end,
     sample_metrics(EnvOpts, StartTime, MetricStatus),
     Result.
 
-%% The literal `Path' was not present in the scan. Resolve any intermediate
-%% links in the path and, if that yields a different key, retry the read against
-%% the resolved target. Content-addressed `data' keys never carry links, so they
-%% short-circuit straight to `not_found' without a resolver walk.
-read_prefix_miss(Opts, Path) ->
-    case hb_store_utils:is_data_path(Path) of
-        true ->
-            {error, not_found};
-        false ->
-            try
-                PathParts = binary:split(Path, <<"/">>, [global, trim_all]),
-                Read = fun(Key) -> read_direct(Opts, Key) end,
-                case hb_store_utils:resolve_path_links(Read, PathParts) of
-                    {ok, ResolvedPathParts} ->
-                        case hb_store_utils:to_path(ResolvedPathParts) of
-                            Path -> {error, not_found};
-                            ResolvedPath -> read_result(Opts, ResolvedPath)
-                        end;
-                    {error, _} ->
-                        {error, not_found}
-                end
-            catch
-                Class:Reason:Stacktrace ->
-                    ?event(error,
-                        {
-                            resolve_path_links_failed,
-                            {class, Class},
-                            {reason, Reason},
-                            {stacktrace, {trace, Stacktrace}},
-                            {path, Path}
-                        }
-                    ),
-                    {error, not_found}
-            end
-    end.
-
-read_resolved(#{<<"name">> := Name} = Opts, Path) ->
-    EnvOpts = ensure_env(Opts),
-    PathBin =
-        case is_binary(Path) of
-            true -> Path;
-            false -> hb_path:to_binary(Path)
-        end,
-    StartTime = erlang:monotonic_time(),
-    case do_read_resolved(EnvOpts, PathBin) of
-        {ok, _ResolvedPath, _Value} = Result ->
-            sample_metrics(Name, StartTime, hit),
-            Result;
+%% @doc Read a key's value, or the rows below it. We read the value with one
+%% `elmdb:get' of the key. For a key that has no value, we read the rows
+%% below it with one `elmdb:read_prefix' of the key and a `/', and return the
+%% key's immediate children, each with its value if it has one.
+read_key(EnvOpts, Path) ->
+    case read_direct(EnvOpts, Path) of
         not_found ->
-            sample_metrics(Name, StartTime, miss),
-            not_found
-    end.
-
-do_read_resolved(Opts, Path) ->
-    case read_with_links(Opts, Path) of
-        {ok, _ResolvedPath, _Value} = Result ->
-            Result;
-        not_found ->
-            case Path of
-                <<"data">> ->
-                    not_found;
-                <<"data/", _/binary>> ->
-                    not_found;
-                _ ->
-                    try
-                        PathParts = binary:split(Path, <<"/">>, [global, trim_all]),
-                        Read = fun(Key) -> read_direct(Opts, Key) end,
-                        Resolved =
-                            hb_store_utils:resolve_path_links(Read, PathParts),
-                        case Resolved of
-                            {ok, ResolvedPathParts} ->
-                                Target =
-                                    hb_store_utils:to_path(ResolvedPathParts),
-                                read_with_links(Opts, Target);
-                            {error, _} ->
-                                not_found
-                        end
-                    catch
-                        Class:Reason:Stacktrace ->
-                            ?event(error,
-                                {
-                                    resolve_path_links_failed,
-                                    {class, Class},
-                                    {reason, Reason},
-                                    {stacktrace, {trace, Stacktrace}},
-                                    {path, Path}
-                                }
-                            ),
-                            not_found
-                    end
-            end
+            Prefix = <<Path/binary, "/">>,
+            maybe
+                {ok, Rows} ?= read_prefix_rows(EnvOpts, Prefix),
+                {composite, hb_store_utils:immediate_children(Prefix, Rows)}
+            end;
+        Read ->
+            Read
     end.
 
 %% @doc Unified read function that handles LMDB reads with fallback to the
@@ -351,21 +247,6 @@ read_direct(DBInstance, Name, Path) ->
             Err
     end.
 
-%% @doc Read a value directly from the database with link resolution.
-%% This is the internal implementation that handles actual database reads.
-read_with_links(Opts, Path) ->
-    case read_direct(Opts, Path) of
-        {ok, Value} ->
-            case hb_store_utils:is_link(Value) of
-                {true, Link} -> 
-                    do_read_resolved(Opts, Link);
-                false ->
-                    {ok, Path, Value}
-            end;
-        not_found ->
-            not_found
-    end.
-
 %% @doc Return the scope of this storage backend.
 %%
 %% The LMDB implementation is always local-only and does not support distributed
@@ -396,9 +277,6 @@ scope(_) -> scope().
 %% not the full paths. For example, listing "colors/" will return ["red", "blue"]
 %% not ["colors/red", "colors/blue"].
 %%
-%% If the Path points to a link, the function resolves the link and lists
-%% the contents of the target directory instead.
-%%
 %% This is particularly useful for implementing hierarchical data organization
 %% and providing tree-like navigation interfaces in applications.
 %%
@@ -412,25 +290,29 @@ list(Opts, Req = #{ <<"list">> := Path }, _NodeOpts) ->
             true -> Path;
             false -> hb_path:to_binary(Path)
         end,
-    case read_resolved(EnvOpts, PathBin) of
-        {ok, ResolvedPath, <<"group">>} ->
-            list_children(EnvOpts, ResolvedPath, Req);
-        {ok, _ResolvedPath, _Value} ->
-            {error, not_found};
-        not_found ->
-            {error, not_found}
+    % An empty page with `from' may have started past the last key.
+    case list_children(EnvOpts, PathBin, Req) of
+        {ok, []} when is_map_key(<<"from">>, Req) ->
+            case list_children(EnvOpts, PathBin, #{ <<"limit">> => 1 }) of
+                {ok, []} -> {error, not_found};
+                {ok, _} -> {ok, []};
+                Error -> Error
+            end;
+        {ok, []} -> {error, not_found};
+        Result -> Result
     end.
 
-%% @doc The children of a group through the NIF's cursor: every one, or
-%% those the request names from its `from' in its direction, no more than
-%% its limit -- a batch being every child: LMDB reads a page at a time only
-%% from a key's fixed-size duplicate values, and the database holds none.
+%% @doc List the children of a path through the NIF's cursor: every one, or
+%% those the request selects from its `from' in its direction, no more than
+%% its limit. A `batch' uses the store's `list-batch-size' (default 256,
+%% minimum 2 for inclusive cursor progress), independently of the write
+%% flush threshold `batch-size'. An `all' request remains unbounded.
 list_children(Opts, ResolvedPath, Req) ->
     #{
         <<"from">> := From,
         <<"limit">> := Limit,
         <<"direction">> := Direction
-    } = hb_store_utils:list_request_bounds(Req),
+    } = hb_store_utils:list_request_bounds(Req, Opts),
     #{ <<"db">> := DBInstance } = find_env(Opts),
     Options =
         [ {from, From} || From =/= none ] ++
@@ -449,29 +331,6 @@ read_prefix_rows(Opts, Path) ->
         {error, not_found} -> not_found;
         not_found -> not_found;
         {error, _Type, _Description} = Error -> Error
-    end.
-
-%% Classify the first (marker) row of a bare-prefix scan. `read_prefix' returns
-%% keys in lexicographic order, so the row whose key equals `Path' — when it
-%% exists — always sorts ahead of the `Path/...' descendants and lands first.
-%% A `link:' marker chases its target, a `group' marker becomes a composite of
-%% its immediate children, and any other marker is a simple value. When no
-%% marker row is present the path is an implicit group: its descendants (if any)
-%% still resolve to a composite, otherwise the read is a miss.
-prefix_read_result(Opts, Path, [{Path, <<"link:", Link/binary>>} | _])
-        when byte_size(Link) > 0 ->
-    read_result(Opts, Link);
-prefix_read_result(_Opts, Path, [{Path, <<"group">>} | Rows]) ->
-    Prefix = hb_store_utils:child_prefix(Path),
-    {composite, hb_store_utils:immediate_children(Prefix, Rows)};
-prefix_read_result(_Opts, Path, [{Path, Value} | _]) ->
-    {ok, Value};
-prefix_read_result(_Opts, Path, Rows) ->
-    Prefix = hb_store_utils:child_prefix(Path),
-    Children = hb_store_utils:immediate_children(Prefix, Rows),
-    case {hb_store_utils:is_data_path(Path), Children} of
-        {false, [_ | _] = Children} -> {composite, Children};
-        _ -> {error, not_found}
     end.
 
 %% @doc Match a series of keys and values against the database. Returns 
@@ -499,145 +358,6 @@ match_patterns(DBInstance, Patterns) ->
         not_found -> {error, not_found}
     end.
 
-%% @doc Create a group entry that can contain other keys hierarchically.
-%%
-%% Groups in the HyperBeam system represent composite entries that can contain
-%% child elements, similar to directories in a filesystem. This function creates
-%% a group by storing the special value "group" at the specified key.
-%%
-%% The group mechanism allows applications to organize data hierarchically and
-%% provides semantic meaning that can be used by navigation and visualization
-%% tools to present appropriate user interfaces.
-%%
-%% Groups can be identified later using `type/3', which will return
-%% 'composite' for group entries versus 'simple' for regular key-value pairs.
-%%
-%% @param Opts Database configuration map
-%% @param GroupName Binary name for the group
-%% @returns Result of the write operation
-group(Opts, #{ <<"group">> := GroupName }, _NodeOpts) ->
-    case is_binary(GroupName) of
-        true -> write(Opts, GroupName, <<"group">>);
-        false -> write(Opts, hb_path:to_binary(GroupName), <<"group">>)
-    end.
-
-%% @doc Ensure all parent groups exist for a given path.
-%%
-%% This function creates the necessary parent groups for a path, similar to
-%% how filesystem stores use ensure_dir. For example, if the path is
-%% "a/b/c/file", it will ensure groups "a", "a/b", and "a/b/c" exist.
-%%
-%% @param Opts Database configuration map
-%% @param Path The path whose parents should exist
-%% @returns ok
--spec ensure_parent_groups(map(), binary() | [binary()]) -> ok.
-ensure_parent_groups(Opts, Path) when is_binary(Path) ->
-    ensure_parent_groups(Opts, [Path]);
-ensure_parent_groups(Opts, Paths) when is_list(Paths) ->
-    % Collect the unique set of ancestor group paths across all of the given
-    % paths, then create each at most once: a single existence check and write
-    % per group for the whole batch, rather than once per path. Links that share
-    % ancestors (e.g. every key of a message under its id) thus pay for their
-    % parent groups only once.
-    Groups =
-        lists:usort(
-            lists:foldl(
-                fun(Path, Acc) -> parent_group_paths(Path, Acc) end,
-                [],
-                Paths
-            )
-        ),
-    lists:foreach(
-        fun(GroupPath) ->
-            case read_direct(Opts, GroupPath) of
-                not_found -> write(Opts, GroupPath, <<"group">>);
-                {ok, _} -> ok
-            end
-        end,
-        Groups
-    ).
-
-%% @doc Collect the ancestor group paths of a single path onto an accumulator.
-parent_group_paths(Path, Acc) ->
-    case binary:split(Path, <<"/">>, [global]) of
-        [_] -> Acc;
-        Parts -> prefix_group_paths(lists:droplast(Parts), [], Acc)
-    end.
-
-prefix_group_paths([], _Current, Acc) ->
-    Acc;
-prefix_group_paths([Next | Rest], Current, Acc) ->
-    NewCurrent = Current ++ [Next],
-    Path = hb_store_utils:to_path(NewCurrent),
-    prefix_group_paths(Rest, NewCurrent, [Path | Acc]).
-
-%% @doc Create a symbolic link from a new key to an existing key.
-%%
-%% This function implements a symbolic link mechanism by storing a special
-%% "link:" prefixed value at the new key location. When the new key is read,
-%% the system will automatically resolve the link and return the value from
-%% the target key instead.
-%%
-%% Links provide a way to create aliases, shortcuts, or alternative access
-%% paths to the same underlying data without duplicating storage. They can
-%% be chained together to create complex reference structures, though care
-%% should be taken to avoid circular references.
-%%
-%% The link resolution happens transparently during read operations, making
-%% links invisible to most application code while providing powerful
-%% organizational capabilities.
-%%
-%% @param StoreOpts Database configuration map
-%% @param Existing The key that already exists and contains the target value
-%% @param New The new key that should link to the existing key
-%% @returns Result of the write operation
-link(Opts, Req, _NodeOpts) when is_map(Req) ->
-    % Resolve every link to a binary `New => "link:Existing"' value. The parent
-    % groups of all the links are created once for the whole batch (de-duplicated
-    % across links that share ancestors) rather than re-checked for every link.
-    Links =
-        maps:fold(
-            fun(New, Existing, Acc) ->
-                Acc#{
-                    hb_path:to_binary(New) =>
-                        <<"link:", (hb_path:to_binary(Existing))/binary>>
-                }
-            end,
-            #{},
-            Req
-        ),
-    ensure_parent_groups(Opts, maps:keys(Links)),
-    write(Opts, Links, #{});
-link(#{ <<"read-only">> := true }, _Existing, _New) ->
-    {error, not_found};
-link(Opts, Existing, New) when is_list(Existing) ->
-    link(Opts, hb_store_utils:to_path(Existing), New);
-link(Opts, Existing, New) ->
-   ExistingBin = hb_util:bin(Existing),
-   ensure_parent_groups(Opts, hb_path:to_binary(New)),
-   write(Opts, hb_path:to_binary(New), <<"link:", ExistingBin/binary>>).
-
-%% @doc Resolve a path by following any symbolic links.
-%%
-%% For LMDB, we handle links through our own "link:" prefix mechanism.
-%% This function resolves link chains in paths, similar to filesystem symlink resolution.
-%% It's used by the cache to resolve paths before type checking and reading.
-%%
-%% @param StoreOpts Database configuration map
-%% @param Path The path to resolve (binary or list)
-%% @returns The resolved path as a binary
-resolve(Opts, #{ <<"resolve">> := Path }, _NodeOpts) ->
-    PathBin = hb_path:to_binary(Path),
-    case hb_store_utils:resolve_path_links(
-        fun(Key) -> read_direct(Opts, Key) end,
-        binary:split(PathBin, <<"/">>, [global])
-    ) of
-        {ok, ResolvedParts} ->
-            {ok, hb_store_utils:to_path(ResolvedParts)};
-        {error, _} ->
-            {ok, PathBin}
-    end.
-
 %% @doc Retrieve or create the LMDB environment handle for a database.
 find_env(Opts = #{ <<"db">> := _ }) -> Opts;
 find_env(Opts) -> hb_store:find(Opts).
@@ -647,11 +367,58 @@ ensure_env(Opts) -> maps:merge(Opts, find_env(Opts)).
 
 %% Shutdown LMDB environment and cleanup resources
 stop(#{ <<"store-module">> := ?MODULE, <<"name">> := DataDir }, _Req, _Opts) ->
+    stop_flusher(DataDir),
     % Soft-close by name; refs stay valid and reopen lazily on next access.
     catch elmdb:env_close_by_name(hb_util:list(DataDir)),
     ok;
 stop(_InvalidStoreOpts, _Req, _Opts) ->
     ok.
+
+%% @doc Stop the store's flusher and wait for it to exit, as a flush after the
+%% environment closes would open it again.
+stop_flusher(DataDir) ->
+    case hb_name:lookup({?MODULE, DataDir}) of
+        undefined -> ok;
+        PID ->
+            Ref = erlang:monitor(process, PID),
+            PID ! stop,
+            receive {'DOWN', Ref, process, PID, _} -> ok end
+    end.
+
+%% @doc Commit the writes that `elmdb' holds in memory, and sync them to disk.
+%% `elmdb:put_batch/2' returns before its writes are committed: writes are
+%% committed in batches of `batch-size', and a halt of the node before then
+%% loses them. A store with `sync' set to `true' syncs every commit to disk.
+%% Any other store commits to the OS page cache only, and a loss of power can
+%% lose its commits since the last flush.
+flush(Opts = #{ <<"sync">> := true }, _Req, _NodeOpts) ->
+    commit(find_env(Opts));
+flush(Opts, _Req, _NodeOpts) ->
+    Instance = #{ <<"env">> := Env } = find_env(Opts),
+    maybe
+        ok ?= commit(Instance),
+        lmdb_result(elmdb:env_sync(Env))
+    end.
+
+%% @doc Commit the writes that `elmdb' holds in memory.
+commit(#{ <<"db">> := DBInstance }) ->
+    lmdb_result(elmdb:flush(DBInstance)).
+
+%% @doc Normalize the result of an `elmdb' call. `ok' is returned as is. An
+%% error is logged and returned as `{error, Type}'.
+lmdb_result(Result) ->
+    case Result of
+        ok -> ok;
+        {error, Type, Description} ->
+            ?event(
+                error,
+                {lmdb_error,
+                    {type, Type},
+                    {description, Description}
+                }
+            ),
+            {error, Type}
+    end.
 
 %% @doc Completely delete the database directory and all its contents.
 %%
@@ -709,9 +476,8 @@ init_prometheus() ->
 %% @doc Test suite demonstrating basic store operations.
 %%
 %% The following functions implement unit tests using EUnit to verify that
-%% the LMDB store implementation correctly handles various scenarios including
-%% basic read/write operations, hierarchical listing, group creation, link
-%% resolution, and type detection.
+%% the LMDB store implementation correctly handles basic read/write operations
+%% and hierarchical listing.
 
 test_reset(StoreOpts) ->
     reset(StoreOpts, #{}, #{}).
@@ -719,42 +485,14 @@ test_reset(StoreOpts) ->
 test_stop(StoreOpts) ->
     stop(StoreOpts, #{}, #{}).
 
-test_group(StoreOpts, Path) ->
-    write(StoreOpts, hb_path:to_binary(Path), <<"group">>).
-
-test_link(StoreOpts, Existing, New) ->
-    link(StoreOpts, Existing, New).
-
-test_type(StoreOpts, Path) ->
-    case read_resolved(StoreOpts, hb_path:to_binary(Path)) of
-        {ok, _ResolvedPath, <<"group">>} -> composite;
-        {ok, _ResolvedPath, _Value} -> simple;
-        not_found -> not_found
-    end.
-
 test_read(StoreOpts, Path) ->
-    case read_resolved(StoreOpts, hb_path:to_binary(Path)) of
-        {ok, _ResolvedPath, <<"group">>} -> not_found;
-        {ok, _ResolvedPath, Value} -> {ok, Value};
-        not_found -> not_found
-    end.
+    read_direct(StoreOpts, hb_path:to_binary(Path)).
 
 test_list(StoreOpts, Path) ->
-    PathBin = hb_path:to_binary(Path),
-    ResolvedPath =
-        case read_direct(StoreOpts, PathBin) of
-            {ok, Value} ->
-                case hb_store_utils:is_link(Value) of
-                    {true, Link} -> Link;
-                    false -> PathBin
-                end;
-            not_found ->
-                PathBin
-        end,
-    list_children(StoreOpts, ResolvedPath, #{}).
+    list_children(StoreOpts, hb_path:to_binary(Path), #{}).
 
 test_write(StoreOpts, Path, Value) ->
-    ok = write(StoreOpts, Path, Value),
+    ok = write(StoreOpts, #{ Path => Value }, #{}),
     ok.
 
 %% @doc Basic store test - verifies fundamental read/write functionality.
@@ -774,6 +512,19 @@ basic_test() ->
     ?assertEqual(Value, <<"World2">>),
     ok = test_stop(StoreOpts).
 
+%% @doc A 511-byte key is written, a 512-byte key returns an error, and the
+%% store still reads the first key afterwards.
+long_key_test() ->
+    StoreOpts = hb_test_utils:test_store(?MODULE),
+    MaxKey = binary:copy(<<"k">>, ?MAX_KEY_SIZE),
+    ?assertEqual(ok, write(StoreOpts, #{ MaxKey => <<"held">> }, #{})),
+    ?assertEqual(
+        {error, validation_error},
+        write(StoreOpts, #{ <<MaxKey/binary, "k">> => <<"refused">> }, #{})
+    ),
+    ?assertEqual({ok, <<"held">>}, test_read(StoreOpts, MaxKey)),
+    ok = test_stop(StoreOpts).
+
 %% @doc List test - verifies prefix-based key listing functionality.
 %%
 %% This test creates several keys with hierarchical names and verifies that
@@ -783,6 +534,7 @@ list_test() ->
     StoreOpts = #{
         <<"store-module">> => ?MODULE,
         <<"name">> => <<"/tmp/store-2">>,
+        <<"list-batch-size">> => 2,
         <<"capacity">> => ?DEFAULT_SIZE
     },
     test_reset(StoreOpts),
@@ -808,6 +560,19 @@ list_test() ->
     % Should NOT include deeply nested items like foo, bar, deep, value
     ExpectedChildren = [<<"blue">>, <<"green">>, <<"multi">>, <<"nested">>, <<"primary">>, <<"red">>],
     ?assert(lists:all(fun(Key) -> lists:member(Key, ExpectedChildren) end, ListResult)),
+    % Batches are bounded in both directions; explicit limits remain independent.
+    lists:foreach(
+        fun({Limit, Direction, Expected}) ->
+            ?assertEqual({ok, Expected}, list(StoreOpts, #{
+                <<"list">> => <<"colors">>, <<"from">> => <<"multi">>,
+                <<"limit">> => Limit, <<"direction">> => Direction
+            }, #{}))
+        end,
+        [{batch, asc, [<<"multi">>, <<"nested">>]},
+            {batch, desc, [<<"multi">>, <<"green">>]},
+            {1, asc, [<<"multi">>]},
+            {all, asc, [<<"multi">>, <<"nested">>, <<"primary">>, <<"red">>]}]
+    ),
     % Test listing a nested directory - should only show immediate children
     {ok, NestedListResult} = test_list(StoreOpts, <<"colors/multi">>),
     ?event_debug({nested_list_result, NestedListResult}),
@@ -818,137 +583,6 @@ list_test() ->
     ?event_debug({deep_list_result, DeepListResult}),
     ExpectedDeepChildren = [<<"deep">>],
     ?assert(lists:all(fun(Key) -> lists:member(Key, ExpectedDeepChildren) end, DeepListResult)),
-    ok = test_stop(StoreOpts).
-
-%% @doc Group test - verifies group creation and type detection.
-%%
-%% This test creates a group entry and verifies that it is correctly identified 
-%% as a composite type and cannot be read directly (like filesystem directories).
-group_test() ->
-    StoreOpts = #{
-        <<"store-module">> => ?MODULE,
-        <<"name">> => <<"/tmp/store3">>,
-        <<"capacity">> => ?DEFAULT_SIZE
-    },
-    test_reset(StoreOpts),
-    test_group(StoreOpts, <<"colors">>),
-    % Groups should be detected as composite types
-    ?assertEqual(composite, test_type(StoreOpts, <<"colors">>)),
-    % Groups should not be readable directly (like directories in filesystem)
-    ?assertEqual(not_found, test_read(StoreOpts, <<"colors">>)).
-
-%% @doc Link test - verifies symbolic link creation and resolution.
-%%
-%% This test creates a regular key-value pair, creates a link pointing to it,
-%% and verifies that reading from the link location returns the original value.
-%% This demonstrates the transparent link resolution mechanism.
-link_test() ->
-    StoreOpts = hb_test_utils:test_store(?MODULE),
-    test_reset(StoreOpts),
-    test_write(StoreOpts, <<"foo/bar/baz">>, <<"Bam">>),
-    test_link(StoreOpts, <<"foo/bar/baz">>, <<"foo/beep/baz">>),
-    {ok, Result} = test_read(StoreOpts, <<"foo/beep/baz">>),
-    ?event_debug({ result, Result}),
-    ?assertEqual(<<"Bam">>, Result).
-
-link_fragment_test() ->
-    StoreOpts = hb_test_utils:test_store(?MODULE),
-    test_reset(StoreOpts),
-    test_write(StoreOpts, [<<"data">>, <<"bar">>, <<"baz">>], <<"Bam">>),
-    test_link(StoreOpts, [<<"data">>, <<"bar">>], <<"my-link">>),
-    {ok, Result} = test_read(StoreOpts, [<<"my-link">>, <<"baz">>]),
-    ?event_debug({ result, Result}),
-    ?assertEqual(<<"Bam">>, Result).
-
-%% @doc Type test - verifies type detection for both simple and composite entries.
-%%
-%% This test creates both a group (composite) entry and a regular (simple) entry,
-%% then verifies that the type detection function correctly identifies each one.
-%% This demonstrates the semantic classification system used by the store.
-type_test() ->
-    StoreOpts = hb_test_utils:test_store(?MODULE),
-    test_reset(StoreOpts),
-    test_group(StoreOpts, <<"assets">>),
-    Type = test_type(StoreOpts, <<"assets">>),
-    ?event_debug({type, Type}),
-    ?assertEqual(composite, Type),
-    test_write(StoreOpts, <<"assets/1">>, <<"bam">>),
-    Type2 = test_type(StoreOpts, <<"assets/1">>),
-    ?event_debug({type2, Type2}),
-    ?assertEqual(simple, Type2).
-
-%% @doc Link key list test - verifies symbolic link creation using structured key paths.
-%%
-%% This test demonstrates the store's ability to handle complex key structures
-%% represented as lists of binary segments, and verifies that symbolic links
-%% work correctly when the target key is specified as a list rather than a
-%% flat binary string.
-%%
-%% The test creates a hierarchical key structure using a list format (which
-%% presumably gets converted to a path-like binary internally), creates a
-%% symbolic link pointing to that structured key, and verifies that link
-%% resolution works transparently to return the original value.
-%%
-%% This is particularly important for applications that organize data in
-%% hierarchical structures where keys represent nested paths or categories,
-%% and need to create shortcuts or aliases to deeply nested data.
-link_key_list_test() ->
-    StoreOpts = hb_test_utils:test_store(?MODULE),
-    test_reset(StoreOpts),
-    test_write(StoreOpts, [ <<"parent">>, <<"key">> ], <<"value">>),
-    test_link(StoreOpts, [ <<"parent">>, <<"key">> ], <<"my-link">>),
-    {ok, Result} = test_read(StoreOpts, <<"my-link">>),
-    ?event_debug({result, Result}),
-    ?assertEqual(<<"value">>, Result).
-
-%% @doc Path traversal link test - verifies link resolution during path traversal.
-%%
-%% This test verifies that when reading a path as a list, intermediate path
-%% segments that are links get resolved correctly. For example, if "link" 
-%% is a symbolic link to "group", then reading ["link", "key"] should 
-%% resolve to reading ["group", "key"].
-%%
-%% This functionality enables transparent redirection at the directory level,
-%% allowing reorganization of hierarchical data without breaking existing
-%% access patterns.
-path_traversal_link_test() ->
-    StoreOpts = hb_test_utils:test_store(?MODULE),
-    test_reset(StoreOpts),
-    % Create the actual data at group/key
-    test_write(StoreOpts, [<<"group">>, <<"key">>], <<"target-value">>),
-    % Create a link from "link" to "group"
-    test_link(StoreOpts, <<"group">>, <<"link">>),
-    % Reading via the link path should resolve to the target value
-    {ok, Result} = test_read(StoreOpts, [<<"link">>, <<"key">>]),
-    ?event_debug({path_traversal_result, Result}),
-    ?assertEqual(<<"target-value">>, Result),
-    ok = test_stop(StoreOpts).
-
-%% @doc Test that matches the exact hb_store hierarchical test pattern
-exact_hb_store_test() ->
-    StoreOpts = hb_test_utils:test_store(?MODULE),
-    % Follow exact same pattern as hb_store test
-    ?event(step1_make_group),
-    test_group(StoreOpts, <<"test-dir1">>),
-    ?event(step2_write_file),
-    test_write(StoreOpts, [<<"test-dir1">>, <<"test-file">>], <<"test-data">>),
-    ?event(step3_make_link),
-    test_link(StoreOpts, [<<"test-dir1">>], <<"test-link">>),
-    % Debug: test that the link behaves like the target (groups are unreadable)
-    ?event(step4_check_link),
-    LinkResult = test_read(StoreOpts, <<"test-link">>),
-    ?event_debug({link_result, LinkResult}),
-    % Since test-dir1 is a group and groups are unreadable, the link should also be unreadable
-    ?assertEqual(not_found, LinkResult),
-    % Debug: test intermediate steps
-    ?event(step5_test_direct_read),
-    _DirectResult = test_read(StoreOpts, <<"test-dir1/test-file">>),
-    ?event_debug({direct_result, _DirectResult}),
-    % This should work: reading via the link path  
-    ?event(step6_test_link_read),
-    Result = test_read(StoreOpts, [<<"test-link">>, <<"test-file">>]),
-    ?event_debug({final_result, Result}),
-    ?assertEqual({ok, <<"test-data">>}, Result),
     ok = test_stop(StoreOpts).
 
 %% @doc Test cache-style usage through hb_store interface
@@ -964,218 +598,43 @@ cache_style_test() ->
     Result = hb_store:read(StoreOpts, <<"test-key">>, #{}),
     ?event_debug({cache_style_read_result, Result}),
     ?assertEqual({ok, <<"test-value">>}, Result),
+    % If the store's directory is replaced, as by a mount over it, a write
+    % goes to the new directory.
+    #{ <<"name">> := Dir } = StoreOpts,
+    ok = file:rename(Dir, <<Dir/binary, "-hidden">>),
+    ok = ensure_dir(Dir),
+    ok = hb_store:write(StoreOpts, #{ <<"mounted">> => <<"yes">> }, #{}),
+    ok = hb_store:flush(StoreOpts, #{}),
+    ok = hb_store:stop(StoreOpts),
+    ?assertEqual({ok, <<"yes">>}, hb_store:read(StoreOpts, <<"mounted">>, #{})),
     hb_store:stop(StoreOpts).
-
-%% @doc Test nested map storage with cache-like linking behavior
-%%
-%% This test demonstrates how to store a nested map structure where:
-%% 1. Each value is stored at data/{hash_of_value} 
-%% 2. Links are created to compose the values back into the original map structure
-%% 3. Reading the composed structure reconstructs the original nested map
-nested_map_cache_test() ->
-    StoreOpts = hb_test_utils:test_store(?MODULE),
-    % Clean up any previous test data
-    test_reset(StoreOpts),
-    % Original nested map structure
-    OriginalMap = #{
-        <<"target">> => <<"Foo">>,
-        <<"commitments">> => #{
-            <<"key1">> => #{
-              <<"alg">> => <<"rsa-pss-512">>,
-              <<"committer">> => <<"unique-id">>
-            },
-            <<"key2">> => #{
-              <<"alg">> => <<"hmac">>,
-              <<"commiter">> => <<"unique-id-2">>              
-            }
-        },
-        <<"other-key">> => #{
-            <<"other-key-key">> => <<"other-key-value">>
-        }
-    },
-    ?event_debug({original_map, OriginalMap}),
-    % Step 1: Store each leaf value at data/{hash}
-    TargetValue = <<"Foo">>,
-    TargetHash = base64:encode(crypto:hash(sha256, TargetValue)),
-    test_write(StoreOpts, <<"data/", TargetHash/binary>>, TargetValue),
-    AlgValue1 = <<"rsa-pss-512">>,
-    AlgHash1 = base64:encode(crypto:hash(sha256, AlgValue1)),
-    test_write(StoreOpts, <<"data/", AlgHash1/binary>>, AlgValue1),
-    CommitterValue1 = <<"unique-id">>,
-    CommitterHash1 = base64:encode(crypto:hash(sha256, CommitterValue1)),
-    test_write(StoreOpts, <<"data/", CommitterHash1/binary>>, CommitterValue1),
-    AlgValue2 = <<"hmac">>,
-    AlgHash2 = base64:encode(crypto:hash(sha256, AlgValue2)),
-    test_write(StoreOpts, <<"data/", AlgHash2/binary>>, AlgValue2),
-    CommitterValue2 = <<"unique-id-2">>,
-    CommitterHash2 = base64:encode(crypto:hash(sha256, CommitterValue2)),
-    test_write(StoreOpts, <<"data/", CommitterHash2/binary>>, CommitterValue2),
-    OtherKeyValue = <<"other-key-value">>,
-    OtherKeyHash = base64:encode(crypto:hash(sha256, OtherKeyValue)),
-    test_write(StoreOpts, <<"data/", OtherKeyHash/binary>>, OtherKeyValue),
-    % Step 2: Create the nested structure with groups and links
-    % Create the root group
-    test_group(StoreOpts, <<"root">>),
-    % Create links for the root level keys
-    test_link(StoreOpts, <<"data/", TargetHash/binary>>, <<"root/target">>),
-    % Create the commitments subgroup
-    test_group(StoreOpts, <<"root/commitments">>),
-    % Create the key1 subgroup within commitments
-    test_group(StoreOpts, <<"root/commitments/key1">>),
-    test_link(StoreOpts, <<"data/", AlgHash1/binary>>, <<"root/commitments/key1/alg">>),
-    test_link(StoreOpts, <<"data/", CommitterHash1/binary>>, <<"root/commitments/key1/committer">>),
-    % Create the key2 subgroup within commitments
-    test_group(StoreOpts, <<"root/commitments/key2">>),
-    test_link(StoreOpts, <<"data/", AlgHash2/binary>>, <<"root/commitments/key2/alg">>),
-    test_link(StoreOpts, <<"data/", CommitterHash2/binary>>, <<"root/commitments/key2/commiter">>),
-    % Create the other-key subgroup
-    test_group(StoreOpts, <<"root/other-key">>),
-    test_link(StoreOpts, <<"data/", OtherKeyHash/binary>>, <<"root/other-key/other-key-key">>),
-    % Step 3: Test reading the structure back
-    % Verify the root is a composite
-    ?assertEqual(composite, test_type(StoreOpts, <<"root">>)),
-    % List the root contents
-    {ok, RootKeys} = test_list(StoreOpts, <<"root">>),
-    ?event_debug({root_keys, RootKeys}),
-    ExpectedRootKeys = [<<"commitments">>, <<"other-key">>, <<"target">>],
-    ?assert(lists:all(fun(Key) -> lists:member(Key, ExpectedRootKeys) end, RootKeys)),
-    % Read the target directly
-    {ok, TargetValueRead} = test_read(StoreOpts, <<"root/target">>),
-    ?assertEqual(<<"Foo">>, TargetValueRead),
-    % Verify commitments is a composite
-    ?assertEqual(composite, test_type(StoreOpts, <<"root/commitments">>)),
-    % Verify other-key is a composite  
-    ?assertEqual(composite, test_type(StoreOpts, <<"root/other-key">>)),
-    % Step 4: Test programmatic reconstruction of the nested map
-    ReconstructedMap = reconstruct_map(StoreOpts, <<"root">>),
-    ?event_debug({reconstructed_map, ReconstructedMap}),
-    % Verify the reconstructed map matches the original structure
-    ?assert(hb_message:match(OriginalMap, ReconstructedMap)),
-    test_stop(StoreOpts).
-
-%% Helper function to recursively reconstruct a map from the store
-reconstruct_map(StoreOpts, Path) ->
-    case test_type(StoreOpts, Path) of
-        composite ->
-            % This is a group, reconstruct it as a map
-            {ok, ImmediateChildren} = test_list(StoreOpts, Path),
-            % The list function now correctly returns only immediate children
-            ?event_debug({path, Path, immediate_children, ImmediateChildren}),
-            maps:from_list([
-                {Key, reconstruct_map(StoreOpts, <<Path/binary, "/", Key/binary>>)}
-                || Key <- ImmediateChildren
-            ]);
-        simple ->
-            % This is a simple value, read it directly
-            {ok, Value} = test_read(StoreOpts, Path),
-            Value;
-        not_found ->
-            % Path doesn't exist
-            undefined
-    end.
-
-%% @doc Debug test to understand cache linking behavior
-cache_debug_test() ->
-    StoreOpts = hb_test_utils:test_store(?MODULE),
-    test_reset(StoreOpts),
-    % Simulate what the cache does:
-    % 1. Create a group for message ID
-    MessageID = <<"test_message_123">>,
-    test_group(StoreOpts, MessageID),
-    % 2. Store a value at data/hash
-    Value = <<"test_value">>,
-    ValueHash = base64:encode(crypto:hash(sha256, Value)),
-    DataPath = <<"data/", ValueHash/binary>>,
-    test_write(StoreOpts, DataPath, Value),
-    % 3. Calculate a key hashpath (simplified version)
-    KeyHashPath = <<MessageID/binary, "/", "key_hash_abc">>,
-    % 4. Create link from data path to key hash path
-    test_link(StoreOpts, DataPath, KeyHashPath),
-    % 5. Test what the cache would see:
-    ?event_debug(debug_cache_test, {step, check_message_type}),
-    _MsgType = test_type(StoreOpts, MessageID),
-    ?event_debug(debug_cache_test, {message_type, _MsgType}),
-    ?event_debug(debug_cache_test, {step, list_message_contents}),
-    {ok, _Subkeys} = test_list(StoreOpts, MessageID),
-    ?event_debug(debug_cache_test, {message_subkeys, _Subkeys}),
-    ?event_debug(debug_cache_test, {step, read_key_hashpath}),
-    _KeyHashResult = test_read(StoreOpts, KeyHashPath),
-    ?event_debug(debug_cache_test, {key_hash_read_result, _KeyHashResult}),
-    % 6. Test with path as list (what cache does):
-    ?event_debug(debug_cache_test, {step, read_path_as_list}),
-    PathAsList = [MessageID, <<"key_hash_abc">>],
-    _PathAsListResult = test_read(StoreOpts, PathAsList),
-    ?event_debug(debug_cache_test, {path_as_list_result, _PathAsListResult}),
-    test_stop(StoreOpts).
-
-%% @doc Isolated test focusing on the exact cache issue
-isolated_type_debug_test() ->
-    StoreOpts = hb_test_utils:test_store(?MODULE),
-    test_reset(StoreOpts),
-    % Create the exact scenario from user's description:
-    % 1. A message ID with nested structure
-    MessageID = <<"Base23">>,
-    test_group(StoreOpts, MessageID),
-    % 2. Create nested groups for "commitments" and "other-test-key"
-    CommitmentsPath = <<MessageID/binary, "/commitments">>,
-    OtherKeyPath = <<MessageID/binary, "/other-test-key">>,
-    ?event_debug(debug_isolated, {creating_nested_groups, CommitmentsPath, OtherKeyPath}),
-    test_group(StoreOpts, CommitmentsPath),
-    test_group(StoreOpts, OtherKeyPath),
-    % 3. Add some actual data within those groups
-    test_write(StoreOpts, <<CommitmentsPath/binary, "/sig1">>, <<"signature_data_1">>),
-    test_write(StoreOpts, <<OtherKeyPath/binary, "/sub_value">>, <<"nested_value">>),
-    % 4. Test type detection on the nested paths
-    ?event_debug(debug_isolated, {testing_main_message_type}),
-    _MainType = test_type(StoreOpts, MessageID),
-    ?event_debug(debug_isolated, {main_message_type, _MainType}),
-    ?event_debug(debug_isolated, {testing_commitments_type}),
-    _CommitmentsType = test_type(StoreOpts, CommitmentsPath),
-    ?event_debug(debug_isolated, {commitments_type, _CommitmentsType}),
-    ?event_debug(debug_isolated, {testing_other_key_type}),
-    _OtherKeyType = test_type(StoreOpts, OtherKeyPath),
-    ?event_debug(debug_isolated, {other_key_type, _OtherKeyType}),
-    % 5. Test what happens when reading these nested paths
-    ?event_debug(debug_isolated, {reading_commitments_directly}),
-    _CommitmentsResult = test_read(StoreOpts, CommitmentsPath),
-    ?event_debug(debug_isolated, {commitments_read_result, _CommitmentsResult}),
-    ?event_debug(debug_isolated, {reading_other_key_directly}),
-    _OtherKeyResult = test_read(StoreOpts, OtherKeyPath),
-    ?event_debug(debug_isolated, {other_key_read_result, _OtherKeyResult}),
-    test_stop(StoreOpts).
-
-%% @doc Test that list function resolves links correctly
-list_with_link_test() ->
-    StoreOpts = hb_test_utils:test_store(?MODULE),
-    test_reset(StoreOpts),
-    % Create a group with some children
-    test_group(StoreOpts, <<"real-group">>),
-    test_write(StoreOpts, <<"real-group/child1">>, <<"value1">>),
-    test_write(StoreOpts, <<"real-group/child2">>, <<"value2">>),
-    test_write(StoreOpts, <<"real-group/child3">>, <<"value3">>),
-    % Create a link to the group
-    test_link(StoreOpts, <<"real-group">>, <<"link-to-group">>),
-    % List the real group to verify expected children
-    {ok, RealGroupChildren} = test_list(StoreOpts, <<"real-group">>),
-    ?event_debug({real_group_children, RealGroupChildren}),
-    ExpectedChildren = [<<"child1">>, <<"child2">>, <<"child3">>],
-    ?assertEqual(ExpectedChildren, lists:sort(RealGroupChildren)),
-    % List via the link - should return the same children
-    {ok, LinkChildren} = test_list(StoreOpts, <<"link-to-group">>),
-    ?event_debug({link_children, LinkChildren}),
-    ?assertEqual(ExpectedChildren, lists:sort(LinkChildren)),
-    test_stop(StoreOpts).
 
 read_prefix_composite_test() ->
     StoreOpts = hb_test_utils:test_store(?MODULE),
     test_reset(StoreOpts),
-    test_group(StoreOpts, <<"root">>),
     test_write(StoreOpts, <<"root/a">>, <<"1">>),
-    test_group(StoreOpts, <<"root/b">>),
     test_write(StoreOpts, <<"root/b/c">>, <<"2">>),
     ?assertEqual(
-        {composite, [{<<"a">>, <<"1">>}, {<<"b">>, <<"group">>}]},
+        {composite, [{<<"a">>, <<"1">>}, <<"b">>]},
         read(StoreOpts, #{ <<"read">> => <<"root">> }, #{})
     ),
     ?assertEqual({ok, [<<"a">>, <<"b">>]}, test_list(StoreOpts, <<"root">>)),
+    % If writes are pending, a read of a key with no value waits for their
+    % commit on a dirty IO scheduler: with one normal scheduler online, this
+    % process runs before the read returns.
+    test_write(StoreOpts, <<"root/d">>, <<"3">>),
+    Online = erlang:system_flag(schedulers_online, 1),
+    Self = self(),
+    spawn(
+        fun() ->
+            Self ! reading,
+            read(StoreOpts, #{ <<"read">> => <<"missing">> }, #{}),
+            Self ! read
+        end
+    ),
+    receive reading -> Self ! ran end,
+    First = receive Msg when Msg == ran; Msg == read -> Msg end,
+    erlang:system_flag(schedulers_online, Online),
+    receive Next when Next == ran; Next == read -> ok end,
+    ?assertEqual(ran, First),
     test_stop(StoreOpts).

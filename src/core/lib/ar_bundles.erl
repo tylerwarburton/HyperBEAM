@@ -2,7 +2,7 @@
 -export([signer/1]).
 -export([id/1, id/2, hd/1, member/2, find/2]).
 -export([new_item/4, sign_item/2, verify_item/1]).
--export([encode_tags/1, decode_tags/1]).
+-export([decode_tags/1]).
 -export([serialize/1, deserialize/1, serialize_bundle/3]).
 -export([deserialize_header/1, deserialize_item_wrapper/1]).
 -export([data_item_signature_data/1]).
@@ -88,15 +88,15 @@ new_item(Target, Anchor, Tags, Data) ->
 
 %% @doc Sign a data item.
 sign_item(_, undefined) -> throw(wallet_not_found);
-sign_item(RawItem, {PrivKey, {KeyType, Owner}}) ->
+sign_item(RawItem, Wallet = #{ <<"owner">> := Owner, <<"type">> := Type }) ->
     Item =
         (ar_tx:normalize(RawItem))#tx{
             format = ans104,
             owner = Owner,
-            signature_type = KeyType
+            signature_type = ar_tx:deserialize_sig_type(Type)
         },
     % Generate the signature from the data item's data segment in 'signed'-ready mode.
-    Sig = ar_wallet:sign(PrivKey, data_item_signature_data(Item)),
+    Sig = ar_wallet:sign(Wallet, data_item_signature_data(Item)),
     ar_tx:reset_ids(Item#tx{signature = Sig}).
 
 %% @doc Verify the validity of a data item.
@@ -199,7 +199,7 @@ data_item_signature_data(RawItem) ->
         <<(Item#tx.owner)/binary>>,
         <<(Item#tx.target)/binary>>,
         <<(Item#tx.anchor)/binary>>,
-        encode_tags(Item#tx.tags),
+        ar_bundles_avro:encode(Item#tx.tags, Item#tx.avro_form),
         <<(Item#tx.data)/binary>>
     ]).
 
@@ -218,7 +218,12 @@ verify_data_item_id(DataItem) ->
 verify_data_item_signature(DataItem) ->
     SignatureData = data_item_signature_data(DataItem),
     ar_wallet:verify(
-        {DataItem#tx.signature_type, DataItem#tx.owner}, SignatureData, DataItem#tx.signature
+        #{
+            <<"type">> => ar_tx:serialize_sig_type(DataItem#tx.signature_type),
+            <<"owner">> => DataItem#tx.owner
+        },
+        SignatureData,
+        DataItem#tx.signature
     ).
 
 %% @doc Verify the validity of the data item's tags.
@@ -238,7 +243,7 @@ serialize(TX) when is_binary(TX) -> TX;
 serialize(RawTX) when is_record(RawTX, tx) ->
     true = enforce_valid_tx(RawTX),
     {_, TX} = ar_tx:serialize_data(RawTX),
-    EncodedTags = encode_tags(TX#tx.tags),
+    EncodedTags = ar_bundles_avro:encode(TX#tx.tags, TX#tx.avro_form),
     <<
         (encode_signature_type(TX#tx.signature_type))/binary,
         (TX#tx.signature)/binary,
@@ -266,7 +271,7 @@ serialize_bundle(BundleType, Map, Normalize) when is_map(Map) ->
     % For now we just serialize the map to a JSON string of Key=>TXID
     BinItems = maps:map(
         fun(_, Item) -> 
-            to_serialized_pair(Item, Normalize, unsigned)
+            to_serialized_pair(Item, Normalize, signed)
         end,
         Map),
     {Manifest, BinItems2} = maybe_generate_manifest(BundleType, BinItems, Normalize),
@@ -338,6 +343,8 @@ encode_signature_type(ethereum) ->
     <<3, 0>>;
 encode_signature_type(solana) ->
     <<4, 0>>;
+encode_signature_type(typed_ethereum) ->
+    <<7, 0>>;
 encode_signature_type(SigType) ->
     ?event(warning, {error_encoding_signature_type, {sig_type, SigType}}),
     {unsupported_tx_format, SigType}.
@@ -356,63 +363,6 @@ encode_tags_size([], <<>>) ->
     <<0:64/little-integer, 0:64/little-integer>>;
 encode_tags_size(Tags, EncodedTags) ->
     <<(length(Tags)):64/little-integer, (byte_size(EncodedTags)):64/little-integer>>.
-
-%% @doc Encode tags into a binary format using Apache Avro.
-encode_tags([]) ->
-    <<>>;
-encode_tags(Tags) ->
-    EncodedBlocks = lists:flatmap(
-        fun({Name, Value}) ->
-            Res = [encode_avro_name(Name), encode_avro_value(Value)],
-            case lists:member(error, Res) of
-                true ->
-                    throw({cannot_encode_empty_string, Name, Value});
-                false ->
-                    Res
-            end
-        end,
-        Tags
-    ),
-    TagCount = length(Tags),
-    ZigZagCount = encode_zigzag(TagCount),
-    <<ZigZagCount/binary, (list_to_binary(EncodedBlocks))/binary, 0>>.
-
-%% @doc Encode a string for Avro using ZigZag and VInt encoding.
-encode_avro_name(<<>>) ->
-    % Zero length names are treated as a special case, due to the Avro encoder.
-    << 0 >>;
-encode_avro_name(String) ->
-    StringBytes = utf8_encoded(String),
-    Length = byte_size(StringBytes),
-    <<(encode_zigzag(Length))/binary, StringBytes/binary>>.
-
-encode_avro_value(<<>>) ->
-    % Zero length values are treated as a special case, due to the Avro encoder.
-    << 0 >>;
-encode_avro_value(Value) when is_binary(Value) ->
-    % Tag values can be raw binaries
-    Length = byte_size(Value),
-    <<(encode_zigzag(Length))/binary, Value/binary>>.
-
-%% @doc Encode an integer using ZigZag encoding.
-encode_zigzag(Int) when Int >= 0 ->
-    encode_vint(Int bsl 1);
-encode_zigzag(Int) ->
-    encode_vint(Int bsl 1, -1).
-
-%% @doc Encode a ZigZag integer to VInt binary format.
-encode_vint(ZigZag) ->
-    encode_vint(ZigZag, []).
-
-encode_vint(0, Acc) ->
-    list_to_binary(lists:reverse(Acc));
-encode_vint(ZigZag, Acc) ->
-    VIntByte = ZigZag band 16#7F,
-    ZigZagShifted = ZigZag bsr 7,
-    case ZigZagShifted of
-        0 -> encode_vint(0, [VIntByte | Acc]);
-        _ -> encode_vint(ZigZagShifted, [VIntByte bor 16#80 | Acc])
-    end.
 
 %% @doc Convert binary data back to #tx record(s).
 %% When deserializing a binary, it is assumed the binary is an ans104 *item*,
@@ -443,7 +393,7 @@ deserialize_header(Binary) ->
     {SignatureType, Signature, Owner, Rest} = decode_signature(Binary),
     {Target, Rest2} = decode_optional_field(Rest),
     {Anchor, Rest3} = decode_optional_field(Rest2),
-    {Tags, RemainingData} = decode_tags(Rest3),
+    {Tags, AvroForm, RemainingData} = decode_tags(Rest3),
     HeaderSize = byte_size(Binary) - byte_size(RemainingData),
     {
         ok,
@@ -456,16 +406,23 @@ deserialize_header(Binary) ->
             target = Target,
             anchor = Anchor,
             tags = Tags,
+            avro_form = AvroForm,
             data = RemainingData,
             data_size = byte_size(RemainingData)
         }
     }.
 
+%% @doc Unbundle an item whose tags say that its data is a bundle. An item whose
+%% data does not decode as a bundle is kept as it is: the item is valid with
+%% such tags, as an L1 TX is (`ar_tx:type/1').
 maybe_unbundle(Item) ->
-    case ar_tx:type(Item) of
-        list -> unbundle_list(Item);
-        binary -> Item;
-        map -> unbundle_map(Item)
+    try
+        case ar_tx:type(Item) of
+            list -> unbundle_list(Item);
+            binary -> Item;
+            map -> unbundle_map(Item)
+        end
+    catch _:_ -> Item
     end.
 
 unbundle_list(Item) ->
@@ -495,15 +452,18 @@ unbundle_map(Item) ->
     end.
 
 %% @doc An internal helper for finding an item in a single-layer of a bundle.
-%% Does not recurse! You probably want `find/2' in most cases.
-find_single_layer(UnsignedID, TX) when is_record(TX, tx) ->
-    find_single_layer(UnsignedID, TX#tx.data);
-find_single_layer(UnsignedID, Items) ->
-    TX = lists:keyfind(UnsignedID, #tx.unsigned_id, Items),
-    case is_record(TX, tx) of
-        true -> TX;
-        false ->
-            throw({cannot_find_item, hb_util:encode(UnsignedID)})
+%% Does not recurse! You probably want `find/2' in most cases. An item is
+%% listed by its signed ID, or by its unsigned ID if it is unsigned.
+find_single_layer(ID, TX) when is_record(TX, tx) ->
+    find_single_layer(ID, TX#tx.data);
+find_single_layer(ID, Items) ->
+    ListedID =
+        fun(#tx{ id = ?DEFAULT_ID, unsigned_id = UnsignedID }) -> UnsignedID;
+            (#tx{ id = SignedID }) -> SignedID
+        end,
+    case lists:search(fun(TX) -> ListedID(TX) =:= ID end, Items) of
+        {value, TX} -> TX;
+        false -> throw({cannot_find_item, hb_util:encode(ID)})
     end.
 
 unbundle(<<Count:256/little-integer, Content/binary>>) ->
@@ -571,15 +531,16 @@ decode_signature(Other) ->
         {sig_type, {explicit, SigType}}}),
     {unsupported_tx_format, SigType}.
 
-%% @doc Decode tags from a binary format using Apache Avro.
+%% @doc Decode tags from a binary format using Apache Avro, with their Avro
+%% form.
 decode_tags(<<0:64/little-integer, 0:64/little-integer, Rest/binary>>) ->
-    {[], Rest};
+    {[], <<>>, Rest};
 decode_tags(<<TagCount:64/little-integer, TagSize:64/little-integer, Binary/binary>>)
         when byte_size(Binary) >= TagSize ->
     <<TagsBinary:TagSize/binary, Rest/binary>> = Binary,
-    Tags = decode_avro_tag_section(TagsBinary),
+    {Tags, AvroForm} = ar_bundles_avro:decode(TagsBinary),
     case length(Tags) of
-        TagCount -> {Tags, Rest};
+        TagCount -> {Tags, AvroForm, Rest};
         _ -> throw({invalid_ans104_tags, tag_count_mismatch})
     end;
 decode_tags(<<_TagCount:64/little-integer, _TagSize:64/little-integer, _/binary>>) ->
@@ -591,90 +552,6 @@ decode_optional_field(<<0, Rest/binary>>) ->
     {<<>>, Rest};
 decode_optional_field(<<1:8/little-integer, Field:32/binary, Rest/binary>>) ->
     {Field, Rest}.
-
-%% @doc Decode Avro blocks (for tags) from binary.
-decode_avro_tag_section(TagsBinary) ->
-    case decode_avro_tag_array(TagsBinary, []) of
-        {Tags, <<>>} -> Tags;
-        {_Tags, _Residue} -> throw({invalid_ans104_tags, residue_in_tag_section})
-    end.
-
-decode_avro_tag_array(<<>>, _Acc) ->
-    throw({invalid_ans104_tags, missing_avro_array_terminator});
-decode_avro_tag_array(Binary, Acc) ->
-    {Count, Rest} = decode_zigzag(Binary),
-    decode_avro_tag_array_block(Count, Rest, Acc).
-
-decode_avro_tag_array_block(0, Rest, Acc) ->
-    {lists:reverse(Acc), Rest};
-decode_avro_tag_array_block(Count, Rest, Acc) when Count > 0 ->
-    {Tags, Rest2} = decode_avro_tags(Rest, Count),
-    decode_avro_tag_array(Rest2, lists:reverse(Tags, Acc));
-decode_avro_tag_array_block(Count, Rest, Acc) when Count < 0 ->
-    {BlockSize, BlockRest} = decode_zigzag(Rest),
-    case BlockSize >= 0 andalso byte_size(BlockRest) >= BlockSize of
-        true ->
-            <<Block:BlockSize/binary, Rest2/binary>> = BlockRest,
-            Tags = decode_avro_tag_block(Block, -Count),
-            decode_avro_tag_array(Rest2, lists:reverse(Tags, Acc));
-        false ->
-            throw({invalid_ans104_tags, invalid_avro_block_size})
-    end.
-
-decode_avro_tag_block(Block, Count) ->
-    case decode_avro_tags(Block, Count) of
-        {Tags, <<>>} -> Tags;
-        {_Tags, _Residue} -> throw({invalid_ans104_tags, residue_in_avro_block})
-    end.
-
-decode_avro_tags(Binary, Count) when Count =:= 0 ->
-    {[], Binary};
-decode_avro_tags(<<>>, _Count) ->
-    throw({invalid_ans104_tags, truncated_avro_tag_item});
-decode_avro_tags(Binary, Count) ->
-    {NameSize, Rest} = decode_zigzag(Binary),
-    decode_avro_name(NameSize, Rest, Count).
-
-decode_avro_name(0, Rest, _) ->
-    {[], Rest};
-decode_avro_name(NameSize, _Rest, _Count) when NameSize < 0 ->
-    throw({invalid_ans104_tags, invalid_avro_name_size});
-decode_avro_name(NameSize, Rest, _Count) when byte_size(Rest) < NameSize ->
-    throw({invalid_ans104_tags, truncated_avro_name});
-decode_avro_name(NameSize, Rest, Count) ->
-    <<Name:NameSize/binary, Rest2/binary>> = Rest,
-    {ValueSize, Rest3} = decode_zigzag(Rest2),
-    decode_avro_value(ValueSize, Name, Rest3, Count).
-
-decode_avro_value(0, Name, Rest, Count) ->
-    {DecodedTags, NonAvroRest} = decode_avro_tags(Rest, Count - 1),
-    {[{Name, <<>>} | DecodedTags], NonAvroRest};
-decode_avro_value(ValueSize, _Name, _Rest, _Count) when ValueSize < 0 ->
-    throw({invalid_ans104_tags, invalid_avro_value_size});
-decode_avro_value(ValueSize, _Name, Rest, _Count) when byte_size(Rest) < ValueSize ->
-    throw({invalid_ans104_tags, truncated_avro_value});
-decode_avro_value(ValueSize, Name, Rest, Count) ->
-    <<Value:ValueSize/binary, Rest2/binary>> = Rest,
-    {DecodedTags, NonAvroRest} = decode_avro_tags(Rest2, Count - 1),
-    {[{Name, Value} | DecodedTags], NonAvroRest}.
-
-%% @doc Decode a VInt encoded ZigZag integer from binary.
-decode_zigzag(Binary) ->
-    {ZigZag, Rest} = decode_vint(Binary, 0, 0),
-    case ZigZag band 1 of
-        1 -> {-(ZigZag bsr 1) - 1, Rest};
-        0 -> {ZigZag bsr 1, Rest}
-    end.
-
-decode_vint(<<>>, Result, _Shift) ->
-    {Result, <<>>};
-decode_vint(<<Byte, Rest/binary>>, Result, Shift) ->
-    VIntPart = Byte band 16#7F,
-    NewResult = Result bor (VIntPart bsl Shift),
-    case Byte band 16#80 of
-        0 -> {NewResult, Rest};
-        _ -> decode_vint(Rest, NewResult, Shift + 7)
-    end.
 
 %%%===================================================================
 %%% Unit tests.
@@ -696,29 +573,29 @@ encode_tags_test() ->
     ],
     lists:foreach(
         fun({Label, InputTags}) ->
-            Encoded = encode_tags(InputTags),
+            Encoded = ar_bundles_avro:encode(InputTags),
             Wrapped =
                 <<
                     (length(InputTags)):64/little,
                     (byte_size(Encoded)):64/little,
                     Encoded/binary
                 >>,
-            {DecodedTags, <<>>} = decode_tags(Wrapped),
+            {DecodedTags, <<>>, <<>>} = decode_tags(Wrapped),
             ?assertEqual(InputTags, DecodedTags, Label)
         end,
         TestCases
     ),
     % Test case: Empty tags list
     EmptyTags = [],
-    EncodedEmpty = encode_tags(EmptyTags),
+    EncodedEmpty = ar_bundles_avro:encode(EmptyTags),
     ?assertEqual(<<>>, EncodedEmpty),
     WrappedEmpty = <<0:64/little, 0:64/little>>,
-    {[], <<>>} = decode_tags(WrappedEmpty).
+    {[], <<>>, <<>>} = decode_tags(WrappedEmpty).
 
 tag_size_boundary_test() ->
     Tags = [{<<"Content-Type">>, <<"application/json">>}],
     Body = <<"{\"ok\":true}">>,
-    EncodedTags = encode_tags(Tags),
+    EncodedTags = ar_bundles_avro:encode(Tags),
     Wrapped =
         <<
             (length(Tags)):64/little,
@@ -726,11 +603,11 @@ tag_size_boundary_test() ->
             EncodedTags/binary,
             Body/binary
         >>,
-    ?assertEqual({Tags, Body}, decode_tags(Wrapped)).
+    ?assertEqual({Tags, <<>>, Body}, decode_tags(Wrapped)).
 
 missing_avro_tag_terminator_test() ->
     Tags = [{<<"Content-Type">>, <<"application/json">>}],
-    EncodedTags = encode_tags(Tags),
+    EncodedTags = ar_bundles_avro:encode(Tags),
     TagsWithoutTerminator = binary:part(EncodedTags, 0, byte_size(EncodedTags) - 1),
     Body = <<"{\"$schema\":\"https://example.invalid/schema\"}">>,
     Wrapped =
@@ -747,7 +624,7 @@ missing_avro_tag_terminator_test() ->
 
 tag_count_mismatch_test() ->
     Tags = [{<<"Content-Type">>, <<"application/json">>}],
-    EncodedTags = encode_tags(Tags),
+    EncodedTags = ar_bundles_avro:encode(Tags),
     Wrapped =
         <<
             (length(Tags) + 1):64/little,
@@ -758,7 +635,7 @@ tag_count_mismatch_test() ->
 
 residue_in_tag_section_test() ->
     Tags = [{<<"Content-Type">>, <<"application/json">>}],
-    EncodedTags = encode_tags(Tags),
+    EncodedTags = ar_bundles_avro:encode(Tags),
     Wrapped =
         <<
             (length(Tags)):64/little,
@@ -769,12 +646,12 @@ residue_in_tag_section_test() ->
     ?assertThrow({invalid_ans104_tags, residue_in_tag_section}, decode_tags(Wrapped)).
 
 no_tags_test() ->
-    {Priv, Pub} = ar_wallet:new(),
-    {KeyType, Owner} = Pub,
+    Wallet = #{ <<"owner">> := Owner } = ar_wallet:new(),
+    KeyType = ?RSA_KEY_TYPE,
     Target = crypto:strong_rand_bytes(32),
     Anchor = crypto:strong_rand_bytes(32),
     DataItem = new_item(Target, Anchor, [], <<"data">>),
-    SignedDataItem = sign_item(DataItem, {Priv, Pub}),
+    SignedDataItem = sign_item(DataItem, Wallet),
     ?assertEqual(true, verify_item(SignedDataItem)),
     assert_data_item(KeyType, Owner, Target, Anchor, [], <<"data">>, SignedDataItem),
     SignedDataItem2 = deserialize(serialize(SignedDataItem)),
@@ -783,13 +660,13 @@ no_tags_test() ->
     assert_data_item(KeyType, Owner, Target, Anchor, [], <<"data">>, SignedDataItem2).
 
 with_tags_test() ->
-    {Priv, Pub} = ar_wallet:new(),
-    {KeyType, Owner} = Pub,
+    Wallet = #{ <<"owner">> := Owner } = ar_wallet:new(),
+    KeyType = ?RSA_KEY_TYPE,
     Target = crypto:strong_rand_bytes(32),
     Anchor = crypto:strong_rand_bytes(32),
     Tags = [{<<"tag1">>, <<"value1">>}, {<<"tag2">>, <<"value2">>}],
     DataItem = new_item(Target, Anchor, Tags, <<"taggeddata">>),
-    SignedDataItem = sign_item(DataItem, {Priv, Pub}),
+    SignedDataItem = sign_item(DataItem, Wallet),
     ?assertEqual(true, verify_item(SignedDataItem)),
     assert_data_item(KeyType, Owner, Target, Anchor, Tags, <<"taggeddata">>, SignedDataItem),
     SignedDataItem2 = deserialize(serialize(SignedDataItem)),
@@ -945,14 +822,17 @@ bundle_map_test() ->
         format = ans104,
         data = <<"item1_data">>
     }, W),
+    % The content of `Item1', signed by another wallet.
+    Item1B = sign_item(Item1, ar_wallet:new()),
     Item2 = sign_item(#tx{
         format = ans104,
         anchor = crypto:strong_rand_bytes(32),
-        data = #{<<"key1">> => Item1}
+        data = #{<<"key1">> => Item1, <<"key2">> => Item1B}
     }, W),
     Bundle = serialize(ar_tx:normalize(Item2)),
     BundleItem = deserialize(Bundle),
     ?assertEqual(Item1#tx.data, (maps:get(<<"key1">>, BundleItem#tx.data))#tx.data),
+    ?assertEqual(Item1B#tx.id, (maps:get(<<"key2">>, BundleItem#tx.data))#tx.id),
     ?assert(verify_item(BundleItem)).
 
 eddsa_cases_test() ->
@@ -1146,9 +1026,9 @@ arbundles_single_list_bundle_roundtrip_test() ->
 
 %% @doc Read a serialized bundle from disk, assert it is as it should be, and
 %% do a full deserialize/serialize roundtrip to confirm idempotency.
-%% The file in question was validated against dha-team/arbundles v1.0.3 on
-%% 2025-09-07, so this test also serves to validate that ar_bundles.erl can
-%% read and write to a bundle that is compatible with dha-team/arbundles.
+%% The file in question is written by `generate_and_write_map_bundle_test'.
+%% dha-team/arbundles v1.0.3 reads its outer item as valid, and gives each
+%% signed item in it the ID that the bundle header lists.
 arbundles_map_bundle_roundtrip_test() ->
     {ok, Bin} = file:read_file(<<"test/arbundles.js/ans104-map-bundle-erlang.bundle">>),
     
@@ -1158,7 +1038,7 @@ arbundles_map_bundle_roundtrip_test() ->
     ?assertEqual([
         {<<"bundle-format">>, <<"binary">>},
         {<<"bundle-version">>, <<"2.0.0">>},
-        {<<"bundle-map">>, <<"DwgwetwuSXGrnQiHFziiRLPKIucN5ua9KWkHA-nRQJQ">>}
+        {<<"bundle-map">>, <<"-APvf-F6eeqKb5wJOI3DGstNDVq5y5XAl0rwpLkhrHY">>}
     ], Deserialized#tx.tags),
 
     #{ <<"key1">> := Item1, <<"key2">> := Item2 } = Deserialized#tx.data,
@@ -1178,8 +1058,8 @@ arbundles_map_bundle_roundtrip_test() ->
     Index = hb_json:decode(Manifest#tx.data),
     ?event(debug_test, {index, Index}),
     ?assertEqual(#{ 
-        <<"key1">> => <<"zZXTg5K_9G3EnpMUOhp9QX1tqa8dJa32p2JPkQtiPT0">>,
-        <<"key2">> => <<"m4D2fObeaz5qFkhpacO1K351jaksg2j0-wpyCetAOb4">>
+        <<"key1">> => <<"7anINFl5GrvJxzK03VLZtml-CYtSOuC1MkOKEu29v0w">>,
+        <<"key2">> => <<"jdlr8hdxQq6c_8jcS6-WMNtWBBS4cI4T34Y0iso4ZK4">>
     }, Index),
     
     Reserialized = serialize(ar_tx:normalize(Deserialized)),
@@ -1262,3 +1142,21 @@ deserialize_ethereum_transaction_test() ->
     ?assertEqual(<<"0x626334b6ef6D3e8537E9f8d97d65f59832219315">>,
         hb_util:human_id(ar_wallet:to_address(Deserialized#tx.owner, Deserialized#tx.signature_type))),
     ?assert(verify_item(Deserialized)).
+
+deserialize_typed_ethereum_transaction_test() ->
+    % ans104-item-typed-ethereum.bin is dataitem 9lLtZcFf6wZFxxQCbdZtdaRA1YrRXYzwUxq57Xry7BI
+    {ok, Serialized} = file:read_file(<<"test/arbundles.js/ans104-item-typed-ethereum.bin">>),
+    Deserialized = deserialize(Serialized),
+    ?assertEqual(typed_ethereum, Deserialized#tx.signature_type),
+    ?assertEqual([{<<"tag1">>, <<"value1">>}], Deserialized#tx.tags),
+    ?assertEqual(<<"0x2c7536e3605d9c16a7a3d7b1898e529396a65c23">>, Deserialized#tx.owner),
+    ?assertEqual(<<"0x2c7536E3605D9C16a7a3D7b1898e529396a65c23">>,
+        hb_util:human_id(ar_wallet:to_address(Deserialized#tx.owner, Deserialized#tx.signature_type))),
+    ?assert(verify_item(Deserialized)),
+    ?assertNot(verify_item(Deserialized#tx{data = <<"changed">>})),
+    ?assertNot(
+        verify_item(
+            Deserialized#tx{owner = <<"0x0000000000000000000000000000000000000000">>}
+        )
+    ),
+    ?assertEqual(Serialized, serialize(Deserialized)).

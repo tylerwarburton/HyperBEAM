@@ -2,42 +2,26 @@
 %%% used in HyperBEAM. Abstracted such that this (extremely!) dangerous code 
 %%% can be carefully managed.
 %%% 
-%%% HyperBEAM currently implements two hashpath algorithms:
-%%% 
-%%% * `sha-256-chain': A simple chained SHA-256 hash.
-%%% 
-%%% * `accumulate-256': A SHA-256 hash that chains the given IDs and accumulates
-%%%   their values into a single commitment.
-%%% 
-%%% The accumulate algorithm is experimental and at this point only exists to
-%%% allow us to test multiple HashPath algorithms in HyperBEAM.
+%%% HyperBEAM implements one hashpath algorithm, `sha-256-chain': a simple
+%%% chained SHA-256 hash.
 -module(hb_crypto).
--export([sha256/1, sha256_chain/2, accumulate/1, accumulate/2]).
+-export([sha256/1, sha256_chain/2, accumulate/1]).
 -export([pbkdf2/5]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %% @doc Add a new ID to the end of a SHA-256 hash chain.
-sha256_chain(ID1, ID2) when ?IS_ID(ID1) ->
+sha256_chain(ID1, ID2) when byte_size(ID1) =:= 32 ->
     sha256(<<ID1:32/binary, ID2/binary>>);
 sha256_chain(ID1, ID2) ->
     throw({cannot_chain_bad_ids, ID1, ID2}).
 
-%% @doc Accumulate two IDs, or a list of IDs, into a single commitment. This 
-%% function requires that the IDs given are already cryptographically-secure,
-%% 256-bit values. No further cryptographic operations are performed upon the
-%% values, they are simply added together.
-%% 
-%% This is useful in situations where the ordering of the IDs is not important,
-%% or explicitly detrimental to the utility of the final commitment. No ordering
-%% information is preserved in the final commitment.
+%% @doc Combine a list of IDs into one, whatever their order: the SHA-256 of
+%% their text forms, sorted and joined by newlines, as of a file that lists
+%% them. No ID may contain a newline.
 accumulate(IDs) when is_list(IDs) ->
-    lists:foldl(fun accumulate/2, << 0:256 >>, IDs).
-accumulate(ID1 = << ID1Int:256 >>, ID2 = << ID2Int:256 >>)
-        when (byte_size(ID1) =:= 32) and (byte_size(ID2) =:= 32) ->
-    << (ID1Int + ID2Int):256 >>;
-accumulate(ID1, ID2) ->
-    throw({cannot_accumulate_bad_ids, ID1, ID2}).
+    [] = [ID || ID <- IDs, binary:match(ID, <<"\n">>) =/= nomatch],
+    sha256(lists:join(<<"\n">>, lists:sort(IDs))).
 
 %% @doc Wrap Erlang's `crypto:hash/2' to provide a standard interface.
 %% Under-the-hood, this uses OpenSSL.
@@ -79,6 +63,8 @@ sha256_chain_test() ->
     ID3 = sha256_chain(ID1, ID2),
     HashBase = << ID1/binary, ID2/binary >>,
     ?assertEqual(ID3, crypto:hash(sha256, HashBase)),
+    % Only a 32-byte first ID can be chained.
+    ?assertThrow({cannot_chain_bad_ids, _, _}, sha256_chain(<<1:336>>, ID2)),
     % Basic entropy check.
     Avg = count_zeroes(ID3) / 256,
     ?assert(Avg > 0.4),

@@ -43,7 +43,7 @@ ledger(Script, Extra, Opts) ->
                             lists:map(
                                 fun({ID, Amount}) when ?IS_ID(ID) ->
                                     {hb_util:human_id(ID), Amount};
-                                ({Wallet, Amount}) when is_tuple(Wallet) ->
+                                ({Wallet, Amount}) when is_map(Wallet) ->
                                     {
                                         hb_util:human_id(
                                             ar_wallet:to_address(Wallet)
@@ -63,9 +63,9 @@ ledger(Script, Extra, Opts) ->
                     <<"device">> => <<"process@1.0">>,
                     <<"type">> => <<"Process">>,
                     <<"scheduler-device">> => <<"scheduler@1.0">>,
-                    <<"scheduler">> => hb_util:human_id(HostWallet),
+                    <<"scheduler">> => hb:address(HostWallet),
                     <<"execution-device">> => <<"lua@5.3a">>,
-                    <<"authority">> => hb_util:human_id(HostWallet),
+                    <<"authority">> => hb:address(HostWallet),
                     <<"module">> => lua_script(Script)
                 },
                 ModExtra
@@ -139,7 +139,7 @@ transfer(ProcMsg, Sender, Recipient, Quantity, Route, Opts) ->
                 hb_message:commit(MaybeRoute#{
                         <<"action">> => <<"Transfer">>,
                         <<"target">> => hb_message:id(ProcMsg, all),
-                        <<"recipient">> => hb_util:human_id(Recipient),
+                        <<"recipient">> => hb:address(Recipient),
                         <<"quantity">> => Quantity
                     },
                     Opts#{ <<"priv-wallet">> => Sender }
@@ -280,7 +280,9 @@ apply_names(Map, EnvNames, Opts) ->
     IDs =
         maps:from_list(
             lists:filtermap(
-                fun({Key, V}) ->
+                fun({Wallet = #{ <<"device">> := <<"did-ar@1.0">> }, V}) ->
+                    {true, {hb:address(Wallet), V}};
+                   ({Key, V}) ->
                     try {true, {hb_util:human_id(Key), V}}
                     catch _:_ ->
                         try {true, {hb_message:id(Key, all), V}}
@@ -291,7 +293,12 @@ apply_names(Map, EnvNames, Opts) ->
                 maps:to_list(EnvNames)
             )
         ),
-    do_apply_names(Map, maps:merge(IDs, EnvNames), Opts).
+    % Balances and ledgers are keyed by the lowercase form of an ID.
+    LowerIDs =
+        maps:from_list(
+            [{hb_util:lowercase_key(K), V} || {K, V} <- maps:to_list(IDs)]
+        ),
+    do_apply_names(Map, maps:merge(maps:merge(IDs, LowerIDs), EnvNames), Opts).
 do_apply_names(Map, EnvNames, Opts) when is_map(Map) ->
     maps:from_list(
         lists:map(
@@ -775,12 +782,12 @@ multischeduler() ->
                     <<"balance">> => #{ Alice => 100 },
                     <<"scheduler">> =>
                         [
-                            hb_util:human_id(NodeWallet),
-                            hb_util:human_id(Scheduler2)
+                            hb:address(NodeWallet),
+                            hb:address(Scheduler2)
                         ],
                     <<"scheduler-required">> =>
                         [
-                            hb_util:human_id(NodeWallet)
+                            hb:address(NodeWallet)
                         ]
                 },
             Opts
@@ -843,12 +850,12 @@ multischeduler() ->
             #{
                 <<"scheduler">> =>
                     [
-                        hb_util:human_id(NodeWallet),
-                        hb_util:human_id(Scheduler2)
+                        hb:address(NodeWallet),
+                        hb:address(Scheduler2)
                     ],
                 <<"scheduler-required">> =>
                     [
-                        hb_util:human_id(NodeWallet)
+                        hb:address(NodeWallet)
                     ]
             },
             OptsWithSchedulers
@@ -859,11 +866,11 @@ multischeduler() ->
             #{
                 <<"scheduler">> =>
                     [
-                        hb_util:human_id(NodeWallet),
-                        hb_util:human_id(Scheduler3)
+                        hb:address(NodeWallet),
+                        hb:address(Scheduler3)
                     ],
                 <<"scheduler-required">> =>
-                    [hb_util:human_id(NodeWallet)]
+                    [hb:address(NodeWallet)]
             },
             OptsWithSchedulers
         ),
@@ -871,11 +878,11 @@ multischeduler() ->
         subledger(
             RootLedger3,
             #{
-                <<"scheduler-required">> => [hb_util:human_id(NodeWallet)],
+                <<"scheduler-required">> => [hb:address(NodeWallet)],
                 <<"scheduler">> =>
                     [
-                        hb_util:human_id(Scheduler2),
-                        hb_util:human_id(Scheduler3)
+                        hb:address(Scheduler2),
+                        hb:address(Scheduler3)
                     ]
             },
             OptsWithSchedulers
@@ -941,15 +948,15 @@ comma_separated_scheduler_list_test() ->
                         iolist_to_binary(
                             [
                                 <<"\"">>,
-                                hb_util:human_id(NodeWallet),
+                                hb:address(NodeWallet),
                                 <<"\",\"">>,
-                                hb_util:human_id(Scheduler2),
+                                hb:address(Scheduler2),
                                 <<"\"">>
                             ]
                         ),
                     <<"scheduler-required">> =>
                         [
-                            hb_util:human_id(NodeWallet)
+                            hb:address(NodeWallet)
                         ]
                 },
             Opts

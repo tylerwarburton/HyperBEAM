@@ -8,7 +8,7 @@
 %%% - `multirequest-nodes': A list of nodes to request from.
 %%% - `multirequest-responses': The number of responses to gather.
 %%% - `multirequest-stop-after': Whether to stop after the required number of
-%%%   responses.
+%%%   responses, or if the caller is killed.
 %%% - `multirequest-parallel': Whether to run the requests in parallel.
 %%% - `multirequest-admissible': A message to resolve against the response.
 %%% - `multirequest-admissible-status': The statuses that are admissible.
@@ -18,8 +18,14 @@
 %%% ```
 %%%     resolve(Base, Response#{ <<"path">> => Base/path OR /is-admissible }, Opts)
 %%% '''
+%%%
+%%% Each selected response invokes `on/http-client-admissible-receipt'
+%%% asynchronously, with a signed receipt in `body'. It contains `request',
+%%% `response', the original `request-method' and `request-path', and the peer's
+%%% `reference', if set. Acceptance means the configured checks passed; without
+%%% a content predicate it does not establish that the returned content is valid.
 -module(hb_http_multi).
--export([request/5]).
+-export([request/5, multirequest_keys/2]).
 -include("include/hb.hrl").
 
 %% @doc Dispatch the same HTTP request to many nodes. Can be configured to
@@ -45,22 +51,12 @@ request(Config, Method, Path, Message, Opts) ->
         admissible_status := Statuses,
         parallel := Parallel
     } = multirequest_opts(Config, Message, Opts),
-    MultirequestMsg =
-        hb_message:without_unless_signed(
-            lists:filter(
-                fun(<<"multirequest-", _/binary>>) -> true; (_) -> false end,
-                hb_maps:keys(Message)
-            ),
-            Message,
-            Opts
-        ),
     ?event(debug_multi,
         {multirequest_opts_parsed,
             {config, Config},
             {method, Method},
             {path, Path},
-            {raw_message, Message},
-            {message_to_send, MultirequestMsg}
+            {raw_message, Message}
         }),
     {AdmissibleResults, AllResponses} =
         if Parallel =/= false ->
@@ -71,7 +67,7 @@ request(Config, Method, Path, Message, Opts) ->
                 StopAfter,
                 Method,
                 Path,
-                MultirequestMsg,
+                Message,
                 Admissible,
                 Statuses,
                 Opts
@@ -82,14 +78,14 @@ request(Config, Method, Path, Message, Opts) ->
                 Responses,
                 Method,
                 Path,
-                MultirequestMsg,
+                Message,
                 Admissible,
                 Statuses,
                 Opts
             )
         end,
     ?event(debug_http, {multirequest_results, {admissible_results, AdmissibleResults}, {all_responses, AllResponses}}),
-    case AdmissibleResults of
+    case [hb_http:only_result(Res, Opts) || Res <- AdmissibleResults] of
         [] -> {error, {no_viable_responses, AllResponses}};
         Results -> if Responses == 1 -> hd(Results); true -> Results end
     end.
@@ -114,22 +110,28 @@ multirequest_opts(Config, Message, Opts) ->
 
 %% @doc Get a value for a multirequest option from the config or message.
 multirequest_opt(Key, Config, Message, Default, Opts) ->
-    hb_ao:get_first(
-        [
-            {Message, <<"multirequest-", Key/binary>>},
-            {Config, Key}
-        ],
-        Default,
-        Opts#{ <<"hashpath">> => ignore }
+    hb_maps:get(
+        <<"multirequest-", Key/binary>>,
+        Message,
+        hb_maps:get(Key, Config, Default, Opts),
+        Opts
     ).
 
-%% @doc Check if a response is admissible, according to the configuration. First,
-%% we check the Erlang response status to check for `ok'. If the response is
-%% not `ok', it is not admissible.
-%% 
-%% If the response is `ok', we check the status and the response message against
-%% the configuration.
-is_admissible(ok, Res, Admissible, Statuses, Opts) ->
+%% @doc Return the `multirequest-*' keys of a message, which configure a
+%% multirequest on this node.
+multirequest_keys(Message, Opts) ->
+    lists:filter(
+        fun(<<"multirequest-", _/binary>>) -> true; (_) -> false end,
+        hb_maps:keys(Message, Opts)
+    ).
+
+%% @doc Check if a response is admissible, according to the configuration. A
+%% reply is admissible if its status is one of the configured statuses and it
+%% satisfies the `admissible' message. With the statuses `All', a reply that
+%% is not `ok' is not admissible. A request that fails without a reply is not
+%% admissible.
+is_admissible(ErlStatus, Res, Admissible, Statuses, Opts)
+        when ErlStatus == ok; is_map(Res), Statuses =/= <<"All">> ->
     ?event(debug_multi,
         {is_admissible,
             {response, Res},
@@ -137,11 +139,9 @@ is_admissible(ok, Res, Admissible, Statuses, Opts) ->
             {statuses, Statuses}
         }
     ),
-    AdmissibleStatus = admissible_status(Res, Statuses),
+    AdmissibleStatus = admissible_status(Res, Statuses, Opts),
     ?event(debug_multi, {admissible_status, {result, AdmissibleStatus}}),
-    AdmissibleResponse = admissible_response(Res, Admissible, Opts),
-    ?event(debug_multi, {admissible_response, {result, AdmissibleResponse}}),
-    AdmissibleStatus andalso AdmissibleResponse;
+    AdmissibleStatus andalso admissible_response(Res, Admissible, Opts);
 is_admissible(_, _, _, _, _) -> false.
 
 %% @doc Serially request a message, collecting responses until the required
@@ -152,9 +152,10 @@ is_admissible(_, _, _, _, _) -> false.
 serial_multirequest(_Nodes, 0, _Method, _Path, _Message, _Admissible, _Statuses, _Opts) -> {[], []};
 serial_multirequest([], _, _Method, _Path, _Message, _Admissible, _Statuses, _Opts) -> {[], []};
 serial_multirequest([Node|Nodes], Remaining, Method, Path, Message, Admissible, Statuses, Opts) ->
-    {ErlStatus, Res} = hb_http:request(Method, Node, Path, Message, Opts),
+    {ErlStatus, Res} = node_request(Method, Node, Path, Message, Opts),
     case is_admissible(ErlStatus, Res, Admissible, Statuses, Opts) of
         true ->
+            receipt(Node, Method, Path, Message, Res, Opts),
             ?event(debug_http, {admissible_status, {response, Res}}),
             {AdmissibleAcc, AllAcc} = serial_multirequest(
                 Nodes,
@@ -187,27 +188,27 @@ parallel_multirequest(true, Nodes, Responses, StopAfter, Method, Path, Message, 
     parallel_multirequest(length(Nodes), Nodes, Responses, StopAfter, Method, Path, Message, Admissible, Statuses, Opts);
 parallel_multirequest(MaxWorkers, Nodes, Responses, StopAfter, Method, Path, Message, Admissible, Statuses, Opts) ->
     Ref = make_ref(),
-    {Workers, Queue} = start_workers(MaxWorkers, Ref, Nodes, Method, Path, Message, Opts),
+    {Workers, Queue} = start_workers(MaxWorkers, Ref, Nodes, StopAfter, Method, Path, Message, Opts),
     parallel_responses([], [], Workers, Queue, {Method, Path, Message}, Ref, Responses, StopAfter, Admissible, Statuses, Opts).
 
-%% @doc Start a new fleet of workers, returning the list of worker PIDs.
-start_workers(Count, Ref, Nodes, Method, Path, Message, Opts) ->
+%% @doc Start a new fleet of workers, returning the list of worker PIDs. If
+%% `StopAfter' is `true', link each worker to the calling process, so that the
+%% worker stops if the caller is killed.
+start_workers(Count, Ref, Nodes, StopAfter, Method, Path, Message, Opts) ->
     Parent = self(),
     {NewWorkerNodes, NewRemainingNodes} =
         lists:split(min(Count, length(Nodes)), Nodes),
     {
         lists:map(
             fun(Node) ->
-                spawn(
+                spawn_opt(
                     fun() ->
-                        Res =
-                            try hb_http:request(Method, Node, Path, Message, Opts)
-                            catch C:R -> {error, {worker_crash, C, R}}
-                            end,
+                        Res = node_request(Method, Node, Path, Message, Opts),
                         receive no_reply -> stopping
-                        after 0 -> Parent ! {Ref, self(), Res}
+                        after 0 -> Parent ! {Ref, self(), {Node, Res}}
                         end
-                    end
+                    end,
+                    [link || StopAfter == true]
                 )
             end,
             NewWorkerNodes
@@ -215,24 +216,69 @@ start_workers(Count, Ref, Nodes, Method, Path, Message, Opts) ->
         NewRemainingNodes
     }.
 
+%% @doc Request a message from one node. A request that raises is a failure,
+%% which is not admissible. The reply is whole: the admissibility checks read
+%% its `status', and `request/5' takes the value that its `ao-result' selects.
+node_request(Method, Node, Path, Message, Opts) ->
+    ReplyOpts = Opts#{ <<"http-only-result">> => false },
+    try hb_http:request(Method, Node, Path, Message, ReplyOpts)
+    catch Class:Exception:Stacktrace ->
+        {failure,
+            #{
+                <<"node">> => Node,
+                <<"class">> => Class,
+                <<"exception">> => Exception,
+                <<"trace">> => Stacktrace
+            }
+        }
+    end.
+
+%% @doc Observe a selected response without changing it. Use the same peer
+%% options as the HTTP request, so its reference and hooks remain attributable.
+receipt(Node, Method, Path, Message, Response, Opts) ->
+    PeerOpts =
+        case Node of
+            #{ <<"uri">> := _, <<"opts">> := Extra } ->
+                hb_maps:merge(
+                    Opts,
+                    hb_opts:mimic_default_types(Extra, new_atoms, Opts),
+                    Opts
+                );
+            _ -> Opts
+        end,
+    spawn(
+        fun() ->
+            hb_http_client:receipt(
+                <<"http-client-admissible-receipt">>,
+                #{
+                    <<"request-method">> => Method,
+                    <<"request-path">> => Path,
+                    <<"request">> => Message,
+                    <<"response">> => Response
+                },
+                PeerOpts
+            )
+        end
+    ).
+
 %% @doc Check if a status is allowed, according to the configuration. Statuses
-%% can be a single integer, a comma-separated list of integers, or the string
-%% `All'.
-admissible_status(_, <<"All">>) -> true;
-admissible_status(_ResponseMsg = #{ <<"status">> := Status }, Statuses) ->
-    admissible_status(Status, Statuses);
-admissible_status(Status, Statuses) when is_integer(Statuses) ->
-    admissible_status(Status, [Statuses]);
-admissible_status(Status, Statuses) when is_binary(Status) ->
-    admissible_status(binary_to_integer(Status), Statuses);
-admissible_status(Status, Statuses) when is_binary(Statuses) ->
-    % Convert the statuses to a list of integers.
+%% can be a single integer, a list of integers, a comma-separated list of
+%% integers, or the string `All'. Integers may be given as binaries.
+admissible_status(_, <<"All">>, _Opts) -> true;
+admissible_status(ResponseMsg = #{ <<"status">> := _ }, Statuses, Opts) ->
     admissible_status(
-        Status,
-        lists:map(fun binary_to_integer/1, binary:split(Statuses, <<",">>))
+        hb_http:status_code({ok, ResponseMsg}, Opts),
+        Statuses,
+        Opts
     );
-admissible_status(Status, Statuses) when is_list(Statuses) ->
-    lists:member(Status, Statuses).
+admissible_status(Status, Statuses, Opts) when is_integer(Statuses) ->
+    admissible_status(Status, [Statuses], Opts);
+admissible_status(Status, Statuses, Opts) when is_binary(Status) ->
+    admissible_status(binary_to_integer(Status), Statuses, Opts);
+admissible_status(Status, Statuses, Opts) when is_binary(Statuses) ->
+    admissible_status(Status, hb_util:binary_to_strings(Statuses), Opts);
+admissible_status(Status, Statuses, _Opts) when is_list(Statuses) ->
+    lists:member(Status, lists:map(fun hb_util:int/1, Statuses)).
 
 %% @doc If an `admissable` message is set for the request, check if the response
 %% adheres to it. Else, return `true'.
@@ -275,23 +321,24 @@ parallel_responses(AdmissibleRes, AllRes, Procs, _, _, Ref, 0, false, _Admissibl
     empty_inbox(Ref),
     {AdmissibleRes, AllRes};
 parallel_responses(AdmissibleRes, AllRes, Procs, _, _, Ref, 0, true, _Admissible, _Statuses, _Opts) ->
-    lists:foreach(fun(P) -> exit(P, kill) end, Procs),
+    lists:foreach(fun(P) -> unlink(P), exit(P, kill) end, Procs),
     empty_inbox(Ref),
     {AdmissibleRes, AllRes};
 parallel_responses(AdmissibleRes, AllRes, Procs, Queue, {Method, Path, Message}, Ref, Awaiting, StopAfter, Admissible, Statuses, Opts) ->
     receive
-        {Ref, Pid, {Status, NewRes}} ->
+        {Ref, Pid, {Node, {Status, NewRes}}} ->
             WorkersWithoutPid = lists:delete(Pid, Procs),
             NewAllRes = [{Status, NewRes} | AllRes],
             case is_admissible(Status, NewRes, Admissible, Statuses, Opts) of
                 true ->
+                    receipt(Node, Method, Path, Message, NewRes, Opts),
                     NewAwaiting = Awaiting - 1,
                     {NewProcs, NewQueue} =
                         case NewAwaiting of
                             0 -> {WorkersWithoutPid, Queue};
                             _ ->
                                 {RefilledWorkers, RemainingQueue} =
-                                    start_workers(1, Ref, Queue, Method, Path, Message, Opts),
+                                    start_workers(1, Ref, Queue, StopAfter, Method, Path, Message, Opts),
                                 {RefilledWorkers ++ WorkersWithoutPid, RemainingQueue}
                         end,
                     parallel_responses(
@@ -309,7 +356,7 @@ parallel_responses(AdmissibleRes, AllRes, Procs, Queue, {Method, Path, Message},
                 );
             false ->
                 {RefilledWorkers, NewQueue} =
-                    start_workers(1, Ref, Queue, Method, Path, Message, Opts),
+                    start_workers(1, Ref, Queue, StopAfter, Method, Path, Message, Opts),
                 parallel_responses(
                     AdmissibleRes,
                     NewAllRes,
@@ -377,11 +424,8 @@ multirequest_test_() ->
                     multi([dead_node(), maps:get(fast, N)], #{}))
             end},
             {"parallel race", fun() ->
-                T0 = erlang:monotonic_time(millisecond),
-                ?assertMatch({ok, _},
-                    multi([maps:get(fast, N), maps:get(slow1, N), maps:get(slow2, N)],
-                        #{<<"parallel">> => true, <<"stop-after">> => true})),
-                ?assert(erlang:monotonic_time(millisecond) - T0 < 750)
+                assert_first_response(
+                    #{ <<"parallel">> => true, <<"stop-after">> => true })
             end},
             {"parallel broadcast", fun() ->
                 ?assertMatch([_, _, _],
@@ -392,9 +436,32 @@ multirequest_test_() ->
                           <<"stop-after">> => false}))
             end},
             {"parallel crash", fun() ->
+                Self = self(),
+                Admissible = #{ <<"device">> => #{ <<"is-admissible">> =>
+                    fun(_, _, _) -> Self ! admissible_ran, {ok, true} end } },
                 ?assertMatch({error, {no_viable_responses, _}},
                     multi([crash(), crash()],
-                        #{<<"parallel">> => true, <<"stop-after">> => true}))
+                        #{<<"parallel">> => true, <<"stop-after">> => true,
+                          <<"admissible">> => Admissible})),
+                % The `admissible' message does not run on a request that fails.
+                ?assertNot(receive admissible_ran -> true after 0 -> false end)
+            end},
+            {"parallel caller killed", fun() ->
+                Caller = spawn(fun() ->
+                    receive go -> ok end,
+                    multi([maps:get(slow2, N)],
+                        #{<<"parallel">> => true, <<"stop-after">> => true})
+                end),
+                erlang:trace(Caller, true, [procs]),
+                Caller ! go,
+                Worker = receive {trace, Caller, spawn, W, _} -> W end,
+                Monitor = erlang:monitor(process, Worker),
+                exit(Caller, kill),
+                % Killing the caller stops its worker before the peer replies.
+                ?assertEqual(killed,
+                    receive {'DOWN', Monitor, process, Worker, Reason} -> Reason
+                    after 500 -> running
+                    end)
             end}
         ]} end}.
 
@@ -404,23 +471,38 @@ multirequest_test_() ->
 parallel_race_stops_at_first_admissible_test_() ->
     {timeout, 30, fun parallel_race_stops_at_first_admissible/0}.
 parallel_race_stops_at_first_admissible() ->
-    Delay = 750,
-    FastURL = hb_http_server:start_node(#{}),
-    SlowURL1 = hb_http_server:start_node(slow_node_opts(Delay)),
-    SlowURL2 = hb_http_server:start_node(slow_node_opts(Delay)),
     Routes = maps:get(<<"routes">>, hb_opts:default_message()),
     [ArweaveRoute] =
         [R || R <- Routes,
             maps:get(<<"template">>, R, undefined) =:= <<"^/arweave">>,
             maps:is_key(<<"nodes">>, R)],
-    Config = ArweaveRoute#{
-        <<"nodes">> => [ao_node(FastURL), ao_node(SlowURL1), ao_node(SlowURL2)]
-    },
-    T0 = erlang:monotonic_time(millisecond),
-    Result = hb_http_multi:request(Config, <<"GET">>, <<"/">>, #{}, #{}),
-    Elapsed = erlang:monotonic_time(millisecond) - T0,
-    ?assertMatch({ok, _}, Result),
-    ?assert(Elapsed < Delay).
+    assert_first_response(ArweaveRoute).
+
+%% @doc Release one real HTTP response while the other requests stay blocked.
+assert_first_response(Config) ->
+    Parent = self(),
+    Ref = make_ref(),
+    Gate = #{ <<"on">> => #{ <<"request">> => #{ <<"device">> => #{
+        <<"request">> => fun(_, #{ <<"body">> := Msgs }, _) ->
+            Parent ! {Ref, self()},
+            receive {Ref, release} -> {ok, #{ <<"body">> => Msgs }}
+            after 10000 -> error(response_not_released)
+            end
+        end } } } },
+    Nodes = [ao_node(hb_http_server:start_node(Gate)) || _ <- lists:seq(1, 3)],
+    Caller = spawn(fun() -> Parent ! {Ref, result, multi(Nodes, Config)} end),
+    Requests = [receive {Ref, Pid} -> Pid
+        after 5000 -> error(request_not_started)
+        end || _ <- Nodes],
+    try
+        hd(Requests) ! {Ref, release},
+        receive {Ref, result, Result} -> ?assertMatch({ok, _}, Result)
+        after 5000 -> error(waiting_for_other_responses)
+        end
+    after
+        [Pid ! {Ref, release} || Pid <- Requests],
+        exit(Caller, kill)
+    end.
 
 %% @doc Serial fallback: unreachable nodes are skipped until a live one
 %% responds with 200.

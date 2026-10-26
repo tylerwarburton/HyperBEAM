@@ -15,7 +15,7 @@
 %%% and private elements of messages.
 -module(hb_private).
 -export([opts/1]).
--export([from_message/1, reset/1, is_private/1]).
+-export([from_message/1, reset/1, is_private/1, is_private_path/2]).
 -export([get/3, get/4, set/4, set/3, set_priv/2, merge/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
@@ -84,13 +84,26 @@ set_priv(Msg, PrivMap)
 set_priv(Msg, PrivMap) ->
     Msg#{ <<"priv">> => PrivMap }.
 
-%% @doc Check if a key is private.
+%% @doc Check if a key is private: it starts with `priv', in any case.
+%% `structured@1.0' does not lowercase private keys, and `message@1.0' checks a
+%% requested key before it lowercases it. `bor 32' lowercases an ASCII capital.
 is_private(Key) ->
 	try hb_util:bin(Key) of
-		<<"priv", _/binary>> -> true;
+		<<P, R, I, V, _/binary>>
+				when P bor 32 =:= $p, R bor 32 =:= $r, I bor 32 =:= $i,
+					V bor 32 =:= $v ->
+			true;
 		_ -> false
     catch _:_ -> false
 	end.
+
+%% @doc Check if a path reaches a private key: any of its parts is private. A
+%% device that sets `r//priv' sets `priv' in `r'.
+is_private_path(Path, Opts) ->
+    case hb_path:term_to_path_parts(Path, Opts) of
+        Parts when is_list(Parts) -> lists:any(fun is_private/1, Parts);
+        undefined -> false
+    end.
 
 %% @doc Remove the first key from the path if it is a private specifier.
 remove_private_specifier(InputPath, Opts) ->
@@ -126,24 +139,24 @@ opts(Opts) ->
 
 %% @doc Unset all of the private keys in a message or deep Erlang term.
 %% This function operates on all types of data, such that it can be used on
-%% non-message terms to ensure that `priv` elements can _never_ pass through.
+%% any term to ensure that `priv` elements can _never_ pass through.
 reset(Msg) when is_map(Msg) ->
     maps:map(
-        fun(_Key, Val) -> reset(Val) end,
+        fun(<<"commitments">>, Commitments) when is_map(Commitments) ->
+            % The keys of `commitments' are IDs: only its values are reset.
+            maps:map(
+                fun(_ID, Commitment) -> reset(Commitment) end,
+                Commitments
+            );
+           (_Key, Val) -> reset(Val)
+        end,
         maps:without(
             lists:filter(fun is_private/1, maps:keys(Msg)),
             Msg
         )
     );
 reset(List) when is_list(List) ->
-    % Check if any of the terms in the list are private specifiers, return an
-    % empty list if so.
-    case lists:any(fun is_private/1, List) of
-        true -> [];
-        false ->
-            % The list itself is safe. Check each of the children.
-            lists:map(fun reset/1, List)
-    end;
+    lists:map(fun reset/1, List);
 reset(Tuple) when is_tuple(Tuple) ->
     list_to_tuple(reset(tuple_to_list(Tuple)));
 reset(NonMapMessage) ->
@@ -169,7 +182,12 @@ get_private_key_test() ->
     {ok, [<<"a">>]} = hb_ao:resolve(M1, <<"keys">>, #{}),
     ?assertEqual(2, get(<<"b">>, M1, #{})),
     {error, _} = hb_ao:resolve(M1, <<"priv/a">>, #{}),
-    {error, _} = hb_ao:resolve(M1, <<"priv">>, #{}).
+    {error, _} = hb_ao:resolve(M1, <<"priv">>, #{}),
+    % `reset/1' keeps a commitment whose ID starts with `priv', in any case.
+    M2 =
+        #{<<"commitments">> =>
+            #{<<"prIv0NzMyShQBtm7vqDkulync-fOFCWLsAzqCVwcEH0">> => #{}}},
+    ?assertEqual(M2, reset(M2)).
 
 get_deep_key_test() ->
     M1 = #{<<"a">> => 1, <<"priv">> => #{<<"b">> => #{<<"c">> => 3}}},
@@ -180,22 +198,20 @@ priv_opts_store_read_link_test() ->
     PublicStore = [hb_test_utils:test_store()],
     timer:sleep(1),
     OnlyPrivStore = [hb_test_utils:test_store()],
-    ok = hb_store:write(PublicStore, #{ <<"key">> => <<"test-message">> }, #{}),
-    {ok, <<"test-message">>} = hb_store:read(PublicStore, <<"key">>, #{}),
-    % Make a link to the key in the public store.
-    ok = hb_store:link(PublicStore, #{ <<"link">> => <<"key">> }, #{}),
-    {ok, <<"test-message">>} = hb_store:read(PublicStore, <<"link">>, #{}),
+    Opts = #{ <<"store">> => PublicStore, <<"priv-store">> => OnlyPrivStore },
+    {ok, ID} = hb_cache:write(#{ <<"key">> => <<"test-message">> }, Opts),
+    % Make a link to the message in the public store.
+    ok = hb_cache:link(ID, <<"link">>, Opts),
     % Read the link from the private store. First as a simple store read, then
     % as a link.
-    Opts = #{ <<"store">> => PublicStore, <<"priv-store">> => OnlyPrivStore },
     PrivOpts = #{ <<"store">> := PrivStore } = opts(Opts),
-    {ok, <<"test-message">>} = hb_store:read(PrivStore, <<"link">>, #{}),
+    {ok, <<"ao:", ID/binary>>} = hb_store:read(PrivStore, <<"link">>, #{}),
     Loaded =
         hb_cache:ensure_loaded(
-            {link, <<"link">>, #{ <<"type">> => <<"link">>, <<"lazy">> => false }},
+            {link, <<"link">>, #{ <<"lazy">> => true }},
             PrivOpts
         ),
-    ?assertEqual(<<"test-message">>, Loaded).
+    ?assertEqual(<<"test-message">>, hb_maps:get(<<"key">>, Loaded, PrivOpts)).
 
 priv_opts_cache_read_message_test() ->
     hb:init(),

@@ -26,13 +26,20 @@ do(State) ->
     hb_forge_args:run_provider(State, ?MODULE, fun run_tests/1).
 
 run_tests(State) ->
-    Args = hb_forge_args:parse(State, <<"_build/device-test-store">>),
+    ErlOpts = rebar_state:get(State, erl_opts, []),
+    Defines =
+        [D || {d, _} = D <- ErlOpts] ++
+        [D || {d, _, _} = D <- ErlOpts],
+    Args =
+        (hb_forge_args:parse(State, <<"_build/device-test-store">>))#{
+            <<"erl-defines">> => Defines
+        },
     % Build a complete store from the configured source set so selected
     % device tests can resolve their dependencies.
     {ok, Result} =
         hb_forge_preload:run(
             Args#{ <<"device-roots">> => all, <<"test">> => true },
-            #{}
+            #{ <<"erl-defines">> => Defines }
         ),
     Roots = maps:get(<<"device-roots">>, Args, all),
     Groups = hb_forge_args:scan_devices(Args),
@@ -60,6 +67,7 @@ run_tests(State) ->
         _ ->
             with_preloaded_test_modules(
                 Roots,
+                Defines,
                 fun(TestModules) ->
                     with_core_test_modules(
                         CoreTests,
@@ -130,7 +138,11 @@ test_modules(
                 ModuleNames,
                 TestSpecs
             ),
-            Res = eunit:test(timeout_tests(RecordTests, Args), eunit_opts(Args)),
+            Res =
+                eunit:test(
+                    spawn_tests(timeout_tests(RecordTests, Args)),
+                    eunit_opts(Args)
+                ),
             print_record_reports(RecordCtx),
             Res
         after restore_test_env(Env)
@@ -249,7 +261,8 @@ named_test_descriptor(Mod, Fun, Label, generator) ->
 named_test_descriptor(Mod, Fun, Label, test) ->
     {{Label, Fun, 0}, {test, Mod, Fun}}.
 
-%% @doc Resolve a requested `-t' name, treating matching `_test_' as generator.
+%% @doc Resolve a requested `-t' name. A name that ends in `_', such as
+%% `x_test_' or `x_test_parallel_', is a generator.
 resolve_test_fun(Mod, Fun) ->
     code:ensure_loaded(Mod),
     case erlang:function_exported(Mod, Fun, 0) of
@@ -257,7 +270,7 @@ resolve_test_fun(Mod, Fun) ->
             [
                 {
                     Fun,
-                    case lists:suffix("_test_", atom_to_list(Fun)) of
+                    case lists:suffix("_", atom_to_list(Fun)) of
                         true -> generator;
                         false -> test
                     end
@@ -296,6 +309,12 @@ timeout_tests(Tests, #{ <<"timeout">> := Timeout })
     [{timeout, Timeout, Test} || Test <- Tests];
 timeout_tests(_Tests, #{ <<"timeout">> := Timeout }) ->
     error({invalid_timeout, Timeout}).
+
+%% @doc Run each top-level EUnit descriptor in its own process. A descriptor
+%% is one module, or one test that `--test' names. A test that times out
+%% cancels only the rest of its own descriptor.
+spawn_tests(Tests) ->
+    [{spawn, Test} || Test <- Tests].
 
 %% @doc EUnit options, preserving the historical timeout multiplier by default.
 eunit_opts(#{ <<"timeout-multiplier">> := Multiplier })
@@ -923,8 +942,8 @@ start_app(App) ->
     end.
 
 %% @doc Compile preloaded test-only modules for whole-library device tests.
-with_preloaded_test_modules(Roots, Fun) when is_function(Fun, 1) ->
-    {Ebin, Modules} = compile_preloaded_test_modules(),
+with_preloaded_test_modules(Roots, Defines, Fun) when is_function(Fun, 1) ->
+    {Ebin, Modules} = compile_preloaded_test_modules(Defines),
     code:add_patha(hb_util:list(Ebin)),
     lists:foreach(
         fun(Mod) -> load_test_module(Mod, preloaded_test_load_failed) end,
@@ -938,22 +957,23 @@ with_preloaded_test_modules(Roots, Fun) when is_function(Fun, 1) ->
     end.
 
 %% @doc Compile `src/preloaded/test' modules into an isolated ebin.
-compile_preloaded_test_modules() ->
+compile_preloaded_test_modules(Defines) ->
     compile_test_modules(
         unique_build_dir("device-test-fixtures"),
         lists:sort(filelib:wildcard("src/preloaded/test/hb_*.erl")),
-        preloaded_test_compile_failed
+        preloaded_test_compile_failed,
+        Defines
     ).
 
 %% @doc Return compile options used for temporary test modules.
-test_compile_opts(Ebin) ->
+test_compile_opts(Ebin, Defines) ->
     [
         debug_info,
         {d, 'TEST'},
         {outdir, hb_util:list(Ebin)},
         {i, "src"},
         {i, "src/core"}
-    ].
+    ] ++ Defines.
 
 %% @doc Only run shared preloaded test vectors when testing the full library.
 test_modules_to_run(_Modules, Roots) when Roots =/= all ->
@@ -974,14 +994,14 @@ purge_test_module(Mod) ->
 
 %% @doc Compile core tests when requested, or when filters name core modules.
 maybe_compile_core_test_modules(
-    #{ <<"with-core">> := true },
+    Args = #{ <<"with-core">> := true },
     _ModuleLabels,
     _SourceLabels
 ) ->
-    compile_core_test_modules();
+    compile_core_test_modules(Args);
 maybe_compile_core_test_modules(Args, ModuleLabels, SourceLabels) ->
     case filter_needs_core(Args, ModuleLabels, SourceLabels) of
-        true -> compile_core_test_modules();
+        true -> compile_core_test_modules(Args);
         false -> none
     end.
 
@@ -1024,11 +1044,12 @@ with_core_test_modules({Ebin, Modules}, Fun) when is_function(Fun, 1) ->
     end.
 
 %% @doc Compile core test modules into an isolated ebin.
-compile_core_test_modules() ->
+compile_core_test_modules(Args) ->
     compile_test_modules(
         unique_build_dir("device-test-core"),
         core_test_paths(),
-        core_test_compile_failed
+        core_test_compile_failed,
+        maps:get(<<"erl-defines">>, Args)
     ).
 
 %% @doc Return source paths that make up the core EUnit suite.
@@ -1053,7 +1074,7 @@ unique_build_dir(Name) ->
     ).
 
 %% @doc Compile a group of test modules to a temporary ebin.
-compile_test_modules(BuildDir, Paths, ErrorTag) ->
+compile_test_modules(BuildDir, Paths, ErrorTag, Defines) ->
     Ebin = filename:join([BuildDir, "ebin"]),
     file:del_dir_r(filename:dirname(Ebin)),
     ok = filelib:ensure_dir(filename:join(Ebin, "x")),
@@ -1061,7 +1082,7 @@ compile_test_modules(BuildDir, Paths, ErrorTag) ->
         Ebin,
         lists:usort(
             [
-                compile_test_module(Path, Ebin, ErrorTag)
+                compile_test_module(Path, Ebin, ErrorTag, Defines)
             ||
                 Path <- Paths
             ]
@@ -1069,8 +1090,8 @@ compile_test_modules(BuildDir, Paths, ErrorTag) ->
     }.
 
 %% @doc Compile one test module and raise a tagged error on failure.
-compile_test_module(Path, Ebin, ErrorTag) ->
-    case compile:file(Path, test_compile_opts(Ebin)) of
+compile_test_module(Path, Ebin, ErrorTag, Defines) ->
+    case compile:file(Path, test_compile_opts(Ebin, Defines)) of
         {ok, Mod} -> Mod;
         {ok, Mod, _} -> Mod;
         Error -> error({ErrorTag, Path, Error})

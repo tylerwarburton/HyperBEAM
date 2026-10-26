@@ -3,6 +3,14 @@
 %%% If `to' is omitted, it keeps moving downward from `from' until it reaches a
 %%% block that is already indexed at the requested mode. If `to' is provided,
 %%% every block in the range is processed.
+%%% `reindex' defaults to true and bypasses cached block headers.
+%%% `mode=blocks' stores only block headers in `arweave-block-store' (or `store'),
+%%% irrespective of `arweave-index-blocks', and does not process pending TXs.
+%%% `include-proofs=false' omits block proofs from the returned/cached headers.
+%%% `mode=block-index' imports the compact native index without block headers
+%%% or pending transactions. `include-block-index=true' also records compact
+%%% entries from headers fetched by blocks, shallow, deep, full and list modes;
+%%% it defaults to false. Both use `arweave-block-store'.
 %%%
 %%% Every transaction header and, in `full' mode, every bundled item an index
 %%% run caches carries its weave offset as `priv/offset'.
@@ -26,10 +34,16 @@ arweave(_Base, Request, Opts) ->
                 {error, unavailable} ->
                     {error, unavailable};
                 {ok, {_IncludePending, From, To}} ->
-                    list_index(From, To, Opts)
+                    list_index(Request, From, To, Opts)
             end;
         {ok, IndexMode} ->
-            case parse_range(Request, Opts) of
+            % Reading the tip must not mark it complete before a blocks run.
+            RangeOpts =
+                case IndexMode of
+                    blocks -> Opts#{ <<"arweave-index-blocks">> => false };
+                    _ -> Opts
+                end,
+            case parse_range(Request, RangeOpts) of
                 {error, unavailable} ->
                     {error, unavailable};
                 {ok, {IncludePending, From, To}} ->
@@ -38,11 +52,13 @@ arweave(_Base, Request, Opts) ->
             end;
         {error, Mode} ->
             {error, <<"Unsupported mode `", (hb_util:bin(Mode))/binary,
-                "`. Supported modes are: shallow, deep, full, list">>}
+                "`. Supported modes are: block-index, blocks, shallow, deep, full, list">>}
     end.
 
 request_mode(Request, Opts) ->
     case hb_maps:get(<<"mode">>, Request, <<"shallow">>, Opts) of
+        <<"blocks">> -> {ok, blocks};
+        <<"block-index">> -> {ok, block_index};
         <<"shallow">> -> {ok, shallow};
         <<"deep">> -> {ok, deep};
         <<"full">> -> {ok, full};
@@ -55,7 +71,7 @@ parse_range(Request, Opts) ->
     FromArg = hb_maps:find(<<"from">>, Request, Opts),
     ToArg = hb_maps:find(<<"to">>, Request, Opts),
     maybe
-        {ok, Tip} ?= range_tip(FromArg, ToArg, Opts),
+        {ok, Tip} ?= range_tip(FromArg, ToArg, Request, Opts),
         {ok, IncludePendingFrom, From} ?= from_height(FromArg, Tip),
         {ok, IncludePendingTo, To} ?= to_height(ToArg, Tip),
         case From < 0 orelse (is_integer(To) andalso To < 0) of
@@ -74,9 +90,9 @@ parse_range(Request, Opts) ->
             {error, unavailable}
     end.
 
-range_tip(FromArg, ToArg, Opts) ->
+range_tip(FromArg, ToArg, Request, Opts) ->
     case needs_tip(FromArg, true) orelse needs_tip(ToArg, false) of
-        true -> latest_height(Opts);
+        true -> latest_height(Request, Opts);
         false -> {ok, undefined}
     end.
 
@@ -106,17 +122,29 @@ normalize_height(_Key, Height, Tip) ->
         false -> {ok, false, RequestedHeight}
     end.
 
-latest_height(Opts) ->
+latest_height(Request, Opts) ->
+    Path = case request_mode(Request, Opts) of
+        {ok, block_index} -> <<?ARWEAVE_DEVICE/binary, "/status/height">>;
+        _ -> <<?ARWEAVE_DEVICE/binary, "/current/height">>
+    end,
     case hb_ao:resolve(
-        <<?ARWEAVE_DEVICE/binary, "/current/height">>,
+        #{ <<"path">> => Path,
+            <<"include-proofs">> => hb_maps:get(<<"include-proofs">>, Request, true, Opts) },
         Opts
     ) of
         {ok, ResolvedHeight} -> {ok, hb_util:int(ResolvedHeight)};
         {error, Reason} -> {error, Reason}
     end.
 
+index_range(Request, _IncludePending, From, To, block_index, Opts) ->
+    hb_ao:resolve(
+        Request#{ <<"path">> => <<?ARWEAVE_DEVICE/binary, "/block-index">>,
+            <<"from">> => From, <<"to">> => To }, Opts);
+index_range(Request, _IncludePending, From, To, blocks, Opts) ->
+    fetch_blocks(Request, From, To, blocks,
+        Opts#{ <<"arweave-index-blocks">> => true });
 index_range(Request, true, From, To, IndexMode, Opts) ->
-    case index_pending(IndexMode, Opts) of
+    case index_pending(Request, IndexMode, Opts) of
         {ok, PendingRes} ->
             case block_range_empty(From, To) of
                 true ->
@@ -160,15 +188,17 @@ is_tx_indexed(TXID, Opts) ->
 
 %% @doc List indexed blocks and transactions in the given range.
 %% Returns JSON with block heights as keys, each containing indexed and not-indexed lists.
-list_index(From, undefined, Opts) ->
-    list_index(From, 0, Opts);
-list_index(From, To, _Opts) when From < To ->
+list_index(_Request, _From, undefined, _Opts) ->
+    {error, <<"`mode=list` requires `to`.">>};
+list_index(_Request, From, To, _Opts) when From < To ->
     {ok, #{
         <<"content-type">> => <<"application/json">>,
         <<"body">> => hb_json:encode(#{})
     }};
-list_index(From, To, Opts) ->
-    Result = list_index_blocks(From, To, Opts, #{}),
+list_index(Request, From, To, Opts) ->
+    % A list reports the index state, so it does not refetch cached headers.
+    Result =
+        list_index_blocks(Request#{ <<"reindex">> => false }, From, To, Opts, #{}),
     JSON = hb_json:encode(Result),
     {ok, #{
         <<"content-type">> => <<"application/json">>,
@@ -176,21 +206,21 @@ list_index(From, To, Opts) ->
     }}.
 
 %% @doc Iterate through blocks and check index status for each transaction.
-list_index_blocks(Current, To, _Opts, Acc) when Current < To ->
+list_index_blocks(_Request, Current, To, _Opts, Acc) when Current < To ->
     Acc;
-list_index_blocks(Current, To, Opts, Acc) ->
-    case fetch_block_header(Current, Opts) of
+list_index_blocks(Request, Current, To, Opts, Acc) ->
+    case fetch_block_header(Current, Request, Opts) of
         {ok, Block} ->
             TXIDs = hb_maps:get(<<"txs">>, Block, [], Opts),
             case TXIDs of
                 [] ->
-                    list_index_blocks(Current - 1, To, Opts, Acc);
+                    list_index_blocks(Request, Current - 1, To, Opts, Acc);
                 _ ->
                     {IndexedTXs, NotIndexedTXs} = classify_txs(TXIDs, Opts),
                     case IndexedTXs of
                         [] ->
                             % Do not include blocks with no locally indexed TXs.
-                            list_index_blocks(Current - 1, To, Opts, Acc);
+                            list_index_blocks(Request, Current - 1, To, Opts, Acc);
                         _ ->
                             BlockKey = hb_util:bin(Current),
                             NewAcc = Acc#{
@@ -199,25 +229,35 @@ list_index_blocks(Current, To, Opts, Acc) ->
                                     <<"not-indexed">> => NotIndexedTXs
                                 }
                             },
-                            list_index_blocks(Current - 1, To, Opts, NewAcc)
+                            list_index_blocks(Request, Current - 1, To, Opts, NewAcc)
                     end
             end;
         {error, _} ->
-            list_index_blocks(Current - 1, To, Opts, Acc)
+            list_index_blocks(Request, Current - 1, To, Opts, Acc)
     end.
 
-fetch_block_header(Height, Opts) ->
+fetch_block_header(Height, Request, Opts) ->
     ?event(debug_copycat, {fetching_block, Height}),
+    CacheControl =
+        lists:flatten([hb_maps:get(<<"cache-control">>, Request, [], Opts)]),
     observe_event(<<"block_header">>, fun() ->
         hb_ao:resolve(
-            <<
-                ?ARWEAVE_DEVICE/binary,
-                "/block=",
-                (hb_util:bin(Height))/binary
-            >>,
+            #{ <<"path">> => <<?ARWEAVE_DEVICE/binary, "/block">>,
+                <<"block">> => Height,
+                <<"cache-control">> =>
+                    case reindex(Request, Opts) of
+                        true -> [<<"no-cache">> | CacheControl];
+                        false -> CacheControl
+                    end,
+                <<"include-proofs">> => hb_maps:get(<<"include-proofs">>, Request, true, Opts),
+                <<"include-block-index">> => include_block_index(Request, Opts) },
             Opts
         )
     end).
+
+%% @doc Existing modes optionally index the headers they already fetch.
+include_block_index(Request, Opts) ->
+    hb_util:bool(hb_maps:get(<<"include-block-index">>, Request, false, Opts)).
 
 %% @doc Classify transactions as indexed or not-indexed.
 classify_txs(TXIDs, Opts) ->
@@ -247,11 +287,11 @@ fetch_blocks(Req, Current, To, _IndexMode, _Opts) when is_integer(To), Current <
 fetch_blocks(_Req, Current, undefined, _IndexMode, _Opts) when Current < 0 ->
     {ok, 0};
 fetch_blocks(Req, Current, undefined, IndexMode, Opts) ->
-    case is_block_indexed(Current, IndexMode, Opts) of
+    case is_block_indexed(Current, IndexMode, Req, Opts) of
         true ->
             stop_at_indexed_block(Req, Current);
         false ->
-            BlockRes = fetch_block_header(Current, Opts),
+            BlockRes = fetch_block_header(Current, Req, Opts),
             case IndexMode =:= shallow andalso is_already_indexed(BlockRes, Opts) of
                 true ->
                     stop_at_indexed_block(Req, Current);
@@ -265,9 +305,9 @@ fetch_blocks(Req, Current, undefined, IndexMode, Opts) ->
 fetch_blocks(Req, Current, To, IndexMode, Opts) ->
     % Unless `reindex' is set (the default), skip blocks already indexed at
     % this mode, so overlapping ranges from different callers are not re-fetched.
-    (reindex(Req, Opts) orelse not is_block_indexed(Current, IndexMode, Opts))
+    (reindex(Req, Opts) orelse not is_block_indexed(Current, IndexMode, Req, Opts))
         andalso observe_event(<<"block_indexed">>, fun() ->
-            process_block(fetch_block_header(Current, Opts), Current, To, IndexMode, Opts)
+            process_block(fetch_block_header(Current, Req, Opts), Current, To, IndexMode, Opts)
         end),
     fetch_blocks(Req, Current - 1, To, IndexMode, Opts).
 
@@ -291,11 +331,13 @@ is_already_indexed({ok, Block}, Opts) ->
 is_already_indexed({error, _}, _Opts) ->
     false.
 
+process_block({ok, _Block}, _Current, _To, blocks, _Opts) ->
+    ok;
 process_block(BlockRes, Current, To, IndexMode, Opts) ->
     case BlockRes of
         {ok, Block} ->
             ?event(debug_copycat, {{processing_block, Current},
-                {indep_hash, hb_maps:get(<<"indep_hash">>, Block, <<>>)}}),
+                {indep_hash, hb_maps:get(<<"indep-hash">>, Block, <<>>)}}),
             case maybe_index_ids(Block, IndexMode, Opts) of
                 {block_skipped, Results} ->
                     TotalTXs = maps:get(total_txs, Results, 0),
@@ -349,7 +391,32 @@ write_block_index(Height, IndexMode, Opts) ->
         Opts
     ).
 
-is_block_indexed(Height, IndexMode, Opts) ->
+is_block_indexed(Height, Mode, Req, Opts) ->
+    HasIndex = case include_block_index(Req, Opts) of
+        false -> true;
+        true ->
+            case hb_ao:resolve(#{ <<"path">> => <<?ARWEAVE_DEVICE/binary, "/blocks">>,
+                    <<"height">> => Height }, Opts) of
+                {ok, [_]} -> true;
+                _ -> false
+            end
+    end,
+    HasIndex andalso is_mode_indexed(Height, Mode, Req, Opts).
+
+is_mode_indexed(Height, blocks, Req, Opts) ->
+    % `no-cache' in the opts takes the request past the resolver's own cache
+    % to the device, which answers `only-if-cached' from its block store.
+    case hb_ao:resolve(
+        #{ <<"device">> => <<"arweave@2.9">> },
+        #{ <<"path">> => <<"block">>, <<"block">> => Height,
+            <<"include-proofs">> => hb_maps:get(<<"include-proofs">>, Req, true, Opts),
+            <<"cache-control">> => [<<"only-if-cached">>] },
+        Opts#{ <<"cache-control">> => [<<"no-cache">>, <<"no-store">>] }
+    ) of
+        {ok, _} -> true;
+        _ -> false
+    end;
+is_mode_indexed(Height, IndexMode, _Req, Opts) ->
     case hb_store_arweave:store_from_opts(Opts) of
         no_store ->
             false;
@@ -388,9 +455,9 @@ maybe_index_ids(Block, IndexMode, Opts) ->
             }};
         true ->
             BlockEndOffset = hb_util:int(
-                hb_maps:get(<<"weave_size">>, Block, 0, Opts)),
+                hb_maps:get(<<"weave-size">>, Block, 0, Opts)),
             BlockSize = hb_util:int(
-                hb_maps:get(<<"block_size">>, Block, 0, Opts)),
+                hb_maps:get(<<"block-size">>, Block, 0, Opts)),
             BlockStartOffset = BlockEndOffset - BlockSize,
             case resolve_tx_headers(TXIDs, Opts) of
                 error ->
@@ -565,10 +632,23 @@ process_tx({{TX, _TXDataRoot}, EndOffset}, BlockStartOffset, IndexMode, Opts) ->
 process_txs(ValidTXs, BlockStartOffset, IndexMode, Opts) ->
     Results = parallel_map(
         ValidTXs,
-        fun(TXWithData) -> process_tx(TXWithData, BlockStartOffset, IndexMode, Opts) end,
+        fun({{TX, _}, _} = TXWithData) ->
+            index_item(hb_util:encode(TX#tx.id), fun() ->
+                process_tx(TXWithData, BlockStartOffset, IndexMode, Opts)
+            end, counters(0, 0, 1))
+        end,
         Opts
     ),
     sum_counters(Results).
+
+%% @doc Contain a downstream failure at the individual ID being indexed.
+index_item(ID, Fun, OnError) ->
+    try Fun()
+    catch Class:Reason ->
+        ?event(copycat_short, {arweave_item_skipped,
+            {id, {explicit, ID}}, {class, Class}, {reason, Reason}}),
+        OnError
+    end.
 
 sum_counters(Results) ->
     lists:foldl(
@@ -611,33 +691,123 @@ index_full_bundle_bytes(BundleData, BundleStartOffset, IndexMode, Store, Opts) -
     end.
 
 %% @doc Index unconfirmed transactions from the Arweave mempool.
-index_pending(IndexMode, Opts) ->
+index_pending(Request, IndexMode, Opts) ->
+    case hb_opts:get(pending_index, [], Opts) of
+        [] -> index_pending(Request, IndexMode, [], Opts);
+        Store ->
+            Name = {copycat_pending, Store},
+            Base = #{
+                <<"device">> => #{
+                    device_info =>
+                        fun() -> #{ grouper => fun() -> Name end } end,
+                    index =>
+                        fun(_, #{ <<"request">> := Req, <<"mode">> := Mode,
+                                <<"options">> := IndexOpts }) ->
+                            index_pending(Req, Mode, Store, IndexOpts)
+                        end
+                }
+            },
+            Worker =
+                hb_name:singleton(
+                    Name,
+                    fun() ->
+                        hb_persistent:default_worker(Name, Base, #{
+                            <<"static-worker">> => true,
+                            <<"resolve-mode">> => raw
+                        })
+                    end
+                ),
+            % Worker controls must not replace the caller's indexing options.
+            Work = #{
+                <<"path">> => <<"index">>,
+                <<"request">> => Request,
+                <<"mode">> => IndexMode,
+                <<"options">> => Opts
+            },
+            Ref = erlang:monitor(process, Worker),
+            Worker ! {resolve, self(), Name, Work, #{}},
+            try hb_persistent:default_await(Worker, Name, Base, Work, #{})
+            after erlang:demonitor(Ref, [flush])
+            end
+    end.
+
+%% @doc Reuse completed parents only while their pending index is retained.
+index_pending(Request, IndexMode, Store, Opts) ->
     case hb_ao:resolve(<<?ARWEAVE_DEVICE/binary, "/pending">>, Opts) of
         {ok, TXIDs} when is_list(TXIDs) ->
-            PendingOpts = pending_opts(Opts),
+            Indexed = pending_index(Request, IndexMode, TXIDs, Store, Opts),
+            Remaining = [ID || ID <- TXIDs, not maps:get(ID, Indexed)],
+            ok = write_pending_index(maps:from_keys(Remaining, false), Store, Opts),
+            PendingOpts =
+                case Store of
+                    [] -> Opts;
+                    _ -> Opts#{ <<"match-index">> => Store }
+                end,
             Results = parallel_map(
-                TXIDs,
+                Remaining,
                 fun(TXID) ->
-                    process_pending_tx(TXID, IndexMode, PendingOpts)
+                    index_item(TXID, fun() ->
+                        process_pending_tx(TXID, IndexMode, PendingOpts)
+                    end, counters(0, 0, 1))
                 end,
                 Opts
             ),
+            Completed = maps:from_list([
+                {ID, true}
+            ||
+                {ID, #{ skipped_count := 0 }} <- lists:zip(Remaining, Results)
+            ]),
+            ok = write_pending_index(Completed, Store, Opts),
             {ok, (sum_counters(Results))#{ total_txs => length(TXIDs) }};
         Error ->
             Error
     end.
 
-%% @doc The options the mempool is indexed with: the node's `pending-index'
-%% store -- emptied ahead of each index run, so it must be a store of the
-%% mempool's own -- as the match index of every message the run caches. A
-%% node without one indexes the mempool with everything else.
-pending_opts(Opts) ->
-    case hb_opts:get(pending_index, [], Opts) of
-        [] -> Opts;
-        Store ->
+%% @doc Completion markers belong to the dedicated pending index, not the message
+%% stores. Rebuild when a parent leaves, to remove its children's predicates
+%% too. A node without a pending index cannot reuse these markers.
+pending_index(_Request, _Mode, TXIDs, [], _Opts) ->
+    maps:from_keys(TXIDs, false);
+pending_index(Request, Mode, TXIDs, Store, Opts) ->
+    Current = maps:from_keys(TXIDs, false),
+    ModeBin = atom_to_binary(Mode),
+    maybe
+        {ok, ModeBin} ?=
+            hb_store:read(Store, <<"~copycat@1.0/pending-mode">>, Opts),
+        false ?= hb_util:bool(hb_maps:get(<<"reindex">>, Request, false, Opts)),
+        {ok, Previous} ?= hb_store:list(Store, <<"~copycat@1.0/pending">>, Opts),
+        0 ?= map_size(maps:without(TXIDs, maps:from_keys(Previous, false))),
+        maps:merge(
+            Current,
+            maps:from_list([
+                {ID,
+                    hb_store:read(Store, <<"~copycat@1.0/pending/", ID/binary>>, Opts)
+                        =:= {ok, <<"1">>}}
+            ||
+                ID <- Previous
+            ])
+        )
+    else
+        _ ->
             ok = hb_store:reset(Store),
-            Opts#{ <<"match-index">> => Store }
+            ok = hb_store:write(
+                Store, #{ <<"~copycat@1.0/pending-mode">> => ModeBin }, Opts),
+            Current
     end.
+
+%% @doc Record attempted parents before writes and completions after them.
+write_pending_index(_Indexed, [], _Opts) -> ok;
+write_pending_index(Indexed, Store, Opts) ->
+    hb_store:write(
+        Store,
+        maps:from_list([
+            {<<"~copycat@1.0/pending/", ID/binary>>,
+                case Complete of true -> <<"1">>; false -> <<"0">> end}
+        ||
+            {ID, Complete} <- maps:to_list(Indexed)
+        ]),
+        Opts
+    ).
 
 process_pending_tx(TXID, IndexMode, Opts) ->
     case resolve_pending_tx_header(TXID, Opts) of
@@ -721,6 +891,8 @@ index_pending_children(TXID, TX, IndexMode, Store, Opts) ->
             end
     end.
 
+index_full_bundle_items([], _, _, _, _, _, {error, _} = Error) ->
+    Error;
 index_full_bundle_items(
         [], _ItemsBin, _ItemStartOffset, _IndexMode, _Store, _Opts, Count) ->
     {ok, Count};
@@ -734,6 +906,25 @@ index_full_bundle_items(
     Count
 ) when byte_size(ItemsBin) >= Size ->
     <<ItemBinary:Size/binary, RestBin/binary>> = ItemsBin,
+    Result = index_item(hb_util:encode(ItemID), fun() ->
+        index_full_bundle_item(ItemID, ItemBinary, ItemStartOffset, IndexMode, Store, Opts)
+    end, {error, 'item-index-failed'}),
+    NextCount =
+        case {Count, Result} of
+            {N, {ok, Added}} when is_integer(N) -> N + Added;
+            {{error, _}, _} -> Count;
+            {_, Error} -> Error
+        end,
+    index_full_bundle_items(
+        Rest, RestBin, add_data_offset(ItemStartOffset, Size),
+        IndexMode, Store, Opts, NextCount);
+index_full_bundle_items(
+        _BundleIndex, _ItemsBin, _ItemStartOffset, _IndexMode,
+        _Store, _Opts, _Count) ->
+    {error, invalid_bundle_header}.
+
+%% @doc Index one item without consuming its siblings.
+index_full_bundle_item(ItemID, ItemBinary, ItemStartOffset, IndexMode, Store, Opts) ->
     EncodedItemID = hb_util:encode(ItemID),
     ParseResult =
         case IndexMode of
@@ -749,23 +940,42 @@ index_full_bundle_items(
         EncodedItemID,
         <<"ans104@1.0">>,
         ItemStartOffset,
-        Size
+        byte_size(ItemBinary)
     ) of
         ok ->
-            ok =
+            LocalOpts = hb_store:scope(Opts, local),
+            % An item that its codec refuses is refused on every pass, so we
+            % skip it and still index its bundle.
+            Converted =
                 case {IndexMode, ParseResult} of
                     {full, {ok, _, Parsed}} ->
-                        LocalOpts = hb_store:scope(Opts, local),
-                        Msg = hb_message:convert(
-                            Parsed, <<"structured@1.0">>, <<"ans104@1.0">>, LocalOpts),
+                        index_item(EncodedItemID, fun() ->
+                            {ok,
+                                hb_message:convert(
+                                    Parsed,
+                                    <<"structured@1.0">>,
+                                    <<"ans104@1.0">>,
+                                    LocalOpts)}
+                        end, refused);
+                    _ -> ok
+                end,
+            CacheRes = index_item(EncodedItemID, fun() ->
+                case Converted of
+                    {ok, Msg} ->
+                        % An item whose signature does not verify is not
+                        % indexed: the cache would write it without its
+                        % commitment.
+                        true = not is_map(Msg) orelse
+                            hb_message:verify(Msg, all, LocalOpts),
                         {ok, _Path} =
                             hb_cache:write(
                                 with_offset(Msg, ItemStartOffset, LocalOpts),
                                 LocalOpts
                             ),
                         ok;
-                    _ -> ok
-                end,
+                    Other -> Other
+                end
+            end, error),
             DescendantRes =
                 case {IndexMode =/= shallow, ParseResult} of
                     {true, {ok, HeaderSize, ParsedItem}} ->
@@ -782,31 +992,19 @@ index_full_bundle_items(
                                 {ok, 0}
                         end;
                     {true, _} ->
-                        {ok, 0};
+                        {error, 'invalid-item'};
                     _ ->
                         {ok, 0}
                 end,
-            case DescendantRes of
-                {ok, DescendantCount} ->
-                    index_full_bundle_items(
-                        Rest,
-                        RestBin,
-                        add_data_offset(ItemStartOffset, Size),
-                        IndexMode,
-                        Store,
-                        Opts,
-                        Count + 1 + DescendantCount
-                    );
-                {error, _} = Error ->
-                    Error
+            case {CacheRes, DescendantRes} of
+                {ok, {ok, DescendantCount}} -> {ok, 1 + DescendantCount};
+                {refused, {ok, DescendantCount}} -> {ok, DescendantCount};
+                {_, {error, _} = Error} -> Error;
+                _ -> {error, 'item-index-failed'}
             end;
         WriteError ->
             {error, {write_offset_failed, WriteError}}
-    end;
-index_full_bundle_items(
-        _BundleIndex, _ItemsBin, _ItemStartOffset, _IndexMode,
-        _Store, _Opts, _Count) ->
-    {error, invalid_bundle_header}.
+    end.
 
 add_data_offset(#{ <<"relative">> := TXID, <<"offset">> := Offset }, Add) ->
     #{ <<"relative">> => TXID, <<"offset">> => Offset + Add };
@@ -918,15 +1116,15 @@ write_tx_header(TX, Offset, Opts) ->
                     {reason, Reason}
                 }
             ),
-            ok
+            {error, {Class, Reason}}
     end.
 
 %% @doc A message carrying its weave offset privately, for `hb_cache' to
 %% index it by: an item in a pending bundle is pending itself.
 with_offset(Msg, #{ <<"relative">> := _ }, Opts) ->
     with_offset(Msg, infinity, Opts);
-with_offset(Bin, _Offset, _Opts) when is_binary(Bin) ->
-    Bin;
+with_offset(Msg, _Offset, _Opts) when is_binary(Msg); is_list(Msg) ->
+    Msg;
 with_offset(Msg, Offset, Opts) ->
     hb_private:set(Msg, <<"offset">>, Offset, Opts).
 
@@ -943,6 +1141,186 @@ observe_event(MetricName, Fun) ->
     Result.
 
 %%% Tests
+
+%% @doc Native compact imports do not populate the block-header cache, and
+%% completed ranges resume offline through both HTTP and AO-Core resolution.
+compact_block_index_test_() ->
+    {timeout, 60, fun() ->
+        Wallet = ar_wallet:new(),
+        Opts = #{
+            <<"priv-wallet">> => Wallet, <<"port">> => 0,
+            <<"store">> => [hb_test_utils:test_store(hb_store_volatile)],
+            <<"arweave-block-store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"gateway">> => <<"http://chain-3.arweave.xyz:1984">>
+        },
+        Node = hb_http_server:start_node(Opts),
+        Path = <<"~copycat@1.0/arweave&mode=block-index&from=2003806&to=2003805">>,
+        try
+            ?assertMatch({ok, _}, hb_http:get(Node, <<"/", Path/binary>>, #{})),
+            ?assertEqual({ok, []}, hb_ao:resolve(<<"~arweave@2.9/block-heights">>, Opts)),
+            {ok, [First, Last]} = hb_ao:resolve(
+                <<"~arweave@2.9/blocks&limit=2">>, Opts),
+            ?assertEqual(2003805, hb_maps:get(<<"height">>, First)),
+            ?assertEqual(2003806, hb_maps:get(<<"height">>, Last)),
+            ?assertEqual(391614827372790, hb_maps:get(<<"weave-size">>, Last)),
+            ?assertEqual({ok, [Last]}, hb_ao:resolve(
+                <<"~arweave@2.9/blocks&weave-size=00000391614821081335",
+                    "&height=00000000000000000000">>, Opts)),
+            ?assertEqual({ok, [Last, First]}, hb_ao:resolve(
+                <<"~arweave@2.9/blocks&direction=desc&limit=2">>, Opts)),
+            Offline = Opts#{ <<"gateway">> => <<"http://127.0.0.1:1">>,
+                <<"routes">> => [] },
+            ?assertEqual({ok, 2003805}, hb_ao:resolve(
+                <<Path/binary, "&reindex=false">>, Offline)),
+            ?assertEqual({ok, 2003806}, hb_ao:resolve(
+                <<"~copycat@1.0/arweave&mode=block-index&from=2003806">>, Offline)),
+            ?assertEqual({ok, 2003805}, hb_ao:resolve(
+                <<Path/binary, "&reindex=true">>, Opts))
+        after
+            cowboy:stop_listener(hb_util:human_id(ar_wallet:to_address(Wallet)))
+        end
+    end}.
+
+%% @doc Ordered seeks retain shared boundaries, reject holes in a partial
+%% index, and follow reindexed canonical rows even when their end changes.
+block_index_boundaries_test_() ->
+    [{atom_to_list(Module), fun() -> block_index_boundaries(Module) end}
+        || Module <- [hb_store_volatile, hb_store_lmdb]].
+
+block_index_boundaries(Module) ->
+    Store = hb_test_utils:test_store(Module),
+    Blocks = hb_test_utils:test_store(Module),
+    Arweave = #{ <<"store-module">> => hb_store_arweave, <<"index-store">> => Store },
+    Opts = #{ <<"store">> => [Store], <<"arweave-block-store">> => Blocks,
+        <<"arweave-index-store">> => Arweave,
+        <<"query-arweave-remote-block-ranges">> => false,
+        <<"gateway">> => <<"http://127.0.0.1:1">>, <<"routes">> => [] },
+    Entries = [{1, 100, 100}, {2, 100, 0}, {3, 100, 0}, {4, 200, 100}, {5, 400, 100}],
+    TXs = lists:map(fun({H, _, _}) ->
+        {ok, ID} = hb_cache:write(#{ <<"test-tx">> => H }, Opts),
+        ok = hb_store_arweave:write_offset(Arweave, ID, <<"tx@1.0">>, 100, 0),
+        ID
+    end, Entries),
+    lists:foreach(
+        fun({{H, End, Size}, ID}) ->
+            block_index_header(H, End, Size, [ID], Blocks)
+        end,
+        lists:zip(Entries, TXs)
+    ),
+    ?assertEqual({ok, 1}, hb_ao:resolve(
+        <<"~copycat@1.0/arweave&mode=blocks&from=5&to=1",
+            "&include-proofs=false&include-block-index=true&reindex=false">>, Opts)),
+    {ok, Indexed} = hb_ao:resolve(<<"~arweave@2.9/blocks&limit=5">>, Opts),
+    ?assertEqual([1, 2, 3, 4, 5], [hb_maps:get(<<"height">>, E) || E <- Indexed]),
+    Items = lists:map(fun({Offset, Expected}) ->
+        {ok, ID} = hb_cache:write(#{ <<"test-item">> => Offset }, Opts),
+        ok = hb_store_arweave:write_offset(Arweave, ID, <<"ans104@1.0">>, Offset, 1),
+        {ID, Expected}
+    end, [{0, 1}, {99, 1}, {100, 4}, {199, 4}, {200, null}, {250, null}, {300, 5}]),
+    Expected = lists:zip(TXs, [1, 2, 3, 4, null]) ++ Items,
+    {ok, Reply} = hb_ao:resolve(#{ <<"path">> => <<"~query@1.0/graphql">>,
+        <<"method">> => <<"POST">>, <<"body">> => hb_json:encode(#{
+            <<"query">> => <<"query($ids:[ID!]) { transactions(ids:$ids,first:100) ",
+                "{ edges { node { id block { height } } } } }">>,
+            <<"variables">> => #{ <<"ids">> => [ID || {ID, _} <- Expected] }
+        }) }, Opts),
+    #{ <<"data">> := #{ <<"transactions">> := #{ <<"edges">> := Edges } } } =
+        hb_json:decode(hb_maps:get(<<"body">>, Reply)),
+    ?assertEqual(maps:from_list(Expected), maps:from_list([
+        {ID, case Block of null -> null; _ -> hb_maps:get(<<"height">>, Block) end}
+        || #{ <<"node">> := #{ <<"id">> := ID, <<"block">> := Block } } <- Edges])).
+
+%% @doc Unfiltered GraphQL pages use block headers, including empty blocks and
+%% distinct zero-data TXs at one position, in either direction.
+block_transaction_pages_test() ->
+    Wallet = ar_wallet:new(),
+    Blocks = hb_test_utils:test_store(hb_store_lmdb),
+    Opts = #{ <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)],
+        <<"arweave-block-store">> => Blocks, <<"priv-wallet">> => Wallet,
+        <<"port">> => 0, <<"query-arweave-remote-block-ranges">> => false,
+        <<"query-arweave-max-index-count">> => 4,
+        <<"gateway">> => <<"http://127.0.0.1:1">> },
+    IDs = lists:sort([begin
+        Msg = hb_message:commit(#{ <<"test-tx">> => hb_util:bin(N) }, Opts, <<"tx@1.0">>),
+        {ok, _} = hb_cache:write(Msg, Opts),
+        hb_message:id(Msg, signed, Opts)
+    end || N <- lists:seq(1, 5)]),
+    lists:foreach(fun({H, TXs}) -> block_index_header(H, 100, 0, TXs, Blocks) end,
+        [{0, lists:sublist(IDs, 2)}, {1, []}, {2, lists:nthtail(2, IDs)}]),
+    {ok, 0} = hb_ao:resolve(<<"~copycat@1.0/arweave&mode=blocks&from=2&to=0",
+        "&include-proofs=false&include-block-index=true&reindex=false">>, Opts),
+    Node = hb_http_server:start_node(Opts),
+    Query = <<"query($block:BlockFilter,$sort:SortOrder,$after:String,$first:Int){",
+        "transactions(block:$block,sort:$sort,after:$after,first:$first,tags:[]){",
+        "count pageInfo{hasNextPage} edges{cursor ...Item}}}",
+        "fragment Item on TransactionEdge {node{id block{height}}}">>,
+    Request = fun(Vars) ->
+        {ok, Reply} = hb_http:post(Node, #{ <<"path">> => <<"~query@1.0/graphql">>,
+            <<"content-type">> => <<"application/json">>,
+            <<"body">> => hb_json:encode(#{ <<"query">> => Query,
+                <<"variables">> => Vars }) }, #{}),
+        hb_json:decode(hb_maps:get(<<"body">>, Reply))
+    end,
+    Page = fun(Vars) ->
+        Res = Request(maps:merge(#{ <<"first">> => 2 }, Vars)),
+        ?assertEqual([], maps:get(<<"errors">>, Res, [])),
+        hb_util:deep_get(<<"data/transactions">>, Res, Opts)
+    end,
+    Pages = fun Pages(Sort, After) ->
+        #{ <<"edges">> := Edges, <<"count">> := <<"4">>,
+            <<"pageInfo">> := #{ <<"hasNextPage">> := More }} =
+                Page(#{ <<"sort">> => Sort, <<"after">> => After }),
+        case More of
+            true -> Edges ++ Pages(Sort, maps:get(<<"cursor">>, lists:last(Edges)));
+            false -> Edges
+        end
+    end,
+    try
+        Asc = Pages(<<"HEIGHT_ASC">>, null),
+        ?assertEqual(IDs, [ID || #{ <<"node">> := #{ <<"id">> := ID }} <- Asc]),
+        ?assertEqual([0, 0, 2, 2, 2], [H || #{ <<"node">> := #{ <<"block">> :=
+            #{ <<"height">> := H } }} <- Asc]),
+        ?assertEqual(lists:reverse(Asc), Pages(<<"HEIGHT_DESC">>, null)),
+        ?assertMatch(#{ <<"edges">> := [_, _], <<"count">> := <<"2">>,
+            <<"pageInfo">> := #{ <<"hasNextPage">> := false }},
+            Page(#{ <<"block">> => #{ <<"max">> => 0, <<"min">> => null }})),
+        ?assertMatch(#{ <<"count">> := <<"3">> },
+            Page(#{ <<"block">> => #{ <<"min">> => 2 }})),
+        ?assertMatch(#{ <<"edges">> := [], <<"count">> := <<"0">> },
+            Page(#{ <<"block">> => #{ <<"min">> => 9000000 }})),
+        ?assertMatch(#{ <<"edges">> := [],
+            <<"pageInfo">> := #{ <<"hasNextPage">> := true }},
+            Page(#{ <<"first">> => 0 })),
+        Last = maps:get(<<"cursor">>, lists:last(Asc)),
+        ?assertMatch(#{ <<"edges">> := [],
+            <<"pageInfo">> := #{ <<"hasNextPage">> := false }},
+            Page(#{ <<"sort">> => <<"HEIGHT_ASC">>,
+                <<"after">> => <<Last/binary, "&remaining=0">> })),
+        ?assertMatch(#{ <<"errors">> := [_ | _] },
+            Request(#{ <<"after">> => <<"block=bad&tx=bad">> })),
+        % Cursor-only reads need neither cached transactions nor a gateway.
+        {ok, Reply} = hb_ao:resolve(#{ <<"path">> => <<"~query@1.0/graphql">>,
+            <<"method">> => <<"POST">>, <<"body">> => hb_json:encode(#{
+                <<"query">> => <<"{transactions(first:5){edges{cursor}}}">>
+            }) }, Opts#{ <<"store">> => [] }),
+        ?assertEqual([maps:with([<<"cursor">>], E) || E <- lists:reverse(Asc)],
+            hb_util:deep_get(<<"data/transactions/edges">>,
+                hb_json:decode(hb_maps:get(<<"body">>, Reply)), Opts))
+    after
+        cowboy:stop_listener(hb_util:human_id(ar_wallet:to_address(Wallet)))
+    end.
+
+%% @doc Cache a sparse header fixture through ordinary message/cache APIs.
+block_index_header(Height, End, Size, TXs, Store) ->
+    Opts = #{ <<"store">> => Store },
+    Hash = hb_util:encode(crypto:strong_rand_bytes(48)),
+    Block = #{ <<"height">> => Height, <<"weave-size">> => End,
+        <<"block-size">> => Size, <<"txs">> => TXs, <<"tx-root">> => <<>>,
+        <<"indep-hash">> => Hash, <<"hash">> => Hash },
+    {ok, ID} = hb_cache:write(Block, Opts),
+    hb_cache:link(ID, Hash, Opts),
+    hb_cache:link(ID, <<"~arweave@2.9/block/height/", (hb_util:bin(Height))/binary>>, Opts),
+    Block.
 
 index_ids_test_parallel() ->
     %% Test block: https://viewblock.io/arweave/block/1827942
@@ -995,9 +1373,9 @@ index_ids_test_parallel() ->
     assert_item_read(
         <<"bXEgFm4K2b5VD64skBNAlS3I__4qxlM3Sm4Z5IXj3h8">>,
         Opts),
-    % This bundle previously triggered the ANS-104 tag-section boundary bug:
-    % the decoder ran past the declared tag bytes into the JSON body and
-    % crashed with a badmatch on the body content (the `"address":"0x..."'
+    % This bundle tests the ANS-104 tag-section boundary: a decoder that runs
+    % past the declared tag bytes into the JSON body crashes with a
+    % badmatch on the body content (the `"address":"0x..."'
     % string). With the strict tag-section boundary enforced, the item is
     % decoded and indexed correctly.
     ?assertMatch(
@@ -1099,6 +1477,26 @@ invalid_bundle_test_parallel() ->
     % L1 TX with bundle tags, but data is not a valid bundle. The L1 TX
     % should still be indexed.
     assert_item_read(<<"cGNURX2IUt98VKVIeXSfYe6eulNwPEqijaQfvatzd_o">>, Opts),
+    ok.
+
+%% @doc A format-1 transaction in block 206780 remains readable by its signed
+%% ID after deep indexing.
+format_one_tx_index_read_test_parallel() ->
+    {Local, IndexStore, BaseOpts} = setup_index_opts(),
+    ArweaveStore = #{
+        <<"store-module">> => hb_store_arweave,
+        <<"index-store">> => [Local],
+        <<"local-store">> => [Local]
+    },
+    Opts = BaseOpts#{ <<"store">> => [Local, ArweaveStore] },
+    Height = 206780,
+    TXID = <<"VLJIGuTJewofKx8ad4JYQs93nEuGnkgjrIt_Sd2QPYw">>,
+    {ok, Height} = hb_ao:resolve(
+        <<"~copycat@1.0/arweave&from=206780&to=206780&mode=deep">>,
+        Opts
+    ),
+    ?assertMatch({ok, _}, hb_store_arweave:read_index_offset(IndexStore, TXID)),
+    assert_item_read(TXID, Opts),
     ok.
 
 block_with_large_integer_test_parallel() ->
@@ -1252,9 +1650,17 @@ tx_with_no_data_test_parallel() ->
 
 non_string_tags_test_parallel() ->
     {_TestStore, _StoreOpts, Opts} = setup_index_opts(),
-    Res = resolve_tx_header(<<"752P6t4cOjMabYHqzC6hyLhxyo4YKZLblg7va_J21YE">>, Opts),
-    ?assertEqual(error, Res),
-    ok.
+    lists:foreach(
+        fun(ID) ->
+            {ok, TX} = resolve_tx_header(ID, Opts),
+            ?assertEqual(ID, hb_util:encode(TX#tx.id)),
+            ?assert(ar_tx:verify(TX))
+        end,
+        [
+            <<"752P6t4cOjMabYHqzC6hyLhxyo4YKZLblg7va_J21YE">>,
+            <<"OvyeU-1pikgs6NpDWcV-ObRhDPkKM5uA5u_qj5xh-UI">>
+        ]
+    ).
 
 list_index_test_parallel() ->
     %% Test block: https://viewblock.io/arweave/block/1827942
@@ -1303,13 +1709,125 @@ list_index_test_parallel() ->
             <<"WbRAQbeyjPHgopBKyi0PLeKWvYZr3rgZvQ7QY3ASJS4">>
         ], maps:get(<<"indexed">>, BlockInfo)),
     ?assertEqual([ ], maps:get(<<"not-indexed">>, BlockInfo)),
+    % A list without `to' is refused, not read down to block 0.
+    ?assertMatch(
+        {error, _},
+        hb_ao:resolve(
+            <<"~copycat@1.0/arweave&from=", BlockBin/binary, "&mode=list">>,
+            Opts
+        )
+    ),
     ok.
 
+%% @doc Reindexing bypasses cached headers while retaining request directives.
+block_cache_control_test_() ->
+    {timeout, 60, fun() ->
+        Store = hb_test_utils:test_store(),
+        Blocks = hb_test_utils:test_store(),
+        Opts = #{
+            <<"store">> => [Store | hb_opts:get(store, [], #{})],
+            <<"arweave-block-store">> => Blocks,
+            <<"gateway">> => <<"http://chain-3.arweave.xyz:1984">>,
+            <<"cache-control">> => [<<"no-cache">>, <<"no-store">>]
+        },
+        Request = #{ <<"reindex">> => false,
+            <<"cache-control">> => [<<"only-if-cached">>] },
+        try
+            {ok, _} = fetch_block_header(2003806, #{}, Opts),
+            ?assertMatch({ok, _}, fetch_block_header(2003806, Request, Opts)),
+            lists:foreach(
+                fun(Req) ->
+                    ?assertEqual({error, not_found},
+                        fetch_block_header(2003806, Req, Opts))
+                end,
+                [
+                    Request#{ <<"reindex">> => true },
+                    maps:remove(<<"reindex">>, Request),
+                    Request#{ <<"cache-control">> =>
+                        [<<"no-cache">>, <<"only-if-cached">>] },
+                    Request#{ <<"reindex">> => true,
+                        <<"cache-control">> => <<"only-if-cached">> }
+                ]
+            )
+        after
+            hb_store:stop(Store),
+            hb_store:stop(Blocks)
+        end
+    end}.
+
+%% @doc Copycat forwards the proof setting and GraphQL uses the lean cache.
+proof_free_blocks_test_() ->
+    {timeout, 60, fun() ->
+        Wallet = ar_wallet:new(),
+        Opts = #{
+            <<"priv-wallet">> => Wallet,
+            <<"port">> => 0,
+            <<"store">> => [hb_test_utils:test_store(hb_store_volatile)],
+            <<"arweave-block-store">> => hb_test_utils:test_store(hb_store_volatile),
+            <<"include-proofs">> => false,
+            <<"gateway">> => <<"http://chain-3.arweave.xyz:1984">>,
+            <<"arweave-index-blocks">> => false,
+            <<"query-arweave-remote-block-ranges">> => false
+        },
+        Node = hb_http_server:start_node(Opts),
+        try
+            {ok, _} = hb_http:get(Node, <<
+                "/~copycat@1.0/arweave&mode=blocks&from=2003806&to=2003806",
+                "&include-proofs=false"
+            >>, #{}),
+            Offline = Opts#{ <<"gateway">> => <<"http://127.0.0.1:1">>,
+                <<"routes">> => [],
+                <<"cache-control">> => [<<"no-cache">>, <<"no-store">>] },
+            Req = #{ <<"path">> => <<"~arweave@2.9/block">>,
+                <<"block">> => 2003806,
+                <<"cache-control">> => [<<"only-if-cached">>] },
+            ?assertEqual({error, not_found}, hb_ao:resolve(Req, Offline)),
+            {ok, Block} = hb_ao:resolve(
+                Req#{ <<"include-proofs">> => false }, Offline),
+            ?assertNot(hb_maps:is_key(<<"poa">>, Block)),
+            ?assertNot(hb_maps:is_key(<<"poa2">>, Block)),
+            {ok, Reply} = hb_ao:resolve(#{
+                <<"path">> => <<"~query@1.0/graphql">>,
+                <<"method">> => <<"POST">>,
+                <<"body">> => hb_json:encode(#{ <<"query">> => <<
+                    "{ blocks(height: {min: 2003806, max: 2003806}) ",
+                    "{ edges { node { height timestamp id } } } }"
+                >> })
+            }, Offline),
+            ?assertMatch(#{ <<"data">> := #{ <<"blocks">> := #{
+                <<"edges">> := [#{ <<"node">> := #{ <<"height">> := 2003806 } }]
+            } } }, hb_json:decode(hb_maps:get(<<"body">>, Reply, <<>>, Offline))),
+            % A lean header is not complete for a default blocks run.
+            {ok, _} = hb_http:get(Node, <<
+                "/~copycat@1.0/arweave&mode=blocks&from=2003806&to=2003806",
+                "&reindex=false"
+            >>, #{}),
+            {ok, Full} = hb_ao:resolve(Req, Offline),
+            ?assert(hb_maps:is_key(<<"poa">>, Full)),
+            ?assert(hb_maps:is_key(<<"poa2">>, Full))
+        after
+            cowboy:stop_listener(hb_util:human_id(ar_wallet:to_address(Wallet)))
+        end
+    end}.
+
 auto_stop_on_indexed_block_test_parallel() ->
-    {_TestStore, _StoreOpts, Opts} = setup_index_opts(),
+    {_TestStore, _StoreOpts, BaseOpts} = setup_index_opts(),
+    Opts = BaseOpts#{
+        <<"arweave-block-store">> => hb_test_utils:test_store(),
+        <<"arweave-index-blocks">> => false
+    },
     IndexedBlock = 1827941,
     Higher1 = IndexedBlock + 1,
     Higher2 = IndexedBlock + 2,
+    {ok, IndexedBlock} = hb_ao:resolve(
+        <<"~copycat@1.0/arweave&from=1827941&to=1827941&mode=blocks">>, Opts),
+    {ok, IndexedBlock} = hb_ao:resolve(
+        <<"~copycat@1.0/arweave&from=1827943&mode=blocks">>, Opts),
+    ?assertEqual([IndexedBlock, Higher1, Higher2], lists:sort(hb_util:ok(
+        hb_ao:resolve(<<"~arweave@2.9/block-heights">>, Opts)))),
+    ?assertNot(has_any_indexed_tx(Higher2, Opts)),
+    ?assertNot(has_any_indexed_tx(Higher1, Opts)),
+    ?assertNot(has_any_indexed_tx(IndexedBlock, Opts)),
     {ok, IndexedBlock} =
         hb_ao:resolve(
             <<
@@ -1367,7 +1885,7 @@ auto_stop_partial_index_test_parallel() ->
     {_TestStore, StoreOpts, Opts} = setup_index_opts(),
     IndexedBlock = 1826700,
     HigherBlock = IndexedBlock + 1,
-    {ok, BlockData} = fetch_block_header(IndexedBlock, Opts),
+    {ok, BlockData} = fetch_block_header(IndexedBlock, #{}, Opts),
     [OneTXID | _] = hb_maps:get(<<"txs">>, BlockData, [], Opts),
     ok = hb_store_arweave:write_offset(
         StoreOpts, OneTXID, <<"tx@1.0">>, 0, 0),
@@ -1386,12 +1904,24 @@ auto_stop_partial_index_test_parallel() ->
     ok.
 
 negative_parse_range_test_parallel() ->
-    {_TestStore, _StoreOpts, Opts} = setup_index_opts(),
-    {ok, Tip} =
+    {_TestStore, _StoreOpts, NetworkOpts} = setup_index_opts(),
+    {ok, Block} =
         hb_ao:resolve(
-            <<?ARWEAVE_DEVICE/binary, "/current/height">>,
-            Opts
+            <<?ARWEAVE_DEVICE/binary, "/current">>,
+            NetworkOpts
         ),
+    Tip = hb_maps:get(<<"height">>, Block, not_found, NetworkOpts),
+    % All range requests see the same real header, even if the tip advances.
+    Header = hb_json:encode(hb_cache:ensure_all_loaded(Block, NetworkOpts)),
+    Node = hb_http_server:start_node(#{ <<"on">> => #{ <<"request">> => #{
+        <<"device">> => #{ <<"request">> => fun(_, _, _) ->
+            {ok, #{ <<"body">> => [#{ <<"body">> => Header,
+                <<"content-type">> => <<"application/json">> }] }}
+        end } } } }),
+    Opts = NetworkOpts#{ <<"routes">> => [#{
+        <<"template">> => <<"^/arweave">>, <<"nodes">> => [#{
+            <<"match">> => <<"^/arweave">>, <<"with">> => Node,
+            <<"opts">> => #{ <<"http-client">> => httpc } }] }] },
     {ok, {false, NegativeFrom, UndefinedTo}} =
         parse_range(#{ <<"from">> => <<"-3">> }, Opts),
     ?assertEqual(hb_util:int(Tip) - 3, NegativeFrom),
@@ -1483,7 +2013,7 @@ negative_resolved_height_test_parallel() ->
 
 negative_from_index_test_parallel() ->
     {_TestStore, _StoreOpts, Opts} = setup_index_opts(),
-    {ok, Tip} = latest_height(Opts),
+    {ok, Tip} = latest_height(#{}, Opts),
     StopBlock = 1827942,
     StartBlock = 1827943,
     OffsetFromTip = Tip - StartBlock,
@@ -1582,7 +2112,7 @@ assert_item_read(ItemID, Opts) ->
     Item.
 
 has_any_indexed_tx(Height, Opts) ->
-    case fetch_block_header(Height, Opts) of
+    case fetch_block_header(Height, #{}, Opts) of
         {ok, Block} ->
             TXIDs = hb_maps:get(<<"txs">>, Block, [], Opts),
             lists:any(fun(TXID) -> is_tx_indexed(TXID, Opts) end, TXIDs);
@@ -1610,6 +2140,32 @@ highest_contiguous_indexed_block(Current, Max, LastIndexed, Opts) ->
     end.
 
 pending_range_indexes_bundle_children_test() ->
+    pending_bundle_children([]).
+
+pending_lmdb_reuse_test() ->
+    pending_bundle_children([], hb_store_lmdb).
+
+pending_range_isolates_bad_child_test() ->
+    Bad = (ar_bundles:sign_item(#tx{data = <<"original">>}, ar_wallet:new()))#tx{
+        data = <<"modified">>
+    },
+    pending_bundle_children([Bad]),
+    Good = ar_bundles:sign_item(#tx{data = <<"nested-child">>}, ar_wallet:new()),
+    Nested = ar_bundles:sign_item(#tx{data = [Bad, Good]}, ar_wallet:new()),
+    Opts = pending_bundle_children([Nested]),
+    ?assertMatch({ok, _}, hb_cache:read(hb_util:encode(Good#tx.id),
+        hb_store:scope(Opts, local))),
+    % An item whose `ao-types' its codec refuses is skipped alone.
+    Refused = ar_bundles:sign_item(
+        #tx{ tags = [{<<"ao-types">>, <<"integer=(\"a\")">>}] }, ar_wallet:new()),
+    {undefined, Bundle} = ar_bundles:serialize_bundle(list, [Refused, Good], false),
+    ?assertEqual({ok, 1}, index_full_bundle_bytes(Bundle, 0, full,
+        hb_store_arweave:store_from_opts(Opts), Opts)).
+
+pending_bundle_children(Rejected) ->
+    pending_bundle_children(Rejected, hb_store_volatile).
+
+pending_bundle_children(Rejected, StoreModule) ->
     {_TestStore, StoreOpts, DefaultOpts} = setup_index_opts(),
     Wallet = ar_wallet:new(),
     Child = ar_bundles:sign_item(
@@ -1619,10 +2175,12 @@ pending_range_indexes_bundle_children_test() ->
         },
         Wallet
     ),
-    Binary = <<"pending-binary-child">>,
+    % A binary child large enough to encode as an item again: a smaller one
+    % decodes to a tag value and the bundle does not verify as signed.
+    Binary = binary:copy(<<"pending-binary-child">>, 256),
     BinaryChild = hb_message:convert(Binary, <<"ans104@1.0">>, DefaultOpts),
     {undefined, BundleData} =
-        ar_bundles:serialize_bundle(list, [Child, BinaryChild], false),
+        ar_bundles:serialize_bundle(list, [Child] ++ Rejected ++ [BinaryChild], false),
     RootTX =
         ar_tx:sign(
             ar_tx:generate_chunk_tree(
@@ -1640,9 +2198,15 @@ pending_range_indexes_bundle_children_test() ->
         ),
     TXID = hb_util:encode(RootTX#tx.id),
     ChildID = hb_util:encode(ar_bundles:id(Child, signed)),
+    Extra = ar_tx:sign(#tx{ format = 2 }, Wallet),
+    ExtraID = hb_util:encode(Extra#tx.id),
     DataPath =
         ar_merkle:generate_path(RootTX#tx.data_root, 0, RootTX#tx.data_tree),
     HeaderJSON = ar_tx:tx_to_json_struct(RootTX#tx{ data = <<>> }),
+    Headers = #{
+        TXID => hb_json:encode(HeaderJSON),
+        ExtraID => hb_json:encode(ar_tx:tx_to_json_struct(Extra))
+    },
     ChunkBody =
         hb_json:encode(
             #{
@@ -1650,11 +2214,36 @@ pending_range_indexes_bundle_children_test() ->
                 <<"data_path">> => hb_util:encode(DataPath)
             }
         ),
+    Control = hb_test_utils:test_store(hb_store_volatile),
+    ok = hb_store:write(
+        Control,
+        #{
+            <<"pending">> => hb_json:encode([TXID]),
+            <<"chunk-status">> => <<"200">>
+        },
+        #{}
+    ),
+    Parent = self(),
     {ok, MockNode, MockHandle} = hb_mock_server:start([
         {"/block/current", block_current, {200, <<"{\"height\": 10}">>}},
-        {"/tx/pending", pending, {200, hb_json:encode([TXID])}},
-        {"/unconfirmed_tx/:id", pending_tx, {200, hb_json:encode(HeaderJSON)}},
-        {"/unconfirmed_chunk/:id/:offset", pending_chunk, {200, ChunkBody}}
+        {"/tx/pending", pending, fun(_) ->
+            case hb_store:read(Control, <<"hold">>, #{}) of
+                {ok, <<"true">>} ->
+                    Parent ! {pending_request, self()},
+                    receive continue -> ok after 1000 -> error(timeout) end;
+                _ -> ok
+            end,
+            {ok, IDs} = hb_store:read(Control, <<"pending">>, #{}),
+            {200, IDs}
+        end},
+        {"/unconfirmed_tx/:id", pending_tx, fun(Req) ->
+            #{ id := ID } = maps:get(<<"bindings">>, Req),
+            {200, maps:get(ID, Headers)}
+        end},
+        {"/unconfirmed_chunk/:id/:offset", pending_chunk, fun(_) ->
+            {ok, Status} = hb_store:read(Control, <<"chunk-status">>, #{}),
+            {binary_to_integer(Status), ChunkBody}
+        end}
     ]),
     Routes = [
         #{
@@ -1670,19 +2259,51 @@ pending_range_indexes_bundle_children_test() ->
         }
     ],
     ReadStore = StoreOpts#{ <<"routes">> => Routes },
-    Pending = hb_test_utils:test_store(hb_store_volatile),
+    Pending = hb_test_utils:test_store(StoreModule),
+    RemoteOpts = #{
+        <<"store">> => [hb_test_utils:test_store(hb_store_volatile)],
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"port">> => 0
+    },
+    RootMsg =
+        hb_message:convert(
+            RootTX, <<"structured@1.0">>, <<"tx@1.0">>, DefaultOpts),
+    % A node keeps no commitment that does not verify, so a remote has the
+    % bundle only when every child verifies; the bytes of a bundle with a
+    % rejected child are read from the network, as they are in production.
+    case Rejected of
+        [] -> {ok, _} = hb_cache:write(RootMsg, RemoteOpts);
+        _ -> ok
+    end,
+    Remote = #{
+        <<"store-module">> => hb_store_remote_node,
+        <<"node">> => hb_http_server:start_node(RemoteOpts)
+    },
     Opts =
         DefaultOpts#{
+            <<"store">> => [Remote | hb_opts:get(store, [], DefaultOpts)],
             <<"routes">> => Routes,
             <<"arweave-index-blocks">> => false,
             <<"arweave-index-store">> => ReadStore,
-            <<"pending-index">> => [Pending]
+            <<"pending-index">> => [Pending],
+            <<"paranoid-verify">> => [cache_write]
         },
     try
-        {ok, #{ items_count := 2, total_txs := 1 }} =
+        case Rejected of
+            [] ->
+                ?assertMatch(
+                    {ok, _},
+                    hb_cache:read(TXID, #{ <<"store">> => [Remote] })
+                );
+            _ -> ok
+        end,
+        ShallowCount = 2 + length(Rejected),
+        {ok, #{ items_count := ShallowCount, total_txs := 1 }} =
             hb_ao:resolve(
                 <<"~copycat@1.0/arweave&from=pending&to=pending">>, Opts),
-        {ok, #{ items_count := 2, total_txs := 1 }} =
+        FullCount = case Rejected of [] -> 2; _ -> 0 end,
+        Skipped = length(Rejected),
+        {ok, #{ items_count := FullCount, total_txs := 1, skipped_count := Skipped }} =
             hb_ao:resolve(
                 <<"~copycat@1.0/arweave&mode=full&from=pending&to=pending">>,
                 Opts),
@@ -1704,7 +2325,7 @@ pending_range_indexes_bundle_children_test() ->
         ?assertEqual(
             {ok, Binary},
             hb_cache:read(
-                [<<"data">>, hb_path:hashpath(Binary, Opts)],
+                ?NI_URI(hb_path:hashpath(Binary, Opts)),
                 hb_store:scope(Opts, local)
             )
         ),
@@ -1718,16 +2339,220 @@ pending_range_indexes_bundle_children_test() ->
                 #{ <<"path">> => <<"locate">> },
                 (hb_store:scope(Opts, local))#{ <<"match-index">> => [Pending] }
             )
-        )
+        ),
+        case Rejected of
+            [] ->
+                pending_reuse_checks(
+                    TXID, ExtraID, ChildID, Control, MockHandle, Opts);
+            _ ->
+                ?assertMatch(
+                    {ok, #{ skipped_count := Skipped }},
+                    hb_ao:resolve(
+                        <<"~copycat@1.0/arweave&mode=full&from=pending&to=pending">>,
+                        Opts
+                    )
+                )
+        end,
+        Opts
     after
-        hb_mock_server:stop(MockHandle)
+        hb_mock_server:stop(MockHandle),
+        cowboy:stop_listener(
+            hb_util:human_id(
+                ar_wallet:to_address(maps:get(<<"priv-wallet">>, RemoteOpts))
+            )
+        ),
+        case hb_name:lookup({copycat_pending, [Pending]}) of
+            undefined -> ok;
+            Worker -> exit(Worker, shutdown)
+        end
     end.
+
+%% @doc Completion is independent of readable messages; retained predicates
+%% survive reuse, while failures, departures and resets cannot hide work.
+pending_reuse_checks(TXID, ExtraID, ChildID, Control, Mock, Opts) ->
+    Path = <<"~copycat@1.0/arweave&mode=full&from=pending&to=pending">>,
+    Run = fun() -> hb_ao:resolve(Path, Opts) end,
+    Counts =
+        fun() ->
+            [
+                length(hb_mock_server:get_requests(Mock, Tag))
+            ||
+                Tag <- [pending_tx, pending_chunk]
+            ]
+        end,
+    SetPending =
+        fun(IDs) ->
+            hb_store:write(
+                Control, #{ <<"pending">> => hb_json:encode(IDs) }, #{})
+        end,
+    Pending = hb_opts:get(pending_index, [], Opts),
+    ?assertEqual(
+        {ok, <<"1">>},
+        hb_store:read(Pending, <<"~copycat@1.0/pending/", TXID/binary>>, Opts)
+    ),
+    Locate =
+        fun() ->
+            hb_ao:raw(
+                <<"match@1.0">>,
+                #{ <<"content-type">> => <<"text/plain">> },
+                #{ <<"path">> => <<"locate">> },
+                Opts#{ <<"match-index">> => Pending }
+            )
+        end,
+    % A warm pass makes no header or chunk requests and retains the rows.
+    Before = Counts(),
+    Monitors = process_info(self(), monitors),
+    lists:foreach(
+        fun(_) ->
+            ?assertMatch({ok, #{ items_count := 0, skipped_count := 0 }}, Run()),
+            ?assertEqual(Before, Counts()),
+            ?assertMatch({ok, [#{ <<"id">> := ChildID }]}, Locate())
+        end,
+        lists:seq(1, 3)
+    ),
+    ?assertEqual(Monitors, process_info(self(), monitors)),
+    % Only an added parent is fetched. Removing one rebuilds the pending
+    % index, leaving the confirmed index untouched.
+    ok = SetPending([TXID, ExtraID]),
+    ?assertMatch({ok, #{ total_txs := 2, skipped_count := 0 }}, Run()),
+    [Headers, Chunks] = Before,
+    ?assertEqual([Headers + 1, Chunks], Counts()),
+    Confirmed = hb_test_utils:test_store(hb_store_volatile),
+    ok = hb_store:write(Confirmed, #{ <<"sentinel">> => <<"retained">> }, #{}),
+    ok = SetPending([ExtraID]),
+    ?assertMatch(
+        {ok, #{ total_txs := 1 }},
+        hb_ao:resolve(Path, Opts#{ <<"match-index">> => [Confirmed] })
+    ),
+    ?assertEqual({ok, []}, Locate()),
+    ?assertEqual(
+        {ok, [ExtraID]}, hb_store:list(Pending, <<"~copycat@1.0/pending">>, Opts)
+    ),
+    ?assertEqual(
+        {ok, <<"retained">>},
+        hb_store:read(Confirmed, <<"sentinel">>, #{})
+    ),
+    % Failed downloads are retried without fetching completed siblings.
+    ok = SetPending([TXID, ExtraID]),
+    ok = hb_store:write(Control, #{ <<"chunk-status">> => <<"500">> }, #{}),
+    ?assertMatch({ok, #{ skipped_count := 1 }}, Run()),
+    ?assertEqual(
+        {ok, <<"0">>},
+        hb_store:read(Pending, <<"~copycat@1.0/pending/", TXID/binary>>, Opts)
+    ),
+    ok = hb_store:write(Control, #{ <<"chunk-status">> => <<"200">> }, #{}),
+    ?assertMatch({ok, #{ items_count := 2, skipped_count := 0 }}, Run()),
+    ?assertMatch({ok, [#{ <<"id">> := ChildID }]}, Locate()),
+    % An explicit rebuild or an emptied store must not reuse completions.
+    ?assertMatch(
+        {ok, #{ items_count := 2 }},
+        hb_ao:resolve(<<Path/binary, "&reindex=true">>, Opts)
+    ),
+    ok = hb_store:reset(Pending),
+    [BeforeHeaders, BeforeChunks] = Counts(),
+    Results = hb_pmap:parallel_map(lists:seq(1, 4), fun(_) -> Run() end, 4),
+    ?assertEqual(4, length(Results)),
+    lists:foreach(
+        fun(Result) ->
+            ?assertMatch({ok, #{ total_txs := 2, skipped_count := 0 }}, Result)
+        end,
+        Results
+    ),
+    ?assertEqual([BeforeHeaders + 3, BeforeChunks + 1], Counts()),
+    ?assertMatch({ok, [#{ <<"id">> := ChildID }]}, Locate()),
+    % A later caller supplies its own stores, not the worker's first options.
+    Fresh = #{ <<"store">> => [hb_test_utils:test_store(hb_store_volatile)] },
+    ?assertEqual({error, not_found}, hb_cache:read(ChildID, Fresh)),
+    ?assertMatch(
+        {ok, #{ items_count := 2 }},
+        hb_ao:resolve(<<Path/binary, "&reindex=true">>, maps:merge(Opts, Fresh))
+    ),
+    ?assertMatch({ok, _}, hb_cache:read(ChildID, Fresh)),
+    % Different modes share the same worker, including forced rebuilds.
+    ok = hb_store:write(Control, #{ <<"hold">> => <<"true">> }, #{}),
+    Force =
+        fun(Mode) ->
+            spawn_monitor(
+                fun() ->
+                    ?assertMatch(
+                        {ok, #{ items_count := 2, skipped_count := 0 }},
+                        hb_ao:resolve(
+                            <<
+                                "~copycat@1.0/arweave&from=pending&to=pending&"
+                                "reindex=true&mode=", Mode/binary
+                            >>,
+                            Opts
+                        )
+                    )
+                end
+            )
+        end,
+    First = Force(<<"full">>),
+    FirstHTTP =
+        receive {pending_request, P1} -> P1 after 1000 -> error(timeout) end,
+    Second = Force(<<"shallow">>),
+    Worker = hb_name:lookup({copycat_pending, Pending}),
+    ?assert(
+        hb_util:wait_until(
+            fun() ->
+                {messages, Messages} = process_info(Worker, messages),
+                lists:any(
+                    fun({resolve, _, _, _, _}) -> true; (_) -> false end,
+                    Messages
+                )
+            end,
+            500
+        )
+    ),
+    receive {pending_request, _} -> ?assert(false) after 0 -> ok end,
+    FirstHTTP ! continue,
+    SecondHTTP =
+        receive {pending_request, P2} -> P2 after 1000 -> error(timeout) end,
+    SecondHTTP ! continue,
+    lists:foreach(
+        fun({PID, Ref}) ->
+            receive
+                {'DOWN', Ref, process, PID, Reason} -> ?assertEqual(normal, Reason)
+            after 1000 ->
+                ?assert(false)
+            end
+        end,
+        [First, Second]
+    ),
+    ok = hb_store:write(Control, #{ <<"hold">> => <<"false">> }, #{}),
+    ?assertEqual({ok, []}, Locate()),
+    ?assertMatch({ok, #{ items_count := 2, skipped_count := 0 }}, Run()),
+    ?assertMatch({ok, [#{ <<"id">> := ChildID }]}, Locate()),
+    % Without a dedicated index there are no completion markers to trust.
+    Untracked = maps:remove(<<"pending-index">>, Opts),
+    ?assertMatch({ok, #{ items_count := 2 }}, hb_ao:resolve(Path, Untracked)),
+    ?assertMatch({ok, #{ items_count := 2 }}, hb_ao:resolve(Path, Untracked)),
+    % An empty pool clears the rows and retains only the mode marker.
+    ok = SetPending([]),
+    ?assertMatch({ok, #{ total_txs := 0, items_count := 0 }}, Run()),
+    ?assertEqual({ok, []}, Locate()),
+    ?assertEqual(
+        {ok, <<"full">>}, hb_store:read(Pending, <<"~copycat@1.0/pending-mode">>, Opts)
+    ),
+    ?assertEqual(
+        {error, not_found},
+        hb_store:list(Pending, <<"~copycat@1.0/pending">>, Opts)
+    ),
+    ?assertMatch({ok, #{ total_txs := 0, items_count := 0 }}, Run()).
 
 assert_indexed_range(From, To, _Opts) when From < To ->
     ok;
 assert_indexed_range(From, To, Opts) ->
     ?assert(has_any_indexed_tx(From, Opts)),
     assert_indexed_range(From - 1, To, Opts).
+
+list_item_full_mode_test() ->
+    {_TestStore, _StoreOpts, Opts} = setup_index_opts(),
+    {ok, 2003013} = hb_ao:resolve(
+        <<"~copycat@1.0/arweave&from=2003013&to=2003013&mode=full">>,
+        Opts
+    ),
+    ?assert(is_block_indexed(2003013, full, #{}, Opts)).
 
 small_block_full_mode_test() ->
     {_TestStore, _StoreOpts, Opts} = setup_index_opts(),

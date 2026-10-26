@@ -2,7 +2,9 @@
 %%% the node message to store a local cache of its known names, and the typical
 %%% non-volatile storage of the node message to store the names long-term.
 -module(dev_local_name).
--export([info/1, lookup/3, register/3]).
+-specification("../../../specs/local-name@1.0.md").
+-device_libraries([lib_meta, lib_process]).
+-export([device_info/1, lookup/3, register/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -10,43 +12,54 @@
 -define(DEV_CACHE, <<"local-name@1.0">>).
 
 %% @doc Export only the `lookup' and `register' functions.
-info(_Opts) ->
+device_info(_Opts) ->
     #{
         excludes => [<<"keys">>, <<"set">>],
         default => fun default_lookup/4
     }.
 
 %% @doc Takes a `key' argument and returns the value of the name, if it exists.
+%% If the names in the node message do not contain the key, look it up in the
+%% names in the store: another request may have registered it since this
+%% request read the node message.
+-spec lookup(#{ _ => _ }, #{ key := binary(), _ => _ }, #{ _ => _ }) ->
+    {ok, _} | {error, _}.
 lookup(_, Req, Opts) ->
     Key = hb_ao:get(<<"key">>, Req, no_key_specified, Opts),
     ?event(local_name, {lookup, Key}),
-    hb_ao:resolve(
-        find_names(Opts),
-        Key,
-        Opts
-    ).
+    case hb_ao:resolve(find_names(Opts), Key, Opts) of
+        {error, not_found} -> hb_ao:resolve(read_names(Opts), Key, Opts);
+        Found -> Found
+    end.
 
 %% @doc Handle all other requests by delegating to the lookup function.
+-spec default_lookup(binary(), #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, _} | {error, _}.
 default_lookup(Key, _, Req, Opts) ->
     lookup(Key, Req#{ <<"key">> => Key }, Opts).
 
 %% @doc Takes a `key' and `value' argument and registers the name. The caller
-%% must be the node operator in order to register a name.
+%% must be the node operator in order to register a name. We read the `key' and
+%% the `value' only from the keys that the operator signed.
+-spec register(
+    #{ _ => _ },
+    #{ key := binary(), value := _, _ => _ },
+    #{ _ => _ }
+) ->
+    {ok, binary()}
+    | {error, #{ status := integer(), message := binary() }}
+    | not_found.
 register(_, Req, Opts) ->
-    case hb_ao:resolve(
-        #{ <<"device">> => <<"meta@1.0">> },
-        #{ <<"path">> => <<"is-operator">>, <<"body">> => Req },
-        Opts#{ <<"hashpath">> => ignore }
-    ) of
-        {ok, false} ->
+    case lib_meta:authorized(lib_meta:role(operator, Opts), Req, Opts) of
+        {error, _} ->
             {error,
                 #{
                     <<"status">> => 403,
                     <<"message">> => <<"Unauthorized.">>
                 }
             };
-        {ok, true} ->
-            direct_register(Req, Opts)
+        {ok, Signed} ->
+            direct_register(Signed, Opts)
     end.
 
 %% @doc Register a name without checking if the caller is an operator. Exported
@@ -83,9 +96,8 @@ find_names(Opts) ->
             LocalNames
     end.
 
-%% @doc Loads all known names from the cache and returns the new `node message'
-%% with those names loaded into it.
-load_names(Opts) ->
+%% @doc Returns a message containing the names registered in the store.
+read_names(Opts) ->
     LocalNames =
         maps:from_list(lists:map(
             fun(Key) ->
@@ -102,7 +114,20 @@ load_names(Opts) ->
             hb_cache:list(?DEV_CACHE, Opts)
         )),
     ?event(local_name, {found_cache_keys, LocalNames}),
-    update_names(LocalNames, Opts).
+    LocalNames.
+
+%% @doc Loads all known names from the cache and returns the new `node message'
+%% with those names loaded into it.
+load_names(Opts) ->
+    % The names in the store, which registrations write, take precedence over
+    % the names already in the node message, such as those in its config.
+    update_names(
+        maps:merge(
+            hb_opts:get(local_names, #{}, Opts#{ <<"only">> => local }),
+            read_names(Opts)
+        ),
+        Opts
+    ).
 
 %% @doc Updates the node message with the new names. Further HTTP requests will
 %% use this new message, removing the need to look up the names from non-volatile
@@ -113,9 +138,23 @@ update_names(LocalNames, Opts) ->
         no_server_ref ->
             ok;
         _ ->
-            ServerOpts = hb_http_server:get_opts(Opts),
-            hb_http_server:set_opts(
-                ServerOpts#{ <<"local-names">> => LocalNames }
+            hb_http_server:update_opts(
+                fun(ServerOpts) ->
+                    % Add `LocalNames' to the names in the node message.
+                    ServerNames =
+                        hb_opts:get(
+                            local_names,
+                            #{},
+                            ServerOpts#{ <<"only">> => local }
+                        ),
+                    hb_http_server:set_opts(
+                        ServerOpts#{
+                            <<"local-names">> =>
+                                maps:merge(ServerNames, LocalNames)
+                        }
+                    )
+                end,
+                Opts
             )
     end,
     NewOpts.
@@ -162,6 +201,15 @@ register_test() ->
     ?assertEqual(
         {ok, Value},
         lookup(#{}, #{ <<"key">> => TestName, <<"load">> => false }, Opts)
+    ),
+    % If the node message's names predate the registration, lookup finds it.
+    ?assertEqual(
+        {ok, Value},
+        lookup(
+            #{},
+            #{ <<"key">> => TestName },
+            Opts#{ <<"local-names">> => #{} }
+        )
     ).
 
 unauthorized_test() ->
@@ -181,9 +229,10 @@ unauthorized_test() ->
 http_test() ->
     Opts = generate_test_opts(),
     Node = hb_http_server:start_node(Opts),
+    % A query parameter does not change the `value' that the operator signed.
     hb_http:post(
         Node,
-        <<"/~local-name@1.0/register">>,
+        <<"/~local-name@1.0/register?value=value2">>,
         hb_message:commit(
             #{ <<"key">> => <<"name1">>, <<"value">> => <<"value1">> },
             Opts

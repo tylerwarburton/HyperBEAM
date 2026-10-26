@@ -3,29 +3,44 @@
 %%% bring trusted results into the local node, or as the `Execution-Device' of
 %%% an AO process.
 -module(dev_delegated_compute).
--device_libraries([lib_process]).
+-specification("../../../specs/delegated-compute@1.0.md").
+-device_libraries([lib_process, lib_scheduler_formats]).
 -export([init/3, compute/3, normalize/3, snapshot/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
+%% The keys with which a request, or the message that it relays, steers
+%% `relay@1.0'.
+-define(RELAY_KEYS, [
+    <<"peer">>, <<"relay-route">>, <<"route-path">>, <<"relay-path">>,
+    <<"relay-method">>, <<"relay-body">>, <<"relay-device">>,
+    <<"relay-commit-request">>, <<"commit-request">>
+]).
+
 %% @doc Initialize or normalize the compute-lite device. For now, we don't
 %% need to do anything special here.
+-spec init(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, #{ _ => _ }}.
 init(Base, _Req, _Opts) ->
     {ok, Base}.
 
-%% @doc We assume that the compute engine stores its own internal state,
-%% with snapshots triggered only when HyperBEAM requests them. Subsequently,
-%% to load a snapshot, we just need to return the original message.
+%% @doc Restore checkpoint memory in the delegated engine before removing the
+%% snapshot from the process state. Failed restores leave normalization failed.
+-spec normalize(
+    #{ snapshot => #{ type => binary(), data => _, _ => _ }, _ => _ },
+    #{ _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }} | {error, _} | #{ _ => _ }.
 normalize(Base, _Req, Opts) ->
     case hb_maps:find(<<"snapshot">>, Base, Opts) of
         error -> {ok, Base};
         {ok, Snapshot} ->
-            Unset = hb_ao:set(Base, #{ <<"snapshot">> => unset }, Opts),
             case hb_maps:get(<<"type">>, Snapshot, Opts) == <<"Checkpoint">> of
-                false -> Unset;
+                false -> hb_ao:set(Base, #{ <<"snapshot">> => unset }, Opts);
                 true ->
-                    load_state(Snapshot, Opts),
-                    Unset
+                    maybe
+                        {ok, _} ?= load_state(Snapshot, Opts),
+                        hb_ao:set(Base, #{ <<"snapshot">> => unset }, Opts)
+                    end
             end
     end.
 
@@ -33,7 +48,10 @@ normalize(Base, _Req, Opts) ->
 load_state(Snapshot, Opts) ->
     ?event(debug_load_snapshot, {loading_snapshot, {snapshot, Snapshot}}),
     Body = hb_maps:get(<<"data">>, Snapshot, Opts),
-    Headers = hb_maps:without([<<"data">>], Snapshot, Opts),
+    % Checkpoint commitments cover data, not the HTTP request body.
+    Headers = hb_maps:without(
+        [<<"data">>], hb_message:uncommitted(Snapshot, Opts), Opts
+    ),
     Res = do_relay(
         <<"POST">>,
         <<"/state">>,
@@ -45,11 +63,19 @@ load_state(Snapshot, Opts) ->
         }
     ),
     ?event(debug_load_snapshot, {load_result, Res}),
-    Res.
+    case Res of
+        {failure, Error} -> {error, Error};
+        _ -> Res
+    end.
 
 %% @doc Call the delegated server to compute the result. The endpoint is
 %% `POST /compute' and the body is the JSON-encoded message that we want to
 %% evaluate.
+-spec compute(
+    #{ _ => _ },
+    #{ type => binary(), slot => integer(), 'process-id' => binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }} | {failure, _}.
 compute(Base, Req, Opts) ->
     OutputPrefix =
         hb_ao:get(
@@ -83,7 +109,7 @@ do_compute(ProcID, Req, Opts) ->
     ?event({do_compute_msg, {req, Req}}),
     Slot = hb_ao:get(<<"slot">>, Req, Opts),
     {ok, AOS2 = #{ <<"body">> := Body }} =
-        dev_scheduler_formats:assignments_to_aos2(
+        lib_scheduler_formats:assignments_to_aos2(
             ProcID,
             #{
                 Slot => Req
@@ -135,7 +161,10 @@ do_dryrun(ProcID, Req, Opts) ->
     ),
     extract_json_res(Response, Opts).
 
-do_relay(Method, Path, Body, Headers, Opts) ->
+do_relay(Method, Path, Body, RawHeaders, Opts) ->
+    % The headers go to the compute server. They do not choose where the relay
+    % goes: a snapshot's keys come from a caller.
+    Headers = hb_maps:without(?RELAY_KEYS, RawHeaders, Opts),
     ContentType =
         hb_maps:get(
             <<"content-type">>,
@@ -143,14 +172,17 @@ do_relay(Method, Path, Body, Headers, Opts) ->
             <<"application/json">>,
             Opts
         ),
+    % The compute peer is set by the node operator, so permit it as an internal
+    % host for this call.
     hb_ao:resolve(
         #{
             <<"device">> => <<"relay@1.0">>,
+            <<"peer">> => hb_opts:get(delegated_compute_peer, not_found, Opts),
             <<"content-type">> => ContentType
         },
         Headers#{
             <<"path">> => <<"call">>,
-            <<"target">> => <<"payload">>,
+            <<"relay-subject">> => <<"payload">>,
             <<"payload">> =>
                 Headers#{
                     <<"path">> => Path,
@@ -159,10 +191,13 @@ do_relay(Method, Path, Body, Headers, Opts) ->
                     <<"content-type">> => ContentType
                 }
         },
-        Opts
+        Opts#{ <<"hosts-block-internal">> => false }
     ).
 
-%% @doc Extract the JSON response from the delegated compute response.
+%% @doc Extract the JSON response from the delegated compute response. An
+%% answer that is not a result, an error status, or no answer at all means
+%% that the server did not compute the message. That depends on the server
+%% this node uses, not on the process, so it is a failure of this node.
 extract_json_res(Response, Opts) ->
     case Response of 
         {ok, Res} ->
@@ -171,10 +206,29 @@ extract_json_res(Response, Opts) ->
                 delegated_compute_res_metadata,
                 {req, hb_maps:without([<<"body">>], Res, Opts)}
             }),
-            {ok, JSONRes};
+            case is_result(hb_json:decode(JSONRes, Opts)) of
+                true -> {ok, JSONRes};
+                false ->
+                    {failure,
+                        #{
+                            <<"status">> => 502,
+                            <<"reason">> =>
+                                <<"Delegated compute answer is not a result.">>,
+                            <<"body">> => JSONRes
+                        }
+                    }
+            end;
         {Err, Error} when Err == error; Err == failure ->
-            {error, Error}
+            {failure, Error}
     end.
+
+%% @doc Return whether a decoded answer of the server is a result, which holds
+%% `Output', `Messages' or `Error'. An `Error' is the process's own error, the
+%% same on every node.
+is_result(#{ <<"Output">> := _ }) -> true;
+is_result(#{ <<"Messages">> := _ }) -> true;
+is_result(#{ <<"Error">> := _ }) -> true;
+is_result(_) -> false.
 
 get_process_id(Base, Req, Opts) ->
     RawProcessID = lib_process:process_id(Base, #{}, Opts),
@@ -216,12 +270,13 @@ handle_relay_response(Base, Req, Opts, Response, OutputPrefix, ProcessID, Slot) 
                     Opts
                 )
             };
-        {error, Error} ->
-            {error, Error}
+        {failure, Failure} ->
+            {failure, Failure}
     end.
 
 %% @doc Generate a snapshot of a running computation by calling the 
 %% `GET /snapshot' endpoint.
+-spec snapshot(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, #{ _ => _ }}.
 snapshot(Msg, Req, Opts) ->
     ?event({snapshotting, {req, Req}}),
     ProcID = lib_process:process_id(Msg, #{}, Opts),
@@ -229,6 +284,7 @@ snapshot(Msg, Req, Opts) ->
         hb_ao:resolve(
             #{
                 <<"device">> => <<"relay@1.0">>,
+                <<"peer">> => hb_opts:get(delegated_compute_peer, not_found, Opts),
                 <<"content-type">> => <<"application/json">>
             },
             #{
@@ -238,9 +294,12 @@ snapshot(Msg, Req, Opts) ->
                 <<"content-type">> => <<"application/json">>,
                 <<"body">> => <<"{}">>
             },
+            % The compute peer is set by the node operator, so permit it as an
+            % internal host for this call.
             Opts#{
                 <<"hashpath">> => ignore,
-                <<"cache-control">> => [<<"no-store">>, <<"no-cache">>]
+                <<"cache-control">> => [<<"no-store">>, <<"no-cache">>],
+                <<"hosts-block-internal">> => false
             }
         ),
     ?event({snapshotting_result, Res}),

@@ -13,6 +13,27 @@ Merged =
         CONFIG,
         SharedConfig
     ),
+%% rebar3 only compiles `.xrl' and `.yrl' files at the top level of `src', but
+%% the grammar of `hb_singleton' sits beside it in `src/core/resolver'. We
+%% generate its lexer and parser modules next to their sources here, whenever
+%% a source is newer than its module, and rebar3 then compiles them with the
+%% rest of `src/core'.
+lists:foreach(
+    fun({Source, Generate}) ->
+        Src = filename:join([ScriptDir, "src/core/resolver", Source]),
+        Erl = filename:rootname(Src) ++ ".erl",
+        case filelib:last_modified(Erl) < filelib:last_modified(Src) of
+            true -> {ok, _} = Generate(Src, Erl);
+            false -> ok
+        end
+    end,
+    [
+        {"hb_singleton_lexer.xrl",
+            fun(Src, Erl) -> leex:file(Src, [{scannerfile, Erl}]) end},
+        {"hb_singleton_parser.yrl",
+            fun(Src, Erl) -> yecc:file(Src, [{parserfile, Erl}]) end}
+    ]
+),
 %% `HB_VERBOSE=1' turns on the `?event_debug' trace macros for this build,
 %% the same effect as the `verbose' rebar3 profile.
 case os:getenv("HB_VERBOSE") of

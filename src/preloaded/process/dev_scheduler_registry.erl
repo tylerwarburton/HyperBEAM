@@ -34,8 +34,7 @@ find(ProcID, ProcMsgOrFalse, Opts) ->
 
 %% @doc Calculate the node-scoped registry name of a scheduling server.
 name(ProcID, Opts) ->
-    Wallet = hb_opts:get(priv_wallet, hb:wallet(), Opts),
-    {<<"scheduler@1.0">>, hb_util:human_id(Wallet), ProcID}.
+    {<<"scheduler@1.0">>, hb_opts:address(hb:wallet(), Opts), ProcID}.
 
 %% @doc Return a list of all currently registered ProcID.
 get_processes() ->

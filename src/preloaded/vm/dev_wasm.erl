@@ -35,20 +35,32 @@
 %%% </pre>
 -module(dev_wasm).
 -implements(<<"wasm-64@1.0">>).
--export([info/2, init/3, compute/3, import/3, terminate/3, snapshot/3, normalize/3]).
+-specification("../../../specs/wasm-64@1.0.md").
+-export([device_info/2]).
+-export([init/3, compute/3, import/3, terminate/3, snapshot/3, normalize/3]).
 %%% API for other devices:
 -export([instance/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %% @doc Export all functions aside the `instance/3' function.
-info(_Base, _Opts) ->
+device_info(_Base, _Opts) ->
     #{
         excludes => [instance]
     }.
 
 %% @doc Boot a WASM image on the image stated in the `process/image' field of
 %% the message.
+-spec init(
+    #{
+        body => _,
+        image => binary() | #{ _ => _ },
+        'input-prefix' => binary(),
+        _ => _
+    },
+    #{ _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }}.
 init(M1, _M2, Opts) ->
     ?event(running_init),
     % Where we should read initial parameters from.
@@ -68,51 +80,14 @@ init(M1, _M2, Opts) ->
             Opts
         ),
     ?event({in_prefix, InPrefix}),
-    ImageBin =
-        case hb_ao:get(<<InPrefix/binary, "/image">>, M1, Opts) of
-            not_found ->
-                case hb_ao:get(<<"body">>, M1, Opts) of
-                    not_found ->
-                        throw(
-                            {
-                                wasm_init_error,
-                                <<
-                                    "No viable image found in ",
-                                    InPrefix/binary,
-                                    "/image."
-                                >>,
-                                {base, M1}
-                            }
-                        );
-                    Bin when is_binary(Bin) -> Bin
-                end;
-            ImageID when ?IS_ID(ImageID) ->
-                ?event({getting_wasm_image, ImageID}),
-                {ok, ImageMsg} = hb_cache:read(ImageID, Opts),
-                hb_ao:get(<<"body">>, ImageMsg, Opts);
-            ImageMsg when is_map(ImageMsg) ->
-                ?event(wasm_image_message_directly_provided),
-                hb_ao:get(<<"body">>, ImageMsg, Opts);
-            Image when is_binary(Image) ->
-                ?event(wasm_image_binary_directly_provided),
-                Image
-        end,
-    Mode =
-        case hb_ao:get(<<InPrefix/binary, "/Mode">>, M1, Opts) of
-            not_found -> wasm;
-            <<"WASM">> -> wasm;
-            <<"AOT">> ->
-                case hb_opts:get(wasm_allow_aot, false, Opts) of
-                    true -> aot;
-                    false -> wasm
-                end
-        end,
+    ImageBin = image(M1, InPrefix, Opts),
+    Mode = mode(M1, InPrefix, Opts),
     % Start the WASM executor.
     {ok, Instance, _Imports, _Exports} = hb_beamr:start(ImageBin, Mode),
     % Set the WASM Instance, handler, and standard library invokation function.
     ?event({setting_wasm_instance, Instance, {prefix, Prefix}}),
     {ok,
-        hb_private:set(M1,
+        hb_private:set(M1#{ <<"cache-control">> => [<<"no-store">>] },
             #{
                 <<Prefix/binary, "/write">> =>
                     fun(Binary) ->
@@ -132,6 +107,49 @@ init(M1, _M2, Opts) ->
             Opts
         )
     }.
+
+%% @doc Read the WASM image binary from the input prefix of the message.
+image(M1, InPrefix, Opts) ->
+    case hb_ao:get(<<InPrefix/binary, "/image">>, M1, Opts) of
+        not_found ->
+            case hb_ao:get(<<"body">>, M1, Opts) of
+                not_found ->
+                    throw(
+                        {
+                            wasm_init_error,
+                            <<
+                                "No viable image found in ",
+                                InPrefix/binary,
+                                "/image."
+                            >>,
+                            {base, M1}
+                        }
+                    );
+                Bin when is_binary(Bin) -> Bin
+            end;
+        ImageID when ?IS_ID(ImageID) ->
+            ?event({getting_wasm_image, ImageID}),
+            {ok, ImageMsg} = hb_cache:read(ImageID, Opts),
+            hb_ao:get(<<"body">>, ImageMsg, Opts);
+        ImageMsg when is_map(ImageMsg) ->
+            ?event(wasm_image_message_directly_provided),
+            hb_ao:get(<<"body">>, ImageMsg, Opts);
+        Image when is_binary(Image) ->
+            ?event(wasm_image_binary_directly_provided),
+            Image
+    end.
+
+%% @doc Read the WASM execution mode from the input prefix of the message.
+mode(M1, InPrefix, Opts) ->
+    case hb_ao:get(<<InPrefix/binary, "/Mode">>, M1, Opts) of
+        not_found -> wasm;
+        <<"WASM">> -> wasm;
+        <<"AOT">> ->
+            case hb_opts:get(wasm_allow_aot, false, Opts) of
+                true -> aot;
+                false -> wasm
+            end
+    end.
 
 %% @doc Take a BEAMR import call and resolve it using `hb_ao'.
 default_import_resolver(Base, Req, Opts) ->
@@ -171,6 +189,15 @@ default_import_resolver(Base, Req, Opts) ->
 
 %% @doc Call the WASM executor with a message that has been prepared by a prior
 %% pass.
+-spec compute(
+    #{ pass => integer(), function => binary(), parameters => [_], _ => _ },
+    #{ body => binary() | #{ function => binary(), parameters => [_], _ => _ },
+        function => binary(),
+        parameters => [_],
+        _ => _
+    },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }}.
 compute(RawM1, M2, Opts) ->
     % Normalize the message to have an open WASM instance, but no literal `State'.
     % The hashpath is not updated during this process. This allows us to take
@@ -244,21 +271,68 @@ compute(RawM1, M2, Opts) ->
                             M1,
                             Opts
                         ),
-                    {ok,
-                        hb_ao:set(MsgAfterExecution,
-                            #{
-                                <<"results/", Prefix/binary, "/type">> => ResType,
-                                <<"results/", Prefix/binary, "/output">> => Res
-                            },
-                            Opts
-                        )
-                    }
+                    case ResType of
+                        error ->
+                            % A trapped call leaves the instance usable, so
+                            % the error goes to the process device, which
+                            % stores it as the slot's results. The trap does
+                            % not unwind the instance's globals, so the
+                            % instance is replaced with a new one of the
+                            % image loaded with the memory as the trap left it:
+                            % the same steps a restore from a snapshot takes.
+                            ok = reset(M1, M2, Opts),
+                            {error, Res};
+                        _ ->
+                            {ok,
+                                hb_ao:set(MsgAfterExecution,
+                                    #{
+                                        <<"results/", Prefix/binary, "/type">> => ResType,
+                                        <<"results/", Prefix/binary, "/output">> => Res
+                                    },
+                                    Opts
+                                )
+                            }
+                    end
             end;
         _ -> {ok, M1}
     end.
 
+%% @doc Replace an instance whose call trapped with a new instance of the
+%% image, loaded with the memory as the trapped call left it. The trapped call
+%% keeps the instance's globals, such as the stack pointer, where the call
+%% stopped, while a restore from a snapshot starts at a new instance, so
+%% the process goes on from the new instance on every node. The worker's
+%% pid is kept, so the state's private element stays valid.
+reset(M1, M2, Opts) ->
+    ?event({resetting_wasm_instance_after_trapped_call, {m1, M1}}),
+    Instance = instance(M1, M2, Opts),
+    {ok, Memory} = hb_beamr:serialize(Instance),
+    InPrefix =
+        hb_ao:get(
+            <<"input-prefix">>,
+            {as, <<"message@1.0">>, M1},
+            <<"">>,
+            Opts
+        ),
+    hb_beamr:reset(
+        Instance,
+        image(M1, InPrefix, Opts),
+        mode(M1, InPrefix, Opts),
+        Memory
+    ).
+
 %% @doc Normalize the message to have an open WASM instance, but no literal
 %% `State' key. Ensure that we do not change the hashpath during this process.
+-spec normalize(
+    #{
+        body => binary(),
+        snapshot => #{ body => binary(), _ => _ },
+        'device-key' => binary(),
+        _ => _
+    },
+    #{ _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }}.
 normalize(RawM1, M2, Opts) ->
     ?event({normalize_raw_m1, RawM1}),
     M3 = 
@@ -286,6 +360,7 @@ normalize(RawM1, M2, Opts) ->
                         {ok, M1} = init(RawM1, State, Opts),
                         Res = hb_beamr:deserialize(instance(M1, M2, Opts), State),
                         ?event(snapshot, {wasm_deserialized, {result, Res}}),
+                        ok = Res,
                         M1
                 end;
             _ ->
@@ -295,6 +370,8 @@ normalize(RawM1, M2, Opts) ->
     {ok, hb_ao:set(M3, #{ <<"snapshot">> => unset }, Opts)}.
 
 %% @doc Serialize the WASM state to a binary.
+-spec snapshot(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ body := binary() }}.
 snapshot(M1, M2, Opts) ->
     ?event(snapshot, generating_snapshot),
     Instance = instance(M1, M2, Opts),
@@ -306,6 +383,8 @@ snapshot(M1, M2, Opts) ->
     }.
 
 %% @doc Tear down the WASM executor.
+-spec terminate(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }}.
 terminate(M1, M2, Opts) ->
     ?event(terminate_called_on_dev_wasm),
     Prefix =
@@ -327,6 +406,7 @@ terminate(M1, M2, Opts) ->
 %% @doc Get the WASM instance from the message. Note that this function is exported
 %% such that other devices can use it, but it is excluded from calls from AO-Core
 %% resolution directly.
+-spec instance(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> pid() | not_found | _.
 instance(M1, _M2, Opts) ->
     Prefix =
         hb_ao:get(
@@ -345,6 +425,17 @@ instance(M1, _M2, Opts) ->
 %% 3. Resolving the adjusted-path-Req against the added-state-Base.
 %% 4. If it succeeds, return the new state from the message.
 %% 5. If it fails with `not_found', call the stub handler.
+-spec import(
+    #{ _ => _ },
+    #{
+        module := binary(),
+        func := binary(),
+        args => [_],
+        'func-sig' => binary(),
+        _ => _
+    },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }}.
 import(Base, Req, Opts) ->
     % 1. Adjust the path to the stdlib.
     ModName = hb_ao:get(<<"module">>, Req, Opts),
@@ -397,7 +488,7 @@ undefined_import_stub(Base, Req, Opts) ->
             Opts
         ),
     UndefinedCallsPath =
-        <<"state/results/", Prefix/binary, "/undefined-calls">>,
+        <<"results/", Prefix/binary, "/undefined-calls">>,
     Res = hb_ao:set(
         Base,
         #{
@@ -493,6 +584,27 @@ basic_execution_64_test() ->
     ?assertEqual(
         {ok, [120.0]},
         test_run_wasm("test/test-64.wasm", <<"fac">>, [5.0], #{})
+    ),
+    {ok, Base} =
+        hb_ao:resolve(cache_wasm_image("test/test-64.wasm"), <<"init">>, #{}),
+    % A call that gives fewer parameters than the function takes is an error,
+    % not a crash of the node's VM.
+    ?assertMatch(
+        {error, _},
+        hb_ao:resolve(Base#{ <<"function">> => <<"fac">> }, <<"compute">>, #{})
+    ),
+    % A function name longer than a fixed buffer is an error, not a crash of
+    % the node's VM.
+    ?assertMatch(
+        {error, _},
+        hb_ao:resolve(
+            Base#{
+                <<"function">> => binary:copy(<<"a">>, 512),
+                <<"parameters">> => [5.0]
+            },
+            <<"compute">>,
+            #{}
+        )
     ).
 
 imported_function_test() ->
@@ -571,6 +683,20 @@ state_export_and_restore_test() ->
     ?assertEqual(
         {ok, [4]},
         hb_ao:resolve(NewBase, <<"compute/results/output">>, #{})
+    ),
+    % An import that no stdlib device answers is recorded beside the results.
+    ?assertMatch(
+        {ok, [#{ <<"module">> := <<"my_lib">>, <<"func">> := <<"mul">> } | _]},
+        hb_ao:resolve(
+            hb_maps:without([<<"stdlib">>], Req, #{}),
+            <<"compute/results/undefined-calls">>,
+            #{}
+        )
+    ),
+    % Parameters that are not numbers make the call an error.
+    ?assertEqual(
+        {error, <<"invalid-parameters">>},
+        hb_ao:resolve(Req#{ <<"parameters">> => [<<"a">>] }, <<"compute">>, #{})
     ).
 
 %%% Test helpers

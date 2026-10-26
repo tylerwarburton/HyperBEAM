@@ -103,6 +103,16 @@
 %%     by the user request).
 %% </pre>
 %% 
+-spec request(
+    #{
+        'secret-provider' => _,
+        'generate-path' => binary(),
+        'finalize-path' => binary(),
+        _ => _
+    },
+    #{ request := #{ _ => _ }, body := _, _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }} | {error, _} | {skip, _, _} | error.
 request(Base, HookReq, Opts) ->
     ?event({auth_hook_request, {base, Base}, {priv_hook_req, HookReq}}),
     maybe
@@ -206,9 +216,11 @@ is_relevant_from_committers(Base, Request, Opts) ->
         <<"always">> -> true;
         <<"uncommitted">> -> hb_message:signers(Request, Opts) == [];
         RelevantCommitters ->
+            Committers =
+                [hb_committer:uri(C, Opts) || C <- RelevantCommitters],
             lists:any(
                 fun(Signer) ->
-                    lists:member(Signer, RelevantCommitters)
+                    lists:member(Signer, Committers)
                 end,
                 hb_message:signers(Request, Opts)
             )
@@ -220,8 +232,8 @@ is_relevant_from_keys(_Base, ID, _Opts) when is_binary(ID) ->
     false;
 is_relevant_from_keys(Base, {as, _, Msg}, Opts) ->
     is_relevant_from_keys(Base, Msg, Opts);
-is_relevant_from_keys(Base, {resolve, Msg}, Opts) ->
-    is_relevant_from_keys(Base, Msg, Opts);
+is_relevant_from_keys(Base, {resolve, Msgs}, Opts) ->
+    lists:any(fun(Msg) -> is_relevant_from_keys(Base, Msg, Opts) end, Msgs);
 is_relevant_from_keys(Base, Request, Opts) ->
     Config = hb_util:deep_get([<<"when">>, <<"keys">>], Base, <<"always">>, Opts),
     ?event(
@@ -380,9 +392,15 @@ finalize(KeyProvider, SignedReq, MessageSequence, Opts) ->
 
 %%% Utility functions
 
-%% @doc Refresh the options and log an event if they have changed.
+%% @doc Refresh the options from the node message and log an event if they
+%% have changed. If `Opts' do not have `priv-wallet' or `identities', as
+%% request execution `Opts' do not, remove that key from the result.
 refresh_opts(Opts) ->
-    NewOpts = hb_http_server:get_opts(Opts),
+    NewOpts =
+        maps:without(
+            [Key || Key <- ?NODE_KEY_OPTS, not is_map_key(Key, Opts)],
+            hb_http_server:get_opts(Opts)
+        ),
     case NewOpts of
         Opts -> ?event(auth_hook_no_opts_change);
         _ ->
@@ -426,7 +444,7 @@ call_provider(Key, Provider, Request, Opts) ->
                 _ -> {ok, Msg}
             end;
         {ok, _} = Res ->
-            % The result is a non-message. We return it as-is.
+            % The result is not a message. We return it as-is.
             Res;
         {error, Err} ->
             ?event({call_provider_error, {priv_error, Err}}),
@@ -471,7 +489,7 @@ cookie_test() ->
         hb_http:get(
             Node,
             #{
-                <<"path">> => <<"commitments">>,
+                <<"path">> => <<"//commitments">>,
                 <<"body">> => <<"Test data">>
             },
             #{}
@@ -496,7 +514,7 @@ cookie_test() ->
         hb_http:get(
             Node,
             #{
-                <<"path">> => <<"/commitments">>,
+                <<"path">> => <<"//commitments">>,
                 <<"body">> => <<"Test data2">>,
                 <<"priv">> => CookiePriv
             },
@@ -506,6 +524,22 @@ cookie_test() ->
     ?assertEqual(
         [CookieAddress],
         signers_from_commitments_response(Response2, ServerWallet)
+    ),
+    % The hook signs a request with the node's commitment device, regardless
+    % of the codec that the client accepts for the reply.
+    {ok, Response3} =
+        hb_http:get(
+            Node,
+            #{
+                <<"path">> => <<"//commitments">>,
+                <<"body">> => <<"Test data">>,
+                <<"accept">> => <<"application/ans104">>
+            },
+            #{}
+        ),
+    ?assertMatch(
+        [_],
+        signers_from_commitments_response(Response3, ServerWallet)
     ).
 
 http_auth_test() ->
@@ -534,7 +568,7 @@ http_auth_test() ->
         hb_http:get(
             Node,
             #{
-                <<"path">> => <<"commitments">>,
+                <<"path">> => <<"//commitments">>,
                 <<"body">> => <<"Test data">>
             },
             #{}
@@ -550,7 +584,7 @@ http_auth_test() ->
         hb_http:get(
             Node,
             #{
-                <<"path">> => <<"commitments">>,
+                <<"path">> => <<"//commitments">>,
                 <<"body">> => <<"Test data">>,
                 <<"authorization">> => AuthStr
             },
@@ -572,7 +606,7 @@ http_auth_test() ->
         hb_http:get(
             Node,
             #{
-                <<"path">> => <<"commitments">>,
+                <<"path">> => <<"//commitments">>,
                 <<"body">> => <<"Test data2">>,
                 <<"authorization">> => AuthStr
             },
@@ -587,7 +621,7 @@ chained_preprocess_test() ->
     % Start a node with the `~http-auth@1.0' device as the secret-provider, with
     % a router chained afterwards in the request hook.
     RelayWallet = ar_wallet:new(),
-    RelayAddress = hb_util:human_id(RelayWallet),
+    RelayAddress = hb:address(RelayWallet),
     RelayURL = hb_http_server:start_node(#{ <<"priv-wallet">> => RelayWallet }),
     Node =
         hb_http_server:start_node(
@@ -680,7 +714,7 @@ when_test() ->
         hb_http:get(
             Node,
             #{
-                <<"path">> => <<"commitments">>,
+                <<"path">> => <<"//commitments">>,
                 <<"body">> => <<"Test data">>,
                 <<"authorization">> => AuthStr
             },
@@ -710,7 +744,7 @@ store_hook_signed_test() ->
         hb_http:post(
             Node,
             #{
-                <<"path">> => <<"/id?committers=all&!">>,
+                <<"path">> => <<"//id?committers=all&!">>,
                 <<"authorization">> => AuthStr,
                 <<"stored-key">> => <<"stored-value">>
             },
@@ -718,6 +752,15 @@ store_hook_signed_test() ->
         ),
     {ok, Read} = hb_http:get(Node, <<"/", ID/binary>>, #{}),
     ?assertEqual(<<"stored-value">>, hb_ao:get(<<"stored-key">>, Read, #{})).
+
+%% @doc A request with a path segment in parentheses resolves on a node with
+%% the default request hooks.
+subpath_request_test() ->
+    Node = hb_http_server:start_node(#{ <<"priv-wallet">> => ar_wallet:new() }),
+    ?assertMatch(
+        {ok, #{ <<"status">> := 200 }},
+        hb_http:get(Node, <<"/(/~meta@1.0/info)">>, #{})
+    ).
 
 %% @doc The cookie hook test(s) call `GET /commitments', which returns the 
 %% commitments found on the client request during execution on the server.

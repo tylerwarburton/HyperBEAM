@@ -1,7 +1,7 @@
 %%% @doc A store module that reads data from the nodes Arweave gateway and 
 %%% GraphQL routes, additionally including additional store-specific routes.
 -module(hb_store_gateway).
--export([scope/1, type/3, read/3, resolve/3, list/3, start/1, stop/1]).
+-export([scope/1, read/3, list/3, start/1, stop/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -11,8 +11,6 @@ stop(_) -> ok.
 
 %% @doc The scope of a GraphQL store is always remote, due to performance.
 scope(_) -> remote.
-resolve(_StoreOpts, #{ <<"resolve">> := Key }, _NodeOpts) ->
-    {ok, Key}.
 
 list(StoreOpts, #{ <<"list">> := Key }, NodeOpts) ->
     ?event(store_gateway, executing_list),
@@ -21,39 +19,16 @@ list(StoreOpts, #{ <<"list">> := Key }, NodeOpts) ->
         Other -> Other
     end.
 
-%% @doc Get the type of the data at the given key. We potentially cache the
-%% result, so that we don't have to read the data from the GraphQL route
-%% multiple times.
-type(StoreOpts, #{ <<"type">> := Key }, NodeOpts) ->
-    ?event(store_gateway, executing_type),
-    case read(StoreOpts, #{ <<"read">> => Key }, NodeOpts) of
-        {ok, Data} ->
-            ?event({type, hb_private:reset(hb_message:uncommitted(Data, StoreOpts))}),
-            IsFlat = lists:all(
-                fun({_, Value}) -> not is_map(Value) end,
-                hb_maps:to_list(
-                    hb_private:reset(
-                        hb_message:uncommitted(Data, StoreOpts)
-                    ),
-                    StoreOpts
-                )
-            ),
-            if
-                IsFlat -> {ok, simple};
-                true -> {ok, composite}
-            end;
-        Other ->
-            Other
-    end.
-
-%% @doc Extract a value from a message, handling sub-paths.
+%% @doc Extract a value from a message, handling sub-paths. A binary is
+%% encoded with `hb_cache:encode_value/1', so that the cache reads it back as
+%% the same binary.
 extract_path_value(Message, Rest, StoreOpts) ->
     case Rest of
         [] -> {ok, Message};
         _ ->
             case hb_util:deep_get(Rest, Message, StoreOpts) of
                 not_found -> {error, not_found};
-                Value -> {ok, Value}
+                Value -> {ok, hb_cache:encode_value(Value)}
             end
     end.
 
@@ -78,7 +53,7 @@ read(BaseStoreOpts, #{ <<"read">> := Key }, NodeOpts) ->
                             {error, not_found};
                         {ok, Message} ->
                             ?event({read_found, {key, ID}}),
-                            hb_store_remote_node:maybe_cache(StoreOpts, Message, [ID]),
+                            hb_store_remote_node:maybe_cache(StoreOpts, Message),
                             extract_path_value(Message, Rest, ReadOpts)
                     catch Class:Reason:Stacktrace ->
                         ?event(
@@ -248,7 +223,8 @@ avoid_double_read_test() ->
     hb_http_server:start_node(#{}),
     %% Setup local node
     ID = <<"BOogk_XAI3bvNWnxNxwxmvOfglZt17o4MOVAdPNZ_ew">>,
-    Data = <<"123">>,
+    % The item's data as the gateway serves it, so that the item verifies.
+    Data = <<"1984">>,
     DefaultResponse = {200, Data},
     Endpoints = [{<<"/arweave/raw/", ID/binary>>, raw, DefaultResponse}],
     %% Start MockServer
@@ -268,13 +244,59 @@ avoid_double_read_test() ->
                 }
             ]
     },
+    LocalOpts = #{ <<"store">> => [Local] },
     {ok, Written} = hb_cache:read(ID, WriteOpts),
-    {ok, Read} = hb_cache:read(ID, #{ <<"store">> => [Local] }),
+    {ok, Read} = hb_cache:read(ID, LocalOpts),
     try
+        % The item verifies, so it is cached under its ID with its commitment.
+        ?assertEqual(
+            [
+                hb_committer:uri(
+                    <<"TeWsA2tuo4aFnhWy-ZiP5t2FYXLisp3s4KagrX9LXEI">>
+                )
+            ],
+            hb_message:signers(Written, WriteOpts)
+        ),
+        Loaded = hb_cache:ensure_all_loaded(Read, LocalOpts),
+        ?assert(hb_message:verify(Loaded, all, LocalOpts)),
         ?assert(hb_message:match(Read, Written)),
         %% Check number of requests make to raw
         TXs = hb_mock_server:get_requests(raw, 1, ServerHandle),
         ?assert(length(TXs) == 1)
+    after
+        hb_mock_server:stop(ServerHandle)
+    end.
+
+%% @doc Unverifiable items are refused by default. Explicit trust serves them
+%% without commitments and does not cache them under the requested ID.
+unverifiable_item_not_cached_test() ->
+    hb_http_server:start_node(#{}),
+    ID = <<"BOogk_XAI3bvNWnxNxwxmvOfglZt17o4MOVAdPNZ_ew">>,
+    % Data that the item's signature does not cover.
+    Endpoints = [{<<"/arweave/raw/", ID/binary>>, raw, {200, <<"123">>}}],
+    {ok, MockServer, ServerHandle} = hb_mock_server:start(Endpoints),
+    Local = #{
+        <<"store-module">> => hb_store_fs,
+        <<"name">> => <<"cache-TEST/unverifiable_item_not_cached_test">>
+    },
+    hb_store:reset(Local),
+    Opts = #{
+        <<"store">> =>
+            [
+                #{ <<"store-module">> => hb_store_gateway,
+                    <<"local-store">> => [Local],
+                    <<"routes">> => custom_raw_routes(MockServer)
+                }
+            ]
+    },
+    try
+        ?assertEqual({error, not_found}, hb_cache:read(ID, Opts)),
+        {ok, First} = hb_cache:read(ID, Opts#{ <<"ans104-trust-gql">> => true }),
+        ?assertEqual([], hb_message:signers(First, Opts)),
+        ?assertEqual(<<"123">>, hb_ao:get(<<"data">>, First, Opts)),
+        ?assertEqual({error, not_found}, hb_cache:read(ID, #{ <<"store">> => [Local] })),
+        TXs = hb_mock_server:get_requests(raw, 2, ServerHandle),
+        ?assertEqual(2, length(TXs))
     after
         hb_mock_server:stop(ServerHandle)
     end.
@@ -285,7 +307,7 @@ custom_raw_routes(MockServer) ->
             <<"template">> => <<"/graphql">>,
             <<"nodes">> => [
                 #{
-                    <<"prefix">> => <<"https://arweave-search.goldsky.com">>,
+                    <<"prefix">> => <<"https://arweave.net">>,
                     <<"opts">> => #{
                         <<"http-client">> => httpc,
                         <<"protocol">> => http2
@@ -326,7 +348,7 @@ specific_route_test() ->
                         <<"template">> => <<"/graphql">>,
                         <<"nodes">> => [
                             #{
-                                <<"prefix">> => <<"https://arweave-search.goldsky.com">>,
+                                <<"prefix">> => <<"https://arweave.net">>,
                                 <<"opts">> => #{
                                     <<"http-client">> => httpc,
                                     <<"protocol">> => http2
@@ -351,10 +373,15 @@ specific_route_test() ->
                 }
             ]
     },
-    {ok, Response} = hb_cache:read(ID, Opts),
+    ?assertEqual({error, not_found}, hb_cache:read(ID, Opts)),
+    {ok, Response} = hb_cache:read(ID, Opts#{ <<"ans104-trust-gql">> => true }),
     %% If the result returns <<"1984">>, it is using the default route, 
     %% not the custom one we defined
-    ?assertEqual(<<"3">>, maps:get(<<"data">>, Response)).
+    ?assertEqual(<<"3">>, maps:get(<<"data">>, Response)),
+    % The custom route serves data that the item's signature does not cover,
+    % so the item is served without its commitment.
+    ?assertEqual([], hb_message:signers(Response, Opts)),
+    ?assertNot(maps:is_key(<<"commitments">>, Response)).
 
 %% @doc Test that the default node config allows for data to be accessed.
 external_http_access_test() ->
@@ -435,6 +462,7 @@ store_opts_test() ->
                 #{
                     <<"store-module">> => hb_store_gateway, 
                     <<"local-store">> => false,
+                    <<"ans104-trust-gql">> => true,
                     <<"subindex">> => [
                         #{
                             <<"name">> => <<"Data-Protocol">>,
@@ -519,7 +547,8 @@ remote_hyperbeam_node_ans104_test() ->
     Msg =
         hb_message:commit(
             #{
-                <<"hello">> => <<"world">>
+                <<"hello">> => <<"world">>,
+                <<"niish">> => <<"ni:literal">>
             },
             ServerOpts,
             #{ <<"commitment-device">> => <<"ans104@1.0">> }
@@ -543,4 +572,9 @@ remote_hyperbeam_node_ans104_test() ->
         },
     {ok, Req} = hb_cache:read(PublicID, ClientOpts),
     ?assert(hb_message:verify(Req)),
-    ?assert(hb_message:match(Msg, Req)).
+    ?assert(hb_message:match(Msg, Req)),
+    % A binary that starts with `ni:' is read back as itself, not as a name.
+    ?assertEqual(
+        {ok, <<"ni:literal">>},
+        hb_cache:read(<<PublicID/binary, "/niish">>, ClientOpts)
+    ).

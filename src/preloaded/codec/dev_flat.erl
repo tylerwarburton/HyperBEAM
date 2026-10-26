@@ -2,6 +2,7 @@
 %%% (potentially multi-layer) paths as their keys, and a normal TABM binary as 
 %%% their value.
 -module(dev_flat).
+-specification("../../../specs/flat@1.0.md").
 -export([from/3, to/3, commit/3, verify/3, deserialize/3]).
 %%% Testing utilities
 -export([serialize/1, serialize/2, deserialize/1]).
@@ -9,26 +10,28 @@
 -include("include/hb.hrl").
 
 %% @doc Route commitments through `httpsig@1.0'.
+-spec commit(#{ _ => _ }, #{ _ => _ }, map()) -> term().
 commit(Msg, Req, Opts) ->
-    {ok,
-        hb_message:commit(
-            Msg,
-            Opts,
-            Req#{ <<"commitment-device">> => <<"httpsig@1.0">> }
-        )
-    }.
+    % `hb_message:commit/3' without its first line, which takes the node key:
+    % a client can call this.
+    {ok, Structured} =
+        hb_ao:raw(<<"structured@1.0">>, <<"to">>, Msg, #{}, Opts),
+    hb_ao:raw(
+        <<"message@1.0">>,
+        <<"commit">>,
+        Structured,
+        Req#{ <<"commitment-device">> => <<"httpsig@1.0">> },
+        Opts
+    ).
 
 %% @doc Route verification through `httpsig@1.0'.
+-spec verify(#{ _ => _ }, #{ _ => _ }, map()) -> term().
 verify(Msg, Req, Opts) ->
-    {ok,
-        hb_message:verify(
-            Msg,
-            Req#{ <<"commitment-device">> => <<"httpsig@1.0">> },
-            Opts
-        )
-    }.
+    hb_ao:raw(<<"httpsig@1.0">>, <<"verify">>, Msg, Req, Opts).
 
 %% @doc Convert a flat map to a TABM.
+-spec from(binary() | #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, binary() | #{ _ => _ }}.
 from(Bin, _, _Opts) when is_binary(Bin) -> {ok, Bin};
 from(Map, Req, Opts) when is_map(Map) ->
     {ok,
@@ -59,10 +62,22 @@ from(Map, Req, Opts) when is_map(Map) ->
     }.
 
 %% @doc Convert a TABM to a flat map.
+-spec to(binary() | [_] | #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, binary() | #{ _ => _ }}.
 to(Bin, _, _Opts) when is_binary(Bin) -> {ok, Bin};
 to(List, Req, Opts) when is_list(List) ->
+    % `structured@1.0' gives the list as a numbered message, marked as a list.
     to(
-        hb_util:list_to_numbered_message(List),
+        hb_message:convert(
+            List,
+            tabm,
+            #{
+                <<"device">> => <<"structured@1.0">>,
+                <<"encode-types">> => [<<"list">>],
+                <<"bundle">> => true
+            },
+            Opts
+        ),
         Req,
         Opts
     );
@@ -96,7 +111,7 @@ serialize(Map) when is_map(Map) ->
     serialize(Map, #{}).
 
 serialize(Map, Opts) when is_map(Map) ->
-    Flattened = hb_message:convert(Map, <<"flat@1.0">>, #{}),
+    Flattened = hb_message:convert(hb_private:reset(Map), <<"flat@1.0">>, #{}),
     {ok,
         iolist_to_binary(lists:foldl(
                 fun(Key, Acc) ->
@@ -115,16 +130,17 @@ serialize(Map, Opts) when is_map(Map) ->
 
 deserialize(Bin) when is_binary(Bin) ->
     Flat = lists:foldl(
-        fun(Line, Acc) ->
+        fun({_, <<>>}, Acc) -> Acc;
+           ({N, Line}, Acc) ->
             case binary:split(Line, <<": ">>, [global]) of
                 [Key, Value] ->
                     Acc#{ Key => Value };
                 _ ->
-                    Acc
+                    error({invalid_line, N})
             end
         end,
         #{},
-        binary:split(Bin, <<"\n">>, [global])
+        lists:enumerate(binary:split(Bin, <<"\n">>, [global]))
     ),
     {ok, hb_message:convert(Flat, <<"structured@1.0">>, <<"flat@1.0">>, #{})}.
 
@@ -146,7 +162,16 @@ nested_conversion_test() ->
     Unflattened = hb_util:ok(dev_flat:from(Flat, #{}, #{})),
     Flattened = hb_util:ok(dev_flat:to(Nested, #{}, #{})),
     ?assert(hb_message:match(Nested, Unflattened)),
-    ?assert(hb_message:match(Flat, Flattened)).
+    ?assert(hb_message:match(Flat, Flattened)),
+    % Native TABM lists round-trip through flat encoding.
+    ?assertEqual([<<"description">>],
+        hb_message:convert(
+            hb_message:convert([<<"description">>], <<"flat@1.0">>, tabm, #{}),
+            <<"structured@1.0">>,
+            <<"flat@1.0">>,
+            #{}
+        )
+    ).
 
 multiple_paths_test() ->
     Flat = #{

@@ -7,25 +7,26 @@
 %%% that the data in process is recovered and resumed.
 -module(dev_bundler_recovery).
 -export([
-    recover_unbundled_items/2,
+    recover_unbundled_items/3,
     recover_bundles/2
 ]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %% @doc Spawn a process to recover unbundled items.
-recover_unbundled_items(ServerPID, Opts) ->
-    spawn(fun() -> do_recover_unbundled_items(ServerPID, Opts) end).
+recover_unbundled_items(ServerPID, ItemIDs, Opts) ->
+    spawn(fun() -> do_recover_unbundled_items(ServerPID, ItemIDs, Opts) end).
 
 %% @doc Spawn a process to recover in-progress bundles.
 recover_bundles(ServerPID, Opts) ->
     spawn(fun() -> do_recover_bundles(ServerPID, Opts) end).
 
-do_recover_unbundled_items(ServerPID, Opts) ->
+do_recover_unbundled_items(ServerPID, ItemIDs, Opts) ->
     try
         ?event(bundler_short, {recover_unbundled_items_start}),
         UnbundledItems = dev_bundler_cache:load_items(
             <<>>,
+            ItemIDs,
             Opts,
             fun(ItemID, Item) ->
                 ?event(
@@ -153,7 +154,7 @@ recover_unbundled_items_test() ->
     ok = dev_bundler_cache:write_item(Item3, Opts),
     FakeTX = new_bundle_tx([Item2], Opts),
     ok = dev_bundler_cache:write_tx(FakeTX, [Item2], Opts),
-    recover_unbundled_items(self(), Opts),
+    recover_unbundled_items(self(), dev_bundler_cache:list_item_ids(Opts), Opts),
     RecoveredItems = receive_enqueue_items(2),
     RecoveredItems1 = normalize_items(RecoveredItems, Opts),
     ?assertEqual(

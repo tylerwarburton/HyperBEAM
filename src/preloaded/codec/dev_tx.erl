@@ -1,18 +1,31 @@
 %%% @doc Codec for managing transformations from `ar_tx'-style Arweave TX
 %%% records to and from TABMs.
 -module(dev_tx).
+-specification("../../../specs/tx@1.0.md").
 -device_libraries([lib_arweave_common]).
 -export([from/3, to/3, to_hint/3, commit/3, verify/3]).
+-export([serialize/3, deserialize/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -define(BASE_FIELDS, [
     <<"anchor">>, <<"format">>, <<"quantity">>, <<"reward">>, <<"target">>,
-    <<"data_root">>, <<"data_size">> ]).
+    <<"data-root">>, <<"data-size">> ]).
 
-%% @doc Sign a message using the `priv-wallet' key in the options. Supports both
-%% the `hmac-sha256' and `rsa-pss-sha256' algorithms, offering unsigned and
-%% signed commitments.
+%% @doc Serialize a TX record to the JSON that `deserialize' reads.
+serialize(TX, _Req, _Opts) ->
+    {ok, hb_json:encode(ar_tx:tx_to_json_struct(TX))}.
+
+%% @doc Deserialize a JSON-encoded transaction to a TABM.
+deserialize(#{ <<"body">> := Body }, Req, Opts) ->
+    deserialize(Body, Req, Opts);
+deserialize(Body, Req, Opts) when is_binary(Body) ->
+    from(ar_tx:json_struct_to_tx(hb_json:decode(Body)), Req, Opts).
+
+%% @doc Sign a message with the committer of the request, or give it an
+%% unsigned commitment.
+-spec commit(#{ _ => _ }, #{ type := binary(), _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }}.
 commit(Msg, Req = #{ <<"type">> := <<"unsigned">> }, Opts) ->
     commit(Msg, Req#{ <<"type">> => <<"unsigned-sha256">> }, Opts);
 commit(Msg, Req = #{ <<"type">> := <<"signed">> }, Opts) ->
@@ -22,8 +35,7 @@ commit(Msg, Req = #{ <<"type">> := ?RSA_SIGN_TYPE }, Opts) ->
     % Convert the given message to an L1 TX record, sign it, and convert
     % it back to a structured message.
     {ok, TX} = to(hb_private:reset(Msg), Req, Opts),
-    Wallet = hb_opts:get(priv_wallet, no_viable_wallet, Opts),
-    Signed = ar_tx:sign(TX, Wallet),
+    Signed = lib_arweave_common:sign(Msg, with_data_root(TX), Req, Opts),
     SignedStructured =
         hb_message:convert(
             Signed,
@@ -31,7 +43,14 @@ commit(Msg, Req = #{ <<"type">> := ?RSA_SIGN_TYPE }, Opts) ->
             <<"tx@1.0">>,
             Opts
         ),
-    {ok, SignedStructured};
+    {ok,
+        lib_arweave_common:add_commitment(
+            <<"tx@1.0">>,
+            Msg,
+            SignedStructured,
+            Opts
+        )
+    };
 commit(Msg, #{ <<"type">> := <<"unsigned-sha256">> }, Opts) ->
     % Remove the commitments from the message, convert it to an L1 TX, 
     % then back. This forces the message to be normalized and the unsigned ID
@@ -46,31 +65,56 @@ commit(Msg, #{ <<"type">> := <<"unsigned-sha256">> }, Opts) ->
         )
     }.
 
-%% @doc Verify an L1 TX commitment.
+%% @doc Give a TX with data the root that `ar_tx:normalize/1' computes for its
+%% data. A commitment of the message gives the TX the signed root, which is not
+%% the root of data changed after signing.
+with_data_root(TX = #tx{ data = ?DEFAULT_DATA }) -> TX;
+with_data_root(TX) -> ar_tx:normalize(TX#tx{ data_root = ?DEFAULT_DATA_ROOT }).
+
+%% @doc Verify an L1 TX commitment. Encoding refuses a message that lacks a key
+%% that its commitment lists, or that bundles such a message, by throwing
+%% `missing_committed_key': the commitment does not verify.
+-spec verify(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, boolean()}.
 verify(Msg, Req, Opts) ->
     ?event({verify, {base, Msg}, {req, Req}}),
-    OnlyWithCommitment =
-        hb_private:reset(
-            hb_message:with_commitments(
-                Req,
-                Msg,
-                Opts
-            )
-        ),
+    OnlyWithCommitment = hb_private:reset(Msg),
     ?event({verify, {only_with_commitment, {explicit, OnlyWithCommitment}}}),
+    try do_verify(OnlyWithCommitment, Req, Opts)
+    catch
+        throw:{missing_committed_key, Key} ->
+            ?event({verify, {committed_key_missing, Key}}),
+            {ok, false}
+    end.
+
+%% @doc Verify an L1 TX commitment against the transaction encoded from the
+%% message.
+do_verify(OnlyWithCommitment, Req, Opts) ->
     {ok, TX} = to(OnlyWithCommitment, Req, Opts),
     ?event({verify, {encoded, {explicit, TX}}}),
-    Res = ar_tx:verify(TX),
+    Res =
+        tx_verifies(TX, Req, OnlyWithCommitment) andalso
+            lib_arweave_common:verify_identity(TX, OnlyWithCommitment, Opts) andalso
+            lib_arweave_common:verify_committed_keys(
+                ?BASE_FIELDS, TX, fun dev_tx_from:fields/3,
+                OnlyWithCommitment, Opts),
     {ok, Res}.
 
+%% @doc An unsigned commitment verifies when the transaction's unsigned ID is
+%% the ID of the commitment; a signed one when its signature verifies.
+tx_verifies(TX, #{ <<"type">> := <<"unsigned-sha256">> }, Msg) ->
+    [ID] = maps:keys(maps:get(<<"commitments">>, Msg, #{})),
+    hb_util:human_id(ar_tx:id(TX, unsigned)) =:= hb_util:human_id(ID);
+tx_verifies(TX, _Req, _Msg) ->
+    ar_tx:verify(TX).
+
 %% @doc Convert a #tx record into a message map recursively.
+-spec from(binary() | #tx{}, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, binary() | #{ _ => _ }}.
 from(Binary, _Req, _Opts) when is_binary(Binary) -> {ok, Binary};
 from(TX, Req, Opts) when is_record(TX, tx) ->
-    case lists:keyfind(<<"ao-type">>, 1, TX#tx.tags) of
-        false ->
-            do_from(TX, Req, Opts);
-        {<<"ao-type">>, <<"binary">>} ->
-            {ok, TX#tx.data}
+    case TX#tx.tags of
+        [{<<"ao-type">>, <<"binary">>}] -> {ok, TX#tx.data};
+        _ -> do_from(TX, Req, Opts)
     end.
 do_from(RawTX, Req, Opts) ->
     ?event({from, {raw_tx, hb_util:human_id(RawTX#tx.id)}}),
@@ -102,18 +146,24 @@ do_from(RawTX, Req, Opts) ->
     ?event({from, {parsed_message, hb_util:human_id(TX#tx.id)}}),
     {ok, WithCommitments}.
 
-%% @doc Inspect a message's signed tx@1.0 commitment and, if the commitment
+%% @doc Inspect a message's tx@1.0 commitment and, if the commitment
 %% carries an explicit `bundle' field, mirror that value onto the request `Req'.
+%% The message is encoded over the keys that its commitment lists.
 to_hint(Msg, Req, Opts) ->
-    case lib_arweave_common:bundle_hint(<<"tx@1.0">>, Msg, Req, Opts) of
+    case lib_arweave_common:item_hint(<<"tx@1.0">>, Msg, Req, Opts) of
         not_found -> hb_ao:raw(<<"ans104@1.0">>, <<"to-hint">>, Msg, Req, Opts);
-        Hint -> Hint
+        Hint -> lib_arweave_common:signed_children_hint(Msg, Hint, Opts)
     end.
 %% @doc Internal helper to translate a message to its #tx record representation,
 %% which can then be used by ar_tx to serialize the message. We call the 
 %% message's device in order to get the keys that we will be checkpointing. We 
 %% do this recursively to handle nested messages. The base case is that we hit
 %% a binary, which we return as is.
+-spec to(
+    binary() | #tx{} | #{ _ => _ },
+    #{ bundle => boolean(), _ => _ },
+    #{ _ => _ }
+) -> {ok, #tx{}}.
 to(Binary, _Req, _Opts) when is_binary(Binary) ->
     % ar_tx cannot serialize just a simple binary or get an ID for it, so
     % we turn it into a TX record with a special tag, tx_to_message will
@@ -330,7 +380,8 @@ happy_tx_test() ->
         <<"field-target">> => hb_util:encode(Target),
         <<"field-anchor">> => hb_util:encode(Anchor),
         <<"field-quantity">> => <<"1000">>,
-        <<"field-reward">> => <<"2000">>
+        <<"field-reward">> => <<"2000">>,
+        <<"field-data-root">> => hb_util:encode(TX#tx.data_root)
     },
     do_tx_roundtrips(TX, UnsignedTABM, SignedCommitment).
 
@@ -357,24 +408,32 @@ data_header_but_no_data_test() ->
         <<"target">> => hb_util:encode(Target),
         <<"quantity">> => <<"1000">>,
         <<"reward">> => <<"2000">>,
-        <<"data_root">> => hb_util:encode(DataRoot),
-        <<"data_size">> => integer_to_binary(DataSize),
+        <<"data-root">> => hb_util:encode(DataRoot),
+        <<"data-size">> => integer_to_binary(DataSize),
         <<"tag1">> => <<"value1">>
     },
     SignedCommitment = #{
         <<"commitment-device">> => <<"tx@1.0">>,
         <<"committed">> => [
             <<"tag1">>, <<"anchor">>, <<"quantity">>, <<"reward">>,
-            <<"target">>, <<"data_root">>, <<"data_size">>],
+            <<"target">>, <<"data-root">>, <<"data-size">>],
         <<"type">> => ?RSA_SIGN_TYPE,
         <<"bundle">> => <<"false">>,
         <<"field-target">> => hb_util:encode(Target),
         <<"field-anchor">> => hb_util:encode(Anchor),
         <<"field-quantity">> => <<"1000">>,
         <<"field-reward">> => <<"2000">>,
-        <<"field-data_root">> => hb_util:encode(DataRoot),
-        <<"field-data_size">> => integer_to_binary(DataSize)
+        <<"field-data-root">> => hb_util:encode(DataRoot),
+        <<"field-data-size">> => integer_to_binary(DataSize)
     },
+    % A `data-size' without a `data-root' stays a tag, so the TX verifies.
+    SizeOnly =
+        hb_message:commit(
+            maps:remove(<<"data-root">>, UnsignedTABM),
+            #{ <<"priv-wallet">> => hb:wallet() },
+            <<"tx@1.0">>
+        ),
+    ?assert(hb_message:verify(SizeOnly)),
     do_tx_roundtrips(
         UnsignedTX,
         UnsignedTABM,
@@ -402,6 +461,7 @@ data_tag_with_data_test() ->
             hb_util:encode(UnsignedID) => #{
                 <<"commitment-device">> => <<"tx@1.0">>,
                 <<"committed">> => [<<"data">>],
+                <<"field-data-root">> => hb_util:encode(TX#tx.data_root),
                 <<"original-tags">> =>#{
                     <<"1">> => #{
                         <<"name">> => <<"data">>,
@@ -417,6 +477,7 @@ data_tag_with_data_test() ->
     SignedCommitment = #{
         <<"commitment-device">> => <<"tx@1.0">>,
         <<"committed">> => [<<"data">>],
+        <<"field-data-root">> => hb_util:encode(TX#tx.data_root),
         <<"original-tags">> =>#{
             <<"1">> => #{
                 <<"name">> => <<"data">>,
@@ -445,10 +506,10 @@ data_tag_no_data_test() ->
         <<"commitments">> => #{
             hb_util:encode(UnsignedID) => #{
                 <<"commitment-device">> => <<"tx@1.0">>,
-                <<"committed">> => [<<"data_root">>, <<"data_size">>],
-                <<"field-data_root">> => 
+                <<"committed">> => [<<"data-root">>, <<"data-size">>],
+                <<"field-data-root">> =>
                     hb_util:encode(DataRoot),
-                <<"field-data_size">> =>
+                <<"field-data-size">> =>
                     integer_to_binary(DataSize),
                 <<"original-tags">> =>#{
                     <<"1">> => #{
@@ -460,15 +521,15 @@ data_tag_no_data_test() ->
                 <<"bundle">> => <<"false">>
             }
         },
-        <<"data_root">> => hb_util:encode(DataRoot),
-        <<"data_size">> => integer_to_binary(DataSize)
+        <<"data-root">> => hb_util:encode(DataRoot),
+        <<"data-size">> => integer_to_binary(DataSize)
     },
     SignedCommitment = #{
         <<"commitment-device">> => <<"tx@1.0">>,
-        <<"committed">> => [<<"data_root">>, <<"data_size">>],
-        <<"field-data_root">> => 
+        <<"committed">> => [<<"data-root">>, <<"data-size">>],
+        <<"field-data-root">> =>
             hb_util:encode(DataRoot),
-        <<"field-data_size">> =>
+        <<"field-data-size">> =>
             integer_to_binary(DataSize),
         <<"original-tags">> =>#{
             <<"1">> => #{
@@ -583,8 +644,8 @@ tags_and_fields_test() ->
             {<<"quantity">>, <<"1000">>},
             {<<"reward">>, <<"2000">>},
             {<<"target">>, hb_util:encode(TargetTag)},
-            {<<"data_root">>, hb_util:encode(DataRootTag)},
-            {<<"data_size">>, <<"100">>}
+            {<<"data-root">>, hb_util:encode(DataRootTag)},
+            {<<"data-size">>, <<"100">>}
         ],
         anchor = AnchorField,
         format = 2,
@@ -602,13 +663,13 @@ tags_and_fields_test() ->
                 <<"commitment-device">> => <<"tx@1.0">>,
                 <<"committed">> => [<<"anchor">>, <<"format">>, 
                     <<"quantity">>, <<"reward">>, <<"target">>,
-                    <<"data_root">>, <<"data_size">>],
+                    <<"data-root">>, <<"data-size">>],
                 <<"field-anchor">> => hb_util:encode(AnchorField),
                 <<"field-quantity">> => <<"5">>,
                 <<"field-reward">> => <<"6">>,
                 <<"field-target">> => hb_util:encode(TargetField),
-                <<"field-data_root">> => hb_util:encode(DataRootField),
-                <<"field-data_size">> => <<"7">>,
+                <<"field-data-root">> => hb_util:encode(DataRootField),
+                <<"field-data-size">> => <<"7">>,
                 <<"original-tags">> =>#{
                     <<"1">> => #{
                         <<"name">> => <<"anchor">>,
@@ -631,11 +692,11 @@ tags_and_fields_test() ->
                         <<"value">> => hb_util:encode(TargetTag)
                     },
                     <<"6">> => #{
-                        <<"name">> => <<"data_root">>,
+                        <<"name">> => <<"data-root">>,
                         <<"value">> => hb_util:encode(DataRootTag)
                     },
                     <<"7">> => #{
-                        <<"name">> => <<"data_size">>,
+                        <<"name">> => <<"data-size">>,
                         <<"value">> => <<"100">>
                     }
                 },
@@ -646,21 +707,21 @@ tags_and_fields_test() ->
         <<"quantity">> => <<"5">>,
         <<"reward">> => <<"6">>,
         <<"target">> => hb_util:encode(TargetField),
-        <<"data_root">> => hb_util:encode(DataRootField),
-        <<"data_size">> => <<"7">>,
+        <<"data-root">> => hb_util:encode(DataRootField),
+        <<"data-size">> => <<"7">>,
         <<"format">> => <<"1">>
     },
     SignedCommitment = #{
         <<"commitment-device">> => <<"tx@1.0">>,
         <<"committed">> => [<<"anchor">>, <<"format">>, 
             <<"quantity">>, <<"reward">>, <<"target">>,
-            <<"data_root">>, <<"data_size">>],
+            <<"data-root">>, <<"data-size">>],
         <<"field-anchor">> => hb_util:encode(AnchorField),
         <<"field-quantity">> => <<"5">>,
         <<"field-reward">> => <<"6">>,
         <<"field-target">> => hb_util:encode(TargetField),
-        <<"field-data_root">> => hb_util:encode(DataRootField),
-        <<"field-data_size">> => <<"7">>,
+        <<"field-data-root">> => hb_util:encode(DataRootField),
+        <<"field-data-size">> => <<"7">>,
         <<"original-tags">> =>#{
             <<"1">> => #{
                 <<"name">> => <<"anchor">>,
@@ -683,11 +744,11 @@ tags_and_fields_test() ->
                 <<"value">> => hb_util:encode(TargetTag)
             },
             <<"6">> => #{
-                <<"name">> => <<"data_root">>,
+                <<"name">> => <<"data-root">>,
                 <<"value">> => hb_util:encode(DataRootTag)
             },
             <<"7">> => #{
-                <<"name">> => <<"data_size">>,
+                <<"name">> => <<"data-size">>,
                 <<"value">> => <<"100">>
             }
         },
@@ -707,8 +768,8 @@ tags_no_fields_test() ->
             {<<"quantity">>, <<"1000">>},
             {<<"reward">>, <<"2000">>},
             {<<"target">>, hb_util:encode(TargetTag)},
-            {<<"data_root">>, hb_util:encode(DataRootTag)},
-            {<<"data_size">>, <<"100">>}
+            {<<"data-root">>, hb_util:encode(DataRootTag)},
+            {<<"data-size">>, <<"100">>}
         ],
         format = 2
     },
@@ -719,7 +780,7 @@ tags_no_fields_test() ->
                 <<"commitment-device">> => <<"tx@1.0">>,
                 <<"committed">> => [<<"anchor">>, <<"format">>, 
                     <<"quantity">>, <<"reward">>, <<"target">>,
-                    <<"data_root">>, <<"data_size">>],
+                    <<"data-root">>, <<"data-size">>],
                 <<"original-tags">> =>#{
                     <<"1">> => #{
                         <<"name">> => <<"anchor">>,
@@ -742,11 +803,11 @@ tags_no_fields_test() ->
                         <<"value">> => hb_util:encode(TargetTag)
                     },
                     <<"6">> => #{
-                        <<"name">> => <<"data_root">>,
+                        <<"name">> => <<"data-root">>,
                         <<"value">> => hb_util:encode(DataRootTag)
                     },
                     <<"7">> => #{
-                        <<"name">> => <<"data_size">>,
+                        <<"name">> => <<"data-size">>,
                         <<"value">> => <<"100">>
                     }
                 },
@@ -758,15 +819,15 @@ tags_no_fields_test() ->
         <<"quantity">> => <<"1000">>,
         <<"reward">> => <<"2000">>,
         <<"target">> => hb_util:encode(TargetTag),
-        <<"data_root">> => hb_util:encode(DataRootTag),
-        <<"data_size">> => <<"100">>,
+        <<"data-root">> => hb_util:encode(DataRootTag),
+        <<"data-size">> => <<"100">>,
         <<"format">> => <<"1">>
     },
     SignedCommitment = #{
         <<"commitment-device">> => <<"tx@1.0">>,
         <<"committed">> => [<<"anchor">>, <<"format">>, 
             <<"quantity">>, <<"reward">>, <<"target">>,
-            <<"data_root">>, <<"data_size">>],
+            <<"data-root">>, <<"data-size">>],
         <<"original-tags">> =>#{
             <<"1">> => #{
                 <<"name">> => <<"anchor">>,
@@ -789,11 +850,11 @@ tags_no_fields_test() ->
                 <<"value">> => hb_util:encode(TargetTag)
             },
             <<"6">> => #{
-                <<"name">> => <<"data_root">>,
+                <<"name">> => <<"data-root">>,
                 <<"value">> => hb_util:encode(DataRootTag)
             },
             <<"7">> => #{
-                <<"name">> => <<"data_size">>,
+                <<"name">> => <<"data-size">>,
                 <<"value">> => <<"100">>
             }
         },
@@ -814,7 +875,7 @@ non_conforming_fields_test() ->
         format = 2,
         tags = [
             {<<"anchor">>, Anchor},
-            {<<"data_root">>, DataRoot},
+            {<<"data-root">>, DataRoot},
             {<<"quantity">>, Quantity},
             {<<"reward">>, Reward},
             {<<"tag1">>, <<"value1">>},
@@ -827,7 +888,7 @@ non_conforming_fields_test() ->
         <<"commitments">> => #{
             hb_util:encode(UnsignedID) => #{
                 <<"commitment-device">> => <<"tx@1.0">>,
-                <<"committed">> => [<<"anchor">>, <<"data_root">>, 
+                <<"committed">> => [<<"anchor">>, <<"data-root">>, 
                     <<"quantity">>, <<"reward">>, <<"tag1">>,
                     <<"tag2">>, <<"target">>],
                 <<"original-tags">> =>#{
@@ -836,7 +897,7 @@ non_conforming_fields_test() ->
                         <<"value">> => Anchor
                     },
                     <<"2">> => #{
-                        <<"name">> => <<"data_root">>,
+                        <<"name">> => <<"data-root">>,
                         <<"value">> => DataRoot
                     },
                     <<"3">> => #{
@@ -868,14 +929,14 @@ non_conforming_fields_test() ->
         <<"target">> => Target,
         <<"quantity">> => Quantity,
         <<"reward">> => Reward,
-        <<"data_root">> => DataRoot,
+        <<"data-root">> => DataRoot,
         <<"tag1">> => <<"value1">>,
         <<"tag2">> => <<"value2">>
     },
 
     SignedCommitment = #{
         <<"commitment-device">> => <<"tx@1.0">>,
-        <<"committed">> => [<<"anchor">>, <<"data_root">>, 
+        <<"committed">> => [<<"anchor">>, <<"data-root">>, 
             <<"quantity">>, <<"reward">>, <<"tag1">>,
             <<"tag2">>, <<"target">>],
         <<"original-tags">> =>#{
@@ -884,7 +945,7 @@ non_conforming_fields_test() ->
                 <<"value">> => Anchor
             },
             <<"2">> => #{
-                <<"name">> => <<"data_root">>,
+                <<"name">> => <<"data-root">>,
                 <<"value">> => DataRoot
             },
             <<"3">> => #{
@@ -932,10 +993,32 @@ ao_data_key_test() ->
     SignedCommitment = #{
         <<"commitment-device">> => <<"tx@1.0">>,
         <<"committed">> => [<<"body">>, <<"tag1">>],
+        <<"field-data-root">> => hb_util:encode(UnsignedTX#tx.data_root),
         <<"type">> => ?RSA_SIGN_TYPE,
-        <<"bundle">> => <<"false">>
+        <<"bundle">> => <<"false">>,
+        <<"original-tags">> => #{
+            <<"1">> => #{ <<"name">> => <<"ao-data-key">>, <<"value">> => <<"body">> },
+            <<"2">> => #{ <<"name">> => <<"tag1">>, <<"value">> => <<"value1">> }
+        }
     },
-    do_tabm_roundtrips(UnsignedTX, UnsignedTABM, SignedCommitment).
+    % The `ao-data-key' tag is not a normal tag, so the decoded message carries
+    % it in an unsigned commitment and encodes to the same TX again.
+    Req = #{ <<"bundle">> => false },
+    TX = hb_util:ok(to(UnsignedTABM, Req, #{})),
+    ?assertEqual(
+        UnsignedTX#tx{ unsigned_id = ar_tx:generate_id(UnsignedTX, unsigned) },
+        TX
+    ),
+    TABM = hb_util:ok(from(TX, Req, #{})),
+    ?assertEqual(UnsignedTABM, hb_message:uncommitted(TABM)),
+    ?assertEqual(TX, hb_util:ok(to(TABM, Req, #{}))),
+    do_signed_tabm_roundtrip(
+        UnsignedTX,
+        UnsignedTABM,
+        SignedCommitment,
+        #{ <<"device">> => <<"tx@1.0">>, <<"bundle">> => false },
+        Req
+    ).
 
 unsorted_tags_test() ->
     TX = #tx{
@@ -1000,6 +1083,7 @@ nested_data_tabm_test() ->
     NoLinksCommitment = #{
         <<"commitment-device">> => <<"tx@1.0">>,
         <<"committed">> => [<<"data">>, <<"tag">>],
+        <<"field-data-root">> => hb_util:encode(UnsignedTX#tx.data_root),
         <<"type">> => ?RSA_SIGN_TYPE,
         <<"bundle">> => <<"true">>,
         <<"bundle-format">> => <<"binary">>,
@@ -1048,6 +1132,7 @@ nested_non_data_key_tabm_test() ->
     NoLinksCommitment = #{
         <<"commitment-device">> => <<"tx@1.0">>,
         <<"committed">> => [<<"a1">>, <<"tag1">>],
+        <<"field-data-root">> => hb_util:encode(UnsignedTX#tx.data_root),
         <<"type">> => ?RSA_SIGN_TYPE,
         <<"bundle">> => <<"true">>,
         <<"bundle-format">> => <<"binary">>,
@@ -1114,6 +1199,7 @@ nested_multiple_tabm_test() ->
     NoLinksCommitment = #{
         <<"commitment-device">> => <<"tx@1.0">>,
         <<"committed">> => [<<"a1">>, <<"data">>, <<"tag1">>],
+        <<"field-data-root">> => hb_util:encode(UnsignedTX#tx.data_root),
         <<"type">> => ?RSA_SIGN_TYPE,
         <<"bundle">> => <<"true">>,
         <<"bundle-format">> => <<"binary">>,
@@ -1175,6 +1261,75 @@ real_2048_bit_rsa_tx_test() ->
         [<<"tj76flZk936u0S2owyEzUFBvBAYle9Al5LH8zJ7icNc">>]
     ).
 
+%% @doc Binary tag names and values survive conversion, caching and HTTP,
+%% including duplicates and literal escaping delimiters in the original tags.
+binary_tags_roundtrip_test() ->
+    Wallet = ar_wallet:new(),
+    Store = hb_test_utils:test_store(hb_store_volatile),
+    Opts = #{
+        <<"store">> => [Store | hb_opts:get(store, [], #{})],
+        <<"priv-wallet">> => Wallet,
+        <<"port">> => 0
+    },
+    Node = hb_http_server:start_node(Opts),
+    Signed = ar_tx:sign(#tx{
+        format = 2,
+        tags = [
+            {<<"Tag", 255, ":, %ff">>, <<0, 255, "\r\n">>},
+            {<<"Tag", 255, ":, %ff">>, <<"second">>},
+            {<<"%ff">>, <<"literal percent">>},
+            {<<255>>, <<"binary name">>},
+            {<<"É"/utf8>>, <<"unicode name">>}
+        ]
+    }, Wallet),
+    try
+        Msg = hb_message:convert(
+            Signed, <<"structured@1.0">>, <<"tx@1.0">>, Opts),
+        ?assertEqual(<<"literal percent">>, hb_maps:get(<<"%ff">>, Msg)),
+        ?assertEqual(<<"binary name">>, hb_maps:get(<<255>>, Msg)),
+        % Only A-Z is lowercased: `É' stays, and `Tag\xff' is `tag\xff'.
+        ?assertEqual(
+            <<"unicode name">>,
+            hb_maps:get(<<"É"/utf8>>, Msg, undefined, Opts)
+        ),
+        ?assert(hb_maps:is_key(<<"tag", 255, ":, %ff">>, Msg, Opts)),
+        ?assertNot(hb_message:verify(
+            Msg#{ <<255>> => <<"changed">> }, all, Opts)),
+        {ok, _} = hb_cache:write(Msg, Opts),
+        ID = hb_util:human_id(Signed#tx.id),
+        {ok, Remote} = hb_http:get(
+            Node, <<"/~cache@1.0/read&read=", ID/binary>>, Opts),
+        ?assert(hb_message:verify(Remote,
+            #{ <<"ids">> => [ID] }, Opts)),
+        Back = hb_message:convert(
+            Remote, <<"tx@1.0">>, <<"structured@1.0">>, Opts),
+        ?assertEqual(Signed#tx.tags, Back#tx.tags),
+        ?assertEqual(Signed#tx.id, Back#tx.id),
+        ?assert(ar_tx:verify(Back))
+    after
+        cowboy:stop_listener(hb_util:human_id(ar_wallet:to_address(Wallet))),
+        hb_store:stop(Store)
+    end.
+
+%% @doc Tags with names that are not UTF-8 keep their order through an
+%% `httpsig@1.0' round trip, and the transaction still verifies.
+binary_tag_order_test() ->
+    Signed = ar_tx:sign(
+        #tx{
+            format = 2,
+            tags = [{<<255>>, <<"last">>}, {<<254>>, <<"first">>}]
+        },
+        hb:wallet()
+    ),
+    Msg = hb_message:convert(Signed, <<"structured@1.0">>, <<"tx@1.0">>, #{}),
+    Wire = hb_message:convert(Msg, <<"httpsig@1.0">>, #{}),
+    Read =
+        hb_message:convert(Wire, <<"structured@1.0">>, <<"httpsig@1.0">>, #{}),
+    Back = hb_message:convert(Read, <<"tx@1.0">>, <<"structured@1.0">>, #{}),
+    ?assertEqual(Signed#tx.tags, Back#tx.tags),
+    ?assertEqual(Signed#tx.id, Back#tx.id),
+    ?assert(ar_tx:verify(Back)).
+
 format_one_roundtrip_test() ->
     Signed = ar_tx:sign(
         #tx{
@@ -1199,6 +1354,48 @@ format_one_roundtrip_test() ->
     ),
     ?assertEqual(Signed#tx.tags, Roundtripped#tx.tags),
     ?assert(ar_tx:verify(Roundtripped)).
+
+%% @doc Ensure that a message does not verify when the values of its committed
+%% keys differ from those of the signed TX. The TX's tags and fields are
+%% restored from its commitment, so the signature alone does not cover them.
+modified_committed_value_test() ->
+    Signed = ar_tx:sign(
+        #tx{
+            format = 2,
+            target = crypto:strong_rand_bytes(32),
+            quantity = 100,
+            reward = 1,
+            tags = [{<<"Content-Type">>, <<"application/json">>}]
+        },
+        hb:wallet()
+    ),
+    Structured = hb_message:convert(
+        Signed,
+        <<"structured@1.0">>,
+        <<"tx@1.0">>,
+        #{}
+    ),
+    ?event({structured, Structured}),
+    ?assert(hb_message:verify(Structured, all, #{})),
+    ModifiedTag =
+        Structured#{
+            <<"content-type">> => <<"application/json; charset=utf-8">>
+        },
+    ?assertNot(hb_message:verify(ModifiedTag, all, #{})),
+    ModifiedField = Structured#{ <<"quantity">> => <<"1">> },
+    ?assertNot(hb_message:verify(ModifiedField, all, #{})),
+    % Commit refuses a request `field-quantity' that differs from the key.
+    ?assertThrow(
+        {request_field_differs, <<"quantity">>},
+        hb_message:commit(
+            #{ <<"quantity">> => <<"1">> },
+            #{ <<"priv-wallet">> => hb:wallet() },
+            #{
+                <<"commitment-device">> => <<"tx@1.0">>,
+                <<"field-quantity">> => <<"100">>
+            }
+        )
+    ).
 
 duplicate_tags_roundtrip_test() ->
     Signed = ar_tx:sign(
@@ -1371,10 +1568,9 @@ do_signed_tx_roundtrip(UnsignedTX, UnsignedTABM, Commitment, Req) ->
     % TX -> TABM
     TABM = hb_util:ok(from(DeserializedTX, Req, #{})),
     SignedCommitment = Commitment#{
-        <<"committer">> => hb_util:human_id(SignedTX#tx.owner_address),
+        <<"committer">> => hb_test_utils:committer(hb:wallet()),
         <<"signature">> => hb_util:encode(SignedTX#tx.signature),
-        <<"keyid">> =>
-            <<"publickey:", (hb_util:encode(SignedTX#tx.owner))/binary>>
+        <<"owner">> => hb_util:encode(SignedTX#tx.owner)
     },
     SignedTABM = UnsignedTABM#{
         <<"commitments">> => 
@@ -1430,10 +1626,9 @@ do_signed_tabm_roundtrip(UnsignedTX, UnsignedTABM, Commitment, Device, Req) ->
         #{}
     ),
     ExpectedCommitment = Commitment#{
-        <<"committer">> => hb_util:human_id(ar_wallet:to_address(Wallet)),
+        <<"committer">> => hb_test_utils:committer(Wallet),
         <<"signature">> => maps:get(<<"signature">>, SignedCommitment),
-        <<"keyid">> =>
-            <<"publickey:", (hb_util:encode(ar_wallet:to_pubkey(Wallet)))/binary>>
+        <<"owner">> => hb_util:encode(ar_wallet:to_pubkey(Wallet))
     },
     ?event(debug_test, {signed_tabm_roundtrip,
         {expected_commitment, ExpectedCommitment},

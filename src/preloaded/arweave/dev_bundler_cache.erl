@@ -18,6 +18,7 @@
     load_tx/2,
     load_items/2,
     load_items/4,
+    load_items/5,
     list_item_ids/1
 ]).
 -include("include/hb.hrl").
@@ -190,6 +191,11 @@ load_items(BundleID, Opts) ->
 
 %% @doc Load all items whose bundle pseudopath matches BundleID and invoke callbacks.
 load_items(BundleID, Opts, OnLoaded, OnFailed) ->
+    load_items(BundleID, list_item_ids(Opts), Opts, OnLoaded, OnFailed).
+
+%% @doc Load the given items whose bundle pseudopath matches BundleID and invoke
+%% callbacks.
+load_items(BundleID, ItemIDs, Opts, OnLoaded, OnFailed) ->
     lists:filtermap(
         fun(ItemID) ->
             BundlePath = item_path(ItemID, Opts),
@@ -208,7 +214,7 @@ load_items(BundleID, Opts, OnLoaded, OnFailed) ->
                     false
             end
         end,
-        list_item_ids(Opts)
+        ItemIDs
     ).
 
 %%% Tests

@@ -112,7 +112,7 @@ debug_trace(Mod, Func, Line, Opts) ->
 term(X) -> term(X, #{}).
 term(X, Opts) -> term(X, Opts, 0).
 term(X, Opts, Indent) ->
-    try do_term(X, Opts, Indent)
+    try do_term(redact_private(X), Opts, Indent)
     catch A:B:C ->
         Mode = hb_opts:get(mode, prod, Opts),
         PrintFailPreference = hb_opts:get(debug_print_fail_mode, quiet, Opts),
@@ -141,24 +141,6 @@ term(X, Opts, Indent) ->
         end
     end.
 
-do_term(
-    { { {rsa, _PublicExpnt1}, _Priv1, _Priv2 },
-      { {rsa, _PublicExpnt2}, Pub }
-    },
-    Opts, Indent
-) ->
-    address(Pub, Opts, Indent);
-do_term(
-    { AtomValue,
-      {
-        { {rsa, _PublicExpnt1}, _Priv1, _Priv2 },
-        { {rsa, _PublicExpnt2}, Pub }
-      }
-    },
-    Opts, Indent
-) ->
-    AddressString = address(Pub, Opts, Indent),
-    indent("~p: ~s", [AtomValue, AddressString], Opts, Indent);
 do_term({explicit, X}, Opts, Indent) ->
     indent("[Explicit:] ~p", [X], Opts, Indent);
 do_term({string, X}, Opts, Indent) ->
@@ -230,13 +212,14 @@ do_term(MsgList, Opts, Indent) when is_list(MsgList) ->
 do_term(X, Opts, Indent) ->
     indent("~80p", [X], Opts, Indent).
 
-%% @doc If the user attempts to print a wallet, format it as an address.
-address(Wallet, Opts, Indent) ->
-    indent("Wallet [Addr: ~s]",
-        [short_id(hb_util:human_id(ar_wallet:to_address(Wallet)))], 
-        Opts, 
-        Indent
-    ).
+%% @doc Replace the value of a tuple `{Key, Value}' whose `Key' starts with
+%% `priv', such as an event's `{priv_wallet, Wallet}', with `redacted'.
+redact_private(Pair = {Key, _}) ->
+    case hb_private:is_private(Key) of
+        true -> {Key, redacted};
+        false -> Pair
+    end;
+redact_private(X) -> X.
 
 %% @doc Helper function to format tuples with arity greater than 2.
 tuple(Tuple, Opts, Indent) ->
@@ -307,13 +290,17 @@ list_lines(MsgList, Footer, Opts, Indent) ->
                 IndentedFooterList ++
                 indent("}", [], Opts, Indent);
         true ->
+            % Reuse a multiline Line. Formatting its Msg again formats every
+            % nested list twice.
             "\n" ++
             lists:flatten(lists:map(
-                fun({N, Msg}) ->
-                    {_, Line} = list_item(multiline, N, Msg, Opts, Indent),
-                    Line
+                fun({{_N, _Msg}, {multiline, Line}}) -> Line;
+                   ({{N, Msg}, {short, _}}) ->
+                        {_, Line} =
+                            list_item(multiline, N, Msg, Opts, Indent),
+                        Line
                 end,
-                Numbered
+                lists:zip(Numbered, Lines)
             )) ++
             IndentedFooterList ++
             indent("}", [], Opts, Indent)
@@ -430,11 +417,16 @@ error(ErrorMsg, Opts) ->
     Stacktrace = hb_maps:get(<<"stacktrace">>, ErrorMsg, <<"[No trace]">>, Opts),
     hb_util:bin(
         [
-            <<"Termination type: '">>, Type,
-            <<"'\n\nStacktrace:\n\n">>, Stacktrace,
-            <<"\n\nError details:\n\n">>, Details
+            <<"Termination type: '">>, error_value(Type, Opts),
+            <<"'\n\nStacktrace:\n\n">>, error_value(Stacktrace, Opts),
+            <<"\n\nError details:\n\n">>, error_value(Details, Opts)
         ]
     ).
+
+%% @doc Format a value of an error message as a string. A binary is returned
+%% as is. Any other term is printed by `term/2'.
+error_value(Bin, _Opts) when is_binary(Bin) -> Bin;
+error_value(Term, Opts) -> term(Term, Opts).
 
 %% @doc Take a series of strings or a combined string and format as a
 %% single string with newlines and indentation to the given level. Note: This
@@ -504,6 +496,7 @@ maybe_multiline(X, Opts, Indent) ->
 %% node options.
 maybe_short(X, Opts, _Indent) ->
     MaxLen = hb_opts:get(debug_print_map_line_threshold, 100, Opts),
+    % Probe only far enough to select the multiline formatter.
     SimpleFmt =
         case is_binary(X) of
             true -> binary(X, Opts);
@@ -570,6 +563,8 @@ trace([Item|Rest], Prefixes) ->
     end;
 trace({Func, ArityOrTerm, Extras}, Prefixes) ->
     trace({no_module, Func, ArityOrTerm, Extras}, Prefixes);
+trace({Mod, Func, Args, Extras}, Prefixes) when is_list(Args) ->
+    trace({Mod, Func, length(Args), Extras}, Prefixes);
 trace({Mod, Func, ArityOrTerm, Extras}, _Prefixes) ->
     ExtraMap = hb_maps:from_list(Extras),
     indent(
@@ -767,11 +762,7 @@ message(RawMsg, Opts, Indent) when is_map(RawMsg) ->
             {if_present, #{}} -> [];
             {_, Priv} -> [{<<"!Private!">>, Priv}]
         end,
-    Msg =
-        case FilterPriv of
-            false -> RawMsg;
-            _ -> hb_private:reset(RawMsg)
-        end,
+    Msg = hb_private:reset(RawMsg),
     % Define helper functions for formatting elements of the map.
     ValOrUndef =
         fun(<<"hashpath">>) ->
@@ -827,7 +818,7 @@ message(RawMsg, Opts, Indent) when is_map(RawMsg) ->
     CommittedKeys =
         hb_message:committed(
             MsgWithNormComms,
-            #{ <<"commitment-ids">> => <<"all">> },
+            #{ <<"ids">> => <<"all">> },
             Opts
         ),
     CommIDs = hb_maps:keys(Comms, Opts),
@@ -838,7 +829,7 @@ message(RawMsg, Opts, Indent) when is_map(RawMsg) ->
                 try
                     hb_message:verify(
                         MsgWithNormComms,
-                        #{ <<"commitment-ids">> => ID },
+                        #{ <<"ids">> => ID },
                         Opts
                     )
                 catch _:_ -> false
@@ -1030,7 +1021,7 @@ message(RawMsg, Opts, Indent) when is_map(RawMsg) ->
                                 )
                             );
                         Other ->
-                            io_lib:format("~p", [Other])
+                            term(Other, Opts, Indent + 2)
                     end
                 ],
                 Opts,
@@ -1048,7 +1039,7 @@ message(RawMsg, Opts, Indent) when is_map(RawMsg) ->
     end;
 message(Item, Opts, Indent) ->
     % Whatever we have is not a message map.
-    indent("~p", [Item], Opts, Indent).
+    term(Item, Opts, Indent).
 
 %%% Utility functions.
 
@@ -1118,6 +1109,125 @@ max_keys(Opts) ->
     end.
 
 %%% Tests
+
+private_message_test() ->
+    Public = #{ <<"body">> => <<"public">> },
+    Private = Public#{
+        <<"priv">> => #{ <<"secret">> => <<"private-marker">> },
+        <<"priv-wallet">> => <<"private-marker">>
+    },
+    lists:foreach(
+        fun(Indent) ->
+            Opts = #{ <<"debug-show-priv">> => false },
+            ?assertEqual(
+                message(Public, Opts, Indent),
+                message(Private, Opts, Indent)
+            ),
+            ?assertEqual(
+                message(#{ <<"nested">> => Public }, Opts, Indent),
+                message(#{ <<"nested">> => Private }, Opts, Indent)
+            )
+        end,
+        [0, 1, 3]
+    ),
+    % A tuple whose first element starts with `priv' prints without its value.
+    ?assertEqual(
+        "priv_wallet: redacted",
+        term({priv_wallet, <<"private-marker">>})
+    ),
+    % `error/2' prints a message in `details' without its private keys.
+    ?assertEqual(
+        ?MODULE:error(#{ <<"details">> => #{} }, #{}),
+        ?MODULE:error(#{ <<"details">> => #{ <<"priv">> => 1 } }, #{})
+    ).
+
+private_trace_test() ->
+    Args = [missing, #{ <<"priv-secret">> => <<"private-marker">> }],
+    ?assertEqual(
+        lists:flatten([
+            indent("maps:get/2 [No details]\n", 1),
+            indent("no_module:apply/2 [test.erl:7]\n", 1),
+            indent("hb_ao:resolve/3 [test.erl:9]\n", 1)
+        ]),
+        lists:flatten(trace([
+            {maps, get, Args, []},
+            {apply, Args, [{file, "test.erl"}, {line, 7}]},
+            {hb_ao, resolve, 3, [{file, "test.erl"}, {line, 9}]}
+        ]))
+    ).
+
+short_format_test() ->
+    lists:foreach(
+        fun({Limit, Value}) ->
+            Formatted = io_lib:format("~p", [Value]),
+            Expected =
+                case is_multiline(Formatted) orelse
+                        lists:flatlength(Formatted) > Limit of
+                    true -> error;
+                    false -> {ok, Formatted}
+                end,
+            ?assertEqual(Expected,
+                maybe_short(Value,
+                    #{<<"debug-print-map-line-threshold">> => Limit}, 0))
+        end,
+        [{Limit, Value} || Limit <- [0, 1, 16, 80, 100, 256],
+            Value <- [#{}, #{a => b}, [1, 2, 3]] ++
+                [#{<<"data">> => binary:copy(<<0, 255>>, Size)}
+                || Size <- [0, 1, 16, 50, 128]]]
+    ).
+
+bounded_format_test() ->
+    lists:foreach(fun bounded_format/1,
+        [fun term/1, fun message/1, fun(Value) ->
+            term(#{<<"reason">> => Value})
+        end]).
+
+%% @doc Format a large failure within a small worker heap.
+bounded_format(Render) ->
+    Parent = self(),
+    Msg = #{<<"data">> => binary:copy(<<0, 255>>, 524288)},
+    {Pid, Ref} = spawn_opt(
+        fun() ->
+            Parent ! {self(), Render({paranoid_verification_failure,
+                {failed_message, Msg}, {while_verifying, Msg}})}
+        end,
+        [monitor, {max_heap_size,
+            #{size => 2000000, kill => true, error_logger => false}}]
+    ),
+    try
+        receive
+            {Pid, Result} ->
+                ?assert(length(Result) < 1000),
+                ?assertNotEqual(nomatch,
+                    string:find(Result, "paranoid_verification_failure"));
+            {'DOWN', Ref, process, Pid, Reason} -> error({formatter_exit, Reason})
+        after 5000 -> ?assert(false)
+        end
+    after
+        exit(Pid, kill),
+        erlang:demonitor(Ref, [flush])
+    end.
+
+%% @doc A nested list is formatted once for each list element, not once per
+%% branch of the list formatter.
+nested_list_format_calls_test() ->
+    Nested = fun(Depth) ->
+        lists:foldl(fun(_, Acc) -> [Acc] end, 1, lists:seq(1, Depth))
+    end,
+    ?assertEqual(
+        "\nList [1] {\n  1 => \n    List [1] {\n      1 => "
+        "[[[[[[[[[[[[[[1]]]]]]]]]]]]]]\n    }\n}",
+        term(Nested(16), #{}, 0)
+    ),
+    try
+        erlang:trace_pattern({?MODULE, list_item, 4}, true, [call_count]),
+        _ = term(Nested(26), #{}, 0),
+        {call_count, Calls} =
+            erlang:trace_info({?MODULE, list_item, 4}, call_count),
+        ?assert(Calls < 1000)
+    after
+        erlang:trace_pattern({?MODULE, list_item, 4}, false, [call_count])
+    end.
 
 truncate_no_truncation_test() ->
     ?assertEqual(<<"hello">>, truncate(<<"hello">>, 10)).

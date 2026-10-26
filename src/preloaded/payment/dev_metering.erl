@@ -15,7 +15,8 @@
 %%% operator sets `metering-rates' in the node message as a map of resource name
 %%% to AO token units per resource unit.
 -module(dev_metering).
--export([info/1, estimate/3, price/3, is_active/0, consume/3]).
+-specification("../../../specs/metering@1.0.md").
+-export([device_info/1, estimate/3, price/3, is_active/0, consume/3]).
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -25,7 +26,7 @@
 -define(RESPONSE_BYTES, <<"response-bytes">>).
 
 %% @doc Device API information.
-info(_) ->
+device_info(_) ->
     #{
         exports =>
             [
@@ -34,8 +35,16 @@ info(_) ->
             ]
     }.
 
-%% @doc Start a metering session for the request.
+%% @doc Start a metering session for the request. A node that sets any rate
+%% above 0 estimates each request at `metering-default-estimate' (default 1),
+%% so that P4 runs it only for a payer whose balance is at least that.
 estimate(_Base, EstimateReq, Opts) ->
+    case hb_private:get(<<"hook-caller">>, EstimateReq, Opts) of
+        <<"kernel">> -> start_session(EstimateReq, Opts);
+        _ -> {error, #{ <<"status">> => 401, <<"body">> => <<"Unauthorized caller.">> }}
+    end.
+
+start_session(EstimateReq, Opts) ->
     {reductions, Reductions} = erlang:process_info(self(), reductions),
     erlang:put(
         ?METERING_KEY,
@@ -45,10 +54,20 @@ estimate(_Base, EstimateReq, Opts) ->
         }
     ),
     consume(?REQUEST_BYTES, body_size(EstimateReq, Opts), Opts),
-    {ok, 0}.
+    Rates = hb_maps:values(hb_opts:get(<<"metering-rates">>, #{}, Opts), Opts),
+    case lists:any(fun(Rate) -> hb_util:int(Rate) > 0 end, Rates) of
+        true -> {ok, hb_opts:get(<<"metering-default-estimate">>, 1, Opts)};
+        false -> {ok, 0}
+    end.
 
 %% @doc Close the metering session and calculate the final AO token price.
 price(_Base, PriceReq, Opts) ->
+    case hb_private:get(<<"hook-caller">>, PriceReq, Opts) of
+        <<"kernel">> -> finish_session(PriceReq, Opts);
+        _ -> {error, #{ <<"status">> => 401, <<"body">> => <<"Unauthorized caller.">> }}
+    end.
+
+finish_session(PriceReq, Opts) ->
     consume(?RESPONSE_BYTES, body_size(PriceReq, Opts), Opts),
     Rates = hb_opts:get(<<"metering-rates">>, #{}, Opts),
     Price =
@@ -154,6 +173,13 @@ add_meter(Resource, Amount, State) ->
 
 %%% Tests
 
+%% The private key that p4's hooks give on their pricing requests.
+-define(HOOK_PRIV, #{ <<"hook-caller">> => <<"kernel">> }).
+
+%% @doc Resolve a metering key as p4's hooks do, with the private key.
+hook_resolve(Metering, Req, Opts) ->
+    hb_ao:resolve(Metering, Req#{ <<"priv">> => ?HOOK_PRIV }, Opts).
+
 %% @doc Metering outside an active session is a no-op.
 inactive_meter_noop_test() ->
     erlang:erase(?METERING_KEY),
@@ -170,9 +196,9 @@ consume_price_test() ->
         }
     },
     Metering = #{ <<"device">> => <<"metering@1.0">> },
-    {ok, 0} = hb_ao:resolve(Metering, #{ <<"path">> => <<"estimate">> }, Opts),
+    {ok, 1} = hook_resolve(Metering, #{ <<"path">> => <<"estimate">> }, Opts),
     ok = consume(<<"arweave-bytes">>, 5, Opts),
-    {ok, 15} = hb_ao:resolve(Metering, #{ <<"path">> => <<"price">> }, Opts).
+    {ok, 15} = hook_resolve(Metering, #{ <<"path">> => <<"price">> }, Opts).
 
 %% @doc Resource consumption is not exposed as an AO-Core key.
 consume_is_not_device_key_test() ->
@@ -198,19 +224,19 @@ beam_reductions_price_test() ->
         <<"metering-rates">> => #{ ?BEAM_REDUCTIONS => 1 }
     },
     Metering = #{ <<"device">> => <<"metering@1.0">> },
-    {ok, 0} = hb_ao:resolve(Metering, #{ <<"path">> => <<"estimate">> }, Opts),
+    {ok, 1} = hook_resolve(Metering, #{ <<"path">> => <<"estimate">> }, Opts),
     lists:foreach(
         fun(_) -> erlang:phash2(rand:bytes(16)) end,
         lists:seq(1, 10)
     ),
-    {ok, Price} = hb_ao:resolve(Metering, #{ <<"path">> => <<"price">> }, Opts),
+    {ok, Price} = hook_resolve(Metering, #{ <<"path">> => <<"price">> }, Opts),
     ?assert(Price > 0).
 
 %% @doc P4 charges a dynamic metering price during response processing.
 p4_response_charge_test() ->
     HostWallet = ar_wallet:new(),
     Wallet = ar_wallet:new(),
-    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Address = hb_test_utils:committer(Wallet),
     Rate = 2,
     Item =
         hb_message:commit(
@@ -218,7 +244,8 @@ p4_response_charge_test() ->
                 <<"data">> => <<"metered-bundler-item">>,
                 <<"test">> => <<"p4-response-metering">>
             },
-            #{ <<"priv-wallet">> => ar_wallet:new() }
+            #{ <<"priv-wallet">> => ar_wallet:new() },
+            <<"ans104@1.0">>
         ),
     {ServerHandle, GatewayOpts} =
         hb_mock_server:start_arweave_gateway(
@@ -242,7 +269,7 @@ p4_response_charge_test() ->
                 <<"arweave-bytes">> => Rate,
                 ?BEAM_REDUCTIONS => 0
             },
-            <<"operator">> => ar_wallet:to_address(HostWallet),
+            <<"operator">> => hb_test_utils:committer(HostWallet),
             <<"on">> => #{
                 <<"request">> => Processor,
                 <<"response">> => Processor
@@ -306,14 +333,14 @@ request_and_response_bytes_test() ->
     Metering = #{ <<"device">> => <<"metering@1.0">> },
     Request = #{ <<"body">> => binary:copy(<<"q">>, 1000) },
     Response = #{ <<"body">> => binary:copy(<<"r">>, 50000) },
-    {ok, 0} =
-        hb_ao:resolve(
+    {ok, 1} =
+        hook_resolve(
             Metering,
             #{ <<"path">> => <<"estimate">>, <<"body">> => Request },
             Opts
         ),
     {ok, Price} =
-        hb_ao:resolve(
+        hook_resolve(
             Metering,
             #{ <<"path">> => <<"price">>, <<"body">> => Response },
             Opts
@@ -332,10 +359,10 @@ response_bytes_scale_with_payload_test() ->
     Metering = #{ <<"device">> => <<"metering@1.0">> },
     Price =
         fun(Bytes) ->
-            {ok, 0} =
-                hb_ao:resolve(Metering, #{ <<"path">> => <<"estimate">> }, Opts),
+            {ok, 1} =
+                hook_resolve(Metering, #{ <<"path">> => <<"estimate">> }, Opts),
             {ok, P} =
-                hb_ao:resolve(
+                hook_resolve(
                     Metering,
                     #{
                         <<"path">> => <<"price">>,
@@ -373,10 +400,10 @@ linked_body_metering_respects_bundle_commitment_test() ->
             {ok, _} = hb_cache:write(Response, Opts),
             {ok, LinkedResponse} =
                 hb_cache:read(hb_message:id(Response, all, Opts), Opts),
-            {ok, 0} =
-                hb_ao:resolve(Metering, #{ <<"path">> => <<"estimate">> }, Opts),
+            {ok, 1} =
+                hook_resolve(Metering, #{ <<"path">> => <<"estimate">> }, Opts),
             {ok, Result} =
-                hb_ao:resolve(
+                hook_resolve(
                     Metering,
                     #{ <<"path">> => <<"price">>, <<"body">> => LinkedResponse },
                     Opts
@@ -396,7 +423,7 @@ unpriced_resources_cost_nothing_test() ->
     },
     Metering = #{ <<"device">> => <<"metering@1.0">> },
     {ok, 0} =
-        hb_ao:resolve(
+        hook_resolve(
             Metering,
             #{
                 <<"path">> => <<"estimate">>,
@@ -405,7 +432,7 @@ unpriced_resources_cost_nothing_test() ->
             Opts
         ),
     {ok, 0} =
-        hb_ao:resolve(
+        hook_resolve(
             Metering,
             #{
                 <<"path">> => <<"price">>,

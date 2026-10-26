@@ -91,7 +91,7 @@ invalid_recid_255_rejected_test() ->
     ?assertEqual(<<>>, ar_wallet:recover_key(Msg, BadRecidSig, ?ECDSA_KEY_TYPE)).
 
 high_s_signature_rejected_test() ->
-    Wallet = {{_KeyType, _Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    Wallet = #{ <<"owner">> := Pub } = ar_wallet:new_ecdsa(),
     Msg = <<"malleability test">>,
     Sig = ar_wallet:sign(Wallet, Msg),
     %% Verify original signature works
@@ -116,7 +116,7 @@ nif_sign_known_key_test() ->
     {ok, true, RecoveredPub} = secp256k1_nif:recover_pk_and_verify(Digest, Sig),
     %% Generate expected pubkey from private key
     Wallet = new_ecdsa_wallet_from_privkey(PrivKey),
-    {{_KeyType, _Priv, ExpectedPub}, _} = Wallet,
+    #{ <<"owner">> := ExpectedPub } = Wallet,
     ?assertEqual(ExpectedPub, RecoveredPub).
 
 signing_is_deterministic_test() ->
@@ -175,7 +175,7 @@ nif_sign_recover_roundtrip_test() ->
     {ok, Sig} = secp256k1_nif:sign_recoverable(Digest, PrivKey),
     {ok, true, RecoveredPub} = secp256k1_nif:recover_pk_and_verify(Digest, Sig),
     Wallet = new_ecdsa_wallet_from_privkey(PrivKey),
-    {{_KeyType, _Priv, ExpectedPub}, _} = Wallet,
+    #{ <<"owner">> := ExpectedPub } = Wallet,
     ?assertEqual(ExpectedPub, RecoveredPub).
 
 empty_message_signs_successfully_test() ->
@@ -185,35 +185,38 @@ empty_message_signs_successfully_test() ->
     ?assertEqual(65, byte_size(Sig)).
 
 recovers_correct_pubkey_test() ->
-    Wallet = {{_KeyType, _Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    Wallet = #{ <<"owner">> := Pub } = ar_wallet:new_ecdsa(),
     Msg = <<"recovery test message">>,
     Sig = ar_wallet:sign(Wallet, Msg),
     RecoveredPub = ar_wallet:recover_key(Msg, Sig, ?ECDSA_KEY_TYPE),
     ?assertEqual(Pub, RecoveredPub).
 
 empty_message_recovers_correctly_test() ->
-    Wallet = {{_KeyType, _Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    Wallet = #{ <<"owner">> := Pub } = ar_wallet:new_ecdsa(),
     Msg = <<>>,
     Sig = ar_wallet:sign(Wallet, Msg),
     RecoveredPub = ar_wallet:recover_key(Msg, Sig, ?ECDSA_KEY_TYPE),
     ?assertEqual(Pub, RecoveredPub).
 
 all_zero_digest_test() ->
-    {{_KeyType, Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    #{ <<"owner">> := Pub, <<"priv">> := #{ <<"d">> := Priv } } =
+        ar_wallet:new_ecdsa(),
     Digest = <<0:256>>,
     {ok, Sig} = secp256k1_nif:sign_recoverable(Digest, Priv),
     {ok, true, RecoveredPub} = secp256k1_nif:recover_pk_and_verify(Digest, Sig),
     ?assertEqual(Pub, RecoveredPub).
 
 all_ones_digest_test() ->
-    {{_KeyType, Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    #{ <<"owner">> := Pub, <<"priv">> := #{ <<"d">> := Priv } } =
+        ar_wallet:new_ecdsa(),
     Digest = <<16#FF:(32*8)>>,
     {ok, Sig} = secp256k1_nif:sign_recoverable(Digest, Priv),
     {ok, true, RecoveredPub} = secp256k1_nif:recover_pk_and_verify(Digest, Sig),
     ?assertEqual(Pub, RecoveredPub).
 
 digest_equals_curve_order_test() ->
-    {{_KeyType, Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    #{ <<"owner">> := Pub, <<"priv">> := #{ <<"d">> := Priv } } =
+        ar_wallet:new_ecdsa(),
     Order = ?SECP256K1_ORDER,
     OrderBin = binary:encode_unsigned(Order, big),
     Digest = pad_to_32_bytes(OrderBin),
@@ -225,7 +228,7 @@ digest_equals_curve_order_test() ->
 %%% Adversarial Robustness Tests
 %%%===================================================================
 wrong_message_recovers_different_key_test() ->
-    Wallet = {{_KeyType, _Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    Wallet = #{ <<"owner">> := Pub } = ar_wallet:new_ecdsa(),
     Msg = <<"original message">>,
     BadMsg = <<"wrong message">>,
     Sig = ar_wallet:sign(Wallet, Msg),
@@ -233,7 +236,7 @@ wrong_message_recovers_different_key_test() ->
     ?assertNotEqual(Pub, RecoveredPub).
 
 corrupted_signature_byte_flip_test() ->
-    Wallet = {{_KeyType, _Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    Wallet = #{ <<"owner">> := Pub } = ar_wallet:new_ecdsa(),
     Msg = <<"flipped bit test">>,
     Sig = ar_wallet:sign(Wallet, Msg),
     CorruptedSig = corrupt_signature(Sig, 10),
@@ -241,7 +244,7 @@ corrupted_signature_byte_flip_test() ->
     ?assertNotEqual(Pub, Result).
 
 zeroed_r_value_fails_test() ->
-    Wallet = {{_KeyType, _Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    Wallet = #{ <<"owner">> := Pub } = ar_wallet:new_ecdsa(),
     Msg = <<"zeroed r test">>,
     Sig = ar_wallet:sign(Wallet, Msg),
     CorruptedSig = zero_signature_range(Sig, 0, 32),
@@ -249,7 +252,7 @@ zeroed_r_value_fails_test() ->
     ?assertNotEqual(Pub, Result).
 
 zeroed_s_value_fails_test() ->
-    Wallet = {{_KeyType, _Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    Wallet = #{ <<"owner">> := Pub } = ar_wallet:new_ecdsa(),
     Msg = <<"zeroed s test">>,
     Sig = ar_wallet:sign(Wallet, Msg),
     CorruptedSig = zero_signature_range(Sig, 32, 32),
@@ -271,25 +274,25 @@ extended_signature_fails_test() ->
     ?assertError(badarg, ar_wallet:recover_key(Msg, ExtendedSig, ?ECDSA_KEY_TYPE)).
 
 verify_rejects_wrong_signature_test() ->
-    Wallet = {{KeyType, _Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    Wallet = ar_wallet:new_ecdsa(),
     TestData = <<"wrong sig test">>,
     Signature = ar_wallet:sign(Wallet, TestData),
     CorruptedSig = corrupt_signature(Signature, 0),
-    false = ar_wallet:verify({KeyType, Pub}, TestData, CorruptedSig).
+    false = ar_wallet:verify(Wallet, TestData, CorruptedSig).
 
 verify_rejects_wrong_data_test() ->
-    Wallet = {{KeyType, _Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    Wallet = ar_wallet:new_ecdsa(),
     TestData = <<"original data">>,
     WrongData = <<"wrong data">>,
     Signature = ar_wallet:sign(Wallet, TestData),
-    false = ar_wallet:verify({KeyType, Pub}, WrongData, Signature).
+    false = ar_wallet:verify(Wallet, WrongData, Signature).
 
 verify_rejects_wrong_pubkey_test() ->
     Wallet1 = ar_wallet:new_ecdsa(),
-    {{KeyType2, _Priv2, Pub2}, _} = ar_wallet:new_ecdsa(),
+    Wallet2 = ar_wallet:new_ecdsa(),
     TestData = <<"wrong pubkey test">>,
     Signature = ar_wallet:sign(Wallet1, TestData),
-    false = ar_wallet:verify({KeyType2, Pub2}, TestData, Signature).
+    false = ar_wallet:verify(Wallet2, TestData, Signature).
 
 verify_rejects_corrupted_signature_test() ->
     Wallet = ar_wallet:new_ecdsa(),
@@ -308,12 +311,13 @@ verify_rejects_wrong_owner_test() ->
     Wallet1 = ar_wallet:new_ecdsa(),
     Wallet2 = ar_wallet:new_ecdsa(),
     TX = make_signed_ecdsa_tx(Wallet1),
-    {{_KeyType, _Priv2, Pub2}, _} = Wallet2,
+    #{ <<"owner">> := Pub2 } = Wallet2,
     TXWrongOwner = TX#tx{owner = Pub2},
     ?assertEqual(false, ar_tx:verify(TXWrongOwner)).
 
 cannot_forge_with_random_bytes_test() ->
-    {{KeyType, _Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    #{ <<"owner">> := Pub } = ar_wallet:new_ecdsa(),
+    KeyType = ?ECDSA_KEY_TYPE,
     TX = make_ecdsa_tx(),
     TX2 = TX#tx{
         owner = Pub,
@@ -363,24 +367,31 @@ signature_commits_to_all_fields_test() ->
 
 wallet_new_shape_contract_test() ->
     Wallet = ar_wallet:new_ecdsa(),
-    {{KeyType1, _Priv, Pub1}, {KeyType2, Pub2}} = Wallet,
-    ?assertEqual(KeyType1, {?ECDSA_SIGN_ALG, secp256k1}),
-    ?assertEqual(KeyType2, {?ECDSA_SIGN_ALG, secp256k1}),
-    ?assertEqual(Pub1, Pub2).
+    ?assertMatch(
+        #{
+            <<"device">> := <<"did-ar@1.0">>,
+            <<"type">> := ?ECDSA_SIGN_TYPE,
+            <<"owner">> := <<_:33/binary>>,
+            <<"priv">> := #{ <<"d">> := <<_:32/binary>> }
+        },
+        Wallet
+    ),
+    % The JSON (JWK) form of the wallet loads back as the same wallet.
+    ?assertEqual(Wallet, ar_wallet:from_json(ar_wallet:to_json(Wallet))).
 
 different_keys_produce_different_pubkeys_test() ->
     Wallet1 = ar_wallet:new_ecdsa(),
     Wallet2 = ar_wallet:new_ecdsa(),
-    {{_KeyType1, _Priv1, Pub1}, _} = Wallet1,
-    {{_KeyType2, _Priv2, Pub2}, _} = Wallet2,
+    #{ <<"owner">> := Pub1 } = Wallet1,
+    #{ <<"owner">> := Pub2 } = Wallet2,
     ?assertNotEqual(Pub1, Pub2).
 
 valid_key_produces_33byte_compressed_pubkey_test() ->
-    {{_KeyType, _Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    #{ <<"owner">> := Pub } = ar_wallet:new_ecdsa(),
     ?assertEqual(33, byte_size(Pub)).
 
 valid_key_produces_32byte_privkey_test() ->
-    {{_KeyType, Priv, _Pub}, _} = ar_wallet:new_ecdsa(),
+    #{ <<"priv">> := #{ <<"d">> := Priv } } = ar_wallet:new_ecdsa(),
     ?assertEqual(32, byte_size(Priv)).
 
 signature_is_65_bytes_test() ->
@@ -421,13 +432,14 @@ empty_signature_fails_test() ->
     ?assertEqual(<<>>, EmptyPub).
 
 sign_verify_roundtrip_test() ->
-    Wallet = {{KeyType, _Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    Wallet = ar_wallet:new_ecdsa(),
     TestData = <<"wallet sign verify test">>,
     Signature = ar_wallet:sign(Wallet, TestData),
-    true = ar_wallet:verify({KeyType, Pub}, TestData, Signature).
+    true = ar_wallet:verify(Wallet, TestData, Signature).
 
 address_is_sha256_of_pubkey_test() ->
-    {{KeyType, _Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    #{ <<"owner">> := Pub } = ar_wallet:new_ecdsa(),
+    KeyType = ?ECDSA_KEY_TYPE,
     Address = ar_wallet:to_address(Pub, KeyType),
     ExpectedAddress = crypto:hash(sha256, Pub),
     ?assertEqual(ExpectedAddress, Address),
@@ -435,21 +447,23 @@ address_is_sha256_of_pubkey_test() ->
     ?assertNotEqual(hb_keccak:key_to_ethereum_address(Pub), Address).
 
 address_is_32_bytes_test() ->
-    {{KeyType, _Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    #{ <<"owner">> := Pub } = ar_wallet:new_ecdsa(),
+    KeyType = ?ECDSA_KEY_TYPE,
     Address = ar_wallet:to_address(Pub, KeyType),
     ?assertEqual(32, byte_size(Address)).
 
 different_keys_different_addresses_test() ->
     Wallet1 = ar_wallet:new_ecdsa(),
     Wallet2 = ar_wallet:new_ecdsa(),
-    {{KeyType, _Priv1, Pub1}, _} = Wallet1,
-    {{KeyType, _Priv2, Pub2}, _} = Wallet2,
+    #{ <<"owner">> := Pub1 } = Wallet1,
+    #{ <<"owner">> := Pub2 } = Wallet2,
+    KeyType = ?ECDSA_KEY_TYPE,
     Address1 = ar_wallet:to_address(Pub1, KeyType),
     Address2 = ar_wallet:to_address(Pub2, KeyType),
     ?assertNotEqual(Address1, Address2).
 
 recover_key_returns_correct_pubkey_test() ->
-    Wallet = {{_KeyType, _Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    Wallet = #{ <<"owner">> := Pub } = ar_wallet:new_ecdsa(),
     Data = <<"recover key test">>,
     Signature = ar_wallet:sign(Wallet, Data),
     RecoveredPub = ar_wallet:recover_key(Data, Signature, ?ECDSA_KEY_TYPE),
@@ -461,7 +475,7 @@ recover_key_empty_signature_returns_empty_test() ->
     ?assertEqual(<<>>, EmptyPub).
 
 recover_key_wrong_message_returns_different_key_test() ->
-    Wallet = {{_KeyType, _Priv, Pub}, _} = ar_wallet:new_ecdsa(),
+    Wallet = #{ <<"owner">> := Pub } = ar_wallet:new_ecdsa(),
     Data = <<"original message">>,
     WrongData = <<"wrong message">>,
     Signature = ar_wallet:sign(Wallet, Data),
@@ -485,7 +499,8 @@ verify_valid_tx_test() ->
 
 json_roundtrip_with_owner_recovery_test() ->
     Wallet = ar_wallet:new_ecdsa(),
-    {{KeyType, _Priv, Pub}, _} = Wallet,
+    #{ <<"owner">> := Pub } = Wallet,
+    KeyType = ?ECDSA_KEY_TYPE,
     TX = make_signed_ecdsa_tx(Wallet),
     ExpectedAddress = ar_wallet:to_address(Pub, KeyType),
     JSON = ar_tx:tx_to_json_struct(TX),
@@ -496,28 +511,28 @@ json_roundtrip_with_owner_recovery_test() ->
 
 rsa_and_ecdsa_coexist_independently_test() ->
     EcdsaWallet = ar_wallet:new_ecdsa(),
-    RsaWallet = {{RsaKeyType, _RsaPriv, _RsaPub}, _} = ar_wallet:new(),
+    RsaWallet = ar_wallet:new(),
     EcdsaTX = make_signed_ecdsa_tx(EcdsaWallet),
     ?assertEqual(true, ar_tx:verify(EcdsaTX)),
     RsaTX = make_ecdsa_tx(),
     RsaTX2 = ar_tx:sign(RsaTX, RsaWallet),
     ?assertEqual(true, ar_tx:verify(RsaTX2)),
-    {{EcdsaKeyType, _, _}, _} = EcdsaWallet,
-    ?assertEqual(EcdsaKeyType, EcdsaTX#tx.signature_type),
-    ?assertEqual(RsaKeyType, RsaTX2#tx.signature_type).
+    ?assertEqual(?ECDSA_KEY_TYPE, EcdsaTX#tx.signature_type),
+    ?assertEqual(?RSA_KEY_TYPE, RsaTX2#tx.signature_type).
 
 full_sign_json_recover_verify_roundtrip_test() ->
     Wallet = ar_wallet:new_ecdsa(),
     TX = make_signed_ecdsa_tx(Wallet),
     ?assertEqual(true, ar_tx:verify(TX)),
     JSON = ar_tx:tx_to_json_struct(TX),
-    JSONEmptyOwner = JSON#{<<"owner">> => <<>>},
-    ParsedTX = ar_tx:json_struct_to_tx(JSONEmptyOwner),
-    ?assertEqual(true, ar_tx:verify(ParsedTX)).
+    % The JSON round trip of an ECDSA transaction verifies and keeps its ID.
+    ParsedTX = ar_tx:json_struct_to_tx(JSON),
+    ?assertEqual(true, ar_tx:verify(ParsedTX)),
+    ?assertEqual(TX#tx.id, ParsedTX#tx.id).
 
 sig_segment_excludes_owner_for_ecdsa_test() ->
-    {{EcdsaKeyType1, _EcdsaPriv1, EcdsaPub1}, _} = ar_wallet:new_ecdsa(),
-    {{EcdsaKeyType2, _EcdsaPriv2, EcdsaPub2}, _} = ar_wallet:new_ecdsa(),
+    #{ <<"owner">> := EcdsaPub1 } = ar_wallet:new_ecdsa(),
+    #{ <<"owner">> := EcdsaPub2 } = ar_wallet:new_ecdsa(),
     BaseTX = #tx{
         format = 2,
         target = <<0:256>>,
@@ -531,13 +546,13 @@ sig_segment_excludes_owner_for_ecdsa_test() ->
     },
     TX1 = BaseTX#tx{
         owner = EcdsaPub1,
-        signature_type = EcdsaKeyType1,
-        owner_address = ar_wallet:to_address(EcdsaPub1, EcdsaKeyType1)
+        signature_type = ?ECDSA_KEY_TYPE,
+        owner_address = ar_wallet:to_address(EcdsaPub1, ?ECDSA_KEY_TYPE)
     },
     TX2 = BaseTX#tx{
         owner = EcdsaPub2,
-        signature_type = EcdsaKeyType2,
-        owner_address = ar_wallet:to_address(EcdsaPub2, EcdsaKeyType2)
+        signature_type = ?ECDSA_KEY_TYPE,
+        owner_address = ar_wallet:to_address(EcdsaPub2, ?ECDSA_KEY_TYPE)
     },
     Segment1 = ar_tx:generate_signature_data_segment(TX1),
     Segment2 = ar_tx:generate_signature_data_segment(TX2),
@@ -546,8 +561,8 @@ sig_segment_excludes_owner_for_ecdsa_test() ->
     ?assert(byte_size(Segment1) > 0).
 
 sig_segment_includes_owner_for_rsa_test() ->
-    {{RsaKeyType1, _RsaPriv1, RsaPub1}, _} = ar_wallet:new(),
-    {{RsaKeyType2, _RsaPriv2, RsaPub2}, _} = ar_wallet:new(),
+    #{ <<"owner">> := RsaPub1 } = ar_wallet:new(),
+    #{ <<"owner">> := RsaPub2 } = ar_wallet:new(),
     BaseTX = #tx{
         format = 2,
         target = <<0:256>>,
@@ -561,13 +576,13 @@ sig_segment_includes_owner_for_rsa_test() ->
     },
     TX1 = BaseTX#tx{
         owner = RsaPub1,
-        signature_type = RsaKeyType1,
-        owner_address = ar_wallet:to_address(RsaPub1, RsaKeyType1)
+        signature_type = ?RSA_KEY_TYPE,
+        owner_address = ar_wallet:to_address(RsaPub1, ?RSA_KEY_TYPE)
     },
     TX2 = BaseTX#tx{
         owner = RsaPub2,
-        signature_type = RsaKeyType2,
-        owner_address = ar_wallet:to_address(RsaPub2, RsaKeyType2)
+        signature_type = ?RSA_KEY_TYPE,
+        owner_address = ar_wallet:to_address(RsaPub2, ?RSA_KEY_TYPE)
     },
     Segment1 = ar_tx:generate_signature_data_segment(TX1),
     Segment2 = ar_tx:generate_signature_data_segment(TX2),
@@ -585,8 +600,7 @@ sig_segment_includes_owner_for_rsa_test() ->
 new_ecdsa_wallet_from_privkey(PrivKey) when byte_size(PrivKey) =:= 32 ->
     {OrigPub, _} = crypto:generate_key(ecdh, secp256k1, PrivKey),
     CompressedPub = ar_wallet:compress_ecdsa_pubkey(OrigPub),
-    KeyType = {?ECDSA_SIGN_ALG, secp256k1},
-    {{KeyType, PrivKey, CompressedPub}, {KeyType, CompressedPub}}.
+    ar_wallet:new(?ECDSA_KEY_TYPE, PrivKey, CompressedPub).
 
 %% @doc Create a simple ECDSA transaction (unsigned).
 make_ecdsa_tx() ->
@@ -603,26 +617,19 @@ make_ecdsa_tx() ->
     }.
 
 %% @doc Create and sign an ECDSA transaction using the NIF directly.
-make_signed_ecdsa_tx({{KeyType, Priv, Pub}, {KeyType, Pub}}) ->
+make_signed_ecdsa_tx(Wallet = #{ <<"owner">> := Pub }) ->
     TX = make_ecdsa_tx(),
     TX2 = TX#tx{
         owner = Pub,
-        signature_type = KeyType,
-        owner_address = ar_wallet:to_address(Pub, KeyType)
+        signature_type = ?ECDSA_KEY_TYPE,
+        owner_address = ar_wallet:to_address(Pub, ?ECDSA_KEY_TYPE)
     },
     SignatureDataSegment = ar_tx:generate_signature_data_segment(TX2),
-    Signature = ar_wallet:sign({{KeyType, Priv, Pub}, {KeyType, Pub}}, SignatureDataSegment),
+    Signature = ar_wallet:sign(Wallet, SignatureDataSegment),
     TX3 = TX2#tx{signature = Signature},
     TX3#tx{
         id = ar_tx:id(TX3, signed)
-    };
-make_signed_ecdsa_tx(Wallet) when is_tuple(Wallet) ->
-    case Wallet of
-        {{KeyType, Priv, Pub}, {KeyType, Pub}} ->
-            make_signed_ecdsa_tx({{KeyType, Priv, Pub}, {KeyType, Pub}});
-        {Priv, {KeyType, Pub}} ->
-            make_signed_ecdsa_tx({{KeyType, Priv, Pub}, {KeyType, Pub}})
-    end.
+    }.
 
 %% @doc Corrupt a signature by flipping a bit at a specific byte position.
 corrupt_signature(Sig, BytePos) when BytePos < byte_size(Sig) ->

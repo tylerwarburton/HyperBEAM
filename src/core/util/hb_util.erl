@@ -4,7 +4,8 @@
 -export([safe_int/1]).
 -export([ceil_int/2, floor_int/2]).
 -export([id/1, id/2, native_id/1, human_id/1, human_int/1, to_hex/1]).
--export([secret_key_to_committer/1, remove_scheme_prefix/1]).
+-export([is_human_id/1]).
+-export([remove_scheme_prefix/1]).
 -export([key_to_atom/1, key_to_atom/2, binary_to_strings/1]).
 -export([encode/1, decode/1, decode/2, safe_encode/1, safe_decode/1]).
 -export([is_printable_string/1]).
@@ -27,11 +28,16 @@
 -export([unquote/1, split_escaped_single/2]).
 -export([check_size/2, check_value/2, check_type/2, ok_or_throw/3]).
 -export([all_atoms/0, binary_is_atom/1]).
--export([lower_case_keys/2]).
--export([base58_encode/1, atom_to_dashed_binary/1]).
+-export([lowercase_key/1]).
+-export([base58_encode/1, base58_decode/1, atom_to_dashed_binary/1]).
+-export([committer_address/1]).
 -include("include/hb.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
+
+%%% The alphabet of base58, in the order of its digits.
+-define(BASE58_ALPHABET,
+    <<"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz">>).
 
 %%% Simple type coercion functions, useful for quickly turning inputs from the
 %%% HTTP API into the correct types for the HyperBEAM runtime, if they are not
@@ -200,8 +206,7 @@ id(Data, Type) when is_list(Data) ->
 %% Pure-ASCII binaries take the fast `hb_util_string' NIF path (identical to
 %% `string:lowercase' for ASCII). Anything with a byte >= 0x80 is delegated to
 %% `string:lowercase', preserving its exact Unicode folding and its `badarg'
-%% throw on invalid UTF-8 — which callers such as `ar_tx' tag parsing rely on
-%% to reject non-string tags.
+%% throw on invalid UTF-8.
 to_lower(Str) when is_binary(Str) ->
     case hb_util_string:lowercase(Str) of
         non_ascii -> string:lowercase(Str);
@@ -210,9 +215,19 @@ to_lower(Str) when is_binary(Str) ->
 to_lower(Str) ->
     string:lowercase(Str).
 
-%% @doc Build a committer address from a shared secret.
-secret_key_to_committer(Key) ->
-    human_id(hb_crypto:sha256(Key)).
+%% @doc Lowercase a key as `structured@1.0' does. Unlike `to_lower/1', only
+%% the ASCII capitals A-Z change: every other byte is kept, so every node gives
+%% the same key. A key that is not a binary is kept.
+lowercase_key(Key) when is_binary(Key) ->
+    case hb_util_string:lowercase(Key) of
+        non_ascii -> << <<(lowercase_byte(C))>> || <<C>> <= Key >>;
+        Lowered -> Lowered
+    end;
+lowercase_key(Key) -> Key.
+
+%% @doc Lowercase an ASCII capital; keep any other byte.
+lowercase_byte(C) when C >= $A, C =< $Z -> C bor 32;
+lowercase_byte(C) -> C.
 
 %% @doc Remove a `scheme:' prefix from a binary key.
 remove_scheme_prefix(KeyID) ->
@@ -261,15 +276,17 @@ key_to_atom(Key, Mode) ->
     end.
 
 %% @doc Convert a human readable ID to a native binary ID. If the ID is already
-%% a native binary ID, it is returned as is.
+%% a native binary ID, it is returned as is. The last of the 43 characters of a
+%% human readable ID has 2 bits that its 32 bytes do not use, so 4 forms decode
+%% to the same bytes: any form but the one that `human_id/1' gives raises.
 native_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 43 ->
-    decode(Bin);
+    Native = decode(Bin),
+    Bin = encode(Native),
+    Native;
 native_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 32 ->
     Bin;
 native_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 42 ->
-    Bin;
-native_id(Wallet = {_Priv, _Pub}) ->
-    native_id(ar_wallet:to_address(Wallet)).
+    Bin.
 
 %% @doc Convert a native binary ID to a human readable ID. If the ID is already
 %% a human readable ID, it is returned as is. If it is an ethereum address, it
@@ -281,10 +298,26 @@ human_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 44 ->
 human_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 43 ->
     Bin;
 human_id(Bin) when is_binary(Bin) andalso byte_size(Bin) == 42 ->
-    Bin;
-human_id(Wallet = {_Priv, _Pub}) ->
-    human_id(ar_wallet:to_address(Wallet)).
+    Bin.
 
+%% @doc Convert a committer to the form that Lua and AOS code read. The
+%% `did-ar@1.0' committer of an Arweave address becomes the address. Any other
+%% committer is returned as it is.
+committer_address(Committer) ->
+    case hb_committer:address(Committer) of
+        {ok, Address} -> Address;
+        error -> Committer
+    end.
+
+%% @doc Check whether a binary is a human-readable ID: the base64url encoding
+%% of 32 bytes, as `human_id/1' returns it.
+is_human_id(Bin) when byte_size(Bin) == 43 ->
+    case safe_decode(Bin) of
+        {ok, ID} -> encode(ID) =:= Bin;
+        {error, invalid} -> false
+    end;
+is_human_id(_Value) ->
+    false.
 
 %% @doc Add `,' characters to a number every 3 digits to make it human readable.
 human_int(Float) when is_float(Float) ->
@@ -325,6 +358,7 @@ decode(Type, Value) when is_binary(Type) ->
     );
 decode(integer, Value) ->
     {item, Number, _} = hb_structured_fields:parse_item(Value),
+    true = is_integer(Number),
     Number;
 decode(float, Value) ->
     binary_to_float(Value);
@@ -353,6 +387,8 @@ decode(map, Value) ->
             hb_structured_fields:parse_dictionary(iolist_to_binary(Value))
         )
     );
+decode(binary, Value) ->
+    decode(Value);
 decode(BinType, Value) when is_binary(BinType) ->
     decode(
         binary_to_existing_atom(to_lower(BinType), latin1),
@@ -419,6 +455,13 @@ deep_merge(Map1, Map2, Opts) when is_map(Map1), is_map(Map2) ->
 deep_set(_Path, undefined, Msg, _Opts) -> Msg;
 deep_set(Path, Value, Msg, Opts) when not is_list(Path) ->
     deep_set(hb_path:term_to_path_parts(Path, Opts), Value, Msg, Opts);
+deep_set(Path, Value, List, Opts) when is_list(List) ->
+    % A set in a list gives a list while its keys stay numbered from 1.
+    Set = deep_set(Path, Value, list_to_numbered_message(List), Opts),
+    case is_ordered_list(Set, Opts) of
+        true -> message_to_ordered_list(Set, Opts);
+        false -> Set
+    end;
 deep_set([Key], unset, Msg, Opts) ->
     hb_maps:remove(Key, Msg, Opts);
 deep_set([Key], Value, Msg, Opts) ->
@@ -430,7 +473,11 @@ deep_set([Key], Value, Msg, Opts) ->
             Msg#{ Key => Value }
     end;
 deep_set([Key|Rest], Value, Map, Opts) ->
-    SubMap = hb_maps:get(Key, Map, #{}, Opts),
+    SubMap =
+        case hb_maps:get(Key, Map, #{}, Opts) of
+            Existing when is_map(Existing); is_list(Existing) -> Existing;
+            _ -> #{}
+        end,
     hb_maps:put(Key, deep_set(Rest, Value, SubMap, Opts), Map, Opts).
 
 %% @doc Get a deep value from a message.
@@ -446,15 +493,15 @@ deep_get([Key|Rest], Msg, Default, Opts) ->
     case hb_maps:find(Key, Msg, Opts) of
         {ok, DeepMsg} when is_map(DeepMsg) ->
             deep_get(Rest, DeepMsg, Default, Opts);
-        error -> Default
+        _ -> Default
     end.
 
 %% @doc Find the target path to route for a request message.
 find_target_path(Msg, Opts) ->
-    case hb_ao:get(<<"route-path">>, Msg, not_found, Opts) of
+    case hb_maps:get(<<"route-path">>, Msg, not_found, Opts) of
         not_found ->
             ?event({find_target_path, {msg, Msg}, not_found}),
-            case hb_ao:get(<<"path">>, Msg, no_path, Opts) of
+            case hb_maps:get(<<"path">>, Msg, no_path, Opts) of
                 no_path -> no_path;
                 Path -> {<<"path">>, Path}
             end;
@@ -561,15 +608,15 @@ list_replace(List, Key, Value) ->
 %% @doc Take a list and return a list of unique elements. The function is
 %% order-preserving.
 unique(List) ->
-    Unique =
+    {Unique, _} =
         lists:foldl(
-            fun(Item, Acc) ->
-                case lists:member(Item, Acc) of
-                    true -> Acc;
-                    false -> [Item | Acc]
+            fun(Item, {Acc, Seen}) ->
+                case maps:is_key(Item, Seen) of
+                    true -> {Acc, Seen};
+                    false -> {[Item | Acc], Seen#{ Item => true }}
                 end
             end,
-            [],
+            {[], #{}},
             List
         ),
     lists:reverse(Unique).
@@ -617,10 +664,11 @@ message_to_ordered_pairs({Key, Val, Iter}, Acc) ->
             message_to_ordered_pairs(Next, [{N, CanonicalKey, MaybeValue}|Acc])
     end.
 
-message_to_ordered_key(<<"commitments">>) -> skip;
-message_to_ordered_key(<<"ao-types">>) -> skip;
-message_to_ordered_key(<<"priv", _/binary>>) -> skip;
-message_to_ordered_key(Key) -> int(Key).
+message_to_ordered_key(Key) ->
+    case is_ordered_list_key(Key) of
+        skip -> skip;
+        _ -> int(Key)
+    end.
 
 message_to_ordered_list(Message, [{Next, NextKey, NextVal}|Rest], N, Key, MaybeValue, Opts, Acc)
         when Next == N + 1 ->
@@ -636,18 +684,16 @@ message_to_ordered_list(Message, [], _N, Key, MaybeValue, Opts, Acc) ->
     lists:reverse([Value|Acc]).
 
 ordered_list_value(Key, lookup, Message, Opts) ->
-    case hb_maps:get(Key, Message, undefined, Opts#{ <<"hashpath">> => ignore }) of
-        undefined ->
+    case hb_maps:find(Key, Message, Opts#{ <<"hashpath">> => ignore }) of
+        error ->
             throw(
                 {missing_key,
                     {key, Key},
                     {message, Message}
                 }
             );
-        Value -> Value
+        {ok, Value} -> Value
     end;
-ordered_list_value(Key, undefined, Message, _Opts) ->
-    throw({missing_key, {key, Key}, {message, Message}});
 ordered_list_value(_Key, Value, _Message, Opts) when ?IS_LINK(Value) ->
     hb_cache:ensure_loaded(Value, Opts#{ <<"hashpath">> => ignore });
 ordered_list_value(_Key, Value, _Message, _Opts) ->
@@ -822,8 +868,8 @@ binary_to_strings(Bin) when is_binary(Bin) ->
         _:_ ->
         try
             lists:map(
-                fun unquote/1,
-                split_depth_string_aware(<<",">>, Bin)
+                fun(Part) -> unquote(string:trim(Part)) end,
+                split_depth_string_aware($,, Bin)
             )
         catch
             _:_ ->
@@ -831,11 +877,12 @@ binary_to_strings(Bin) when is_binary(Bin) ->
         end
     end.
 
-%% @doc Unquote a binary string.
-unquote(<<"\"", Inner/binary>>) ->
+%% @doc Unquote a binary string. A string that does not both start and end
+%% with a quote is returned as it is.
+unquote(Bin = <<"\"", Inner/binary>>) when byte_size(Inner) > 0 ->
     case binary:last(Inner) of
         $" -> binary:part(Inner, 0, byte_size(Inner) - 1);
-        _ -> Inner
+        _ -> Bin
     end;
 unquote(Bin) -> Bin.
 
@@ -919,42 +966,20 @@ ok_or_throw(_TX, false, Error) ->
     throw(Error).
 
 %% @doc List the loaded atoms in the Erlang VM.
-all_atoms() -> all_atoms(0).
-all_atoms(N) ->
-    case atom_from_int(N) of
-        not_found -> [];
-        A -> [A | all_atoms(N+1)]
-    end.
+all_atoms() ->
+    [
+        atom_from_int(N)
+    ||
+        N <- lists:seq(0, erlang:system_info(atom_count) - 1)
+    ].
 
 %% @doc Find the atom with the given integer reference.
 atom_from_int(Int) ->
-    case catch binary_to_term(<<131,75,Int:24>>) of
-        A -> A;
-        _ -> not_found
-    end.
+    binary_to_term(<<131,75,Int:24>>).
 
 %% @doc Check if a given binary is already an atom.
 binary_is_atom(X) ->
     lists:member(X, lists:map(fun hb_util:bin/1, all_atoms())).
-
-%% @doc Convert all keys in a message or map to lowercase.
-%% Note: Recursively forces load of _all_ keys in the map recursively for 
-%% conversion.
-lower_case_keys(Map, Opts) ->
-    hb_maps:fold(
-        fun(K, V, Acc) ->
-            maps:put(
-                to_lower(K),
-                if is_map(V) -> lower_case_keys(V, Opts);
-                true -> V
-                end,
-                Acc
-            )
-        end,
-        #{},
-        Map,
-        Opts
-    ).
 
 %% @doc Base58 encode.
 base58_encode(<<0, Rest/binary>>) ->
@@ -966,11 +991,30 @@ base58_encode(Bin) when is_binary(Bin) ->
 base58_encode_int(0) ->
     <<>>;
 base58_encode_int(N) ->
-    Alphabet = <<"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz">>,
     Rem = N rem 58,
-    Char = binary:at(Alphabet, Rem),
+    Char = binary:at(?BASE58_ALPHABET, Rem),
     Rest = base58_encode_int(N div 58),
     <<Rest/binary, Char>>.
+
+%% @doc Decode a base58 binary, as `base58_encode/1' encodes it. Returns
+%% `error' for a binary with a character that is not in the alphabet.
+base58_decode(<<$1, Rest/binary>>) ->
+    maybe
+        {ok, Decoded} ?= base58_decode(Rest),
+        {ok, <<0, Decoded/binary>>}
+    end;
+base58_decode(Bin) when is_binary(Bin) ->
+    base58_decode_int(Bin, 0).
+
+base58_decode_int(<<>>, 0) ->
+    {ok, <<>>};
+base58_decode_int(<<>>, N) ->
+    {ok, binary:encode_unsigned(N)};
+base58_decode_int(<<Char, Rest/binary>>, N) ->
+    case binary:match(?BASE58_ALPHABET, <<Char>>) of
+        {Digit, 1} -> base58_decode_int(Rest, N * 58 + Digit);
+        nomatch -> error
+    end.
 
 %% @doc Convert an atom with underscope to dashed binary form.
 atom_to_dashed_binary(Key) when is_atom(Key) ->
@@ -980,6 +1024,24 @@ atom_to_dashed_binary(Key) when is_atom(Key) ->
 
 atom_to_dashed_binary_test_parallel() ->
     ?assertEqual(atom_to_dashed_binary(atom_1), <<"atom-1">>).
+
+%% @doc Every atom of the VM is listed.
+all_atoms_test() ->
+    Count = erlang:system_info(atom_count),
+    ?assert(length(all_atoms()) >= Count).
+
+%% @doc Setting a deep key over a path that contains a literal replaces the
+%% literal with a message. Getting a deep key over that path returns the
+%% default.
+deep_literal_test() ->
+    ?assertEqual(
+        #{ <<"a">> => #{ <<"b">> => 2 } },
+        deep_set([<<"a">>, <<"b">>], 2, #{ <<"a">> => 1 }, #{})
+    ),
+    ?assertEqual(
+        not_found,
+        deep_get([<<"a">>, <<"b">>], #{ <<"a">> => 1 }, #{})
+    ).
 
 message_to_ordered_list_metadata_test() ->
     Msg = #{
@@ -992,8 +1054,7 @@ message_to_ordered_list_metadata_test() ->
     ?assertEqual([one, two], message_to_ordered_list(Msg)).
 
 %% `to_lower/1' must remain byte-for-byte equivalent to `string:lowercase',
-%% including the `badarg' throw on invalid UTF-8 that `ar_tx' tag parsing
-%% relies on to reject non-string tags.
+%% including the `badarg' throw on invalid UTF-8.
 to_lower_equivalence_test_parallel() ->
     Throws = fun(F) -> try F(), false catch error:_ -> true end end,
     Valid = [<<"Content-Type">>, <<"slot">>, <<"ALLCAPS-123">>, <<>>,

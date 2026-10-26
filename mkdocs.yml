@@ -19,6 +19,7 @@ nav:
       - Configuring your machine: 'run/configuring-your-machine.md'
       - TEE nodes: 'run/tee-nodes.md'
       - Joining/running a router: 'run/joining-running-a-router.md'
+      - Verified community reads: 'run/community-reads.md'
   - Build on HyperBEAM:
       - Get started building on AO-Core: 'build/get-started-building-on-ao-core.md'
       - Exposing process state: 'build/exposing-process-state.md'

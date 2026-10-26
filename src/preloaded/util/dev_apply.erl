@@ -12,15 +12,18 @@
 %%% Paths found in keys interpreted by this device can contain a `base:' or
 %%% `request:' prefix to indicate the message from which the path should be
 %%% retrieved. If no such prefix is present, the `Request' message is checked
-%%% first, and the `Base' message is checked second.
+%%% first, and the `Base' message is checked second. `hb_singleton' reads a
+%%% path part that starts with `base:' or `request:' as a URI, so a key with
+%%% one of these prefixes must be given as a value: `source=request:key'.
 -module(dev_apply).
--export([info/1, pair/3, default/4]).
+-specification("../../../specs/apply@1.0.md").
+-export([device_info/1, pair/3, default/4]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 
 %% @doc The device info. Forwards all keys aside `pair', `keys' and `set' are
 %% resolved with the `apply/4' function.
-info(_) ->
+device_info(_) ->
     #{
         excludes => [
             <<"committers">>,
@@ -35,6 +38,12 @@ info(_) ->
 %% @doc The default handler. If the `base' and `request' keys are present in
 %% the given request, then the `pair' function is called. Otherwise, the `eval'
 %% key is used to resolve the request.
+-spec default(
+    binary(),
+    #{ _ => _ },
+    #{ base => _, request => _, source => _, _ => _ },
+    #{ _ => _ }
+) -> {ok, _} | {error, _}.
 default(Key, Base, Request, Opts) ->
     ?event(debug_apply, {req, {key, Key}, {base, Base}, {request, Request}}),
     FoundBase = hb_maps:get(<<"base">>, Request, not_found, Opts),
@@ -91,6 +100,8 @@ eval(Base, Request, Opts) ->
     end.
 
 %% @doc Apply the message found at `request' to the message found at `base'.
+-spec pair(#{ _ => _ }, #{ base => _, request => _, _ => _ }, #{ _ => _ }) ->
+    {ok, _} | {error, _}.
 pair(Base, Request, Opts) ->
     pair(<<"undefined">>, Base, Request, Opts).
 pair(PathToSet, Base, Request, Opts) ->
@@ -244,7 +255,7 @@ reverse_resolve_pair_test() ->
         )
     ).
 
-resolve_with_prefix_test() ->
+resolve_from_request_test() ->
     ShortTraceLen = hb_opts:get(short_trace_len),
     Node = hb_http_server:start_node(),
     ?assertEqual(
@@ -252,9 +263,9 @@ resolve_with_prefix_test() ->
         hb_http:request(
             <<"GET">>,
             Node,
-            <<"/~meta@1.0/info/request:debug-info~apply@1.0">>,
+            <<"/~meta@1.0/info/debug-info~apply@1.0">>,
             #{
-                <<"debug-info">> => <<"short-trace-len">>
+                <<"debug-info">> => <<"//short-trace-len">>
             },
             #{}
         )
@@ -266,7 +277,7 @@ apply_over_http_test() ->
         hb_message:commit(
             #{
                 <<"device">> => <<"apply@1.0">>,
-                <<"user-path">> => <<"/user-request/test-key">>,
+                <<"user-path">> => <<"//user-request/test-key">>,
                 <<"user-request">> =>
                     #{
                         <<"test-key">> => <<"DATA">>
@@ -277,7 +288,7 @@ apply_over_http_test() ->
     ?assertEqual(
         {ok, <<"DATA">>},
         hb_ao:resolve(
-            Signed#{ <<"path">> => <<"/user-path">> },
+            Signed#{ <<"path">> => <<"//user-path">> },
             #{ <<"priv-wallet">> => hb:wallet() }
         )
     ),
@@ -286,7 +297,7 @@ apply_over_http_test() ->
         hb_http:request(
             <<"GET">>,
             Node,
-            <<"/user-path">>,
+            <<"//user-path">>,
             Signed,
             #{ <<"priv-wallet">> => hb:wallet() }
         )

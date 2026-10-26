@@ -92,6 +92,8 @@ test_suite() ->
             fun basic_message_codec_test/2},
         {<<"Priv survives conversion">>,
             fun priv_survives_conversion_test/2},
+        {<<"Literal priv">>,
+            fun literal_priv_test/2},
         {<<"Message with body">>,
             fun set_body_codec_test/2},
         {<<"Message with large keys">>,
@@ -102,6 +104,10 @@ test_suite() ->
             fun structured_field_decimal_parsing_test/2},
         {<<"Header escaping">>,
             fun header_escaping_test/2},
+        {<<"Signature as a data key">>,
+            fun signature_data_key_test/2},
+        {<<"Content-digest as a data key">>,
+            fun content_digest_data_key_test/2},
         {<<"Unsigned id">>,
             fun unsigned_id_test/2},
         % Nested structures
@@ -132,6 +138,8 @@ test_suite() ->
         % Signed messages
         {<<"Signed message to message and back">>,
             fun signed_message_encode_decode_verify_test/2},
+        {<<"Changed signed message">>,
+            fun changed_signed_message_test/2},
         {<<"Specific order signed message">>,
             fun specific_order_signed_message_test/2},
         {<<"Specific order deeply nested signed message">>,
@@ -288,7 +296,16 @@ is_idempotent(Func, Msg, Opts) ->
 
 %% @doc Ensure that converting a message to/from TABM multiple times repeatedly 
 %% does not alter the message's contents.
-tabm_conversion_is_idempotent_test(_Codec, Opts) ->
+tabm_conversion_is_idempotent_test(Codec, Opts) ->
+    % L1 TXs can not be nested inside each other, so we'll commit the nested
+    % message as an ANS104 message instead.
+    NestedCodec =
+        case Codec of
+            <<"tx@1.0">> -> <<"ans104@1.0">>;
+            #{ <<"device">> := <<"tx@1.0">> } ->
+                Codec#{ <<"device">> => <<"ans104@1.0">> };
+            _ -> Codec
+        end,
     From = fun(M) -> hb_message:convert(M, <<"structured@1.0">>, tabm, Opts) end,
     To = fun(M) -> hb_message:convert(M, tabm, <<"structured@1.0">>, Opts) end,
     SimpleMsg = #{ <<"a">> => <<"x">>, <<"b">> => <<"y">>, <<"c">> => <<"z">> },
@@ -315,7 +332,7 @@ tabm_conversion_is_idempotent_test(_Codec, Opts) ->
                                 >>
                         },
                         Opts,
-                        <<"structured@1.0">>
+                        NestedCodec
                     )
             },
     ?assert(is_idempotent(From, SimpleMsg, Opts)),
@@ -370,24 +387,6 @@ codec_roundtrip_conversion_is_idempotent_test(Codec, Opts) ->
     ?assert(is_idempotent(Roundtrip, Signed, Opts)),
     ?assert(is_idempotent(Roundtrip, ComplexMsg, Opts)).
 
-%% @doc Test that the filter_default_keys/1 function removes TX fields
-%% that have the default values found in the tx record, but not those that
-%% have been set by the user.
-default_keys_removed_test() ->
-    TX = #tx { unsigned_id = << 1:256 >>, anchor = << 2:256 >> },
-    TXMap = #{
-        <<"unsigned_id">> => TX#tx.unsigned_id,
-        <<"anchor">> => TX#tx.anchor,
-        <<"owner">> => TX#tx.owner,
-        <<"target">> => TX#tx.target,
-        <<"data">> => TX#tx.data
-    },
-    FilteredMap = hb_message:filter_default_keys(TXMap),
-    ?assertEqual(<< 1:256 >>, hb_maps:get(<<"unsigned_id">>, FilteredMap)),
-    ?assertEqual(<< 2:256 >>, hb_maps:get(<<"anchor">>, FilteredMap, not_found)),
-    ?assertEqual(not_found, hb_maps:get(<<"owner">>, FilteredMap, not_found)),
-    ?assertEqual(not_found, hb_maps:get(<<"target">>, FilteredMap, not_found)).
-
 minimization_test() ->
     Msg = #{
         <<"unsigned_id">> => << 1:256 >>,
@@ -403,6 +402,8 @@ match_modes_test() ->
     Res = #{ <<"a">> => 1, <<"b">> => 2, <<"c">> => 3 },
     ?assert(hb_message:match(Base, Req, only_present)),
     ?assert(hb_message:match(Req, Base, strict) =/= true),
+    % `match' compares a key with a `#tx{}' default value like any other key.
+    ?assert(hb_message:match(#{ <<"quantity">> => 0 }, #{}, strict) =/= true),
     ?assert(hb_message:match(Base, Res, primary)),
     ?assert(hb_message:match(Res, Base, primary) =/= true),
     StrictMap =
@@ -586,6 +587,55 @@ header_escaping_test(Codec, Opts) ->
     ?assert(hb_message:verify(Decoded, all, Opts)),
     ?assert(hb_message:match(Msg, Decoded, strict, Opts)).
 
+%% @doc A message's own `signature' key is data. It is committed, survives the
+%% wire beside the signature headers of the same name, and is not read back as
+%% a commitment.
+signature_data_key_test(Codec, Opts) ->
+    Msg =
+        hb_message:commit(
+            #{ <<"signature">> => <<"abc">>, <<"height">> => 1 },
+            Opts,
+            Codec
+        ),
+    Encoded = hb_message:convert(Msg, Codec, <<"structured@1.0">>, Opts),
+    Decoded = hb_message:convert(Encoded, <<"structured@1.0">>, Codec, Opts),
+    ?assertEqual(
+        <<"abc">>,
+        hb_maps:get(<<"signature">>, Decoded, not_found, Opts)
+    ),
+    ?assertEqual(
+        hb_message:signers(Msg, Opts),
+        hb_message:signers(Decoded, Opts)
+    ),
+    ?assert(hb_message:verify(Decoded, all, Opts)),
+    ?assert(hb_message:match(Msg, Decoded, strict, Opts)).
+
+%% @doc A key of a message named `content-digest' is data, at any depth. It is
+%% distinct from the digest of the body that `httpsig@1.0' derives.
+content_digest_data_key_test(Codec, Opts) ->
+    Msg =
+        hb_message:commit(
+            #{
+                <<"content-digest">> => <<"abc">>,
+                <<"body">> => <<"hello">>,
+                <<"nested">> => #{ <<"content-digest">> => <<"def">> }
+            },
+            Opts,
+            Codec
+        ),
+    Encoded = hb_message:convert(Msg, Codec, <<"structured@1.0">>, Opts),
+    Decoded = hb_message:convert(Encoded, <<"structured@1.0">>, Codec, Opts),
+    ?assertEqual(
+        <<"abc">>,
+        hb_maps:get(<<"content-digest">>, Decoded, not_found, Opts)
+    ),
+    ?assertEqual(
+        hb_message:signers(Msg, Opts),
+        hb_message:signers(Decoded, Opts)
+    ),
+    ?assert(hb_message:verify(Decoded, all, Opts)),
+    ?assert(hb_message:match(Msg, Decoded, strict, Opts)).
+
 %% @doc Test that the data field is correctly managed when we have multiple
 %% uses for it (the 'data' key itself, as well as keys that cannot fit in
 %% tags).
@@ -672,7 +722,7 @@ verify_nested_complex_signed_test(Codec, Opts) ->
     ?assert(MatchRes),
     ?assert(hb_message:verify(Decoded, all, Opts)),
     % % Ensure that both of the messages can be verified (and retreived).
-    % `hb_cache:read' no longer normalizes commitments, so `hb_maps:get' returns
+    % `hb_cache:read' does not normalize commitments, so `hb_maps:get' returns
     % the inner message exactly as it was signed. Re-normalizing it here would
     % mint an unsigned commitment for the nested `parameters' submessage -- a key
     % the outer signature was made over in its uncommitted form -- changing the
@@ -901,6 +951,42 @@ signed_message_encode_decode_verify_test(Codec, Opts) ->
     ?event({match_result, MatchRes}),
     ?assert(MatchRes).
 
+%% @doc A signed message whose committed value is changed after signing does
+%% not verify, before or after it is converted, and keeps the new value and
+%% type when it is converted. Signed again, it keeps the new value.
+changed_signed_message_test(Codec, Opts) ->
+    Signed = hb_message:commit(#{ <<"a">> => 1, <<"b">> => 2 }, Opts, Codec),
+    RoundTrip =
+        fun(Msg) ->
+            hb_message:convert(
+                hb_message:convert(Msg, Codec, <<"structured@1.0">>, Opts),
+                <<"structured@1.0">>,
+                Codec,
+                Opts
+            )
+        end,
+    Changed = Signed#{ <<"a">> => 3 },
+    ?assertNot(hb_message:verify(Changed, all, Opts)),
+    Converted = RoundTrip(Changed),
+    ?assertMatch(#{ <<"a">> := 3 }, Converted),
+    ?assertNot(hb_message:verify(Converted, all, Opts)),
+    ?assertMatch(#{ <<"a">> := 3 }, hb_message:commit(Changed, Opts, Codec)),
+    ?assertMatch(
+        #{ <<"a">> := <<"1">> },
+        RoundTrip(Signed#{ <<"a">> => <<"1">> })
+    ),
+    % A message given keys after signing, typed or untyped, still verifies
+    % after the round trip.
+    ?assert(
+        hb_message:verify(
+            RoundTrip(
+                Signed#{ <<"t">> => 3, <<"big">> => binary:copy(<<"z">>, 5000) }
+            ),
+            all,
+            Opts
+        )
+    ).
+
 specific_order_signed_message_test(RawCodec, Opts) ->
     Msg = #{
         <<"key-1">> => <<"DATA-1">>,
@@ -918,7 +1004,31 @@ specific_order_signed_message_test(RawCodec, Opts) ->
             Codec#{ <<"committed">> => [<<"key-3">>, <<"key-1">>, <<"key-2">>] }
         ),
     ?event({signed_msg, SignedMsg}),
-    ?assert(hb_message:verify(SignedMsg, all, Opts)).
+    ?assert(hb_message:verify(SignedMsg, all, Opts)),
+    % The commitment lists its keys in the order requested, and keeps that
+    % order through `httpsig@1.0'.
+    Roundtrip =
+        hb_message:convert(
+            hb_message:convert(SignedMsg, <<"httpsig@1.0">>, Opts),
+            <<"structured@1.0">>,
+            <<"httpsig@1.0">>,
+            Opts
+        ),
+    ?assertEqual(
+        [[<<"key-3">>, <<"key-1">>, <<"key-2">>]],
+        lists:usort(
+            [
+                hb_util:message_to_ordered_list(
+                    maps:get(<<"committed">>, Commitment),
+                    Opts
+                )
+            ||
+                Committed <- [SignedMsg, Roundtrip],
+                Commitment <-
+                    maps:values(maps:get(<<"commitments">>, Committed))
+            ]
+        )
+    ).
 
 specific_order_deeply_nested_signed_message_test(RawCodec, Opts) ->
     Msg = #{
@@ -1039,8 +1149,22 @@ deep_multisignature_test() ->
     ?assert(hb_message:verify(MsgSignedTwice, all, Opts)),
     Committers = hb_message:signers(MsgSignedTwice, Opts),
     ?event({committers, Committers}),
-    ?assert(lists:member(hb_util:human_id(ar_wallet:to_address(Wallet1)), Committers)),
-    ?assert(lists:member(hb_util:human_id(ar_wallet:to_address(Wallet2)), Committers)).
+    ?assert(lists:member(hb_test_utils:committer(Wallet1), Committers)),
+    ?assert(lists:member(hb_test_utils:committer(Wallet2), Committers)),
+    % A committer given by its address selects only its own commitment.
+    Address1 = hb:address(Wallet1),
+    ?assert(hb_message:verify(MsgSignedTwice, [Address1], Opts)),
+    ?assertMatch(
+        {ok, _, _},
+        hb_message:commitment(Address1, MsgSignedTwice, Opts)
+    ),
+    ?assertEqual(
+        [hb_test_utils:committer(Wallet1)],
+        hb_message:signers(
+            hb_message:with_only_committers(MsgSignedTwice, [Address1], Opts),
+            Opts
+        )
+    ).
 
 deep_typed_message_id_test(Codec, Opts) ->
     Msg = #{
@@ -1396,7 +1520,7 @@ signed_with_inner_signed_message_test(Codec, Opts) ->
         ),
     ?event({match_result, MatchRes}),
     ?assert(MatchRes),
-    ?assert(hb_message:verify(InnerFromDecoded, all, Opts)),
+    ?assert(hb_message:verify(InnerFromDecoded, signers, Opts)),
     ?assert(hb_message:verify(Decoded, all, Opts)),
     % 4. If the message is not a bundle, verify the inner message from the
     % converted message, applying `with_only_committed` first.
@@ -1535,6 +1659,17 @@ priv_survives_conversion_test(Codec, Opts) ->
         maps:get(<<"priv">>, Decoded)
     ).
 
+%% @doc A message whose `priv' key contains a literal converts, and decodes to
+%% its other keys.
+literal_priv_test(Codec, Opts) ->
+    Msg = #{ <<"data">> => <<"TEST_DATA">>, <<"priv">> => <<"literal">> },
+    Encoded = hb_message:convert(Msg, Codec, <<"structured@1.0">>, Opts),
+    Decoded = hb_message:convert(Encoded, <<"structured@1.0">>, Codec, Opts),
+    ?assertEqual(
+        <<"TEST_DATA">>,
+        hb_maps:get(<<"data">>, Decoded, not_found, Opts)
+    ).
+
 encode_balance_table(Size, Codec, Opts) ->
     Msg =
         hb_message:commit(
@@ -1575,9 +1710,10 @@ sign_links_test(Codec, Opts) ->
     % Make a message with definitively non-accessible lazy-loadable links. Sign
     % it, ensuring that we can produce signatures and IDs without having the 
     % data directly in memory.
+    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Msg = #{
         <<"immediate-key">> => <<"immediate-value">>,
-        <<"submap+link">> => hb_util:human_id(crypto:strong_rand_bytes(32))
+        <<"submap">> => {link, <<"ao:", ID/binary>>, #{}}
     },
     Signed = hb_message:commit(Msg, Opts, Codec),
     ?event({signed, Signed}),
@@ -1632,13 +1768,10 @@ bundled_and_unbundled_ids_differ_test(_Codec, _Opts) ->
 id_of_linked_message_test(#{ <<"bundle">> := true }, _Opts) ->
     skip;
 id_of_linked_message_test(Codec, Opts) ->
+    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Msg = #{
         <<"immediate-key">> => <<"immediate-value">>,
-        <<"link-key">> =>
-            {link, hb_util:human_id(crypto:strong_rand_bytes(32)), #{
-                <<"type">> => <<"link">>,
-                <<"lazy">> => false
-            }}
+        <<"link-key">> => {link, <<"ao:", ID/binary>>, #{}}
     },
     UnsignedID = hb_message:id(Msg, Opts),
     ?event({id, UnsignedID}),
@@ -1786,52 +1919,3 @@ bundled_ordering_test(Codec = #{ <<"bundle">> := true }, Opts) ->
     ?assert(hb_message:verify(Decoded, all, Opts));
 bundled_ordering_test(_Codec, _Opts) ->
     skip.
-
-rsa_wallet_not_match_message_ed25519_type_test() ->
-    Opts = #{<<"priv-wallet">> => ar_wallet:new(?RSA_KEY_TYPE)},
-    SignatureType = ?EDDSA_SIGN_TYPE,
-    Msg = #{<<"a">> => <<"b">>},
-    ?assertThrow({wrong_wallet_to_sign,
-                 {request_type, ?EDDSA_SIGN_TYPE},
-                 {wallet_type, {rsa,65537}}},
-        hb_message:commit(
-            Msg,
-            Opts,
-            #{<<"commitment-device">> => <<"ans104@1.0">>, <<"type">> => SignatureType}
-        )).
-
-ed25519_wallet_not_match_message_rsa_type_test() ->
-    Opts = #{<<"priv-wallet">> => ar_wallet:new(?EDDSA_KEY_TYPE)},
-    SignatureType = ?RSA_SIGN_TYPE,
-    Msg = #{<<"a">> => <<"b">>},
-    ?assertThrow({wrong_wallet_to_sign,
-                 {request_type, ?RSA_SIGN_TYPE},
-                 {wallet_type, {eddsa,ed25519}}},
-        hb_message:commit(
-            Msg,
-            Opts,
-            #{<<"commitment-device">> => <<"ans104@1.0">>, <<"type">> => SignatureType}
-        )).
-
-ethereum_wallet_not_match_message_rsa_type_test() ->
-    Opts = #{<<"priv-wallet">> => ar_wallet:new(?ETHEREUM_KEY_TYPE)},
-    SignatureType = ?RSA_SIGN_TYPE,
-    Msg = #{<<"a">> => <<"b">>},
-    ?assertThrow({wrong_wallet_to_sign,
-                 {request_type, ?RSA_SIGN_TYPE},
-                 {wallet_type, ethereum}},
-        hb_message:commit(
-            Msg,
-            Opts,
-            #{<<"commitment-device">> => <<"ans104@1.0">>, <<"type">> => SignatureType}
-        )).
-
-ethereum_wallet_match_message_ethereum_type_test() ->
-    Opts = #{<<"priv-wallet">> => ar_wallet:new(?ETHEREUM_KEY_TYPE)},
-    SignatureType = <<"ethereum">>,
-    Msg = #{<<"a">> => <<"b">>},
-    ?assert(is_map(hb_message:commit(
-            Msg,
-            Opts,
-            #{<<"commitment-device">> => <<"ans104@1.0">>, <<"type">> => SignatureType}
-        ))).

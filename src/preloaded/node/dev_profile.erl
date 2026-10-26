@@ -6,15 +6,15 @@
 %%% If the `eval' function is instead directly invoked via Erlang, the first
 %%% argument may be a function to profile instead.
 -module(dev_profile).
--export([info/1, eval/1, eval/2, eval/3, eval/4]).
+-export([device_info/1, eval/1, eval/2, eval/3, eval_key/4]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 
 %% @doc Default to the `eval' function.
-info(_) ->
+device_info(_) ->
     #{
         excludes => [<<"committers">>, <<"keys">>, <<"set">>],
-        default => fun eval/4
+        default => fun eval_key/4
     }.
 
 %% @doc Invoke a profiling tool on a function or an AO-Core resolution. If a 
@@ -36,6 +36,8 @@ info(_) ->
 %% output from the engine formatted as an AO-Core message.
 eval(Fun) -> eval(Fun, #{}).
 eval(Fun, Opts) -> eval(Fun, #{}, Opts).
+-spec eval(function() | #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }} | {error, _} | {_, _}.
 eval(Fun, Req, Opts) when is_function(Fun) ->
     do_eval(
         Fun,
@@ -46,8 +48,10 @@ eval(Fun, Req, Opts) when is_function(Fun) ->
         Opts
     );
 eval(Base, Request, Opts) ->
-    eval(<<"eval">>, Base, Request, Opts).
-eval(PathKey, Base, Req, Opts) when not is_function(Base) ->
+    eval_key(<<"eval">>, Base, Request, Opts).
+-spec eval_key(binary(), #{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ _ => _ }} | {error, _} | {_, _}.
+eval_key(PathKey, Base, Req, Opts) when not is_function(Base) ->
     case hb_ao:get(PathKey, Req, undefined, Opts) of
         undefined ->
             {
@@ -84,6 +88,8 @@ do_eval(Fun, Req, Opts) ->
             {error, <<"Unsupported engine `", (hb_util:bin(Unknown))/binary, "`">>};
         {validation_error, disabled} ->
             {error, <<"Profiling is disabled.">>};
+        {validation_error, invalid_signer} ->
+            {error, <<"Invalid signer.">>};
         {validation_error, invalid_request} ->
             {error, <<"Invalid request.">>}
     end.
@@ -106,7 +112,9 @@ find_profiling_config(Opts) ->
                 prod -> false;
                 _ -> hb_features:test()
             end;
-        EnableProfiling -> EnableProfiling
+        Signers when is_list(Signers) -> Signers;
+        % A configuration file gives `true' and `false' as binaries.
+        EnableProfiling -> hb_util:bool(EnableProfiling)
     end.
 
 %% @doc Validate that profiling is enabled. 
@@ -126,7 +134,7 @@ validate_return_mode(Req, Opts) ->
     case return_mode(Req, Opts) of
         <<"open">> -> hb_opts:get(mode, prod, Opts) == debug;
         _ -> true
-    end.
+    end orelse {validation_error, invalid_request}.
 
 %% @doc Validate that the request is from a valid signer, if set by the node
 %% operator. If the `profiling' config option is `true', all requests are
@@ -134,8 +142,9 @@ validate_return_mode(Req, Opts) ->
 validate_signer(Req, Opts) ->
     case find_profiling_config(Opts) of
         ValidSigners when is_list(ValidSigners) ->
+            Committers = [hb_committer:uri(S, Opts) || S <- ValidSigners],
             lists:any(
-                fun(Signer) -> lists:member(Signer, ValidSigners) end,
+                fun(Signer) -> lists:member(Signer, Committers) end,
                 hb_message:signers(Req, Opts)
             );
         EnableProfiling -> EnableProfiling
@@ -319,7 +328,40 @@ temp_file(Ext) ->
 %%% Tests.
 
 eprof_fun_test() -> test_engine(function, <<"eprof">>).
-eprof_resolution_test() -> test_engine(resolution, <<"eprof">>).
+eprof_resolution_test() ->
+    test_engine(resolution, <<"eprof">>),
+    % A request from a signer that is not in `profiling' is refused.
+    ?assertEqual(
+        {error, <<"Invalid signer.">>},
+        hb_ao:resolve(
+            hb_message:commit(
+                #{ <<"path">> => <<"/~profile@1.0/run?run=/~meta@1.0/build">> },
+                #{ <<"priv-wallet">> => ar_wallet:new() }
+            ),
+            #{ <<"profiling">> => [] }
+        )
+    ),
+    % A node in `prod' mode does not profile unless `profiling' is set.
+    ?assertEqual(
+        {error, <<"Profiling is disabled.">>},
+        hb_ao:resolve(
+            #{ <<"path">> => <<"/~profile@1.0/run?run=/~meta@1.0/build">> },
+            #{ <<"mode">> => prod }
+        )
+    ),
+    % `profiling: true' in a configuration file enables profiling.
+    {ok, Conf} = hb_opts:load_bin(<<"profiling: true">>, #{}),
+    validate_profiler_output(
+        <<"eprof">>,
+        hb_ao:resolve(
+            #{
+                <<"path">> => <<"/~profile@1.0/run?run=/~meta@1.0/build">>,
+                <<"engine">> => <<"eprof">>,
+                <<"return-mode">> => <<"message">>
+            },
+            Conf
+        )
+    ).
 
 -ifdef(ENABLE_EFLAME).
 eflame_fun_test() -> test_engine(function, <<"eflame">>).
@@ -339,14 +381,14 @@ test_profiler_exec(function, Engine) ->
     eval(
         fun() -> {ok, #{ <<"node">> => <<"HyperBEAM">> }} end,
         #{ <<"engine">> => Engine, <<"return-mode">> => <<"message">> },
-        #{}
+        #{ <<"profiling">> => true }
     );
 test_profiler_exec(resolution, Engine) ->
     hb_ao:resolve(
         #{
             <<"path">> => <<"/~profile@1.0/run?run=/~meta@1.0/build">>,
             <<"engine">> => Engine, <<"return-mode">> => <<"message">> },
-        #{}
+        #{ <<"profiling">> => true }
     ).
 
 %% @doc Verify the expected type of output from a profiler.

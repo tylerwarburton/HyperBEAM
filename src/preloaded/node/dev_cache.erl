@@ -1,9 +1,10 @@
 %%% @doc A device that looks up an ID from a local store and returns it,
 %%% honoring the `accept' key to return the correct format. The cache also
-%%% supports writing messages to the store, if the node message has the
-%%% writer's address in its `cache_writers' key.
+%%% supports writing messages to the store when the node operator has signed
+%%% the corresponding cache operation type.
 -module(dev_cache).
--export([read/3, write/3, link/3, group/3]).
+-device_libraries([lib_meta, lib_process]).
+-export([read/3, write/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -21,6 +22,11 @@
 %% @returns {ok, Data} on success,
 %%          {error, not_found} if the key does not exist,
 %%          {error, Reason} or {failure, Reason} on failure.
+-spec read(
+    #{ _ => _ },
+    #{ read := binary(), accept => binary(), _ => _ },
+    #{ _ => _ }
+) -> {ok, _} | {error, _} | {failure, _}.
 read(_M1, M2, Opts) ->
     Location = hb_ao:get(<<"read">>, M2, Opts),
     ?event({read, {key_extracted, Location}}),
@@ -51,12 +57,15 @@ read(_M1, M2, Opts) ->
                             <<"content-type">> => <<"application/aos-2">>
                         }
 					};
+                _ when is_list(Res) ->
+                    % The reply's `ao-result' is the list, as it was written.
+                    {ok, #{ <<"ao-result">> => <<"body">>, <<"body">> => Res }};
                 _ ->
                     {ok, Res}
             end;
         {error, not_found} ->
-            % The cache does not have this ID,but it may still be an explicit
-            % `data/' path.
+            % The cache does not have this ID, but the store may have a value at
+            % the path.
             % Store = hb_opts:get(store, [], Opts),
             Store = hb_opts:get(store, no_viable_store, Opts),
             ?event(dev_cache, {read, {location, Location}, {store, Store}}),
@@ -67,100 +76,32 @@ read(_M1, M2, Opts) ->
             Failure
     end.
 
-%% @doc Write data to the cache.
-%% Processes a write request by first verifying that the request comes from a
-%% trusted writer (as defined by the `cache_writers' configuration in the
-%% options). Single writes accept a binary body for direct cache insertion or a
-%% map body for direct store writes. Batch writes iterate over the items in the
-%% body and apply the same transformation to each value.
-%%
-%% @param M1 Ignored parameter.
-%% @param M2 The request message containing the data to write, the write type,
-%%            and any additional parameters.
-%% @param Opts A map of configuration options.
-%% @returns {ok, Path} on success, where Path indicates where the data was
-%%          stored, {error, Reason} or {failure, Reason} on failure.
-write(_M1, M2, Opts) ->
-    case is_trusted_writer(M2, Opts) of
-        true ->
-            ?event(dev_cache, {write, {trusted_writer, true}}),
-            Body = hb_ao:get(<<"body">>, M2, not_found, Opts),
-            Type =
-                case hb_maps:get(<<"type">>, M2, <<"single">>, Opts) of
-                    <<"batch">> -> <<"batch">>;
-                    _ -> <<"single">>
-                end,
-            ?event(dev_cache, {write, {write_type, Type}}),
-            case Type of
-                <<"single">> ->
-                    ?event(dev_cache, {write, {write_single_called}}),
-                    write_single(Body, Opts);
-                <<"batch">> ->
-                    ?event(dev_cache, {write, {write_batch_called}}),
-                    case Body of
-                        Batch when is_map(Batch) ->
-                            hb_maps:map(
-                                fun(_, Value) ->
-                                    ?event(dev_cache, {write, {batch_item, Value}}),
-                                    write_single(Value, Opts)
-                                end,
-                                Batch,
-                                Opts
-                            );
-                        _ ->
-                            {error,
-                                #{
-                                    <<"status">> => 400,
-                                    <<"body">> => <<"Invalid write type.">>
-                                }
-                            }
-                    end;
-                _ ->
-                    ?event(dev_cache, {write, {invalid_write_type, Type}}),
-                    {error,
-                        #{
-                            <<"status">> => 400,
-                            <<"body">> => <<"Invalid write type.">>
-                        }
-                    }
-            end;
-        false ->
-            ?event(dev_cache, {write, {trusted_writer, false}}),
-            {error,
-                #{
-                    <<"status">> => 403,
-                    <<"body">> => <<"Not authorized to write to the cache.">>
-                }
-            }
-    end.
-
-%% @doc Link a source to a destination in the cache.
-link(_Base, Req, Opts) ->
-    case is_trusted_writer(Req, Opts) of
-        true ->
-            Destination = hb_ao:get(<<"destination">>, Req, Opts),
-            Source = hb_ao:get(<<"source">>, Req, Opts),
-            wrap_store_result(hb_store:link(#{ Destination => Source }, Opts));
-        false ->
-            {error, not_authorized}
-    end.
-
-group(_Base, Req, Opts) ->
-    case is_trusted_writer(Req, Opts) of
-        true ->
-            wrap_store_result(
-                hb_store:group(
-                    #{ <<"group">> => hb_ao:get(<<"group">>, Req, Opts) },
+%% @doc Write a binary or a message on behalf of the node operator.
+%% The request must sign `type: cache-write'. Set `write-type: batch' to write
+%% each value in a map body separately.
+write(_Base, Req, Opts) ->
+    maybe
+        {ok, Authorized} ?=
+            lib_meta:is_authorized(<<"cache-write">>, operator, Req, Opts),
+        Body = hb_maps:get(<<"body">>, Authorized, not_found, Opts),
+        case hb_maps:get(<<"write-type">>, Authorized, <<"single">>, Opts) of
+            <<"single">> -> write_single(Body, Opts);
+            <<"batch">> when is_map(Body) ->
+                hb_maps:map(
+                    fun(_, Value) -> write_single(Value, Opts) end,
+                    Body,
                     Opts
-                )
-            );
-        false ->
-            {error, not_authorized}
+                );
+            _ ->
+                {error,
+                    #{ <<"status">> => 400, <<"body">> => <<"Invalid write type.">> }
+                }
+        end
     end.
 
 %% @doc Helper function to write a single data item to the cache.
-%% Writes store-shaped request maps directly to the store layer, or stores
-%% direct binaries in the cache and returns their derived path.
+%% Writes a binary or a message to the cache, and returns its path: the `ni:'
+%% name of a binary, or the unsigned ID of a message.
 %%
 %% @param Body The data to be written.
 %% @param Opts A map of configuration options.
@@ -177,13 +118,11 @@ write_single(Body, Opts) ->
                     <<"body">> => <<"No body to write.">>
                 }
             };
-        Binary when is_binary(Binary) ->
-            ?event(dev_cache, {write_single, {processing_binary, Binary}}),
-            {ok, Path} = hb_cache:write(Binary, Opts),
-            ?event(dev_cache, {write_single, {binary_written, Path}}),
+        Value when is_binary(Value); is_map(Value); is_list(Value) ->
+            ?event(dev_cache, {write_single, {processing_value, Value}}),
+            {ok, Path} = hb_cache:write(Value, Opts),
+            ?event(dev_cache, {write_single, {value_written, Path}}),
             {ok, #{ <<"status">> => 200, <<"path">> => Path }};
-        Req when is_map(Req) ->
-            wrap_store_result(hb_store:write(Req, Opts));
         _Other ->
             ?event(dev_cache, {write_single, {error, <<"Invalid write type">>}}),
             {error,
@@ -194,34 +133,6 @@ write_single(Body, Opts) ->
             }
     end.
 
-wrap_store_result(ok) ->
-    {ok, #{ <<"status">> => 200 }};
-wrap_store_result(OtherResult) ->
-    OtherResult.
-
-%% @doc Verify that the request originates from a trusted writer.
-%% Checks that the single signer of the request is present in the list
-%% of trusted cache writer addresses specified in the options.
-%%
-%% @param Req The request message.
-%% @param Opts A map of configuration options.
-%% @returns true if the request is from an authorized writer, false
-%%          otherwise.
-is_trusted_writer(Req, Opts) ->
-    Signers = hb_message:signers(Req, Opts),
-    ?event(dev_cache, {is_trusted_writer, {signers, Signers}, {req, Req}}),
-    CacheWriters = hb_opts:get(cache_writers, [], Opts),
-    ?event(dev_cache, {is_trusted_writer, {cache_writers, CacheWriters}}),
-    AnyTrusted = lists:any(fun(Signer) -> lists:member(Signer, CacheWriters) end, Signers),
-    case AnyTrusted of
-        true ->
-            ?event(dev_cache, {is_trusted_writer, {trusted, true}}),
-            true;
-        _ ->
-            ?event(dev_cache, {is_trusted_writer, {trusted, false}}),
-            false
-    end.
-
 %%%--------------------------------------------------------------------
 %%% Test Helpers
 %%%--------------------------------------------------------------------
@@ -229,8 +140,7 @@ is_trusted_writer(Req, Opts) ->
 %% @doc Create a test environment with a local store and node.
 %% Ensures that the required application is started, configures a local
 %% file-system store, resets the store for a clean state, creates a wallet
-%% for signing requests, and starts a node with the store and trusted cache
-%% writer configuration.
+%% for signing requests, and starts a node with the store and operator settings.
 %%
 %% @param StorePrefix A binary specifying the prefix for the local store.
 %% @returns {ok, TestOpts, [LocalStore, Wallet, Address, Node]}
@@ -246,15 +156,12 @@ setup_test_env() ->
     hb_store:reset(LocalStore),
     ?event(dev_cache, {setup_test_env, {store_reset}}),
     Wallet = ar_wallet:new(),
-    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Address = hb_test_utils:committer(Wallet),
     ?event(dev_cache, {setup_test_env, {address, Address}}),
     Node = hb_http_server:start_node(#{ 
         <<"cache-control">> => [<<"no-cache">>, <<"no-store">>],
         <<"store">> => LocalStore,
-        <<"cache-writers">> => [
-			Address,
-			hb_util:human_id(ar_wallet:to_address(hb:wallet()))
-		],
+        <<"operator">> => Address,
         <<"store-all-signed">> => false
     }),
     ?event(dev_cache, {setup_test_env, {node_started, Node}}),
@@ -265,7 +172,9 @@ setup_test_env() ->
             #{
                 <<"store-module">> => hb_store_remote_node,
                 <<"node">> => Node,
-                <<"priv-wallet">> => Wallet
+                <<"priv-wallet">> => Wallet,
+                % The tests read back the `ni:' path of a binary they write.
+                <<"trusted">> => true
             }
 	    ]
     },
@@ -275,31 +184,64 @@ setup_test_env() ->
 %%% Tests
 %%%--------------------------------------------------------------------
 
-%% @doc Test that the cache can be written to and read from using the hb_cache
-%% API.
-cache_write_message_test() ->
-    ?event(dev_cache, {cache_api_test, {start}}),
-    {ok, Opts, _} = setup_test_env(),
-    TestData = #{
-        <<"test_key">> => <<"test_value">>
-    },
-    ?event(dev_cache, {cache_api_test, {opts, Opts}}),
-    {ok, Path} = hb_cache:write(TestData, Opts),
-    ?event(dev_cache, {cache_api_test, {data_written, Path}}),
-    {ok, ReadData} = hb_cache:read(Path, Opts),
-    ?event(dev_cache, {cache_api_test, {data_read, ReadData}}),
-    ?assert(hb_message:match(TestData, ReadData, only_present, Opts)),
-    ?event(dev_cache, {cache_api_test}),
-    ok.
+%% @doc Ensure that a cache write requires its own signed type.
+typed_cache_mutations_test() ->
+    Wallet = ar_wallet:new(),
+    Store = hb_test_utils:test_store(),
+    Opts = #{ <<"priv-wallet">> => Wallet, <<"store">> => Store,
+        <<"http-only-result">> => false },
+    Node = hb_http_server:start_node(Opts),
+    Signed =
+        hb_message:commit(
+            #{
+                <<"type">> => <<"node-message">>,
+                <<"body">> => <<"wrong-type">>
+            },
+            Opts
+        ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 403 }},
+        hb_http:post(
+            Node,
+            Signed#{ <<"path">> => <<"/~cache@1.0/write">> },
+            Opts
+        )
+    ).
 
-%% @doc Ensure that we can write direct binaries to the cache.
+%% @doc Ensure that the operator can write direct binaries to the cache.
 cache_write_binary_test() ->
     ?event(dev_cache, {cache_api_test, {start}}),
-    {ok, Opts, _} = setup_test_env(),
+    {ok, Opts, [_LocalStore, Wallet, _Address, Node]} = setup_test_env(),
     TestData = <<"test_binary">>,
-    {ok, Path} = hb_cache:write(TestData, Opts),
+    Write =
+        hb_message:commit(
+            #{
+                <<"path">> => <<"/~cache@1.0/write">>,
+                <<"type">> => <<"cache-write">>,
+                <<"method">> => <<"POST">>,
+                <<"body">> => TestData
+            },
+            #{ <<"priv-wallet">> => Wallet }
+        ),
+    {ok, Written} = hb_http:post(Node, Write, Opts),
+    Path = hb_ao:get(<<"path">>, Written, Opts),
     {ok, ReadData} = hb_cache:read(Path, Opts),
     ?event(dev_cache, {cache_api_test, {data_read, ReadData}}),
     ?assertEqual(TestData, ReadData),
+    % A message with a nested message reads back by the ID its write returns.
+    Msg = #{ <<"child">> => #{ <<"key">> => <<"value">> } },
+    {ok, #{ <<"path">> := ID }} =
+        hb_http:post(
+            Node,
+            hb_message:commit(
+                (hb_message:uncommitted(Write))#{ <<"body">> => Msg },
+                #{ <<"priv-wallet">> => Wallet }
+            ),
+            Opts
+        ),
+    ?assertEqual(
+        {ok, <<"value">>},
+        hb_http:get(Node, <<"/", ID/binary, "/child/key">>, Opts)
+    ),
     ?event(dev_cache, {cache_api_test}),
     ok.

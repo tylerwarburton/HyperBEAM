@@ -6,7 +6,7 @@
 -include("include/hb_opts.hrl").
 -include("include/hb_http_client.hrl").
 %% Public API
--export([request/2, response_status_to_atom/1, setup_conn/1]).
+-export([request/2, response_status_to_atom/1, receipt/3]).
 %% GenServer
 -export([start_link/1, init/1]).
 -export([handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
@@ -19,15 +19,6 @@
 %%% ==================================================================
 %%% Public interface.
 %%% ==================================================================
-
-%% @doc Use Opts to configure connection pool size.
-setup_conn(Opts) ->
-    MaxConnections =
-        hb_opts:get(http_client_hackney_max_connections, ?DEFAULT_HACKNEY_MAX_CONNECTIONS, Opts),
-    KeepAlive = hb_opts:get(http_client_keepalive, ?DEFAULT_KEEPALIVE_TIMEOUT, Opts),
-    ?event(connection_pool, {http_client_hackney_max_connections, MaxConnections}),
-    hackney_pool:set_max_connections(?HACKNEY_POOL, MaxConnections),
-    hackney_pool:set_timeout(?HACKNEY_POOL, KeepAlive).
 
 start_link(Opts) ->
 	gen_server:start_link({local, ?MODULE}, ?MODULE, Opts, []).
@@ -43,7 +34,7 @@ response_status_to_atom(Status) ->
 
 request(Args, Opts) ->
     Opts1 = hb_opts:mimic_default_types(Opts, existing, Opts),
-    request(Args, hb_opts:get(http_retry, ?DEFAULT_RETRIES, Opts1), Opts1).
+    redirect(Args, 0, Opts1).
 request(Args, RemainingRetries, Opts) ->
     Response = do_request(Args, Opts),
     case Response of
@@ -57,12 +48,62 @@ request(Args, RemainingRetries, Opts) ->
             end
     end.
 
-do_request(Args, Opts) ->
-    case hb_opts:get(http_client, ?DEFAULT_HTTP_CLIENT, Opts) of
-        gun -> gun_req(Args, Opts);
-        httpc -> httpc_req(Args, Opts);
-        hackney -> hackney_req(Args, Opts)
+%% @doc Make a request, following a `307' or `308' response to the absolute URL
+%% in its `location' with the same method, headers and body, up to
+%% `http-redirects' times. One more redirect is `{error, 'too-many-redirects'}'.
+%% With `http-redirects' at 0, the redirect is the response. If
+%% `hb_hostname:is_blocked/2' blocks the host of a `location', return
+%% `{error, blocked_host}' without following it.
+redirect(Args, Redirects, Opts) ->
+    Response =
+        request(Args, hb_opts:get(http_retry, ?DEFAULT_RETRIES, Opts), Opts),
+    MaxRedirects = hb_opts:get(http_redirects, ?DEFAULT_REDIRECTS, Opts),
+    Location = location(Response),
+    case uri_string:parse(Location) of
+        URI = #{ scheme := _, host := _ } when Redirects < MaxRedirects ->
+            Path = uri_string:recompose(maps:with([path, query], URI)),
+            case hb_hostname:is_blocked(Location, Opts) of
+                true -> {error, blocked_host};
+                false ->
+                    redirect(
+                        Args#{
+                            peer => Location,
+                            path => hb_path:normalize(Path)
+                        },
+                        Redirects + 1,
+                        Opts
+                    )
+            end;
+        #{ scheme := _, host := _ } when MaxRedirects > 0 ->
+            {error, 'too-many-redirects'};
+        _ -> Response
     end.
+
+%% @doc The `location' of a `307' or `308' response, else `<<>>'.
+location({ok, Status, Headers, _Body}) when Status == 307; Status == 308 ->
+    Lower = [{hb_util:to_lower(Key), Value} || {Key, Value} <- Headers],
+    proplists:get_value(<<"location">>, Lower, <<>>);
+location(_Response) -> <<>>.
+
+%% @doc Record one receipt per transport attempt, including failures and retries.
+do_request(Args, Opts) ->
+    StartTime = erlang:monotonic_time(native),
+    Response =
+        case hb_opts:get(http_client, ?DEFAULT_HTTP_CLIENT, Opts) of
+            gun -> gun_req(Args, Opts);
+            httpc -> httpc_req(Args, Opts);
+            hackney -> hackney_req(Args, Opts)
+        end,
+    record_duration(
+        #{
+            <<"request-method">> => method_to_bin(maps:get(method, Args)),
+            <<"request-path">> => hb_util:bin(maps:get(path, Args)),
+            <<"status-class">> => get_status_class(Response),
+            <<"duration">> => erlang:monotonic_time(native) - StartTime
+        },
+        Opts
+    ),
+    Response.
 
 maybe_retry(0, _, OriginalResponse, _) -> OriginalResponse;
 maybe_retry(Remaining, Args, OriginalResponse, Opts) ->
@@ -100,13 +141,11 @@ httpc_req(Args, Opts) ->
     ?event({httpc_req, {priv_args, Args}}),
     case parse_peer(Peer, Opts) of
         {error, _} = Err -> Err;
-        {ok, {Host, Port}} ->
-            Scheme = case Port of
-                443 -> "https";
-                _ -> "http"
-            end,
+        {ok, {Scheme, Host, Port}} ->
             ?event(debug_http_client, {httpc_req, {explicit, Args}}),
-            URL = binary_to_list(iolist_to_binary([Scheme, "://", Host, ":", integer_to_binary(Port), Path])),
+            URL = binary_to_list(iolist_to_binary(
+                [Scheme, "://", Host, ":", integer_to_binary(Port), Path]
+            )),
             FilteredHeaders = hb_maps:without([<<"content-type">>, <<"cookie">>], Headers, Opts),
             HeaderKV =
                 [
@@ -124,7 +163,11 @@ httpc_req(Args, Opts) ->
                             List when is_list(List) ->
                                 List
                         end
-                ],
+                ] ++
+                % Close each connection after its request: httpc sends a
+                % request again when a connection that it reuses closes before
+                % the reply.
+                [{"connection", "close"}],
             Method = binary_to_existing_atom(hb_util:to_lower(RawMethod)),
             ContentType = hb_maps:get(<<"content-type">>, Headers, <<"application/octet-stream">>, Opts),
             Request =
@@ -136,12 +179,30 @@ httpc_req(Args, Opts) ->
                         {URL, HeaderKV, binary_to_list(ContentType), Body}
                 end,
             ?event({http_client_outbound, Method, URL, {priv_req, Request}}),
+            % Give httpc the send and connect timeouts that gun takes. httpc
+            % runs each request in a process of its own, which keeps running
+            % if the caller exits: without a timeout, a request to a peer that
+            % never answers keeps that process and its connection forever.
+            ConnectTimeout =
+                hb_opts:get(
+                    http_client_connect_timeout,
+                    ?DEFAULT_CONNECT_TIMEOUT,
+                    Opts
+                ),
+            SendTimeout = hb_opts:get(http_client_send_timeout, infinity, Opts),
+            HTTPOptions =
+                [
+                    {autoredirect, false},
+                    % Turn off httpc's retry: by default it sends the request
+                    % again after a `503' with `retry-after'.
+                    {autoretry, 0},
+                    {timeout, SendTimeout},
+                    {connect_timeout, ConnectTimeout}
+                ],
             HTTPCOpts = [{full_result, true}, {body_format, binary}],
-            StartTime = os:system_time(native),
-            case httpc:request(Method, Request, [], HTTPCOpts) of
+            case httpc:request(Method, Request, HTTPOptions, HTTPCOpts) of
                 {ok, {{_, Status, _}, RawRespHeaders, RespBody}} ->
                     download_metric(RespBody, Opts),
-                    EndTime = os:system_time(native),
                     RespHeaders =
                         [
                             {list_to_binary(Key), list_to_binary(Value)}
@@ -149,14 +210,6 @@ httpc_req(Args, Opts) ->
                             {Key, Value} <- RawRespHeaders
                         ],
                     ?event(debug_http_client, {httpc_resp, Status, RespHeaders, RespBody}),
-                    record_duration(#{
-                            <<"request-method">> => method_to_bin(Method),
-                            <<"request-path">> => hb_util:bin(Path),
-                            <<"status-class">> => get_status_class(Status),
-                            <<"duration">> => EndTime - StartTime
-                        },
-                        Opts
-                    ),
                     {ok, Status, RespHeaders, RespBody};
                 {error, Reason} ->
                     ?event(http_client, {httpc_error, Reason}),
@@ -175,11 +228,7 @@ hackney_req(Args, Opts) ->
     ?event({hackney_req, {priv_args, Args}}),
     case parse_peer(Peer, Opts) of
         {error, _} = Err -> Err;
-        {ok, {Host, Port}} ->
-            Scheme = case Port of
-                443 -> <<"https">>;
-                _ -> <<"http">>
-            end,
+        {ok, {Scheme, Host, Port}} ->
             URL = <<Scheme/binary, "://",
                 (hb_util:bin(Host))/binary, ":",
                 (integer_to_binary(Port))/binary,
@@ -191,14 +240,24 @@ hackney_req(Args, Opts) ->
             ConnTimeout = hb_opts:get(http_client_connect_timeout, ?DEFAULT_CONNECT_TIMEOUT, Opts),
             RecvTimeout = hb_opts:get(http_client_hackney_recv_timeout, ?DEFAULT_HACKNEY_RECEIVE_TIMEOUT, Opts),
             CheckoutTimeout = hb_opts:get(http_client_hackney_checkout_timeout, ?DEFAULT_HACKNEY_CHECKOUT_TIMEOUT, Opts),
+            MaxConnections =
+                hb_opts:get(http_client_hackney_max_connections, ?DEFAULT_HACKNEY_MAX_CONNECTIONS, Opts),
+            KeepAlive = hb_opts:get(http_client_keepalive, ?DEFAULT_KEEPALIVE_TIMEOUT, Opts),
+            % Each peer has a pool of its own, which its first request starts
+            % with these limits. hackney gives a freed connection only to the
+            % requests for its own peer, so a peer that fills a shared pool
+            % stops the requests to every other peer.
             HackneyOpts = [with_body,
-                {pool, ?HACKNEY_POOL},
+                {pool, {?HACKNEY_POOL, Scheme, Host, Port}},
+                {max_connections, MaxConnections},
+                {timeout, KeepAlive},
                 {connect_timeout, ConnTimeout},
                 {connect_options, [{nodelay, true}]},
                 {checkout_timeout, CheckoutTimeout},
                 {recv_timeout, RecvTimeout}],
-            StartTime = erlang:monotonic_time(native),
-            Response = case hackney:request(Method, URL, HeaderList, Body, HackneyOpts) of
+            % gun bounds each whole request by the same option.
+            SendTimeout = hb_opts:get(http_client_send_timeout, infinity, Opts),
+            Response = case hackney_request(Method, URL, HeaderList, Body, HackneyOpts, SendTimeout) of
                 {ok, Status, RespHeaders, RespBody} ->
                     download_metric(RespBody, Opts),
                     ?event(debug_http_client, {hackney_resp, Status, RespHeaders, RespBody}),
@@ -210,81 +269,72 @@ hackney_req(Args, Opts) ->
                     ?event(http_client, {hackney_error, Reason}),
                     {error, Reason}
             end,
-            EndTime = erlang:monotonic_time(native),
-            record_duration(#{
-                    <<"request-method">> => method_to_bin(Method),
-                    <<"request-path">> => hb_util:bin(Path),
-                    <<"status-class">> => get_status_class(Response),
-                    <<"duration">> => EndTime - StartTime
-                },
-                Opts
-            ),
             record_response_status(Method, Response, Path, Opts),
             Response
     end.
 
+%% @doc Make a hackney request in a process of its own, which exits once it has
+%% sent the result, and stop it at `Timeout': hackney's own timeouts bound each
+%% read of a reply, not the reply. When a request raises, as it does for a
+%% reply with a malformed chunk size, hackney keeps the request's connection
+%% checked out of the pool until the process that made the request exits, and
+%% gives no reference to release it: this process exits at once, so the
+%% connection goes back to the pool. The raise is returned as `{error, Reason}'.
+hackney_request(Method, URL, Headers, Body, HackneyOpts, Timeout) ->
+    Caller = self(),
+    Ref = make_ref(),
+    Worker =
+        spawn_link(
+            fun() ->
+                Result =
+                    try hackney:request(Method, URL, Headers, Body, HackneyOpts)
+                    catch _:Reason -> {error, Reason}
+                    end,
+                Caller ! {Ref, Result}
+            end
+        ),
+    receive
+        {Ref, Response} -> Response
+    after Timeout ->
+        % hackney closes the connection of a request whose process exits.
+        unlink(Worker),
+        exit(Worker, kill),
+        receive {Ref, _} -> ok after 0 -> ok end,
+        {error, timeout}
+    end.
+
 gun_req(Args, Opts) ->
-	StartTime = os:system_time(native),
-	#{ path := Path, method := Method } = Args,
 	ConnectTimeout = hb_opts:get(http_client_connect_timeout, ?DEFAULT_CONNECT_TIMEOUT, Opts),
-	Response =
-		case open_connection(Args, Opts) of
-			{error, _} = Err ->
-				Err;
-			{ok, PID} ->
-				case gun:await_up(PID, ConnectTimeout) of
-					{error, Reason} ->
-						gun:close(PID),
-						{error, Reason};
-					{ok, _Protocol} ->
-						Result = do_gun_request(PID, Args, Opts),
-						gun:close(PID),
-						Result
-				end
-		end,
-	EndTime = os:system_time(native),
-	record_duration(#{
-			<<"request-method">> => method_to_bin(Method),
-			<<"request-path">> => hb_util:bin(Path),
-			<<"status-class">> => get_status_class(Response),
-			<<"duration">> => EndTime - StartTime
-		},
-		Opts
-	),
-	Response.
+	case open_connection(Args, Opts) of
+		{error, _} = Err ->
+			Err;
+		{ok, PID} ->
+			case gun:await_up(PID, ConnectTimeout) of
+				{error, Reason} ->
+					gun:close(PID),
+					{error, Reason};
+				{ok, _Protocol} ->
+					Result = do_gun_request(PID, Args, Opts),
+					gun:close(PID),
+					Result
+			end
+	end.
 
-%% @doc Start the hackney connection pool with default settings.
-%% Overridden at runtime by setup_conn/1 once node config is available.
-init_hackney_pool() ->
-    hackney_pool:start_pool(?HACKNEY_POOL, [
-        {max_connections, ?DEFAULT_HACKNEY_MAX_CONNECTIONS},
-        {timeout, ?DEFAULT_KEEPALIVE_TIMEOUT}
-    ]).
-
-%% @doc Invoke the HTTP monitor message with AO-Core, if it is set in the 
-%% node message key. We invoke the given message with the `body' set to a signed
-%% version of the details. This allows node operators to configure their machine
-%% to record duration statistics into customized data stores, computations, or
-%% processes etc. Additionally, we include the `http-reference' value, if set in
-%% the given `opts'.
-%% 
-%% We use `hb_ao:get' rather than `hb_opts:get', as settings configured
-%% by the `~router@1.0' route `opts' key are unable to generate atoms.
-maybe_invoke_monitor(Details, Opts) ->
-    case hb_ao:get(<<"http-monitor">>, Opts, Opts) of
-        not_found -> ok;
-        Monitor ->
-            % We have a monitor message. Place the `details' into the body, set
-            % the `method' to "POST", add the `http-reference' (if applicable)
-            % and sign the request. We use the node message's wallet as the
-            % source of the key.
+%% @doc Invoke a receipt hook with signed details in its `body'. The reference
+%% comes from the selected peer's options, never its response. Callers run this
+%% outside the request process so handlers cannot delay or replace its result.
+receipt(Hook, Details, Opts) ->
+    case hb_hook:find(Hook, Opts) of
+        [] -> ok;
+        _ ->
             MaybeWithReference =
                 case hb_ao:get(<<"http-reference">>, Opts, Opts) of
                     not_found -> Details;
                     Ref -> Details#{ <<"reference">> => Ref }
                 end,
-            Req =
-                Monitor#{
+            hb_hook:on(
+                Hook,
+                #{
                     <<"body">> =>
                         hb_message:commit(
                             MaybeWithReference#{
@@ -293,11 +343,8 @@ maybe_invoke_monitor(Details, Opts) ->
                             Opts
                         )
                 },
-            % Use the singleton parse to generate the message sequence to 
-            % execute.
-            ReqMsgs = hb_singleton:from(Req, Opts),
-            Res = hb_ao:resolve_many(ReqMsgs, Opts),
-            ?event(debug_http_monitor, {resolved_monitor, Res})
+                Opts
+            )
     end.
 
 %%% ==================================================================
@@ -305,7 +352,6 @@ maybe_invoke_monitor(Details, Opts) ->
 %%% ==================================================================
 
 init(Opts) ->
-    init_hackney_pool(),
     case prometheus_enabled(Opts) of
         true ->
             ?event({starting_prometheus_application,
@@ -367,10 +413,11 @@ terminate(_Reason, _State) ->
 open_connection(#{ peer := Peer }, Opts) ->
     case parse_peer(Peer, Opts) of
         {error, _} = Err -> Err;
-        {ok, {Host, Port}} -> open_connection_gun(Host, Port, Peer, Opts)
+        {ok, {Scheme, Host, Port}} ->
+            open_connection_gun(Scheme, Host, Port, Peer, Opts)
     end.
 
-open_connection_gun(Host, Port, Peer, Opts) ->
+open_connection_gun(Scheme, Host, Port, Peer, Opts) ->
     ?event(http_outbound, {parsed_peer, {peer, Peer}, {host, Host}, {port, Port}}),
     BaseGunOpts =
         #{
@@ -389,12 +436,13 @@ open_connection_gun(Host, Port, Peer, Opts) ->
                     http_client_connect_timeout,
                     ?DEFAULT_CONNECT_TIMEOUT,
                     Opts
-                )
+                ),
+            tls_opts => client_tls_options(Scheme, Opts)
         },
     Transport =
-        case Port of
-            443 -> tls;
-            _ -> tcp
+        case Scheme of
+            <<"https">> -> tls;
+            <<"http">> -> tcp
         end,
     DefaultProto =
         case hb_features:http3() of
@@ -405,8 +453,8 @@ open_connection_gun(Host, Port, Peer, Opts) ->
     GunOpts =
         case Proto = hb_opts:get(protocol, DefaultProto, Opts) of
             http3 -> BaseGunOpts#{protocols => [http3], transport => quic};
-            http2 -> BaseGunOpts#{protocols => [http2]};
-            http1 -> BaseGunOpts#{protocols => [http]}
+            http2 -> BaseGunOpts#{protocols => [http2], transport => Transport};
+            http1 -> BaseGunOpts#{protocols => [http], transport => Transport}
         end,
     ?event(http_outbound,
         {gun_open,
@@ -419,20 +467,35 @@ open_connection_gun(Host, Port, Peer, Opts) ->
 	gun:open(Host, Port, GunOpts).
 
 parse_peer(Peer, Opts) ->
-    Parsed = uri_string:parse(Peer),
-    case Parsed of
-        #{ host := Host, port := Port } ->
-            {ok, {hb_util:list(Host), Port}};
-        URI = #{ host := Host } ->
-            {ok, {
-                hb_util:list(Host),
-                case hb_maps:get(scheme, URI, undefined, Opts) of
-                    <<"https">> -> 443;
-                    _ -> hb_opts:get(port, 8734, Opts)
-                end
-            }};
-        _ ->
-            {error, {bad_peer, Peer}}
+    try
+        URI = #{host := Host} = uri_string:parse(Peer),
+        DefaultScheme = case maps:get(port, URI, undefined) of
+            443 -> <<"https">>;
+            _ -> <<"http">>
+        end,
+        Scheme = hb_util:to_lower(
+            hb_util:bin(maps:get(scheme, URI, DefaultScheme))
+        ),
+        true = Scheme =:= <<"http">> orelse Scheme =:= <<"https">>,
+        DefaultPort = case Scheme of
+            <<"https">> -> 443;
+            <<"http">> -> hb_opts:get(port, 8734, Opts)
+        end,
+        {ok, {Scheme, hb_util:list(Host), maps:get(port, URI, DefaultPort)}}
+    catch
+        _:_ -> {error, {bad_peer, Peer}}
+    end.
+
+client_tls_options(<<"http">>, _Opts) ->
+    [];
+client_tls_options(<<"https">>, Opts) ->
+    case hb_opts:get(http_client_tls_ca, not_found, Opts) of
+        not_found -> [];
+        CertificateAuthorities ->
+            [
+                {verify, verify_peer},
+                {cacerts, CertificateAuthorities}
+            ]
     end.
 
 do_gun_request(PID, Args, Opts) ->
@@ -488,7 +551,7 @@ do_gun_request(PID, Args, Opts) ->
 await_response(Args, Opts) ->
 	#{ pid := PID, stream_ref := Ref, timer := Timer, limit := Limit,
 			counter := Counter, acc := Acc, method := Method, path := Path } = Args,
-	case gun:await(PID, Ref, inet:timeout(Timer)) of
+	case gun_await(PID, Ref, Timer) of
 		{response, fin, Status, Headers} ->
 			upload_metric(Args, Opts),
 			?event(http, {gun_response, {status, Status}, {priv_headers, Headers}, {body, none}}),
@@ -517,15 +580,14 @@ await_response(Args, Opts) ->
 							{error, too_much_data}
 					end
 			end;
+		{data, fin, Data}
+                when Limit =/= infinity, Counter + byte_size(Data) > Limit ->
+            {error, too_much_data};
 		{data, fin, Data} ->
-			FinData = iolist_to_binary([Acc | Data]),
-			download_metric(FinData, Opts),
-			upload_metric(Args, Opts),
-			{ok,
-                hb_maps:get(status, Args, undefined, Opts),
-                hb_maps:get(headers, Args, undefined, Opts),
-                FinData
-            };
+			reply([Acc | Data], Args, Opts);
+		% After the trailers gun gives nothing more: return the reply.
+		{trailers, _Trailers} ->
+			reply(Acc, Args, Opts);
 		{error, timeout} = Response ->
 			record_response_status(Method, Response, Path, Opts),
             ?event(http_outbound, {gun_cancel, {path, Path}}),
@@ -540,11 +602,34 @@ await_response(Args, Opts) ->
 			record_response_status(Method, Response, Path),
 			log(warning, gun_await_process_down, Args, Reason, Opts),
 			Response;
+		% Return any other result of `gun:await/3' as an error. It is
+		% not a reply: it is an upgrade, after a `101' reply, or a
+		% pushed stream, which HyperBEAM never asks for.
 		Response ->
 			record_response_status(Method, Response, Path),
 			log(warning, gun_await_unknown, Args, Response, Opts),
-			Response
+			{error, Response}
 	end.
+
+%% @doc Return the next result of `gun:await/3' for the request. A `1xx' reply
+%% comes before the final one, so we wait for the next result.
+gun_await(PID, Ref, Timer) ->
+    case gun:await(PID, Ref, inet:timeout(Timer)) of
+        {inform, _Status, _Headers} -> gun_await(PID, Ref, Timer);
+        Message -> Message
+    end.
+
+%% @doc Return the reply, with `Data' as its body, and record the bytes that
+%% the request sent and received.
+reply(Data, Args, Opts) ->
+    FinData = iolist_to_binary(Data),
+    download_metric(FinData, Opts),
+    upload_metric(Args, Opts),
+    {ok,
+        hb_maps:get(status, Args, undefined, Opts),
+        hb_maps:get(headers, Args, undefined, Opts),
+        FinData
+    }.
 
 %% @doc Debug `http` state logging.
 log(Type, Event, #{method := Method, peer := Peer, path := Path}, Reason, Opts) ->
@@ -617,8 +702,8 @@ init_prometheus() ->
     ok.
 
 %% @doc Record the duration of the request in an async process. We write the 
-%% data to prometheus if the application is enabled, as well as invoking the
-%% `http-monitor' if appropriate.
+%% data to prometheus if enabled and invoke `on/http-client-receipt'. The
+%% receipt describes a transport attempt, not application-level acceptance.
 record_duration(Details, Opts) ->
     spawn(
         fun() ->
@@ -648,7 +733,8 @@ record_duration(Details, Opts) ->
                 false ->
                     ok
             end,
-            maybe_invoke_monitor(
+            receipt(
+                <<"http-client-receipt">>,
                 Details#{ <<"path">> => <<"duration">> },
                 Opts
             )

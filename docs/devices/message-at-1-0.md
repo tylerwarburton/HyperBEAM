@@ -17,7 +17,7 @@ The `message@1.0` device treats the message itself as the state it operates on. 
 
 ### Key Access (`/key`)
 
-To retrieve the value associated with a specific key in the message map, simply append the key name to the path. Key lookup is case-insensitive.
+To retrieve the value associated with a specific key in the message map, simply append the key name to the path. Keys are lowercase: the device lowercases the requested key, then looks it up exactly.
 
 **Example:**
 

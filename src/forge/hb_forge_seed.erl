@@ -3,7 +3,9 @@
 %%% Computing a device's identity (the unsigned AO-Core message ID of
 %%% its source-file message) and signing the preloaded spec/impl
 %%% messages requires the `message@1.0', `structured@1.0',
-%%% `httpsig@1.0' and commitment codec devices. At build time the Forge
+%%% `httpsig@1.0' and commitment codec devices, as well as the committer
+%%% devices that they call: `hmac@1.0', `did-ar@1.0', and `did@1.0', which
+%%% reads `did:' URIs. At build time the Forge
 %%% compiles those few device groups from `src/preloaded' under their
 %%% ordinary module names, loads them, and exposes a `Name => RootModule' message.
 %%%
@@ -23,6 +25,9 @@ seed_names(Opts) ->
         <<"message@1.0">>,
         <<"structured@1.0">>,
         <<"httpsig@1.0">>,
+        <<"hmac@1.0">>,
+        <<"did@1.0">>,
+        <<"did-ar@1.0">>,
         hb_opts:get(commitment_device, <<"httpsig@1.0">>, Opts)
     ]).
 

@@ -1,6 +1,6 @@
 %%% @doc A module that provides a cache for scheduler assignments and locations.
 -module(dev_scheduler_cache).
--export([write/2, write_spawn/2, read/3]).
+-export([write/3, write_spawn/2, read/3, flush/1]).
 -export([list/2, latest/2]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -20,13 +20,12 @@ opts(Opts) ->
             )
     }.
 
-%% @doc Write an assignment message into the cache.
-write(RawAssignment, RawOpts) ->
+%% @doc Cache an assignment under the process whose schedule was requested.
+%% The assignment's own process field cannot select the cache namespace.
+write(ProcID, RawAssignment, RawOpts) ->
     Assignment = hb_cache:ensure_all_loaded(RawAssignment, RawOpts),
     Opts = opts(RawOpts),
-    Store = hb_opts:get(store, no_viable_store, Opts),
     % Write the message into the main cache
-    ProcID = hb_ao:get(<<"process">>, Assignment, Opts),
     Slot = hb_ao:get(<<"slot">>, Assignment, Opts),
     ?event(
         {writing_assignment,
@@ -37,18 +36,15 @@ write(RawAssignment, RawOpts) ->
     ),
     case hb_cache:write(Assignment, Opts) of
         {ok, _UnsignedID} ->
-            % Create symlinks from the message on the process and the 
-            % slot on the process to the underlying data.
-            ok = hb_store:link(
-                Store,
-                #{
-                    hb_path:to_binary([
-                        ?SCHEDULER_CACHE_PREFIX,
-                        <<"assignments">>,
-                        hb_util:human_id(ProcID),
-                        hb_ao:normalize_key(Slot)
-                    ]) => hb_message:id(Assignment, signed, Opts)
-                },
+            % Link the slot on the process to the signed message.
+            ok = hb_cache:link(
+                hb_message:id(Assignment, signed, Opts),
+                hb_path:to_binary([
+                    ?SCHEDULER_CACHE_PREFIX,
+                    <<"assignments">>,
+                    hb_util:human_id(ProcID),
+                    hb_ao:normalize_key(Slot)
+                ]),
                 Opts
             ),
             ok;
@@ -56,6 +52,12 @@ write(RawAssignment, RawOpts) ->
             ?event(error, {failed_to_write_assignment, {reason, Reason}}),
             {error, Reason}
     end.
+
+%% @doc Commit the writes that the scheduler store holds in memory, such that
+%% they survive a halt of the node.
+flush(RawOpts) ->
+    Opts = opts(RawOpts),
+    hb_store:flush(hb_opts:get(store, no_viable_store, Opts), Opts).
 
 %% @doc Write the initial assignment message to the cache.
 write_spawn(RawInitMessage, Opts) ->
@@ -81,37 +83,31 @@ read(ProcID, Slot, RawOpts) ->
             {store, Store}
         }
     ),
-    case hb_store:resolve(Store, P1, Opts) of
-        {ok, ResolvedPath} ->
-            ?event({resolved_path, {p1, P1}, {p2, ResolvedPath}, {resolved, ResolvedPath}}),
-            case hb_cache:read(ResolvedPath, Opts) of
-                {ok, RawAssignment} ->
-                    % `hb_cache:read' no longer normalizes commitments; the
-                    % scheduler relies on each assignment carrying its unsigned
-                    % commitment ID, so we restore it here.
-                    Assignment =
-                        hb_message:normalize_commitments(RawAssignment, Opts),
-                    % If the slot key is not present, the format of the assignment is
-                    % AOS2, so we need to convert it to the canonical format.
-                    case hb_ao:get(<<"variant">>, Assignment, Opts) of
-                        <<"ao.TN.1">> ->
-                            Loaded = hb_cache:ensure_all_loaded(Assignment, Opts),
-                            Norm = dev_scheduler_formats:aos2_to_assignment(Loaded, Opts),
-                            ?event({normalized_aos2_assignment, Norm}),
-                            {ok, Norm};
-                        <<"ao.N.1">> ->
-                            {ok, hb_cache:ensure_all_loaded(Assignment, Opts)}
-                    end;
-                {error, not_found} ->
-                    ?event(debug_sched, {read_assignment, {res, not_found}}),
-                    not_found
+    case hb_cache:read(P1, Opts) of
+        {ok, RawAssignment} ->
+            % The scheduler relies on each assignment carrying its unsigned
+            % commitment ID, which `hb_cache:read' does not add.
+            Assignment =
+                hb_message:normalize_commitments(RawAssignment, Opts),
+            % If the slot key is not present, the format of the assignment is
+            % AOS2, so we need to convert it to the canonical format.
+            case hb_ao:get(<<"variant">>, Assignment, Opts) of
+                <<"ao.TN.1">> ->
+                    Loaded = hb_cache:ensure_all_loaded(Assignment, Opts),
+                    Norm =
+                        lib_scheduler_formats:aos2_to_assignment(Loaded, Opts),
+                    ?event({normalized_aos2_assignment, Norm}),
+                    {ok, Norm};
+                <<"ao.N.1">> ->
+                    {ok, hb_cache:ensure_all_loaded(Assignment, Opts)}
             end;
         {error, not_found} ->
             ?event(debug_sched, {read_assignment, {res, not_found}}),
             not_found
     end.
 
-%% @doc Get the assignments for a process.
+%% @doc Get the assignments for a process. If the store fails, raise the failure
+%% to the caller: an empty list gives the next assignment slot 0.
 list(ProcID, RawOpts) ->
     Opts = opts(RawOpts),
     hb_cache:list_numbered(
@@ -120,7 +116,7 @@ list(ProcID, RawOpts) ->
             <<"assignments">>,
             hb_util:human_id(ProcID)
         ]),
-        Opts
+        Opts#{ <<"store-failure">> => throw }
     ).
 
 %% @doc Get the latest assignment from the cache.
@@ -144,16 +140,7 @@ latest(ProcID, RawOpts) ->
                 AssignmentNum,
                 Opts
             ),
-            {
-                AssignmentNum,
-                hb_ao:get_first(
-                    [
-                        {Assignment, <<"base-hashpath">>},
-                        {Assignment, <<"hash-chain">>}
-                    ],
-                    #{ <<"hashpath">> => ignore }
-                )
-            }
+            {AssignmentNum, Assignment}
     end.
 
 %%% Tests
@@ -174,7 +161,7 @@ volatile_schedule_test() ->
         <<"slot">> => 1,
         <<"hash-chain">> => <<"test-hash-chain">>
     },
-    ?assertEqual(ok, write(Assignment, Opts)),
+    ?assertEqual(ok, write(ProcID, Assignment, Opts)),
     ?assertMatch({1, _}, latest(ProcID, Opts)),
     {ok, ReadAssignment} = read(ProcID, 1, Opts),
     ?assertEqual(ReadAssignment, hb_message:normalize_commitments(Assignment, Opts)),
@@ -205,7 +192,7 @@ concurrent_scheduler_write_test() ->
                 <<"hash-chain">> =>
                     <<"concurrent-test-", (integer_to_binary(Slot))/binary>>
             },
-            Result = write(Assignment, Opts),
+            Result = write(ProcID, Assignment, Opts),
             Parent ! {write_result, Slot, Result}
         end)
     end, lists:seq(1, Workers)),
@@ -252,15 +239,15 @@ concurrent_read_write_test() ->
                     <<"race-test-", (integer_to_binary(Slot))/binary>>
             }
         end,
-    %% Pre-write slot 1 synchronously so readers always have at least
-    %% one assignment available; otherwise under heavy CPU contention the
-    %% 10 reader processes can blast through their 100 reads before the
-    %% writer's first `write/2' lands, causing `TotalSuccessfulReads > 0'
-    %% to fail spuriously.
-    write(MkAssignment(1), Opts),
+    % Pre-write slot 1 synchronously so readers always have at least
+    % one assignment available; otherwise under heavy CPU contention the
+    % 10 reader processes can blast through their 100 reads before the
+    % writer's first `write/3' lands, causing `TotalSuccessfulReads > 0'
+    % to fail spuriously.
+    write(ProcID, MkAssignment(1), Opts),
     spawn_link(fun() ->
         lists:foreach(fun(Slot) ->
-            write(MkAssignment(Slot), Opts),
+            write(ProcID, MkAssignment(Slot), Opts),
             timer:sleep(1)
         end, lists:seq(2, 100)),
         ?event(testing, {writer_completed}),
@@ -285,15 +272,10 @@ concurrent_read_write_test() ->
     ),
     receive 
         writer_done -> ok
-    after 15000 -> 
-        ?assert(false) 
     end,
     AllReaderResults = lists:map(fun(ReaderNum) ->
         receive
             {reader_done, ReaderNum, Results} -> Results
-        after 5000 ->
-            ?assert(false),
-            []
         end
     end, lists:seq(1, 10)),
     FinalSlots = list(ProcID, Opts),
@@ -333,7 +315,7 @@ large_assignment_volume() ->
                 <<"slot">> => Slot,
                 <<"hash-chain">> => crypto:strong_rand_bytes(64)
             },
-            ?assertEqual(ok, write(Assignment, Opts))
+            ?assertEqual(ok, write(ProcID, Assignment, Opts))
         end,
         lists:seq(1, VolumeSize)
     ),
@@ -371,7 +353,7 @@ rapid_restart_test() ->
                         <<"hash-chain">> =>
                             <<"restart-cycle-", (integer_to_binary(Cycle))/binary>>
                     },
-                    ?assertEqual(ok, write(Assignment, Opts))
+                    ?assertEqual(ok, write(ProcID, Assignment, Opts))
                 end,
                 lists:seq(1, 10)
             ),
@@ -408,7 +390,7 @@ mixed_store_reset_operations_test() ->
         <<"slot">> => 1,
         <<"hash-chain">> => <<"mixed-test-1">>
     },
-    ?assertEqual(ok, write(Assignment1, Opts)),
+    ?assertEqual(ok, write(ProcID, Assignment1, Opts)),
     ?event(testing, {assignment_written, ProcID}),
     hb_store:reset(NonVolStore),
     ReadAfterNonVolReset = read(ProcID, 1, Opts),
@@ -419,7 +401,7 @@ mixed_store_reset_operations_test() ->
     ?assertEqual(not_found, ReadAfterVolReset),
     ?event(testing, {after_vol_reset, ReadAfterVolReset}).
 
-%% @doc Test handling of invalid assignment data.
+%% @doc Invalid process targets cannot select an assignment cache namespace.
 invalid_assignment_stress_test() ->
     VolStore = hb_test_utils:test_store(hb_store_fs, <<"invalid-vol">>),
     NonVolStore = hb_test_utils:test_store(hb_store_fs, <<"invalid-nonvol">>),
@@ -430,17 +412,17 @@ invalid_assignment_stress_test() ->
     hb_store:start(VolStore),
     hb_store:start(NonVolStore),
     InvalidAssignments = [
-        #{},
-        #{<<"process">> => <<"invalid">>},
-        #{<<"slot">> => 1},
-        #{<<"process">> => <<>>, <<"slot">> => 1},
-        #{<<"process">> => <<"valid">>, <<"slot">> => -1},
-        #{<<"process">> => <<"valid">>, <<"slot">> => <<"not-integer">>}
+        {not_found, #{}},
+        {<<"invalid">>, #{}},
+        {not_found, #{<<"slot">> => 1}},
+        {<<>>, #{<<"slot">> => 1}},
+        {<<"valid">>, #{<<"slot">> => -1}},
+        {<<"valid">>, #{<<"slot">> => <<"not-integer">>}}
     ],
     ?event(testing, {testing_invalid_assignments, length(InvalidAssignments)}),
-    Results = lists:map(fun(Assignment) ->
+    Results = lists:map(fun({ProcID, Assignment}) ->
         Result = try
-            write(Assignment, Opts)
+            write(ProcID, Assignment, Opts)
         catch
             _:_ -> error
         end,
@@ -474,7 +456,7 @@ volatile_store_corruption_test() ->
         <<"slot">> => 1,
         <<"hash-chain">> => <<"corruption-test">>
     },
-    ?assertEqual(ok, write(Assignment, Opts)),
+    ?assertEqual(ok, write(ProcID, Assignment, Opts)),
     ReadBeforeCorruption = read(ProcID, 1, Opts),
     ?assertMatch({ok, _}, ReadBeforeCorruption),
     ?event(testing, {before_corruption, ReadBeforeCorruption}),

@@ -134,18 +134,22 @@ trusted_device_id_matches(Pkg, Opts, SpecIDs, ImplID) ->
     Other = hb_util:human_id(crypto:strong_rand_bytes(32)),
     IDOpts = Opts#{
         <<"trusted-device-signers">> => [Other],
-        <<"trusted-devices">> => #{ SpecID => ImplID }
+        % No preloaded store has the implementation, and a config file gives
+        % the key lowercase.
+        <<"preloaded-store">> => [],
+        <<"trusted-devices">> => #{ hb_util:lowercase_key(SpecID) => ImplID }
     },
     {ok, Mod} = hb_device_load:reference(SpecID, IDOpts),
     ?assertEqual(maps:get(module_name, Pkg), Mod).
 
 preloaded_index_matches(_Pkg, Opts, _, _) ->
     Store = maps:get(<<"preloaded-store">>, Opts),
+    {ok, <<"ao:", IndexID/binary>>} =
+        hb_store:read(Store, ?PRELOADED_INDEX_KEY, Opts),
     {ok, Got} =
-        hb_store:read(
-            Store,
-            <<?PRELOADED_INDEX_KEY/binary, "/test-pkg@1.0">>,
-            Opts
+        hb_cache:read(
+            <<IndexID/binary, "/test-pkg@1.0">>,
+            Opts#{ <<"store">> => [Store] }
         ),
     ?assert(byte_size(Got) == 43).
 
@@ -318,12 +322,59 @@ dynamic_internal_dispatch_supported_test() ->
     ?assertEqual({ok, <<"hello">>}, Mod:call(#{}, #{}, #{})),
     ?assertEqual(false, code:is_loaded(dev_dyn_pkg_helper)).
 
+%% @doc Test packages compile guarded functions with the active profile defines.
+profile_defines_test() ->
+    Dir = test_fixture_dir(),
+    Path = filename:join(Dir, <<"dev_test_pkg_helper.erl">>),
+    ok = file:write_file(Path, <<
+        "-module(dev_test_pkg_helper).\n"
+        "-export([greet/2]).\n"
+        "-ifdef(HB_TEST_PROFILE).\n"
+        "-export([profile/0]).\n"
+        "profile() -> ?HB_TEST_PROFILE.\n"
+        "-endif.\n"
+        "greet(_, _) -> <<\"hello\">>.\n"
+    >>),
+    try
+        [Group] = hb_packager:scan([Dir], #{}),
+        lists:foreach(
+            fun(Defines) ->
+                Pkg = hb_forge_seed:with_forge_bootstrap(
+                    #{
+                        <<"bootstrap-device-src">> => [<<"src/preloaded">>],
+                        <<"test">> => true,
+                        <<"erl-defines">> => Defines
+                    },
+                    fun(Opts) -> hb_packager:package(Group, Opts) end
+                ),
+                {ok, Modules, _} =
+                    hb_device_archive:contents(maps:get(archive, Pkg)),
+                Exports = lists:append([
+                    begin
+                        {ok, {_, [{exports, E}]}} =
+                            beam_lib:chunks(Beam, [exports]),
+                        E
+                    end
+                 || {_, _, Beam} <- Modules
+                ]),
+                ?assertEqual(Defines =/= [], lists:member({profile, 0}, Exports))
+            end,
+            [[], [{d, 'HB_TEST_PROFILE'}], [{d, 'HB_TEST_PROFILE', enabled}]]
+        )
+    after file:del_dir_r(Dir)
+    end.
+
 archive_contains_ebin_and_priv_entries_test() ->
     Dir = priv_fixture_dir(),
     [Group] = hb_packager:scan([Dir], #{}),
     Pkg = package_for_test(Group),
     Msg = hb_packager:impl_message(Pkg, <<"spec-id">>, #{}),
     ?assertEqual(false, maps:is_key(<<"requires-system-architecture">>, Msg)),
+    % Every implementation requires the AO runtime version that packaged it.
+    ?assertEqual(
+        ?AO_RUNTIME_VERSION,
+        maps:get(<<"requires-ao-runtime-version">>, Msg)
+    ),
     ArchPkg =
         hb_forge_seed:with_forge_bootstrap(
             #{

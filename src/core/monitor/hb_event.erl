@@ -444,7 +444,7 @@ parse_name(Name)
         andalso byte_size(Name) > ?MAX_EVENT_NAME_LENGTH ->
     no_event_name;
 parse_name(Name) when is_list(Name) ->
-    iolist_to_binary(Name);
+    parse_name(iolist_to_binary(Name));
 parse_name(Name) when is_binary(Name) ->
     Name;
 parse_name(_) -> no_event_name.
@@ -557,12 +557,15 @@ batch_correctness_test() -> ok.
 overload_checks_past_first_thousand_test() -> ok.
 -else.
 benchmark_drain_rate_test() ->
+    EventPid = spawn(fun server/0),
+    try benchmark_drain_rate(EventPid)
+    after exit(EventPid, kill)
+    end.
+
+%% @doc Measure draining independently of the enqueue benchmarks' backlog.
+benchmark_drain_rate(EventPid) ->
     NumKeys = 50,
     NumEvents = 100000,
-    log(warmup, {warmup, 0}),
-    timer:sleep(100),
-    EventPid = hb_name:lookup(?MODULE),
-    wait_drain(EventPid, 5000),
     erlang:suspend_process(EventPid),
     Keys =
         [

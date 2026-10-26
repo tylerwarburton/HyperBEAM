@@ -109,7 +109,7 @@ find_or_register(Base, Req, Opts) ->
     find_or_register(group(Base, Req, Opts), Base, Req, Opts).
 find_or_register(ungrouped_exec, _Base, _Req, _Opts) ->
     {leader, ungrouped_exec};
-find_or_register(GroupName, _Base, _Req, Opts) ->
+find_or_register(GroupName, Base, Req, Opts) ->
     case hb_opts:get(await_inprogress, false, Opts) of
         false -> {leader, GroupName};
         _ ->
@@ -122,8 +122,10 @@ find_or_register(GroupName, _Base, _Req, Opts) ->
                     {infinite_recursion, GroupName};
                 _ ->
                     ?event({register_resolver, {group, GroupName}}),
-                    register_groupname(GroupName, Opts),
-                    {leader, GroupName}
+                    case register_groupname(GroupName, Opts) of
+                        ok -> {leader, GroupName};
+                        error -> find_or_register(GroupName, Base, Req, Opts)
+                    end
             end
     end.
 
@@ -142,19 +144,21 @@ find_execution(Groupname, _Opts) ->
     end.
 
 %% @doc Calculate the group name for a Base and Req pair. Uses the Base's
-%% `group' function if it is found in the `info', otherwise uses the default.
+%% `group' function if it is found in the `device_info', otherwise uses the
+%% default. A device's grouper gets the base and the request without unsigned
+%% commitments, as the device's functions do. The default grouper gets them as
+%% they are.
 group(Base, Req, Opts) ->
-    Grouper =
-        hb_maps:get(
-            grouper,
-            hb_device:info(Base, Opts),
-            fun default_grouper/3,
-            Opts
-        ),
-    apply(
-        Grouper,
-        hb_device:truncate_args(Grouper, [Base, Req, Opts])
-    ).
+    case hb_maps:find(grouper, hb_device:device_info(Base, Opts), Opts) of
+        {ok, Grouper} ->
+            apply(
+                Grouper,
+                hb_device:truncate_args(Grouper,
+                    [hb_ao:execution_input(Base, Opts),
+                        hb_ao:execution_input(Req, Opts), Opts])
+            );
+        error -> default_grouper(Base, Req, Opts)
+    end.
 
 %% @doc Register for performing an AO-Core resolution.
 register_groupname(Groupname, _Opts) ->
@@ -177,7 +181,7 @@ await(Worker, Base, Req, Opts) ->
     AwaitFun =
         hb_maps:get(
             await,
-            hb_device:info(Base, Opts),
+            hb_device:device_info(Base, Opts),
             fun default_await/5,
 			Opts
         ),
@@ -185,9 +189,14 @@ await(Worker, Base, Req, Opts) ->
     % Register with the process.
     GroupName = group(Base, Req, Opts),
     % set monitor to a worker, so we know if it exits
-    _Ref = erlang:monitor(process, Worker),
+    Ref = erlang:monitor(process, Worker),
     Worker ! {resolve, self(), GroupName, Req, Opts},
-    AwaitFun(Worker, GroupName, Base, Req, Opts).
+    case find_execution(GroupName, Opts) of
+        {ok, Worker} -> AwaitFun(Worker, GroupName, Base, Req, Opts);
+        _ ->
+            erlang:demonitor(Ref, [flush]),
+            {error, leader_died}
+    end.
 
 %% @doc Default await function that waits for a resolution from a worker.
 default_await(Worker, GroupName, Base, Req, Opts) ->
@@ -262,7 +271,7 @@ send_response(Listener, GroupName, Req, Res) ->
     ),
     Listener ! {resolved, self(), GroupName, Req, Res}.
 
-%% @doc Start a worker process that will hold a message in memory for
+%% @doc Start a worker process that will keep a message in memory for
 %% future executions.
 
 start_worker(Msg, Opts) ->
@@ -275,12 +284,12 @@ start_worker(GroupName, Msg, Opts) ->
     ),
     WorkerPID = spawn(
         fun() ->
-            % If the device's info contains a `worker' function we
+            % If the device's `device_info' contains a `worker' function we
             % use that instead of the default implementation.
             WorkerFun =
                 hb_maps:get(
                     worker,
-                    hb_device:info(Msg, Opts),
+                    hb_device:device_info(Msg, Opts),
                     Def = fun default_worker/3,
 					Opts
                 ),
@@ -367,24 +376,66 @@ default_worker(GroupName, Base, Opts) ->
         unregister(Base, undefined, Opts)
     end.
 
-%% @doc Create a group name from a Base and Req pair as a tuple.
+%% @doc Create a group name from a base and a request. If both have commitments
+%% and contain no signed message, the group name is `BaseID/ReqID': the path at
+%% which the cache links their result. `hb_ao' commits the base and the request
+%% before it groups them, so their IDs are read from those commitments.
+%% Otherwise, the group name is the SHA-256 of the base and the request without
+%% `priv', as an integer.
 default_grouper(Base, Req, Opts) ->
     %?event({calculating_default_group_name, {base, Base}, {req, Req}}),
-    % Use Erlang's `phash2' to hash the result of the Grouper function.
-    % `phash2' is relatively fast and ensures that the group name is short for
-    % storage in `pg'. In production we should only use a hash with a larger
-    % output range to avoid collisions.
-    ?no_prod("Using a hash for group names is not secure."),
     case hb_opts:get(await_inprogress, true, Opts) of
         true ->
-            erlang:phash2(
-                {
-                    hb_maps:without([<<"priv">>], Base, Opts),
-                    hb_maps:without([<<"priv">>], Req, Opts)
-                }
-            );
+            case has_commitments(Base) andalso has_commitments(Req) andalso
+                    is_recursively_unsigned(Base, Opts) andalso
+                    is_recursively_unsigned(Req, Opts) of
+                true ->
+                    <<
+                        (hb_message:id(Base, all, Opts))/binary,
+                        "/",
+                        (hb_message:id(Req, all, Opts))/binary
+                    >>;
+                false ->
+                    binary:decode_unsigned(
+                        hb_crypto:sha256(
+                            term_to_binary(
+                                {
+                                    hb_maps:without([<<"priv">>], Base, Opts),
+                                    hb_maps:without([<<"priv">>], Req, Opts)
+                                },
+                                [deterministic]
+                            )
+                        )
+                    )
+            end;
         _ -> ungrouped_exec
     end.
+
+%% @doc Return whether a message has commitments.
+has_commitments(#{ <<"commitments">> := _ }) -> true;
+has_commitments(_Value) -> false.
+
+%% @doc Return whether a value contains no signed message: no commitment in it
+%% has a `committer'. A signed message keeps its ID when a key outside its
+%% signature changes, and so does a message that contains it. Links are not
+%% loaded: two messages with the same link read the same message for it.
+is_recursively_unsigned(Msg, Opts) when is_map(Msg) ->
+    not lists:any(
+        fun(Commitment) ->
+            hb_maps:is_key(<<"committer">>, Commitment, Opts)
+        end,
+        hb_maps:values(hb_maps:get(<<"commitments">>, Msg, #{}, Opts), Opts)
+    ) andalso
+        lists:all(
+            fun({Key, Value}) ->
+                hb_private:is_private(Key) orelse
+                    is_recursively_unsigned(Value, Opts)
+            end,
+            maps:to_list(hb_message:uncommitted(Msg, Opts))
+        );
+is_recursively_unsigned(Values, Opts) when is_list(Values) ->
+    lists:all(fun(Value) -> is_recursively_unsigned(Value, Opts) end, Values);
+is_recursively_unsigned(_Value, _Opts) -> true.
 
 %% @doc Log an event with the worker process. If we used the default grouper
 %% function, we should also include the Base and Req in the event. If we did not,
@@ -400,7 +451,7 @@ worker_event(Group, Data, _, _, Opts) ->
 test_device() -> test_device(#{}).
 test_device(Base) ->
     #{
-        info =>
+        device_info =>
             fun() ->
                 hb_maps:merge(
                     #{
@@ -468,6 +519,62 @@ deduplicated_execution_test() ->
     ?assertEqual(Res1, Res2),
     % Check the time it took is less than the sum of the two test times.
     ?assert(T1 - T0 < (2*TestTime)).
+
+%% @doc Use a result cached during election.
+cached_before_election_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(),
+        <<"attested-store">> => hb_test_utils:test_store(),
+        <<"cache-control">> => [<<"always">>],
+        <<"await-inprogress">> => true
+    },
+    Base = #{ <<"device">> => test_device(#{
+        grouper => fun(M1, M2, NodeOpts) ->
+            hb_cache_control:maybe_store(M1, M2, <<"cached">>, M2, Opts),
+            default_grouper(M1, M2, NodeOpts)
+        end
+    }) },
+    ?assertEqual(
+        {ok, <<"cached">>},
+        hb_ao:resolve(
+            Base,
+            #{ <<"path">> => <<"self">>, <<"wait">> => 0 },
+            Opts
+        )
+    ).
+
+%% @doc Two bases that `phash2/1' gives one hash, with the same request, get
+%% two group names: without commitments, and with the commitments that `hb_ao'
+%% adds before it groups them. Two bases that differ only in a key outside the
+%% signature of a message that they contain also get two group names.
+default_grouper_collision_test() ->
+    Opts =
+        #{
+            <<"await-inprogress">> => true,
+            <<"priv-wallet">> => ar_wallet:new()
+        },
+    Req = #{ <<"path">> => <<"compute">> },
+    Base1 = #{ <<"device">> => <<"test-device@1.0">>, <<"slot">> => 6916 },
+    Base2 = Base1#{ <<"slot">> => 12406 },
+    ?assertEqual(erlang:phash2({Base1, Req}), erlang:phash2({Base2, Req})),
+    ?assertNotEqual(
+        default_grouper(Base1, Req, Opts),
+        default_grouper(Base2, Req, Opts)
+    ),
+    Group =
+        fun(Base) ->
+            group(
+                hb_ao:normalize_input(Base, Opts),
+                hb_ao:normalize_input(Req, Opts),
+                Opts
+            )
+        end,
+    ?assertNotEqual(Group(Base1), Group(Base2)),
+    Signed = hb_message:commit(#{ <<"slot">> => 1 }, Opts),
+    ?assertNotEqual(
+        Group(Base1#{ <<"process">> => Signed }),
+        Group(Base1#{ <<"process">> => Signed#{ <<"key">> => 1 } })
+    ).
 
 %% @doc Test spawning a default persistent worker.
 persistent_worker_test() ->

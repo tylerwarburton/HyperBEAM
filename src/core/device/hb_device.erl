@@ -4,21 +4,28 @@
 -module(hb_device).
 -export([truncate_args/2, message_to_fun/3, message_to_device/2]).
 -export([is_direct_key_access/3, is_direct_key_access/4]).
--export([find_exported_function/5, is_exported/4, info/2, info/3]).
+-export([find_exported_function/5, is_exported/4]).
+-export([device_info/2, device_info/3]).
 -include("include/hb.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 -define(DEFAULT_DEVICE, <<"message@1.0">>).
 
 %%% All keys in the `message@1.0` device that are not resolved to underlying
 %%% data in the their Erlang map representations.
 -define(MESSAGE_KEYS, [
-    <<"get">>,
+    <<"index">>,
+    <<"info">>,
     <<"set">>,
+    <<"set-path">>,
+    <<"set_path">>,
     <<"remove">>,
     <<"keys">>,
     <<"id">>,
     <<"commit">>,
     <<"verify">>,
+    <<"with-commitments">>,
+    <<"with_commitments">>,
     <<"committers">>,
     <<"committed">>
 ]).
@@ -34,7 +41,7 @@ truncate_args(Fun, Args) ->
 %%
 %% This comes in 7 forms:
 %% 1. The message does not specify a device, so we use the default device.
-%% 2. The device has a `handler' key in its `Dev:info()' map, which is a
+%% 2. The device has a `handler' key in its `Dev:device_info()' map, which is a
 %% function that takes a key and returns a function to handle that key. We pass
 %% the key as an additional argument to this function:
 %%     `Mod:Handler(Key, Base, Req, Opts) -> {Status, Fun}'
@@ -57,7 +64,7 @@ message_to_fun(Msg, Key, Opts) ->
     % Get the device module from the message and recurse.
     message_to_fun(message_to_device(Msg, Opts), Msg, Key, Opts).
 message_to_fun(Dev, Msg, Key, Opts) ->
-    Info = info(Dev, Msg, Opts),
+    Info = device_info(Dev, Msg, Opts),
     % Is the key exported by the device?
     Exported = is_exported(Info, Key, Opts),
 	?event(
@@ -106,7 +113,7 @@ message_to_fun(Dev, Msg, Key, Opts) ->
 						_ ->
 							% Case 6: The device has no default handler.
 							% We retry with the default unless the message
-							% already names it (loop guard).
+							% already has it as its `device' (loop guard).
 							case hb_maps:get(<<"device">>, Msg, undefined, Opts) of
 								?DEFAULT_DEVICE ->
 									throw({
@@ -132,12 +139,59 @@ message_to_fun(Dev, Msg, Key, Opts) ->
 %% internal module-loading path.
 message_to_device(Msg, Opts) ->
     DevID = hb_maps:get(<<"device">>, Msg, ?DEFAULT_DEVICE, Opts),
+    % Refuse a device in `exclude-devices' before `hb_device_load' resolves it.
+    case lists:member(DevID, hb_opts:get(exclude_devices, [], Opts)) of
+        true -> throw({device_not_loadable, DevID, <<"device-excluded">>});
+        false -> ok
+    end,
     case hb_device_load:reference(DevID, Opts) of
-        {error, Reason} -> throw({error, {device_not_loadable, DevID, Reason}});
+        {error, Reason} -> throw({device_not_loadable, DevID, Reason});
         {ok, DevMod} -> DevMod
     end.
 
-%% @doc Parse a handler key given by a device's `info'.
+%% @doc A device in `exclude-devices' is refused, with or without an
+%% implementation in `trusted-devices'.
+excluded_device_test() ->
+    Ref = <<"excluded-test-device@1.0">>,
+    Msg = #{ <<"device">> => Ref },
+    Opts = #{ <<"exclude-devices">> => [Ref] },
+    ?assertThrow(
+        {device_not_loadable, Ref, <<"device-excluded">>},
+        message_to_device(Msg, Opts)
+    ),
+    ?assertThrow(
+        {device_not_loadable, Ref, <<"device-excluded">>},
+        message_to_device(Msg, Opts#{
+            <<"trusted-devices">> => #{ Ref => <<0:344>> }
+        })
+    ),
+    % A node replies to a request for the device with a 403.
+    ?assertMatch(
+        {error, #{ <<"status">> := 403 }},
+        hb_http:get(
+            hb_http_server:start_node(Opts),
+            <<"/~", Ref/binary, "/key">>,
+            #{}
+        )
+    ).
+
+%% @doc A resolved device cannot bypass a subsequently applied exclusion.
+excluded_cached_device_test() ->
+    Ref = <<"message@1.0">>,
+    Msg = #{ <<"device">> => Ref },
+    Mod = message_to_device(Msg, #{}),
+    ?assertEqual(Mod, message_to_device(Msg, #{ <<"exclude-devices">> => [] })),
+    ?assertThrow(
+        {device_not_loadable, Ref, <<"device-excluded">>},
+        message_to_device(Msg, #{ <<"exclude-devices">> => [Ref] })
+    ),
+    ?assertThrow(
+        {device_not_loadable, Ref, <<"device-excluded">>},
+        message_to_device(#{}, #{ <<"exclude-devices">> => [Ref] })
+    ),
+    ?assertEqual(Mod, message_to_device(#{}, #{})).
+
+%% @doc Parse a handler key given by a device's `device_info'.
 info_handler_to_fun(Handler, _Msg, _Key, _Opts) when is_function(Handler) ->
 	{add_key, Handler};
 info_handler_to_fun(HandlerMap, Msg, Key, Opts) ->
@@ -167,15 +221,20 @@ info_handler_to_fun(HandlerMap, Msg, Key, Opts) ->
 %% and try again.
 find_exported_function(Msg, Mod, Key, Arity, Opts) ->
     find_exported_function(Msg, Mod, Key, Arity, 0, Opts).
-find_exported_function(Msg, Mod, Key, Arity, MinArity, Opts) when not is_atom(Key) ->
-	try hb_util:key_to_atom(Key, false) of
-		KeyAtom -> find_exported_function(Msg, Mod, KeyAtom, Arity, MinArity, Opts)
-	catch _:_ -> not_found
-	end;
+find_exported_function(_Msg, _Dev, Key, _MaxArity, _MinArity, _Opts)
+        when Key =:= device_info; Key =:= <<"device_info">> ->
+    % `device_info' gives the kernel the options of a device: it is never a key
+    % of the device.
+    not_found;
 find_exported_function(Msg, Dev, Key, MaxArity, MinArity, Opts) when is_map(Dev) ->
     NormKey = hb_ao:normalize_key(Key),
     NormDev = hb_ao:normalize_keys(Dev, Opts),
 	case hb_maps:get(NormKey, NormDev, not_found, Opts) of
+		not_found when not is_atom(Key) ->
+			try hb_util:key_to_atom(Key, false) of
+				KeyAtom -> find_exported_function(Msg, Dev, KeyAtom, MaxArity, MinArity, Opts)
+			catch _:_ -> not_found
+			end;
 		not_found -> not_found;
 		Fun when is_function(Fun) ->
 			case erlang:fun_info(Fun, arity) of
@@ -187,7 +246,16 @@ find_exported_function(Msg, Dev, Key, MaxArity, MinArity, Opts) when is_map(Dev)
 				_ -> not_found
 			end
 	end;
+find_exported_function(Msg, Mod, Key, Arity, MinArity, Opts) when not is_atom(Key) ->
+	try hb_util:key_to_atom(Key, false) of
+		KeyAtom -> find_exported_function(Msg, Mod, KeyAtom, Arity, MinArity, Opts)
+	catch _:_ -> not_found
+	end;
 find_exported_function(_Msg, _Mod, _Key, Arity, MinArity, _Opts) when Arity < MinArity ->
+    not_found;
+find_exported_function(_Msg, _Mod, module_info, _Arity, _MinArity, _Opts) ->
+    % The Erlang compiler exports `module_info' from every module: it is
+    % never a key of a device.
     not_found;
 find_exported_function(Msg, Mod, Key, Arity, MinArity, Opts) ->
 	case erlang:function_exported(Mod, Key, Arity) of
@@ -201,18 +269,10 @@ find_exported_function(Msg, Mod, Key, Arity, MinArity, Opts) ->
 	end.
 
 %% @doc Check if a device is guarding a key via its `exports' list. Defaults to
-%% true if the device does not specify an `exports' list. The `info' function is
-%% always exported, if it exists. Elements of the `exludes' list are not
-%% exported. Note that we check for info _twice_ -- once when the device is
-%% given but the info result is not, and once when the info result is given.
-%% The reason for this is that `info/3' calls other functions that may need to
-%% check if a key is exported, so we must avoid infinite loops. We must, however,
-%% also return a consistent result in the case that only the info result is
-%% given, so we check for it in both cases.
-is_exported(_Msg, _Dev, info, _Opts) -> true;
+%% true if the device does not specify an `exports' list. Elements of the
+%% `excludes' list are not exported.
 is_exported(Msg, Dev, Key, Opts) ->
-	is_exported(info(Dev, Msg, Opts), Key, Opts).
-is_exported(_, info, _Opts) -> true;
+	is_exported(device_info(Dev, Msg, Opts), Key, Opts).
 is_exported(Info = #{ excludes := Excludes }, Key, Opts) ->
     NormKey = maybe_normalize_device_key(Key, existing),
     case lists:member(NormKey, lists:map(fun maybe_normalize_device_key/1, Excludes)) of
@@ -228,7 +288,7 @@ is_exported(_Info, _Key, _Opts) -> true.
 
 %% @doc Normalize an exported key to its canonical atomized form. By default
 %% new atoms are created if necessary. In practice this is used for keys that
-%% orinate from a device's `info' response, but _not_ for keys that could be
+%% originate from a device's `device_info', but _not_ for keys that could be
 %% chosen by non-author users. This imparts a requirement that device developers
 %% should not generate too many different exports/excludes -- just as they should
 %% not generate too many atoms.
@@ -238,14 +298,23 @@ maybe_normalize_device_key(Key, Mode) ->
     catch _:_ -> Key
     end.
 
-%% @doc Get the info map for a device, optionally giving it a message if the
-%% device's info function is parameterized by one.
-info(Msg, Opts) -> info(message_to_device(Msg, Opts), Msg, Opts).
-info(DevMod, Msg, Opts) ->
-    case find_exported_function(Msg, DevMod, info, 2, Opts) of
-		{ok, Fun} -> apply(Fun, truncate_args(Fun, [Msg, Opts]));
-		not_found -> #{}
-	end.
+%% @doc Get the options map of a device, optionally giving it a message if the
+%% device's `device_info' function is parameterized by one. As `device_info' is
+%% never a key, we read it from the device directly: a map device contains it
+%% under `device_info', and a module exports it with an arity of 0 to 2.
+device_info(Msg, Opts) -> device_info(message_to_device(Msg, Opts), Msg, Opts).
+device_info(Dev, Msg, Opts) when is_map(Dev) ->
+    NormDev = hb_ao:normalize_keys(Dev, Opts),
+    case hb_maps:find(<<"device_info">>, NormDev, Opts) of
+        {ok, Fun} -> apply(Fun, truncate_args(Fun, [Msg, Opts]));
+        error -> #{}
+    end;
+device_info(Mod, Msg, Opts) ->
+    case [N || N <- [2, 1, 0], erlang:function_exported(Mod, device_info, N)] of
+        [Arity | _] ->
+            apply(Mod, device_info, lists:sublist([Msg, Opts], Arity));
+        [] -> #{}
+    end.
 
 %% @doc Determine if a device is a `direct access': If there is a literal key
 %% in the message's Erlang map representation, will it always be returned?
@@ -256,28 +325,36 @@ is_direct_key_access(Base, Req, Opts, MaybeStore) when ?IS_ID(Base) ->
         if MaybeStore =:= unknown -> hb_opts:get(store, no_viable_store, Opts);
         true -> MaybeStore
         end,
-    DevPath =
-        hb_util:ok_or(
-            hb_store:resolve(Store, [Base, <<"device">>], Opts),
-            [Base, <<"device">>]
-        ),
-    case hb_store:read(Store, DevPath, Opts) of
+    ReadOpts = Opts#{ <<"store">> => Store },
+    case hb_cache:read(<<Base/binary, "/device">>, ReadOpts) of
         {ok, Dev} ->
             do_is_direct_key_access(Dev, Req, Opts);
-        {error, not_found} ->
-            fallback_direct_key_access(Store, Base, Req, Opts)
+        _ ->
+            fallback_direct_key_access(Base, Req, ReadOpts)
     end;
 is_direct_key_access(Base, Req, Opts, _) when is_map(Base) ->
     do_is_direct_key_access(hb_maps:find(<<"device">>, Base, Opts), Req, Opts).
 
-fallback_direct_key_access(Store, Base, Req, Opts) ->
-    case hb_store:type(Store, Base, Opts) of
-        {error, not_found} -> unknown;
-        {ok, _} -> do_is_direct_key_access(<<"message@1.0">>, Req, Opts)
+%% @doc Determine whether a key can be read directly from a message that has no
+%% `device' key in the stores. Such a message is read by `message@1.0', and an
+%% ID that the stores do not hold is `unknown'. We first list one key under
+%% the ID in the local stores. If there is none, we list the ID with
+%% `hb_cache:list/2', which also follows a signed ID to its message.
+fallback_direct_key_access(Base, Req, Opts) ->
+    Local = hb_store:scope(hb_opts:get(store, no_viable_store, Opts), local),
+    OneKey = #{ <<"list">> => Base, <<"limit">> => 1 },
+    Listed =
+        case hb_store:list(Local, OneKey, Opts) of
+            {ok, [_ | _]} -> true;
+            _ -> hb_cache:list(Base, Opts) =/= []
+        end,
+    case Listed of
+        false -> unknown;
+        true -> do_is_direct_key_access(<<"message@1.0">>, Req, Opts)
     end.
 
 do_is_direct_key_access(DevRes, #{ <<"path">> := Key }, Opts) ->
-    do_is_direct_key_access(DevRes, Key, Opts);
+    do_is_direct_key_access(DevRes, hb_util:lowercase_key(Key), Opts);
 do_is_direct_key_access({_Status, DevRes}, Key, Opts) ->
     do_is_direct_key_access(DevRes, Key, Opts);
 do_is_direct_key_access(not_found, Key, Opts) ->
@@ -285,10 +362,10 @@ do_is_direct_key_access(not_found, Key, Opts) ->
 do_is_direct_key_access(error, Key, Opts) ->
     do_is_direct_key_access(<<"message@1.0">>, Key, Opts);
 do_is_direct_key_access(<<"message@1.0">>, Key, _Opts) ->
-    not lists:member(Key, ?MESSAGE_KEYS);
+    not lists:member(Key, ?MESSAGE_KEYS) andalso not hb_private:is_private(Key);
 do_is_direct_key_access(Dev, NormKey, Opts) ->
     ?event_debug(debug_read_cached, {calculating_info, {device, Dev}}),
-    case info(#{ <<"device">> => Dev}, Opts) of
+    case device_info(#{ <<"device">> => Dev}, Opts) of
         Info = #{ exports := Exports }
             when not is_map_key(handler, Info) andalso not is_map_key(default, Info) ->
             ?event_debug(debug_read_cached,
@@ -298,6 +375,8 @@ do_is_direct_key_access(Dev, NormKey, Opts) ->
                     {exports, Exports}
                 }
             ),
-            not lists:member(NormKey, Exports ++ ?MESSAGE_KEYS);
+            not lists:member(NormKey, ?MESSAGE_KEYS)
+                andalso not hb_private:is_private(NormKey)
+                andalso not is_exported(Info, NormKey, Opts);
         _ -> false
     end.

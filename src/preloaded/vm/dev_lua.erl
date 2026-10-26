@@ -1,11 +1,12 @@
 %%% @doc A device that calls a Lua module upon a request and returns the result.
 -module(dev_lua).
 -implements(<<"lua@5.3a">>).
--export([info/1, init/3, snapshot/3, normalize/3, functions/3]).
+-specification("../../../specs/lua@5.3a.md").
+-export([device_info/1, init/3, snapshot/3, normalize/3, functions/3]).
 %%% Public Utilities
 -export([encode/2, decode/2]).
--export([pure_lua_process_benchmark/1]).
 -include("include/hb.hrl").
+-include_lib("luerl/include/luerl.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %%% Utility macro to check if a binary is a Lua script content-type.
@@ -27,11 +28,21 @@
     {['_G', os, tmpname], <<"sandboxed">>}
 ]).
 
+%%% The set of functions that will be sandboxed if the base sets
+%%% `requires-determinism': their results depend on the node's random seed,
+%%% clock and time zone.
+-define(DETERMINISTIC_SANDBOX, [
+    {['_G', math, random], <<"sandboxed">>},
+    {['_G', os, clock], <<"sandboxed">>},
+    {['_G', os, date], <<"sandboxed">>},
+    {['_G', os, time], <<"sandboxed">>}
+]).
+
 %% @doc All keys that are not directly available in the base message are 
 %% resolved by calling the Lua function in the module of the same name.
 %% Additionally, we exclude the `keys', `set', `encode' and `decode' functions
 %% which are `message@1.0' core functions, and Lua public utility functions.
-info(Base) ->
+device_info(Base) ->
     #{
         default => fun compute/4,
         excludes =>
@@ -52,6 +63,18 @@ info(Base) ->
 
 %% @doc Initialize the device state, loading the script into memory if it is 
 %% a reference.
+-spec init(
+    #{
+        module => _,
+        'content-type' => binary(),
+        body => _,
+        sandbox => _,
+        'requires-determinism' => _,
+        _ => _
+    },
+    #{ _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }} | {error, _}.
 init(Base, Req, Opts) ->
     ensure_initialized(Base, Req, Opts).
 
@@ -184,17 +207,11 @@ load_modules([Module|Rest], Opts, Acc) when is_map(Module) ->
 initialize(Base, Modules, Opts) ->
     % Apply the node's minimum sandbox and install the disk-free `require'
     % before loading any modules, such that code run while a module loads
-    % cannot escape them. The message may add further restrictions via
+    % cannot escape them. If the base sets `requires-determinism', also
+    % sandbox the functions whose results depend on the node, with or without
+    % the minimum sandbox. The message may add further restrictions via
     % `sandbox', but cannot lift these.
-    State0 =
-        case hb_opts:get(<<"lua-minimum-sandbox">>, ?DEFAULT_MIN_SANDBOX, Opts) of
-            false -> luerl:init();
-            MinSpec ->
-                dev_lua_require:install(
-                    sandbox(luerl:init(), MinSpec, Opts),
-                    Opts
-                )
-        end,
+    State0 = create_state(Base, Opts),
     % Load each script into the Lua state.
     State1 =
         lists:foldl(
@@ -235,7 +252,26 @@ initialize(Base, Modules, Opts) ->
     % Return the base message with the state added to it.
     {ok, hb_private:set(Base, <<"state">>, State3, Opts)}.
 
+%% @doc Create a Lua state with no modules, in the node's minimum sandbox and
+%% the sandbox that `requires-determinism' asks for.
+create_state(Base, Opts) ->
+    DeterministicSpec =
+        case hb_util:bool(hb_maps:get(<<"requires-determinism">>, Base, false, Opts)) of
+            true -> ?DETERMINISTIC_SANDBOX;
+            false -> []
+        end,
+    case hb_opts:get(<<"lua-minimum-sandbox">>, ?DEFAULT_MIN_SANDBOX, Opts) of
+        false -> sandbox(luerl:init(), DeterministicSpec, Opts);
+        MinSpec ->
+            dev_lua_require:install(
+                sandbox(luerl:init(), MinSpec ++ DeterministicSpec, Opts),
+                Opts
+            )
+    end.
+
 %%% @doc Return a list of all functions in the Lua environment.
+-spec functions(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, [_]} | {error, not_found}.
 functions(Base, _Req, Opts) ->
     case hb_private:get(<<"state">>, Base, Opts) of
         not_found ->
@@ -275,7 +311,15 @@ sandbox(State, [Path | Rest], Opts) ->
     {ok, NextState} = luerl:set_table_keys_dec(Path, <<"sandboxed">>, State),
     sandbox(NextState, Rest, Opts).
 
-%% @doc Call the Lua script with the given arguments.
+%% @doc Call the Lua script with the given arguments, returning the status
+%% and result that the Lua function returns. A key with no function in the
+%% script is not found.
+-spec compute(
+    binary(),
+    #{ _ => _ },
+    #{ _ => _ },
+    #{ _ => _ }
+) -> {atom(), _}.
 compute(Key, RawBase, RawReq, Opts) ->
     ?event(debug_lua, compute_called),
     Req = 
@@ -301,6 +345,14 @@ compute(Key, RawBase, RawReq, Opts) ->
             Opts#{ <<"hashpath">> => ignore }
         ),
     ?event(debug_lua, function_found),
+    case luerl:get_table_keys_dec([Function], State) of
+        {ok, nil, _} -> {error, not_found};
+        _ -> call_function(Function, Base, Req, OldPriv, State, Opts)
+    end.
+
+%% @doc Call a function of the Lua state with the parameters that the request
+%% or the base gives, or else with the base and the request.
+call_function(Function, Base, Req, OldPriv, State, Opts) ->
     Params =
         hb_ao:get_first(
             [
@@ -318,7 +370,8 @@ compute(Key, RawBase, RawReq, Opts) ->
     ?event(debug_lua, parameters_found),
     % Resolve all hyperstate links
     ResolvedParams = hb_cache:ensure_all_loaded(Params, Opts),
-    % Call the VM function with the given arguments.
+    % Call the VM function with the given arguments. The AO-Core library
+    % functions read the node message from the private data of the Lua state.
     ?event(lua,
         {calling_lua_func,
             {function, Function},
@@ -326,18 +379,20 @@ compute(Key, RawBase, RawReq, Opts) ->
             {req, Req}
         }
     ),
-    process_response(
-        try luerl:call_function_dec(
-            [Function],
-            encode(ResolvedParams, Opts),
-            State
+    try
+        process_response(
+            luerl:call_function_dec(
+                [Function],
+                encode(ResolvedParams, Opts),
+                luerl:put_private(<<"node-message">>, Opts, State)
+            ),
+            OldPriv,
+            Opts
         )
-        catch
-            _:Reason:Stacktrace -> {error, Reason, Stacktrace}
-        end,
-        OldPriv,
-		Opts
-    ).
+    catch
+        _:Reason:Stacktrace ->
+            process_response({error, Reason, Stacktrace}, OldPriv, Opts)
+    end.
 
 %% @doc Process a response to a Luerl invocation. Returns the typical AO-Core
 %% HyperBEAM response format.
@@ -349,48 +404,77 @@ process_response({ok, [Status, MsgResult], NewState}, Priv, Opts) ->
     case decode(MsgResult, Opts) of
         Msg when is_map(Msg) ->
             ?event(lua, {response, {status, Status}, {msg, Msg}}),
+            % Each call encodes its arguments and results as new tables in
+            % the state. Luerl frees the tables that Lua cannot reach
+            % only when it collects garbage, so collect after each call.
             {hb_util:atom(Status), Msg#{
                 <<"priv">> => Priv#{
-                    <<"state">> => NewState
+                    <<"state">> => luerl:gc(NewState)
                 }
             }};
         NonMsgRes -> {hb_util:atom(Status), NonMsgRes}
     end;
+process_response({ok, Results, _NewState}, _Priv, _Opts) ->
+    % A Lua function returns a result, or a status and a result. Any other
+    % number of values is an error of the script.
+    {error,
+        <<
+            "Lua function returned ",
+            (hb_util:bin(length(Results)))/binary,
+            " values: it must return a result, or a status and a result."
+        >>
+    };
 process_response({lua_error, RawError, State}, _Priv, Opts) ->
-    % An error occurred while calling the Lua function. Parse the stack trace
-    % and return it.
+    % The script raised an error and did not catch it, with `error' or at
+    % runtime. A script that throws is a failure, as a device that throws
+    % is. Parse the stack trace and return it.
     Error = try decode(luerl:decode(RawError, State), Opts) catch _:_ -> RawError end,
     StackTrace = decode_stacktrace(luerl:get_stacktrace(State), State, Opts),
     ?event(lua_error, {lua_error, Error, {stacktrace, StackTrace}}),
-    {error, #{
+    {failure, #{
         <<"status">> => 500,
         <<"body">> => Error,
         <<"trace">> => hb_ao:normalize_keys(StackTrace, Opts)
     }};
 process_response({error, Reason, Trace}, _Priv, _Opts) ->
-    % An Erlang error occurred while calling the Lua function. Return it.
+    % An Erlang exception of the Lua call, for example inside a library call
+    % into the node, or of decoding its result. The node does not attest to
+    % it, so it is a failure, not a result of the computation.
     ?event(lua_error, {trace, Trace}),
     TraceBin = iolist_to_binary(hb_format:trace(Trace)),
     ?event(lua_error, {formatted, {string, TraceBin}}),
     ReasonBin = iolist_to_binary(io_lib:format("~p", [Reason])),
-    {error, #{
+    {failure, #{
         <<"status">> => 500,
         <<"body">> =>
             << "Erlang error while running Lua: ", ReasonBin/binary >>,
         <<"trace">> => TraceBin
     }}.
 
-%% @doc Snapshot the Lua state from a live computation. Normalizes its `priv'
-%% state element, then serializes the state to a binary.
+%% @doc Snapshot the Lua state from a live computation. Removes the node message
+%% from the private data of the state and clears Luerl's `tag', then serializes
+%% the state to a binary.
+-spec snapshot(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ body := binary(), _ => _ }} | {error, binary()}.
 snapshot(Base, _Req, Opts) ->
     case hb_private:get(<<"state">>, Base, Opts) of
         not_found ->
             {error, <<"Cannot snapshot Lua state: state not initialized.">>};
-        State ->
-            {ok, #{ <<"body">> => term_to_binary(luerl:externalize(State)) }}
+        RawState ->
+            % Luerl sets the `tag' of a state to a reference made by the VM
+            % that created it, and never reads it. Without it, equal states
+            % give equal snapshots.
+            State = luerl:delete_private(<<"node-message">>, RawState),
+            Snapshot = luerl:externalize(State#luerl{ tag = undefined }),
+            {ok, #{ <<"body">> => term_to_binary(Snapshot) }}
     end.
 
 %% @doc Restore the Lua state from a snapshot, if it exists.
+-spec normalize(
+    #{ snapshot => #{ body => binary(), _ => _ }, _ => _ },
+    #{ _ => _ },
+    #{ _ => _ }
+) -> {ok, #{ _ => _ }}.
 normalize(Base, _Req, RawOpts) ->
     Opts = RawOpts#{ <<"hashpath">> => ignore },
     case hb_private:get(<<"state">>, Base, Opts) of
@@ -414,19 +498,86 @@ normalize(Base, _Req, RawOpts) ->
             case SerializedState of
                 not_found -> throw({error, no_lua_state_snapshot_found});
                 State ->
-                    ExternalizedState = binary_to_term(State),
+                    ExternalizedState = decode_snapshot(State, Base, Opts),
                     InternalizedState = luerl:internalize(ExternalizedState),
                     ?event(snapshot, loaded_state_from_snapshot),
-                    {ok, hb_private:set(Base, <<"state">>, InternalizedState, Opts)}
+                    {ok, LibState} =
+                        dev_lua_lib:reinstall(Base, InternalizedState, Opts),
+                    {ok, hb_private:set(Base, <<"state">>, LibState, Opts)}
             end;
         _ ->
             ?event(snapshot, state_already_initialized),
             {ok, Base}
     end.
 
-%% @doc Decode a Lua result into a HyperBEAM `structured@1.0' message.
+%% @doc Decode a snapshot, which may come from the caller, without creating
+%% atoms. Each Erlang function in it that a new state for the base does not
+%% contain becomes `nil'; restore sets the host library functions again.
+decode_snapshot(Serialized, Base, Opts) ->
+    % Collect the garbage of the new state first: sandboxing `package.searchers'
+    % leaves the disk searchers in its table store.
+    Allowed = sets:from_list(collect_mfas(luerl:gc(create_state(Base, Opts)))),
+    strip_host_functions(binary_to_term(Serialized, [safe]), Allowed).
+
+%% @doc Collect the Erlang functions in a term.
+collect_mfas(#erl_mfa{} = MFA) -> [MFA];
+collect_mfas([Head | Tail]) -> collect_mfas(Head) ++ collect_mfas(Tail);
+collect_mfas(Term) when is_tuple(Term) -> collect_mfas(tuple_to_list(Term));
+collect_mfas(Term) when is_map(Term) -> collect_mfas(maps:to_list(Term));
+collect_mfas(_Term) -> [].
+
+%% @doc Replace each Erlang function in a term that is not in `Allowed' with
+%% `nil'. Luerl's wrappers around Lua functions become the Lua functions they
+%% call.
+strip_host_functions(#erl_func{ code = Fun }, Allowed) ->
+    case unwrap_lua_function(Fun) of
+        {ok, LuaFunction} -> strip_host_functions(LuaFunction, Allowed);
+        error -> nil
+    end;
+strip_host_functions(#erl_mfa{} = MFA, Allowed) ->
+    case sets:is_element(MFA, Allowed) of
+        true -> MFA;
+        false -> nil
+    end;
+strip_host_functions(Fun, _Allowed) when is_function(Fun) ->
+    nil;
+strip_host_functions([Head | Tail], Allowed) ->
+    [strip_host_functions(Head, Allowed) | strip_host_functions(Tail, Allowed)];
+strip_host_functions(Term, Allowed) when is_tuple(Term) ->
+    list_to_tuple(strip_host_functions(tuple_to_list(Term), Allowed));
+strip_host_functions(Term, Allowed) when is_map(Term) ->
+    maps:from_list(strip_host_functions(maps:to_list(Term), Allowed));
+strip_host_functions(Term, _Allowed) ->
+    Term.
+
+%% @doc Find the Lua function in one of Luerl's wrappers, which call it with
+%% their arguments. Luerl makes them when it decodes a table that contains a Lua
+%% function and encodes it again, as `dev_lua_lib:install/3' does with `ao'.
+unwrap_lua_function(Fun) when is_function(Fun, 2) ->
+    case [erlang:fun_info(Fun, Item) || Item <- [module, name, env]] of
+        [{module, luerl}, {name, '-encode/2-fun-1-'}, {env, [Inner]}] ->
+            unwrap_lua_function(Inner);
+        [{module, luerl}, {name, '-decode_luafunc/3-fun-0-'}, {env, [Lua]}]
+                when is_record(Lua, funref) ->
+            {ok, Lua};
+        _ ->
+            error
+    end;
+unwrap_lua_function(_Term) ->
+    error.
+
+%% @doc Decode a Lua result into a HyperBEAM `structured@1.0' message, removing
+%% the commitments that do not verify. No commitment is added, so a message
+%% that passes through Lua unchanged keeps exactly the commitments it had.
+%% Every key is a binary, as the cache writes it. A key that is a table, and a
+%% value that is a function or userdata, which Luerl gives as a fun or a tuple,
+%% are dropped, as a message cannot have them.
 decode(EncMsg, Opts) ->
-    hb_message:normalize_commitments(do_decode(EncMsg, Opts), Opts, verify).
+    hb_message:normalize_commitments(
+        do_decode(EncMsg, Opts),
+        Opts,
+        #{ <<"verify">> => all, <<"add-unsigned">> => false }
+    ).
 do_decode(EncMsg, _Opts) when is_list(EncMsg) andalso length(EncMsg) == 0 ->
     % The value is an empty table, so we assume it is a message rather than
     % a list.
@@ -434,8 +585,20 @@ do_decode(EncMsg, _Opts) when is_list(EncMsg) andalso length(EncMsg) == 0 ->
 do_decode(EncMsg = [{_K, _V} | _], Opts) when is_list(EncMsg) ->
     do_decode(
         maps:map(
-            fun(_, V) -> do_decode(V, Opts) end,
-            maps:from_list(EncMsg)
+            fun(Key, V) -> decode_value(Key, do_decode(V, Opts)) end,
+            hb_ao:normalize_keys(
+                maps:from_list(
+                    [
+                        {K, V}
+                    ||
+                        {K, V} <- EncMsg,
+                        not is_list(K),
+                        not is_function(V),
+                        not is_tuple(V)
+                    ]
+                ),
+                Opts
+            )
         ),
         Opts
     );
@@ -453,14 +616,26 @@ do_decode(Msg, Opts) when is_map(Msg) ->
 do_decode(Other, _Opts) ->
     Other.
 
-%% @doc Encode a HyperBEAM `structured@1.0' message into a Lua term.
+%% @doc Decode a value of a message from Lua. Lua gives the Arweave committer
+%% of a commitment as its address, so we convert it back to its URI.
+decode_value(<<"commitments">>, Commitments) when is_map(Commitments) ->
+    map_committers(fun hb_committer:uri/1, Commitments);
+decode_value(_Key, Value) ->
+    Value.
+
+%% @doc Encode a HyperBEAM `structured@1.0' message into a Lua term. Arweave
+%% committers are given to Lua as their addresses, because Lua code compares
+%% them with the addresses that process definitions hold.
 encode(Map, Opts) ->
     hb_message:normalize_commitments(do_encode(Map, Opts), Opts).
 do_encode(Map, Opts) when is_map(Map) ->
     hb_cache:ensure_all_loaded(
         case hb_util:is_ordered_list(Map, Opts) of
             true -> do_encode(hb_util:message_to_ordered_list(Map), Opts);
-            false -> maps:to_list(maps:map(fun(_, V) -> do_encode(V, Opts) end, Map))
+            false ->
+                maps:to_list(
+                    maps:map(fun(K, V) -> encode_value(K, V, Opts) end, Map)
+                )
         end,
         Opts
     );
@@ -469,10 +644,40 @@ do_encode(List, Opts) when is_list(List) ->
         lists:map(fun(V) -> do_encode(V, Opts) end, List),
         Opts
     );
+% Luerl holds Lua's `nil' as the atom `nil'.
+do_encode(nil, _Opts) -> nil;
 do_encode(Atom, _Opts) when is_atom(Atom) and (Atom /= false) and (Atom /= true)->
     hb_util:bin(Atom);
 do_encode(Other, _Opts) ->
     Other.
+
+%% @doc Encode a value of a message for Lua. Lua sees only the signed
+%% commitments of a message: each node makes its own unsigned commitments, so
+%% a script that read them could compute differently on two nodes. The Arweave
+%% committer of a commitment is given as its address.
+encode_value(<<"commitments">>, Commitments, Opts) when is_map(Commitments) ->
+    Signed =
+        hb_maps:filter(
+            fun(_ID, Commitment) ->
+                hb_maps:is_key(<<"committer">>, Commitment, Opts)
+            end,
+            Commitments,
+            Opts
+        ),
+    do_encode(map_committers(fun hb_util:committer_address/1, Signed), Opts);
+encode_value(_Key, Value, Opts) ->
+    do_encode(Value, Opts).
+
+%% @doc Apply `Fun' to the committer of each commitment.
+map_committers(Fun, Commitments) ->
+    maps:map(
+        fun(_ID, Commitment = #{ <<"committer">> := Committer }) ->
+            Commitment#{ <<"committer">> => Fun(Committer) };
+           (_ID, Commitment) ->
+            Commitment
+        end,
+        Commitments
+    ).
 
 %% @doc Parse a Lua stack trace into a list of messages.
 decode_stacktrace(StackTrace, State0, Opts) ->
@@ -560,7 +765,12 @@ post_invocation_message_validation_test() ->
     {ok, ReadMsg} = hb_cache:read(UnsignedID, Opts),
     ?assertEqual(<<"test-value-1">>, hb_ao:get(<<"test-key">>, ReadMsg, Opts)),
     ?assert(length(hb_message:signers(Res, Opts)) == 0),
-    ?assert(hb_message:verify(Res, all, Opts)).
+    ?assert(hb_message:verify(Res, all, Opts)),
+    % Lua sees the signed commitment of the base alone.
+    ?assertEqual({ok, 1}, hb_ao:resolve(Base, <<"commitment_count">>, Opts)),
+    % A `committer' key outside of a commitment is not converted.
+    Bare = #{ <<"committer">> => <<"bare">> },
+    ?assertEqual(Bare, decode(encode(Bare, Opts), Opts)).
 
 load_modules_by_id_test_() ->
     {timeout, 30, fun load_modules_by_id/0}.
@@ -613,6 +823,28 @@ error_response_test() ->
     ?assertEqual(
         {error, <<"Very bad, but Lua caught it.">>},
         hb_ao:resolve(Base, <<"error_response">>, #{})
+    ),
+    % A key with no normalized form is a bad argument, which `pcall' catches.
+    ?assertEqual(
+        {ok, [false, <<"bad argument table,table to 'set'">>]},
+        hb_ao:resolve(Base, <<"ao_set_float_key">>, #{})
+    ),
+    % An exception inside the library call into the node -- here, reading a
+    % message this node does not have -- depends on this node, so it is a
+    % failure, not a result of the computation.
+    ?assertMatch(
+        {failure,
+            #{
+                <<"status">> := 500,
+                <<"body">> := <<"Erlang error while running Lua: ", _/binary>>
+            }
+        },
+        hb_ao:resolve(Base, <<"ao_get_as_missing">>, #{})
+    ),
+    % A result that has a float key cannot be decoded, so it is a failure.
+    ?assertMatch(
+        {failure, _},
+        hb_ao:resolve(Base, <<"float_key_result">>, #{})
     ).
 
 sandboxed_failure_test() ->
@@ -626,7 +858,7 @@ sandboxed_failure_test() ->
         <<"parameters">> => [],
         <<"sandbox">> => true
     },
-    ?assertMatch({error, _}, hb_ao:resolve(Base, <<"sandboxed_fail">>, #{})).
+    ?assertMatch({failure, _}, hb_ao:resolve(Base, <<"sandboxed_fail">>, #{})).
 
 default_sandboxed_failure_test() ->
     {ok, Module} = file:read_file("test/test.lua"),
@@ -638,7 +870,7 @@ default_sandboxed_failure_test() ->
         },
         <<"parameters">> => []
     },
-    ?assertMatch({error, _}, hb_ao:resolve(Base, <<"sandboxed_fail">>, #{})).
+    ?assertMatch({failure, _}, hb_ao:resolve(Base, <<"sandboxed_fail">>, #{})).
 
 minimum_sandbox_overrides_false_test() ->
     {ok, Module} = file:read_file("test/test.lua"),
@@ -651,7 +883,7 @@ minimum_sandbox_overrides_false_test() ->
         <<"parameters">> => [],
         <<"sandbox">> => false
     },
-    ?assertMatch({error, _}, hb_ao:resolve(Base, <<"sandboxed_fail">>, #{})).
+    ?assertMatch({failure, _}, hb_ao:resolve(Base, <<"sandboxed_fail">>, #{})).
 
 lua_minimum_sandbox_can_be_disabled_test() ->
     {ok, Module} = file:read_file("test/test.lua"),
@@ -717,7 +949,7 @@ io_popen_is_sandboxed_by_default_test() ->
         },
         <<"parameters">> => []
     },
-    ?assertMatch({error, _}, hb_ao:resolve(Base, <<"popen_fail">>, #{})).
+    ?assertMatch({failure, _}, hb_ao:resolve(Base, <<"popen_fail">>, #{})).
 
 require_cannot_load_from_disk_test() ->
     % Untrusted code cannot restore `require's filesystem search by
@@ -834,7 +1066,9 @@ ao_core_resolution_from_lua_test() ->
         <<"parameters">> => []
     },
     {ok, Res} = hb_ao:resolve(Base, <<"ao_resolve">>, #{}),
-    ?assertEqual(<<"Hello, AO world!">>, Res).
+    ?assertEqual(<<"Hello, AO world!">>, Res),
+    % A key that `ao.set' sets to `nil' is removed, and `ao.get' gives `nil'.
+    ?assertEqual({ok, <<"nil">>}, hb_ao:resolve(Base, <<"ao_set_nil">>, #{})).
 
 %% @doc Benchmark the performance of Lua executions.
 direct_benchmark_test() ->
@@ -886,7 +1120,12 @@ invoke_non_compute_key_test() ->
             #{}
         ),
     ?event({result2, Result2}),
-    ?assertEqual(<<"Alice">>, hb_ao:get(<<"hello">>, Result2, #{})).
+    ?assertEqual(<<"Alice">>, hb_ao:get(<<"hello">>, Result2, #{})),
+    % A key with no function in the script is not found.
+    ?assertEqual(
+        {error, not_found},
+        hb_ao:resolve(Base, <<"no_function">>, #{})
+    ).
 
 %% @doc Use a Lua module as a hook on the HTTP server via `~meta@1.0'.
 lua_http_hook_test() ->
@@ -934,6 +1173,50 @@ pure_lua_restore_test() ->
     {ok, Count2} = hb_ao:resolve(Process, <<"now/count">>, Opts),
     ?assertEqual(2, Count2).
 
+%% @doc Snapshots of a Lua state do not contain the wallet of the node, and
+%% restore to a state whose AO-Core library functions still resolve.
+snapshot_excludes_node_wallet_test() ->
+    Wallet = #{ <<"priv">> := #{ <<"d">> := PrivKey } } = ar_wallet:new(),
+    Opts = #{
+        <<"priv-wallet">> => Wallet,
+        <<"store">> => [hb_test_utils:test_store()]
+    },
+    {ok, Script} = file:read_file("test/test.lua"),
+    {ok, ModuleID} =
+        hb_cache:write(
+            #{
+                <<"content-type">> => <<"application/lua">>,
+                <<"body">> => Script
+            },
+            Opts
+        ),
+    Node = hb_http_server:start_node(Opts),
+    % Snapshot the state over HTTP after an invocation.
+    {ok, Snapshot} =
+        hb_http:get(
+            Node,
+            <<
+                "/~lua@5.3a&module=", ModuleID/binary,
+                "/init/hello~lua@5.3a/snapshot~lua@5.3a/body"
+            >>,
+            #{}
+        ),
+    ?assertEqual(nomatch, binary:match(Snapshot, PrivKey)),
+    % Restore the state and call a function that uses the AO-Core library.
+    {ok, Restored} =
+        hb_ao:resolve(
+            #{
+                <<"device">> => <<"lua@5.3a">>,
+                <<"snapshot">> => #{ <<"body">> => Snapshot }
+            },
+            <<"normalize">>,
+            Opts
+        ),
+    ?assertEqual(
+        {ok, <<"Hello, AO world!">>},
+        hb_ao:resolve(Restored, <<"ao_resolve">>, Opts)
+    ).
+
 pure_lua_process_benchmark_test_() ->
     {timeout,
         30,
@@ -976,8 +1259,18 @@ invoke_aos_test() ->
     {ok, _Assignment} =
         hb_ao:resolve(Process, Message, Opts#{ <<"hashpath">> => ignore }),
     {ok, Results} = hb_ao:resolve(Process, <<"now/results/output">>, Opts),
+    % The process gives its authority by address, and trusts its message.
     ?assertEqual(<<"1">>, hb_ao:get(<<"data">>, Results, #{})),
-    ?assertEqual(<<"aos> ">>, hb_ao:get(<<"prompt">>, Results, #{})).
+    ?assertEqual(<<"aos> ">>, hb_ao:get(<<"prompt">>, Results, #{})),
+    % A process that does not set `requires-determinism' cannot call
+    % `math.random'.
+    RandomMessage = generate_test_message(Process, Opts, <<"math.random">>),
+    {ok, _} =
+        hb_ao:resolve(Process, RandomMessage, Opts#{ <<"hashpath">> => ignore }),
+    ?assertEqual(
+        {ok, <<"sandboxed">>},
+        hb_ao:resolve(Process, <<"now/results/output/data">>, Opts)
+    ).
 
 aos_authority_not_trusted_test() ->
     Opts = #{ <<"priv-wallet">> => ar_wallet:new() },

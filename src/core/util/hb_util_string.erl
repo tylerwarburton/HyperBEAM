@@ -5,7 +5,7 @@
 %%% full Unicode folding and throws on invalid UTF-8). `dash_chars/1' only swaps
 %%% the ASCII byte `_'<->`-' and never folds, so it is exact for all input.
 -module(hb_util_string).
--export([lowercase/1, key_chars/1, canon_chars/1, dash_chars/1]).
+-export([lowercase/1, key_chars/1, dash_chars/1]).
 -export([normalize_path/1]).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -22,11 +22,6 @@ lowercase(_Bin) ->
 %% @doc ASCII-lowercase and map `-' to `_' (the `key_to_atom' transform), or
 %% return `non_ascii' if any byte is >= 0x80.
 key_chars(_Bin) ->
-    erlang:nif_error(not_loaded).
-
-%% @doc ASCII-lowercase and map `_' to `-' (the `hb_opts' `canonical_key'
-%% transform), or return `non_ascii' if any byte is >= 0x80.
-canon_chars(_Bin) ->
     erlang:nif_error(not_loaded).
 
 %% @doc Map `_' to `-' — the `atom_to_dashed_binary' transform. Exact for all
@@ -55,12 +50,6 @@ key_chars_test() ->
     ?assertEqual(<<"a_b_c">>, key_chars(<<"A-B-C">>)),
     ?assertEqual(<<>>, key_chars(<<>>)),
     ?assertEqual(non_ascii, key_chars(<<"A-B", 16#C5>>)).
-
-canon_chars_test() ->
-    ?assertEqual(<<"content-type">>, canon_chars(<<"Content_Type">>)),
-    ?assertEqual(<<"a-b-c">>, canon_chars(<<"A_B_C">>)),
-    ?assertEqual(<<>>, canon_chars(<<>>)),
-    ?assertEqual(non_ascii, canon_chars(<<"A_B", 16#C5>>)).
 
 dash_chars_test() ->
     ?assertEqual(<<"atom-1">>, dash_chars(<<"atom_1">>)),
@@ -103,9 +92,6 @@ equivalence_test() ->
     OldKey = fun(K) ->
         string:lowercase(binary:replace(K, <<"-">>, <<"_">>, [global]))
     end,
-    OldCanon = fun(K) ->
-        string:lowercase(binary:replace(K, <<"_">>, <<"-">>, [global]))
-    end,
     OldDash = fun(B) ->
         re:replace(B, <<"_">>, <<"-">>, [global, {return, binary}])
     end,
@@ -113,5 +99,4 @@ equivalence_test() ->
               <<"ALLCAPS">>, <<"123-456_789">>, <<>>],
     [ ?assertEqual(iolist_to_binary(OldLower(I)), lowercase(I)) || I <- Inputs ],
     [ ?assertEqual(iolist_to_binary(OldKey(I)), key_chars(I)) || I <- Inputs ],
-    [ ?assertEqual(iolist_to_binary(OldCanon(I)), canon_chars(I)) || I <- Inputs ],
     [ ?assertEqual(iolist_to_binary(OldDash(I)), dash_chars(I)) || I <- Inputs ].
