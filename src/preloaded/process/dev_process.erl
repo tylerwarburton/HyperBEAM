@@ -44,7 +44,7 @@
 %%% Public API
 -export([device_info/1]).
 -export([as/3, compute/3, schedule/3, slot/3, now/3, push/3, snapshot/3]).
--export([target_slot/2]).
+-export([target_slot/2, request_slot/2, is_cached_state/1]).
 -export([default_device/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("include/hb.hrl").
@@ -225,8 +225,11 @@ init(Base, Req, Opts) ->
 compute(Base, Req, Opts) ->
     ProcBase = lib_process:ensure_process_key(Base, Opts),
     ProcID = lib_process:process_id(ProcBase, #{}, Opts),
-    TargetSlot = target_slot(Req, Opts),
+    TargetSlot = request_slot(Req, Opts),
     case TargetSlot of
+        {invalid, RawSlot} ->
+            ?event(compute, {invalid_slot_requested, {slot, RawSlot}}, Opts),
+            {error, invalid_slot_error()};
         not_found ->
             % The slot is not set, so we need to serve the latest known state
             % unless the `init' key is set to a value aside from `now'.
@@ -237,8 +240,7 @@ compute(Base, Req, Opts) ->
                 _ ->
                     {error, not_found}
             end;
-        RawSlot ->
-            Slot = hb_util:int(RawSlot),
+        Slot ->
             case lib_process_cache:read(ProcID, Slot, Opts) of
                 {ok, Result} ->
                     % The result is already cached, so we can return it.
@@ -249,7 +251,7 @@ compute(Base, Req, Opts) ->
                             {result, Result}
                         }
                     ),
-                    {ok, without_snapshot(Result, Opts)};
+                    {ok, mark_cached_state(without_snapshot(Result, Opts), Opts)};
                 {error, not_found} ->
                     {ok, Loaded} = ensure_loaded(ProcBase, Req, Opts),
                     ?event(compute,
@@ -276,6 +278,78 @@ target_slot(Req, Opts) ->
         ],
         Opts
     ).
+
+%% @doc Return the slot a `compute' request asks for as an integer of at least
+%% -1, `not_found' when it names none, or `{invalid, Raw}'.
+%%
+%% This is the one reading of a request's slot: `compute/3', the process
+%% worker, its grouper and its waiters all use it, so they cannot disagree on
+%% which slot a request means -- `compute' takes precedence over `slot', as in
+%% `target_slot/2'. A slot that is not an integer, or is below -1, can never
+%% name a state; it is reported here instead of crashing `hb_util:int/1' or
+%% reaching `compute_to_slot/6', where such a target rewinds to nothing and
+%% throws.
+%%
+%% -1 is a real state: the initialized process before its first assignment
+%% (`init/3' sets `at-slot' to -1), and the `current' slot the scheduler
+%% reports for a process with no assignments yet. `now/3' asks for exactly
+%% that slot, so rejecting it answered every `now' on a fresh process with a
+%% 400 instead of its initial state.
+%%
+%% A request that carries its slot as a plain literal -- every HTTP `compute'
+%% does -- is read directly: resolving the keys through `message@1.0' costs
+%% ~125us, and this runs in the grouper, the worker and each waiter on every
+%% request. Any other shape (a link, a typed or wrapped value, no literal at
+%% all) takes the full `target_slot/2' path.
+request_slot(Req, Opts) when is_map(Req) ->
+    case literal_slot(Req) of
+        {ok, Raw} -> parse_slot(Raw);
+        not_literal -> request_slot_resolved(Req, Opts)
+    end;
+request_slot(Req, Opts) ->
+    request_slot_resolved(Req, Opts).
+
+request_slot_resolved(Req, Opts) ->
+    case target_slot(Req, Opts) of
+        not_found -> not_found;
+        Raw -> parse_slot(unwrap_slot(Raw))
+    end.
+
+%% @doc The slot a request carries as a literal value, in `target_slot/2''s
+%% precedence order, if it carries one that way.
+literal_slot(#{ <<"compute">> := Slot }) when is_integer(Slot); is_binary(Slot) ->
+    {ok, Slot};
+literal_slot(Req = #{ <<"slot">> := Slot })
+        when is_integer(Slot) orelse is_binary(Slot),
+            not is_map_key(<<"compute">>, Req),
+            not is_map_key(<<"compute+link">>, Req) ->
+    {ok, Slot};
+literal_slot(_) ->
+    not_literal.
+
+parse_slot(Slot) when is_integer(Slot), Slot >= -1 -> Slot;
+parse_slot(Slot) when is_binary(Slot); is_list(Slot) ->
+    try hb_util:int(Slot) of
+        Int when Int >= -1 -> Int;
+        _ -> {invalid, Slot}
+    catch error:badarg -> {invalid, Slot}
+    end;
+parse_slot(Slot) -> {invalid, Slot}.
+
+%% @doc The error returned for a request whose slot cannot name an assignment.
+invalid_slot_error() ->
+    #{
+        <<"status">> => 400,
+        <<"body">> => <<"Invalid slot: expected an integer of at least -1.">>
+    }.
+
+%% @doc Unwrap an HTTP typed-result map to the scalar it carries. Any other
+%% term -- including `not_found', which both callers depend on -- is returned
+%% untouched.
+unwrap_slot(Slot) when is_map(Slot) ->
+    maps:get(maps:get(<<"ao-result">>, Slot, <<"body">>), Slot, Slot);
+unwrap_slot(Slot) ->
+    Slot.
 
 %% @doc Continually get and apply the next assignment from the scheduler until
 %% we reach the target slot that the user has requested.
@@ -758,7 +832,15 @@ now(RawBase, Req, Opts) ->
                         {error, _} = Error ->
                             Error;
                         true ->
-                            LatestMsg = without_snapshot(RawLatestMsg, Opts),
+                            % Marked as a cache hit: it is public state only
+                            % (never a base to compute from), and the store
+                            % already holds it, so result caching must not
+                            % write it back on every read.
+                            LatestMsg =
+                                mark_cached_state(
+                                    without_snapshot(RawLatestMsg, Opts),
+                                    Opts
+                                ),
                             ?event(compute_cache,
                                 {serving_latest_cached_state,
                                     {proc_id, ProcessID},
@@ -821,6 +903,21 @@ push(Base, Req, Opts) ->
 %% @doc Ensure that the process message we have in memory is live and
 %% up-to-date.
 ensure_loaded(Base, Req, Opts) ->
+    case is_cached_state(Base) of
+        true ->
+            % A state read back from the cache (or sent to a listener) is
+            % public only: it has no execution-device state, so it must never
+            % be computed onward. Restore from the process definition instead.
+            ensure_loaded_state(
+                hb_maps:get(<<"process">>, Base, Base, Opts),
+                Req,
+                Opts
+            );
+        false ->
+            ensure_loaded_state(Base, Req, Opts)
+    end.
+
+ensure_loaded_state(Base, Req, Opts) ->
     % Get the nonce we are currently on and the inbound nonce.
     TargetSlot = hb_ao:get(<<"slot">>, Req, undefined, Opts),
     ProcID = lib_process:process_id(Base, #{}, Opts),
@@ -913,6 +1010,18 @@ ensure_loaded(Base, Req, Opts) ->
                     )
             end
     end.
+
+%% @doc Mark a state that was read back from the process cache. Cached states
+%% are public only: they carry no execution-device state (for Lua, no VM), so
+%% they are answers, never a base to compute the next slot from.
+mark_cached_state(Msg, Opts) ->
+    hb_private:set(Msg, #{ <<"process-cached-state">> => true }, Opts).
+
+%% @doc Return `true' if a state came from the process cache rather than from
+%% executing the process.
+is_cached_state(Msg) ->
+    maps:get(<<"process-cached-state">>, hb_private:from_message(Msg), false)
+        =:= true.
 
 %% @doc Remove the `snapshot' key from a message and return it.
 without_snapshot(Msg, Opts) ->

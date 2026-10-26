@@ -23,6 +23,19 @@
 %% Base is not used, such that it can specify cache control information about 
 %% itself, without affecting its outputs. Cache identity uses the varied inputs.
 maybe_store(Base, Req, Res, OriginalReq, Opts) ->
+    case is_process_cached_state(Base) orelse is_process_cached_state(Res) of
+        true ->
+            % A process state read back from the process cache is already
+            % durable there. Writing it again re-serializes and re-hashes the
+            % whole state on every `now' read, and on every key read from it,
+            % for no new data.
+            ?event(caching, {skip_store, process_cached_state}),
+            not_caching;
+        false ->
+            maybe_store_by_settings(Base, Req, Res, OriginalReq, Opts)
+    end.
+
+maybe_store_by_settings(Base, Req, Res, OriginalReq, Opts) ->
     case derive_cache_settings([Res, OriginalReq], Opts) of
         #{ <<"store">> := true } ->
             ?event(caching, {caching_result, {base, Base}, {req, Req}, {res, Res}}),
@@ -74,6 +87,14 @@ maybe_lookup(Base, Req, _OriginalBase, OriginalReq, Opts) ->
     end.
 
 %%% Internal functions
+
+%% @doc Is this a process state served from the process cache? The process
+%% device marks such states privately with `process-cached-state'.
+is_process_cached_state(Msg) when is_map(Msg) ->
+    maps:get(<<"process-cached-state">>, hb_private:from_message(Msg), false)
+        =:= true;
+is_process_cached_state(_) ->
+    false.
 
 %% @doc Dispatch the cache write to a worker process if requested.
 %% Invoke the appropriate cache write function based on the type of the message.
@@ -773,3 +794,25 @@ async_computation_writes_test() ->
             end
         end, 2000))
     end, [<<"first">>, <<"second">>]).
+
+%% A process state served from the process cache is never written back, even
+%% when the node asks for every result to be stored.
+process_cached_state_not_stored_test() ->
+    Cached =
+        #{
+            <<"count">> => <<"1">>,
+            <<"priv">> => #{ <<"process-cached-state">> => true }
+        },
+    Always = #{ <<"cache-control">> => [<<"always">>] },
+    Now = #{ <<"path">> => <<"now">> },
+    ?assertEqual(not_caching, maybe_store(#{}, Now, Cached, Now, Always)),
+    ?assertEqual(
+        not_caching,
+        maybe_store(
+            Cached,
+            #{ <<"path">> => <<"count">> },
+            <<"1">>,
+            #{ <<"path">> => <<"count">> },
+            Always
+        )
+    ).
