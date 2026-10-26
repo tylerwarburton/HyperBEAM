@@ -296,10 +296,20 @@ do_assign(State, Message, ReplyPID) ->
                 State
             ),
             ?event(writes_complete),
-            ?event(uploading_message),
-            upload(Message, Opts),
-            upload(Assignment, Opts),
-            ?event(uploads_complete),
+            % Publishing is a network round trip made inside the scheduling
+            % loop, so it holds every later slot behind this one's upload:
+            % measured at ~120 ms a message, 8 msg/s, on a node with no
+            % reachable bundler. `scheduler-publish-remote => false' keeps a
+            % node's schedule local.
+            case hb_opts:get(scheduler_publish_remote, true, Opts) of
+                false ->
+                    ?event(remote_publication_disabled);
+                _ ->
+                    ?event(uploading_message),
+                    upload(Message, Opts),
+                    upload(Assignment, Opts),
+                    ?event(uploads_complete)
+            end,
             maybe_inform_recipient(
                 remote_confirmation,
                 ReplyPID,
