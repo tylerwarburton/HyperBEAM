@@ -104,6 +104,17 @@ is_async(Process, Req, Opts) ->
         )
     ) =:= <<"true">>.
 
+%% @doc The push's compute is nested, so `hb_ao' has stripped `spawn-worker'
+%% from its options. With `process-worker-spawn => true' it asks for the
+%% process's worker again, as `dev_process:worker_spawn_opts/1' does for
+%% `now', so the slots a push computes stay in a live VM instead of each push
+%% rebuilding the process from the cache.
+worker_spawn_opts(Opts) ->
+    case hb_opts:get(<<"process-worker-spawn">>, false, Opts) of
+        true -> Opts#{ <<"spawn-worker">> => true };
+        _ -> Opts
+    end.
+
 %% @doc Push a message or slot number, including its downstream results.
 do_push(PrimaryProcess, Assignment, Opts) ->
     Slot = hb_ao:get(<<"slot">>, Assignment, Opts),
@@ -114,7 +125,7 @@ do_push(PrimaryProcess, Assignment, Opts) ->
             hb_ao:resolve(
                 {as, <<"process@1.0">>, PrimaryProcess},
                     #{ <<"path">> => <<"compute/results">>, <<"slot">> => Slot },
-                    Opts#{ <<"hashpath">> => ignore }
+                    (worker_spawn_opts(Opts))#{ <<"hashpath">> => ignore }
                 )
         catch
             Class:Reason:Trace ->

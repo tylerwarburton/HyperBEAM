@@ -159,6 +159,36 @@ The counter's own state is a few bytes of this. RC7 stores every field of every
 message and commitment as its own row; that layout is what the storage unit has
 to change. Tool: `bench/census.erl` (run via `hb eval`), diffed per row kind.
 
+## The real game on RC7 (2026-10-26)
+
+Game on `lua-patch@1.0`, 28 fixture players, the port's required node config,
+`contract-latency.mjs --game-phase basic`. The monorepo client signs with
+`HB_HTTPSIG=v011`.
+
+Before push spawned a worker, every slot was computed twice: once as its own
+target, then again by the next request, which started from the state before
+it (`slot N, target N+1`, store 150-185 ms). Each request was a new process;
+no worker was used. With `process-worker-spawn` covering push's compute too,
+the game reached 43 slots with 44 patch applications: each slot computed
+once.
+
+Round trip per action, same harness, same SSH tunnel, 5 samples (absolute
+numbers include the tunnel and the harness's 250 ms poll):
+
+| Action | Old fork, bench config | RC7 branch |
+|---|---:|---:|
+| `User.Info` | 1,126 ms | 656 ms |
+| `Sprite.Update` | 1,144 ms | 690 ms |
+| `Monster.LevelUp` | 1,253 ms | 820 ms |
+| `Monster.Feed` | 1,172 ms | 898 ms |
+| `Market.List` | 1,223 ms | 862 ms |
+| `Market.Cancel` | 1,222 ms | 861 ms |
+
+The old fork bench node runs a basic config, not prod's (no compute on
+schedule), so this is not yet the final comparison. A worker's slots print no
+`computed_slot` line (its options drop `debug-print`), so per-phase node
+timing for worker-computed slots is still to do.
+
 RC7's built-in benchmarks on the same box: scheduler alone 258 msg/s (no
 compute, no HTTP; this is where "200-400 msg/s" comes from), pure Lua process
 46 slots/s, aos process 20 slots/s.
