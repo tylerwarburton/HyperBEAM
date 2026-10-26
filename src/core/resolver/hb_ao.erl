@@ -758,19 +758,27 @@ resolve_stage(10, Base, Req, Res, Original, ExecName, Opts) ->
 resolve_stage(11, _Base, _Req, Res, _Original, undefined, _Opts) ->
     % Cached and awaited results do not start a worker.
     Res;
-resolve_stage(11, _Base, _Req, {ok, Res} = Res, _Original, ExecName, Opts) ->
+resolve_stage(11, _Base, _Req, {ok, Res} = FullRes, _Original, ExecName, Opts) ->
     ?event_debug(debug_ao_core, {stage, 11, ExecName, maybe_spawn_worker}, Opts),
-    % Check if we should fork out a new worker process for the current execution
+    % Check if we should fork out a new worker process for the current execution.
+    % The head used to be `{ok, Res} = Res', which no term matches, so no
+    % worker was ever spawned. `ungrouped_exec' is the sentinel for a
+    % resolution that was never registered under a name: there is nothing for
+    % a worker to be found under, and spawning one would leak a process per
+    % request, all under that one name.
     case
-        {is_map(Res), hb_opts:get(spawn_worker, false, Opts#{ <<"prefer">> => local })}
+        {
+            is_map(Res),
+            ExecName =/= ungrouped_exec,
+            hb_opts:get(spawn_worker, false, Opts#{ <<"prefer">> => local })
+        }
     of
-        {A, B} when (A == false) or (B == false) ->
-            Res;
-        {_, _} ->
-            % Spawn a worker for the current execution
+        {true, true, SpawnWorker} when SpawnWorker =/= false ->
             WorkerPID = hb_persistent:start_worker(ExecName, Res, Opts),
             hb_persistent:forward_work(WorkerPID, Opts),
-            Res
+            FullRes;
+        _ ->
+            FullRes
     end;
 resolve_stage(11, _Base, _Req, OtherRes, _Original, _ExecName, _Opts) ->
     ?event_debug(debug_ao_core, {stage, 11, _ExecName, abnormal_status_skip_spawning}, _Opts),
