@@ -38,6 +38,7 @@ Settings our v0.11 nodes run with, each one decided or measured:
 | `scheduler-lookahead` | `false` | with workers live, lookahead waits 1.5 s per request |
 | `process-snapshot-target` | `false` | no whole-VM snapshot per message once a worker holds the VM (decided 2026-10-26) |
 | `match-index` | `false` | RC7 indexes every key/value for `~match@1.0`, which we do not use: 23 of 100 rows a message. Off: 23.7 -> 18.1 KB/msg, 84 -> 78.5 ms |
+| `process-delta-cache` | `true` | store a slot as its patches between checkpoints: store 50 -> 4 ms a slot, disk -63% (2026-10-26) |
 
 ## Port order
 
@@ -236,6 +237,20 @@ two alternating runs per build:
 
 Store is the largest cost of a slot: RC7 writes the whole process state every
 slot. Next is delta persistence.
+
+Delta storage (`process-delta-cache`), game, 98 slots a run, two runs each:
+
+| | Delta off (RC7) | Delta on |
+|---|---:|---:|
+| store per slot | 50-52 ms | 4 ms |
+| node time per slot (execution + store) | ~92 ms | ~47 ms |
+| disk growth per run | 19 MiB | 7 MiB |
+| Lua per slot | 29-34 ms | 32-33 ms |
+
+One process now computes ~21 game actions a second instead of ~11. The 7 MiB
+left is mostly fixed: the 620 KB module, the slot-0 checkpoint, the helper
+process. Round trips through the WAN tunnel improve less (640-950 vs
+730-990 ms), as the tunnel and polling dominate them.
 
 RC7's built-in benchmarks on the same box: scheduler alone 258 msg/s (no
 compute, no HTTP; this is where "200-400 msg/s" comes from), pure Lua process
