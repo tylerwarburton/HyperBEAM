@@ -109,10 +109,23 @@ old fork got live workers from compute-on-schedule (unit 12) and from handing
 compute to a worker before execution (unit 5). RC7's hb_opts fallback is its
 built-in defaults and environment only, not the node config.
 
-A first attempt, an opt-in `process-worker-spawn` that re-adds
-`spawn-worker` on `now`'s compute, made the round trip 1,590 ms (from 90) and
-was not landed; the patch is kept aside. Next: port unit 5 (hand compute to
-the worker before execution) and find the ~1.5 s wait first.
+Fixed by an opt-in `process-worker-spawn` (committed): process computes
+carry `spawn-worker`, verified with a trace (one worker started, every request
+delegated to it). It needs `scheduler-lookahead => false`: with lookahead on,
+a live worker waits 1.5 s (`LOOKAHEAD_TIMEOUT`) for a slot that does not exist
+yet, and the round trip went 90 -> 1,590 ms. Our node configs already set it.
+
+With workers live, 200 sequential messages, two runs each:
+
+| `process-snapshot-target` | Store per message | Round trip |
+|---|---|---|
+| `true` (RC7 default) | 24.0-24.1 KB | 87 ms |
+| `false` | 24.0 KB | 84-85 ms |
+
+Off no longer costs anything once a worker holds the VM. This counter's
+snapshot is tiny, so the ~24 KB per message is other overhead, still to be
+attributed. For the game, whose snapshot is megabytes, off should matter a
+lot.
 
 Every bench now prints `worker_starts`, so a run without workers is visible.
 
