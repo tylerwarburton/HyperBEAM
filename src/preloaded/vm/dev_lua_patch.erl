@@ -102,6 +102,8 @@ compute(Key, RawBase, RawReq, Opts) ->
         {lua_patch_timing, {prep_us, T1 - T0}, {lua_us, T2 - T1}},
         Opts
     ),
+    hb_phase_timer:record(lua_patch_prep, T1 - T0),
+    hb_phase_timer:record(lua_patch_lua, T2 - T1),
     process_response(Response, Base, OldPriv, Opts).
 
 %% @doc Normalize the two supported Lua return shapes.
@@ -120,6 +122,8 @@ process_response({ok, [Status, Encoded], NewState}, Base, Priv, Opts) ->
                 },
                 Opts
             ),
+            hb_phase_timer:record(lua_patch_decode, DecodeMicros),
+            hb_phase_timer:record(lua_patch_apply, ApplyMicros),
             case Applied of
                 {ok, Patched, Delta} ->
                     {
