@@ -100,6 +100,22 @@ a target): 22.4 KB vs 22.3 KB.
 Every step is judged on speed, reliability, memory and storage. A step that
 improves one and costs another goes to Tyler before it lands.
 
+After units 1-4, measured again with `spawn-worker` and `process-workers`
+on: no change from before (round trip ~90 ms, 24 KB per message). A trace
+showed why: **no process worker ever starts on RC7.** `spawn-worker` is a
+temporary option that `hb_ao` strips from every nested execution, and a
+process compute is always nested (inside `now`, a push, the scheduler). The
+old fork got live workers from compute-on-schedule (unit 12) and from handing
+compute to a worker before execution (unit 5). RC7's hb_opts fallback is its
+built-in defaults and environment only, not the node config.
+
+A first attempt, an opt-in `process-worker-spawn` that re-adds
+`spawn-worker` on `now`'s compute, made the round trip 1,590 ms (from 90) and
+was not landed; the patch is kept aside. Next: port unit 5 (hand compute to
+the worker before execution) and find the ~1.5 s wait first.
+
+Every bench now prints `worker_starts`, so a run without workers is visible.
+
 RC7's built-in benchmarks on the same box: scheduler alone 258 msg/s (no
 compute, no HTTP; this is where "200-400 msg/s" comes from), pure Lua process
 46 slots/s, aos process 20 slots/s.
