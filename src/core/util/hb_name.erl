@@ -4,7 +4,7 @@
 %%% An important characteristic of these functions is that they are atomic:
 %%% There can only ever be one registrant for a given name at a time.
 -module(hb_name).
--export([start/0, register/1, register/2, unregister/1, lookup/1, all/0]).
+-export([start/0, register/1, register/2, handoff/3, unregister/1, lookup/1, all/0]).
 -export([singleton/2, atomic/2, ok_or_atomic_apply/2, ok_or_atomic_apply/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -58,6 +58,21 @@ unregister(Name) ->
     start(),
     ets:delete(?NAME_TABLE, Name),
     ok.
+
+%% @doc Hand a non-atom name to another PID while the old owner still holds it.
+%% Registration cannot race this: `insert_new' keeps failing until the
+%% replacement is done, so there is no moment the name is unregistered.
+handoff(Name, From, To)
+        when not is_atom(Name), is_pid(From), is_pid(To) ->
+    start(),
+    case ets:lookup(?NAME_TABLE, Name) of
+        [{Name, From}] ->
+            true = ets:insert(?NAME_TABLE, {Name, To}),
+            ok;
+        _ -> error
+    end;
+handoff(_Name, _From, _To) ->
+    error.
 
 %% @doc Atomic singleton lookup/spawn+register operation.
 %% 
@@ -370,3 +385,14 @@ all_test() ->
             2000
         ) andalso length(hb_name:all())
     ).
+
+handoff_test() ->
+    Name = {handoff, os:timestamp()},
+    Parent = self(),
+    NewOwner = spawn(fun() -> receive stop -> ok end end),
+    ?assertEqual(ok, ?MODULE:register(Name, Parent)),
+    ?assertEqual(ok, handoff(Name, Parent, NewOwner)),
+    ?assertEqual(NewOwner, lookup(Name)),
+    ?assertEqual(error, handoff(Name, Parent, self())),
+    NewOwner ! stop,
+    ?MODULE:unregister(Name).

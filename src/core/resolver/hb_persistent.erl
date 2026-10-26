@@ -10,8 +10,11 @@
 
 -module(hb_persistent).
 -export([start_monitor/0, start_monitor/1, stop_monitor/1]).
--export([find_or_register/3, unregister_notify/4, await/4, notify/4]).
--export([group/3, start_worker/3, start_worker/2, forward_work/2]).
+-export([find_or_register/3, unregister_notify/4, await/4, await/5, notify/4]).
+-export([group/3, start_worker/3, start_worker/2, forward_work/2, forward_work/3]).
+
+%% How many times `find_or_register/3' retries a lost registration race.
+-define(REGISTER_ATTEMPTS, 8).
 -export([default_grouper/3, default_worker/3, default_await/5]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -109,30 +112,57 @@ find_or_register(Base, Req, Opts) ->
     find_or_register(group(Base, Req, Opts), Base, Req, Opts).
 find_or_register(ungrouped_exec, _Base, _Req, _Opts) ->
     {leader, ungrouped_exec};
-find_or_register(GroupName, Base, Req, Opts) ->
+find_or_register(GroupName, _Base, _Req, Opts) ->
     case hb_opts:get(await_inprogress, false, Opts) of
         false -> {leader, GroupName};
+        _ -> find_or_register_group(GroupName, Opts, ?REGISTER_ATTEMPTS)
+    end.
+
+%% @doc Find the live leader of a group, or register as it. A lost
+%% registration race is retried, bounded: the bound only guards against a name
+%% that churns on every attempt, which then runs unserialised. The leader is
+%% returned with the group name it is registered under, which is the only name
+%% its `receive' matches (see `await/5').
+find_or_register_group(GroupName, _Opts, 0) ->
+    ?event({register_attempts_exhausted, {group, GroupName}}),
+    {leader, ungrouped_exec};
+find_or_register_group(GroupName, Opts, Attempts) ->
+    Self = self(),
+    case find_execution(GroupName, Opts) of
+        {ok, Leader} when Leader =/= Self ->
+            ?event({found_leader, GroupName, {leader, Leader}}),
+            {wait, Leader, GroupName};
+        {ok, Leader} when Leader =:= Self ->
+            {infinite_recursion, GroupName};
         _ ->
-            Self = self(),
-            case find_execution(GroupName, Opts) of
-                {ok, Leader} when Leader =/= Self ->
-                    ?event({found_leader, GroupName, {leader, Leader}}),
-                    {wait, Leader};
-                {ok, Leader} when Leader =:= Self ->
-                    {infinite_recursion, GroupName};
-                _ ->
-                    ?event({register_resolver, {group, GroupName}}),
-                    case register_groupname(GroupName, Opts) of
-                        ok -> {leader, GroupName};
-                        error -> find_or_register(GroupName, Base, Req, Opts)
-                    end
+            ?event({register_resolver, {group, GroupName}}),
+            case register_groupname(GroupName, Opts) of
+                ok -> {leader, GroupName};
+                error ->
+                    ?event({register_race_lost, {group, GroupName}}),
+                    find_or_register_group(GroupName, Opts, Attempts - 1)
             end
     end.
 
 %% @doc Unregister as the leader for an execution and notify waiting processes.
 unregister_notify(ungrouped_exec, _Req, _Res, _Opts) -> ok;
 unregister_notify(GroupName, Req, Res, Opts) ->
-    unregister_groupname(GroupName, Opts),
+    % When this execution is about to hand its state to a worker, keep the
+    % name: `start_worker/3' hands it to the worker directly. Unregistering
+    % first left a gap in which a new request found no leader and started a
+    % second execution of the same group.
+    KeepForHandoff =
+        not is_atom(GroupName) andalso
+        case Res of
+            {ok, Msg} when is_map(Msg) ->
+                hb_opts:get(spawn_worker, false,
+                    Opts#{ <<"prefer">> => local }) =/= false;
+            _ -> false
+        end,
+    case KeepForHandoff of
+        true -> ok;
+        false -> unregister_groupname(GroupName, Opts)
+    end,
     notify(GroupName, Req, Res, Opts).
 
 %% @doc Find a group with the given name.
@@ -177,6 +207,13 @@ unregister_groupname(Groupname, _Opts) ->
 %% we should register with them and wait for them to notify us of
 %% completion.
 await(Worker, Base, Req, Opts) ->
+    await(Worker, group(Base, Req, Opts), Base, Req, Opts).
+
+%% @doc Wait on a leader under the group name it is registered under.
+%% Re-deriving the name here can give a different one (a grouper may depend on
+%% what the cache holds), and a request sent under a name the leader does not
+%% `receive' sits in its mailbox while the caller waits.
+await(Worker, GroupName, Base, Req, Opts) ->
     % Get the device's await function, if it exists.
     AwaitFun =
         hb_maps:get(
@@ -185,18 +222,18 @@ await(Worker, Base, Req, Opts) ->
             fun default_await/5,
 			Opts
         ),
-    % Calculate the compute path that we will wait upon resolution of.
-    % Register with the process.
-    GroupName = group(Base, Req, Opts),
     % set monitor to a worker, so we know if it exits
     Ref = erlang:monitor(process, Worker),
     Worker ! {resolve, self(), GroupName, Req, Opts},
-    case find_execution(GroupName, Opts) of
-        {ok, Worker} -> AwaitFun(Worker, GroupName, Base, Req, Opts);
-        _ ->
-            erlang:demonitor(Ref, [flush]),
-            {error, leader_died}
-    end.
+    Res =
+        case find_execution(GroupName, Opts) of
+            {ok, Worker} -> AwaitFun(Worker, GroupName, Base, Req, Opts);
+            _ -> {error, leader_died}
+        end,
+    % Drop the monitor and any `DOWN' it delivered: a later await on the same
+    % worker would otherwise read it as the death of its own leader.
+    erlang:demonitor(Ref, [flush]),
+    Res.
 
 %% @doc Default await function that waits for a resolution from a worker.
 default_await(Worker, GroupName, Base, Req, Opts) ->
@@ -240,10 +277,20 @@ notify(GroupName, Req, Res, Opts) ->
 
 %% @doc Forward requests to a newly delegated execution process.
 forward_work(NewPID, Opts) ->
+    forward_work(NewPID, '_', Opts).
+
+%% @doc Forward requests for `GroupName' to a newly delegated execution
+%% process. Requests for any other group stay in our mailbox: this process may
+%% lead other resolutions, and a worker only receives messages tagged with its
+%% own group, so anything else forwarded to it would wait there forever.
+%% `'_'' forwards every request.
+forward_work(NewPID, GroupName, Opts) ->
     Gather =
         fun Gather() ->
             receive
-                Req = {resolve, _, _, _, _} -> [Req | Gather()]
+                Req = {resolve, _, G, _, _}
+                        when GroupName =:= '_' orelse G =:= GroupName ->
+                    [Req | Gather()]
             after 0 -> []
             end
         end,
@@ -279,6 +326,7 @@ start_worker(Msg, Opts) ->
 start_worker(_, NotMsg, _) when not is_map(NotMsg) -> not_started;
 start_worker(GroupName, Msg, Opts) ->
     start(),
+    Parent = self(),
     ?event(worker_spawns,
         {starting_worker, {group, GroupName}, {msg, Msg}, {opts, Opts}}
     ),
@@ -323,6 +371,13 @@ start_worker(GroupName, Msg, Opts) ->
             )
         end
     ),
+    % The resolution spawning this worker still holds the group name (see
+    % `unregister_notify/4'): pass it straight to the worker.
+    case hb_name:lookup(GroupName) of
+        Parent when not is_atom(GroupName) ->
+            ok = hb_name:handoff(GroupName, Parent, WorkerPID);
+        _ -> ok
+    end,
     WorkerPID.
 
 %% @doc A server function for handling persistent executions. 
@@ -711,3 +766,180 @@ await_registration(GroupName, Retries) ->
             await_registration(GroupName, Retries - 1);
         PID -> PID
     end.
+
+%% @doc Regression: a request waiting on a leader is sent under the name the
+%% leader is registered as, even when re-deriving the group would differ.
+await_enqueues_under_registered_group_test() ->
+    start(),
+    GroupName = {?MODULE, make_ref()},
+    Grouper =
+        fun(_Base, _Req, GrouperOpts) ->
+            case hb_maps:is_key(<<"force-message">>, GrouperOpts) of
+                true -> ungrouped_exec;
+                false -> GroupName
+            end
+        end,
+    Base = #{ <<"device">> => test_device(#{ grouper => Grouper }) },
+    Opts =
+        #{
+            <<"static-worker">> => true,
+            <<"hashpath">> => ignore,
+            <<"worker-timeout">> => 30000,
+            <<"force-message">> => true
+        },
+    Worker = start_worker(GroupName, Base, Opts),
+    ?assertEqual(Worker, await_registration(GroupName, 100)),
+    Ref = spawn_test_client(Base, #{ <<"path">> => <<"increment">> }, Opts),
+    receive
+        {result, Ref, Res} ->
+            ?assertMatch({ok, _}, Res),
+            {ok, Msg} = Res,
+            ?assertEqual(1, hb_maps:get(<<"count">>, Msg, not_found, Opts))
+    after 2000 ->
+        {messages, Stuck} = erlang:process_info(Worker, messages),
+        erlang:error({request_hung, {group, GroupName}, {mailbox, Stuck}})
+    end,
+    exit(Worker, normal).
+
+%% @doc Regression: a waiter whose leader dies re-elects a bounded number of
+%% times, then answers with an error. Here every leader dies on the request it
+%% is sent, after handing its name to a successor -- as a worker does that a
+%% request crashes deterministically, with a new worker spawned for each retry.
+%% The unbounded retry never returned and killed a leader per round.
+leader_died_retries_are_bounded_test_() ->
+    {timeout, 30, fun() ->
+        start(),
+        GroupName = {?MODULE, make_ref()},
+        Base =
+            #{
+                <<"device">> =>
+                    test_device(#{ grouper => fun(_, _, _) -> GroupName end })
+            },
+        Self = self(),
+        First = spawn(fun() -> dying_leader(GroupName, Self, true) end),
+        ?assertEqual(First, await_registration(GroupName, 100)),
+        Ref =
+            spawn_test_client(
+                Base,
+                #{ <<"path">> => <<"slow_key">>, <<"wait">> => 1 },
+                #{ <<"await-inprogress">> => true, <<"spawn-worker">> => false }
+            ),
+        Res =
+            receive {result, Ref, R} -> R
+            after 5000 -> no_result_after_5s
+            end,
+        Deaths = count_leader_deaths(0),
+        case hb_name:lookup(GroupName) of
+            undefined -> ok;
+            Last -> exit(Last, kill)
+        end,
+        hb_name:unregister(GroupName),
+        ?assertMatch({error, #{ <<"status">> := 500 }}, Res),
+        ?assertEqual(3, Deaths)
+    end}.
+
+dying_leader(GroupName, Parent, Register) ->
+    case Register of
+        true -> ok = hb_name:register(GroupName);
+        false -> ok
+    end,
+    receive
+        {resolve, _Listener, GroupName, _Req, _Opts} ->
+            Next = spawn(fun() -> dying_leader(GroupName, Parent, false) end),
+            ok = hb_name:handoff(GroupName, self(), Next),
+            Parent ! leader_died,
+            exit(crashed_on_request)
+    end.
+
+count_leader_deaths(N) when N >= 100 -> N;
+count_leader_deaths(N) ->
+    receive leader_died -> count_leader_deaths(N + 1)
+    after 100 -> N
+    end.
+
+%% @doc Regression: a caller told it leads a group must own the group's name.
+%% A registration fails while any entry for the name exists, including one
+%% whose owner died after our lookup; the lookup that follows the lost race
+%% then clears that dead entry and finds nobody -- which means the name is
+%% free, not that it is ours. Contenders race short-lived owners here and
+%% check every leadership they are granted.
+find_or_register_leader_owns_name_test_() ->
+    {timeout, 60, fun() ->
+        start(),
+        GroupName = {?MODULE, make_ref()},
+        Base =
+            #{
+                <<"device">> =>
+                    test_device(#{ grouper => fun(_, _, _) -> GroupName end })
+            },
+        Opts = #{ <<"await-inprogress">> => true },
+        Deadline = erlang:monotonic_time(millisecond) + 1500,
+        Self = self(),
+        Churner = spawn(fun() -> churn_owner(GroupName) end),
+        Contenders =
+            [
+                spawn(fun() ->
+                    Self ! {unowned, self(), contend(GroupName, Base, Opts, Deadline, 0)}
+                end)
+            ||
+                _ <- lists:seq(1, 4)
+            ],
+        Unowned =
+            lists:sum(
+                [ receive {unowned, C, N} -> N after 10000 -> 0 end
+                || C <- Contenders ]
+            ),
+        exit(Churner, kill),
+        hb_name:unregister(GroupName),
+        ?assertEqual(0, Unowned)
+    end}.
+
+churn_owner(GroupName) ->
+    Owner = spawn(fun() -> erlang:yield() end),
+    hb_name:register(GroupName, Owner),
+    churn_owner(GroupName).
+
+contend(GroupName, Base, Opts, Deadline, Unowned) ->
+    case erlang:monotonic_time(millisecond) > Deadline of
+        true -> Unowned;
+        false ->
+            Self = self(),
+            NewUnowned =
+                case find_or_register(Base, #{ <<"path">> => <<"k">> }, Opts) of
+                    {leader, GroupName} ->
+                        case ets:lookup(hb_name_registry, GroupName) of
+                            [{GroupName, Self}] ->
+                                ets:delete_object(
+                                    hb_name_registry, {GroupName, Self}),
+                                Unowned;
+                            _ -> Unowned + 1
+                        end;
+                    _ -> Unowned
+                end,
+            contend(GroupName, Base, Opts, Deadline, NewUnowned)
+    end.
+
+%% @doc Regression: delegating to a new worker forwards only the requests for
+%% that worker's group. A worker never matches another group's name, so any
+%% other request forwarded to it was stranded in its mailbox.
+forward_work_keeps_other_groups_test() ->
+    Self = self(),
+    Mine = {?MODULE, make_ref()},
+    Other = {?MODULE, make_ref()},
+    Worker =
+        spawn(fun() ->
+            receive go -> ok end,
+            {messages, Msgs} = erlang:process_info(self(), messages),
+            Self ! {worker_mailbox, Msgs}
+        end),
+    Self ! {resolve, Self, Mine, #{ <<"n">> => 1 }, #{}},
+    Self ! {resolve, Self, Other, #{ <<"n">> => 2 }, #{}},
+    ok = ?MODULE:forward_work(Worker, Mine, #{}),
+    Worker ! go,
+    Forwarded = receive {worker_mailbox, M} -> M after 1000 -> timeout end,
+    Kept =
+        receive {resolve, _, Other, _, _} = K -> K
+        after 0 -> missing
+        end,
+    ?assertEqual([{resolve, Self, Mine, #{ <<"n">> => 1 }, #{}}], Forwarded),
+    ?assertMatch({resolve, _, Other, _, _}, Kept).
