@@ -201,6 +201,24 @@ times the several requests each action makes; it is the same on both. A worker's
 `computed_slot` line (its options drop `debug-print`), so per-phase node
 timing for worker-computed slots is still to do.
 
+Where a game slot's time goes inside the worker (dbg trace of outermost calls,
+70 game slots, RC7 branch):
+
+| Phase | Per slot |
+|---|---:|
+| store (`hb_cache:write`, whole state each slot) | 54 ms |
+| Lua (`luerl:call_function_dec`) | 48 ms |
+| patch apply (`hb_state_patch:apply`) | 28 ms |
+| `hb_message:normalize_commitments` | 18 ms |
+| total | ~148 ms |
+
+Order of attack: delta persistence (store), then patch apply (each patch goes
+through the AO-Core resolver), then the contract's own Lua (offline it is 5-10
+ms; Luerl runs it at ~48). Across all request processes,
+`normalize_commitments` was called 53,092 times in one run: it adds an
+unsigned (hmac) commitment to every nested message that has no signed one,
+hashing each.
+
 RC7's built-in benchmarks on the same box: scheduler alone 258 msg/s (no
 compute, no HTTP; this is where "200-400 msg/s" comes from), pure Lua process
 46 slots/s, aos process 20 slots/s.
