@@ -592,6 +592,19 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
             {failure, Failure}
     end.
 
+%% @doc Options for a compute this device issues itself, such as the one in
+%% `now/3'. `spawn-worker' is a temporary option that `hb_ao' strips from
+%% every nested execution, and a process compute is always nested (inside
+%% `now', a push, the scheduler), so without this a process worker never
+%% starts and every request rebuilds the process state from the cache.
+%% `process-worker-spawn => true' asks for a worker on these computes only;
+%% it is off by default, keeping v0.11's behaviour.
+worker_spawn_opts(Opts) ->
+    case hb_opts:get(<<"process-worker-spawn">>, false, Opts) of
+        true -> Opts#{ <<"spawn-worker">> => true };
+        _ -> Opts
+    end.
+
 %% @doc Prepare the process state message for computing the next slot.
 prepare_next_slot(ProcID, State, RawReq, Opts) ->
     Slot = hb_util:int(hb_ao:get(<<"slot">>, RawReq, Opts)),
@@ -819,7 +832,7 @@ now(RawBase, Req, Opts) ->
                         <<"path">> => <<"compute">>,
                         <<"slot">> => CurrentSlot
                     },
-                    Opts
+                    worker_spawn_opts(Opts)
                 )
             end;
         CacheParam ->
