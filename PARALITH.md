@@ -184,8 +184,20 @@ numbers include the tunnel and the harness's 250 ms poll):
 | `Market.List` | 1,223 ms | 862 ms |
 | `Market.Cancel` | 1,222 ms | 861 ms |
 
-The old fork bench node runs a basic config, not prod's (no compute on
-schedule), so this is not yet the final comparison. A worker's slots print no
+Against the old fork running the test node's real config (rendered/test.json
+without its host and bridge hook), polling every 25 ms, two alternating runs:
+
+| Action | Old fork, test-node config | RC7 branch |
+|---|---:|---:|
+| `User.Info` | 1,108-1,114 ms | 715-915 ms |
+| `Sprite.Update` | 1,115-1,118 ms | 820-825 ms |
+| `Monster.Feed` | 1,112-1,134 ms | 767-848 ms |
+| `Monster.LevelUp` | 1,131-1,140 ms | 870-884 ms |
+| `Market.List` | 1,179-1,203 ms | 956-969 ms |
+| `Market.Cancel` | 1,228 ms | 921-974 ms |
+
+RC7 is 15-30% faster on every action. The ~700+ ms floor is the WAN tunnel
+times the several requests each action makes; it is the same on both. A worker's slots print no
 `computed_slot` line (its options drop `debug-print`), so per-phase node
 timing for worker-computed slots is still to do.
 
