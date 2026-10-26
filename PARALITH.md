@@ -82,6 +82,21 @@ before and after 500 messages; container memory over 1,000 messages):
 The counter's own state is a few bytes, so this is all overhead: the message,
 its assignment, commitments and a computed state per slot.
 
+`process-snapshot-target` (unit 2), measured BEFORE unit 3, so without live
+workers. 200 sequential messages, each read back (the live-traffic shape),
+two runs each:
+
+| Setting | Store per message | Round trip | Sequential |
+|---|---|---|---|
+| `true` (RC7 default) | 24.3 KB | 92 ms | 10.9/s |
+| `false` | 26.1-26.8 KB | 107 ms | 8.9-9.5/s |
+
+Off is worse here: with no worker holding the VM, each request rebuilds its
+state, and the forced snapshot is what makes that cheap. Leave it on until
+re-measured with units 3 and 4 (live workers), where it should be pure cost.
+A burst of 500 computed in one `now` cannot show this (only its last slot is
+a target): 22.4 KB vs 22.3 KB.
+
 Every step is judged on speed, reliability, memory and storage. A step that
 improves one and costs another goes to Tyler before it lands.
 
