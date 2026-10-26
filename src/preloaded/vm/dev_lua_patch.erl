@@ -629,6 +629,8 @@ process_delta_restore_test_() ->
             <<"hashpath">> => ignore,
             <<"spawn-worker">> => false,
             <<"process-workers">> => false,
+            <<"process-delta-cache">> => true,
+            <<"process-snapshot-target">> => false,
             <<"process-delta-checkpoint-slots">> => 2
         },
         Process = delta_process(Opts),
@@ -678,8 +680,11 @@ worker_keeps_live_vm_after_cached_read_test_() ->
             <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
             <<"priv-wallet">> => ar_wallet:new(),
             <<"spawn-worker">> => true,
+            <<"process-worker-spawn">> => true,
             <<"process-workers">> => true,
             <<"await-inprogress">> => named,
+            <<"process-delta-cache">> => true,
+            <<"process-snapshot-target">> => false,
             <<"process-delta-checkpoint-slots">> => 1000
         },
         Process = delta_process(Opts),
@@ -733,6 +738,8 @@ worker_started_from_cached_state_restores_vm_test_() ->
             <<"priv-wallet">> => ar_wallet:new(),
             <<"spawn-worker">> => false,
             <<"process-workers">> => false,
+            <<"process-delta-cache">> => true,
+            <<"process-snapshot-target">> => false,
             <<"process-delta-checkpoint-slots">> => 1000
         },
         Process = delta_process(Opts),
@@ -783,6 +790,8 @@ now_http_read_does_not_store_state_test_() ->
             <<"priv-wallet">> => ar_wallet:new(),
             <<"port">> => 10000 + rand:uniform(20000),
             <<"process-now-from-cache">> => true,
+            <<"process-delta-cache">> => true,
+            <<"process-snapshot-target">> => false,
             <<"process-delta-checkpoint-slots">> => 1000
         },
         Node = hb_http_server:start_node(Opts),
@@ -868,8 +877,11 @@ push_leaves_worker_for_next_push_test_() ->
             <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
             <<"priv-wallet">> => ar_wallet:new(),
             <<"spawn-worker">> => true,
+            <<"process-worker-spawn">> => true,
             <<"process-workers">> => true,
             <<"await-inprogress">> => named,
+            <<"process-delta-cache">> => true,
+            <<"process-snapshot-target">> => false,
             <<"process-delta-checkpoint-slots">> => 1000,
             <<"port">> => 10000 + rand:uniform(20000)
         },
@@ -952,8 +964,11 @@ worker_compute_does_not_store_whole_state_test_() ->
             <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
             <<"priv-wallet">> => ar_wallet:new(),
             <<"spawn-worker">> => true,
+            <<"process-worker-spawn">> => true,
             <<"process-workers">> => true,
             <<"await-inprogress">> => named,
+            <<"process-delta-cache">> => true,
+            <<"process-snapshot-target">> => false,
             <<"process-delta-checkpoint-slots">> => 1000
         },
         Process = delta_process(Opts),
@@ -1006,6 +1021,8 @@ compute_from_public_state_restores_vm_test_() ->
             <<"priv-wallet">> => ar_wallet:new(),
             <<"spawn-worker">> => false,
             <<"process-workers">> => false,
+            <<"process-delta-cache">> => true,
+            <<"process-snapshot-target">> => false,
             <<"process-delta-checkpoint-slots">> => 1000
         },
         Process = delta_process(Opts),
