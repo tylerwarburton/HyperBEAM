@@ -67,8 +67,44 @@ to changed state back. Compute is one `now` over a 500-message backlog.
 | 2026-10-26 | RC7 stock config | 170 ms | 8 | 62 | scheduler uploads to Arweave inside its loop |
 | 2026-10-26 | RC7, uploads off | 95 ms | 43 | 67 | baseline for this branch |
 
+Storage and memory, same counter process (store size inside the container
+before and after 500 messages; container memory over 1,000 messages):
+
+| Date | Build | Store per message | Memory |
+|---|---|---|---|
+| 2026-10-26 | old fork 44c016ae | 13.6 KB | 131 -> 192 MiB |
+| 2026-10-26 | RC7 + scheduler fix | 21.5 KB | 137 -> 165 MiB |
+
+The counter's own state is a few bytes, so this is all overhead: the message,
+its assignment, commitments and a computed state per slot.
+
+Every step is judged on speed, reliability, memory and storage. A step that
+improves one and costs another goes to Tyler before it lands.
+
 RC7's built-in benchmarks on the same box: scheduler alone 258 msg/s (no
 compute, no HTTP; this is where "200-400 msg/s" comes from), pure Lua process
 46 slots/s, aos process 20 slots/s.
 
 Across processes the old fork scales: 1 process 99/s, 4 processes 251/s total.
+
+## Where the real game spends a slot
+
+Old fork on the bench node, game on `lua@5.3b`, 28 fixture players, node's own
+`computed_slot` timings (`contract-latency.mjs --only game --game-phase basic`
+in the monorepo). A trivial Lua slot is ~11 ms (94/s), so anything above that
+is the contract.
+
+| Handler | Execution | Store | Total | Per process |
+|---|---|---|---|---|
+| `User.Info` (read) | 10-12 ms | 2-3 ms | 12-15 ms | ~70/s |
+| `Sprite.Update` | 18 ms | 3 ms | 21 ms | ~48/s |
+| `Monster.Feed` | 20 ms | 5 ms | 27 ms | ~37/s |
+| `Monster.LevelUp` | 28 ms | 7 ms | 35 ms | ~29/s |
+| `Market.List` | 79 ms | 8 ms | 86 ms | ~12/s |
+| `Market.Cancel` | 112 ms | 8 ms | 119 ms | ~8/s |
+
+Execution, not store, is where it goes. The same handlers measured as pure
+Lua offline (`run-local-profile.mjs 28 30`, WASM Lua, so indicative only):
+`User.Info` 4.9 ms, `Monster.Feed` 10.6 ms. Our Lua is about half of a slot,
+not a rounding error. The market handlers are tiny; their cost is in what
+they publish afterwards, not yet attributed.
