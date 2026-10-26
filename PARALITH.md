@@ -252,6 +252,12 @@ left is mostly fixed: the 620 KB module, the slot-0 checkpoint, the helper
 process. Round trips through the WAN tunnel improve less (640-950 vs
 730-990 ms), as the tunnel and polling dominate them.
 
+The old fork's Luerl incremental-GC patch was tried and reverted
+(2026-10-26): with delta storage on, Lua per game slot went 31 -> 34-35 ms and
+slot execution 42 -> 46-47 ms, two runs each, with no memory gain (BEAM 135
+MiB both). Its benefit on the old fork was tied to snapshotting the VM every
+message, which this node no longer does.
+
 RC7's built-in benchmarks on the same box: scheduler alone 258 msg/s (no
 compute, no HTTP; this is where "200-400 msg/s" comes from), pure Lua process
 46 slots/s, aos process 20 slots/s.
