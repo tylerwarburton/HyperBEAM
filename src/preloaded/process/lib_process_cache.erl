@@ -15,12 +15,35 @@ read(ProcID, Opts) ->
 read(ProcID, SlotRef, RawOpts) ->
     Opts = lib_process:cache_opts(RawOpts),
     ?event({reading_computed_result, ProcID, SlotRef}),
-    Path = path(ProcID, SlotRef, Opts),
-    hb_cache:read(Path, Opts).
+    case is_integer(SlotRef) andalso hot_get(ProcID, SlotRef) of
+        {ok, Hot} -> {ok, Hot};
+        _ ->
+            Path = path(ProcID, SlotRef, Opts),
+            case hb_cache:read(Path, Opts) of
+                {ok, Stored} -> materialize(ProcID, Stored, Opts);
+                Other -> Other
+            end
+    end.
 
 %% @doc Write a process computation result to the cache.
 write(ProcID, Slot, Msg, RawOpts) ->
     Opts = lib_process:cache_opts(RawOpts),
+    Public = hb_private:reset(Msg),
+    Result =
+        case delta(Msg, Opts) of
+            {ok, Patches, Results} ->
+                case checkpoint_due(ProcID, Slot, Msg, Opts) of
+                    true -> write_full(ProcID, Slot, Msg, Opts);
+                    false ->
+                        write_delta(ProcID, Slot, Patches, Results, Opts)
+                end;
+            not_found -> write_full(ProcID, Slot, Msg, Opts)
+        end,
+    hot_put(ProcID, Slot, Public, Opts),
+    Result.
+
+%% @doc Write the whole public state of a slot, as RC7 does for every slot.
+write_full(ProcID, Slot, Msg, Opts) ->
     % Write the item to the cache in the root of the store.
     {ok, Root} = hb_cache:write(hb_private:reset(Msg), Opts),
     % Link the item to the path in the store by slot number.
@@ -161,6 +184,199 @@ clock(Opts) ->
         Time -> hb_util:int(Time)
     end.
 
+%%% Delta storage and the hot cache.
+%%%
+%%% RC7 writes the whole public state of every slot: on the game, ~50 ms a
+%%% slot and most of a slot's storage. With `process-delta-cache => true', a
+%%% slot computed by `lua-patch@1.0' between checkpoints is stored as its
+%%% patches and results only. A checkpoint (the whole state) is written every
+%%% `process-delta-checkpoint-slots' (default 1000), whenever the state carries
+%%% a VM snapshot, and whenever the previous slot cannot be found, so a chain
+%%% never crosses a gap. Reading a delta slot applies its patches to the
+%%% previous slot, which comes from the hot cache when it is there and is
+%%% otherwise read the same way, back to the checkpoint.
+%%%
+%%% The hot cache keeps the newest `process-hot-cache-slots' (default 8)
+%%% public states of each process in memory, so the steady state never reads
+%%% a chain, and `latest' does not list every slot of the process.
+
+-define(DELTA_FORMAT, <<"lua-patch-delta@1">>).
+-define(HOT, lib_process_cache_hot).
+
+delta(Msg, Opts) ->
+    case hb_opts:get(<<"process-delta-cache">>, false, Opts) of
+        true ->
+            case hb_private:get(<<"process-cache-delta">>, Msg, not_found, Opts) of
+                #{ <<"patches">> := Patches, <<"results">> := Results }
+                        when is_list(Patches), is_map(Results) ->
+                    {ok, Patches, Results};
+                _ -> not_found
+            end;
+        _ -> not_found
+    end.
+
+checkpoint_due(ProcID, Slot, Msg, Opts) ->
+    Slot =< 0
+        orelse maps:is_key(<<"snapshot">>, Msg)
+        orelse Slot rem checkpoint_slots(Opts) =:= 0
+        orelse not base_exists(ProcID, Slot - 1, Opts).
+
+checkpoint_slots(Opts) ->
+    case hb_util:int(hb_opts:get(<<"process-delta-checkpoint-slots">>, 1000, Opts)) of
+        N when N > 0 -> N;
+        _ -> 1000
+    end.
+
+base_exists(ProcID, Slot, Opts) ->
+    case hot_get(ProcID, Slot) of
+        {ok, _} -> true;
+        not_found ->
+            case hb_cache:read(path(ProcID, Slot, Opts), Opts) of
+                {ok, _} -> true;
+                _ -> false
+            end
+    end.
+
+write_delta(ProcID, Slot, Patches, Results, Opts) ->
+    Envelope = #{
+        <<"cache-format">> => ?DELTA_FORMAT,
+        <<"slot">> => Slot,
+        <<"base-slot">> => Slot - 1,
+        <<"patches">> => Patches,
+        <<"results">> => Results
+    },
+    {ok, Root} = hb_cache:write(Envelope, Opts),
+    SlotNumPath = path(ProcID, Slot, Opts),
+    hb_cache:link(Root, SlotNumPath, Opts),
+    ok = refresh(ProcID, Slot, Opts),
+    {ok, SlotNumPath}.
+
+%% @doc A stored message as the public state of its slot: a delta envelope is
+%% applied to the state of the slot before it; anything else is that state.
+materialize(ProcID, Stored = #{ <<"cache-format">> := ?DELTA_FORMAT }, Opts) ->
+    Slot = hb_util:int(hb_maps:get(<<"slot">>, Stored, Opts)),
+    BaseSlot = hb_util:int(hb_maps:get(<<"base-slot">>, Stored, Opts)),
+    case read(ProcID, BaseSlot, Opts) of
+        {ok, Base} ->
+            Patches =
+                patch_list(
+                    hb_cache:ensure_all_loaded(
+                        hb_maps:get(<<"patches">>, Stored, Opts),
+                        Opts
+                    ),
+                    Opts
+                ),
+            Results =
+                hb_cache:ensure_all_loaded(
+                    hb_maps:get(<<"results">>, Stored, Opts),
+                    Opts
+                ),
+            hb_state_patch:apply(
+                maps:remove(<<"snapshot">>, Base),
+                Patches,
+                Results,
+                Slot,
+                Opts
+            );
+        Error -> Error
+    end;
+materialize(_ProcID, Msg, _Opts) ->
+    {ok, Msg}.
+
+patch_list(Patches, _Opts) when is_list(Patches) -> Patches;
+patch_list(Patches, Opts) when is_map(Patches) ->
+    case hb_util:is_ordered_list(Patches, Opts) of
+        true -> hb_util:message_to_ordered_list(Patches);
+        false -> []
+    end.
+
+hot_put(ProcID, Slot, Msg, Opts) when is_integer(Slot) ->
+    case hot_slots(Opts) of
+        0 -> ok;
+        Keep ->
+            ensure_hot_table(),
+            try
+                ets:insert(?HOT, {{ProcID, Slot}, Msg}),
+                hot_trim(ProcID, Keep)
+            catch error:badarg -> ok
+            end,
+            ok
+    end;
+hot_put(_ProcID, _Slot, _Msg, _Opts) ->
+    ok.
+
+hot_trim(ProcID, Keep) ->
+    Held = ets:select_count(?HOT, [{{{ProcID, '_'}, '_'}, [], [true]}]),
+    case Held > Keep of
+        true ->
+            case ets:next(?HOT, {ProcID, -2}) of
+                {ProcID, Oldest} ->
+                    ets:delete(?HOT, {ProcID, Oldest}),
+                    hot_trim(ProcID, Keep);
+                _ -> ok
+            end;
+        false -> ok
+    end.
+
+hot_get(ProcID, Slot) ->
+    try ets:lookup(?HOT, {ProcID, Slot}) of
+        [{_, Msg}] -> {ok, Msg};
+        [] -> not_found
+    catch error:badarg -> not_found
+    end.
+
+%% @doc The newest hot slot of a process, at or below `Limit'.
+hot_latest(ProcID, Limit) ->
+    Upper = case Limit of undefined -> infinity; _ -> Limit + 1 end,
+    try ets:prev(?HOT, {ProcID, Upper}) of
+        {ProcID, Slot} = Key ->
+            case ets:lookup(?HOT, Key) of
+                [{_, Msg}] -> {ok, Slot, Msg};
+                [] -> not_found
+            end;
+        _ -> not_found
+    catch error:badarg -> not_found
+    end.
+
+hot_slots(Opts) ->
+    case hb_opts:get(<<"process-delta-cache">>, false, Opts) of
+        true ->
+            case hb_util:int(hb_opts:get(<<"process-hot-cache-slots">>, 8, Opts)) of
+                N when N >= 0 -> N;
+                _ -> 8
+            end;
+        _ -> 0
+    end.
+
+%% The table is owned by a process that never exits: a table dies with its
+%% owner, and the first writer is usually a short-lived request.
+ensure_hot_table() ->
+    case ets:whereis(?HOT) of
+        undefined ->
+            Parent = self(),
+            Ref = make_ref(),
+            {Owner, Mon} =
+                spawn_monitor(
+                    fun() ->
+                        try ets:new(?HOT, [named_table, public, ordered_set,
+                                {read_concurrency, true}]) of
+                            _ ->
+                                Parent ! {Ref, created},
+                                receive after infinity -> ok end
+                        catch error:badarg -> Parent ! {Ref, exists}
+                        end
+                    end
+                ),
+            receive
+                {Ref, _} -> ok;
+                {'DOWN', Mon, process, Owner, _} -> ok
+            after 5000 -> ok
+            end,
+            erlang:demonitor(Mon, [flush]),
+            ok;
+        _ -> ok
+    end.
+
 %% @doc Calculate the path of a result, given a process ID and a slot.
 path(ProcID, Ref, Opts) ->
     path(ProcID, Ref, [], Opts).
@@ -198,6 +414,17 @@ latest(ProcID, RawRequiredPath, Limit, RawOpts) ->
                 )
         end,
     ?event({required_path_converted, {proc_id, ProcID}, {required_path, RequiredPath}}),
+    case hot_latest(ProcID, Limit) of
+        {ok, HotSlot, HotMsg} ->
+            case path_exists(RequiredPath, HotMsg, Opts) of
+                true -> {ok, HotSlot, HotMsg};
+                false -> latest_stored(ProcID, RequiredPath, Limit, Opts)
+            end;
+        not_found -> latest_stored(ProcID, RequiredPath, Limit, Opts)
+    end.
+
+%% @doc The latest stored slot, listing every slot of the process.
+latest_stored(ProcID, RequiredPath, Limit, Opts) ->
     Path = path(ProcID, slot_root, Opts),
     AllSlots = slots(ProcID, Opts),
     ?event({all_slots, {proc_id, ProcID}, {slots, AllSlots}}),
@@ -252,10 +479,15 @@ read_candidate(ProcID, RequiredPath, Slot, Rest, Opts) ->
             Failure;
         {error, _} = Error ->
             Error;
-        {ok, Msg} ->
-            case path_exists(RequiredPath, Msg, Opts) of
-                true -> {ok, Slot, Msg};
-                false -> first_with_path(ProcID, RequiredPath, Rest, Opts)
+        {ok, Stored} ->
+            case materialize(ProcID, Stored, Opts) of
+                {ok, Msg} ->
+                    case path_exists(RequiredPath, Msg, Opts) of
+                        true -> {ok, Slot, Msg};
+                        false ->
+                            first_with_path(ProcID, RequiredPath, Rest, Opts)
+                    end;
+                Error -> Error
             end
     end.
 
@@ -285,6 +517,56 @@ path_exists([Key | Rest], Msg, Opts) ->
     end.
 
 %%% Tests
+
+%% @doc A slot stored as a delta reads back as the state that was computed,
+%% from the hot cache and, with the hot cache empty, from the store; a
+%% checkpoint is written at slot 0 and at the cadence.
+delta_slots_read_back_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+        <<"process-delta-cache">> => true,
+        <<"process-delta-checkpoint-slots">> => 3
+    },
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    State0 = #{ <<"count">> => <<"0">>, <<"keep">> => <<"k">>, <<"at-slot">> => 0 },
+    Step =
+        fun(N, Prev) ->
+            Patches = [#{ <<"path">> => <<"/count">>, <<"value">> => integer_to_binary(N) }],
+            Results = #{ <<"output">> => #{ <<"data">> => integer_to_binary(N) } },
+            {ok, Next} = hb_state_patch:apply(Prev, Patches, Results, N, Opts),
+            Msg = Next#{ <<"priv">> => #{ <<"process-cache-delta">> =>
+                #{ <<"patches">> => Patches, <<"results">> => Results } } },
+            {ok, _} = write(ProcID, N, Msg, Opts),
+            Next
+        end,
+    {ok, _} = write(ProcID, 0, State0, Opts),
+    States = lists:foldl(
+        fun(N, Acc = [Prev | _]) -> [Step(N, Prev) | Acc] end,
+        [State0],
+        lists:seq(1, 4)
+    ),
+    Expected = lists:reverse(States),
+    Raw = fun(N) -> {ok, M} = hb_cache:read(path(ProcID, N, Opts), Opts), M end,
+    % Slots 1, 2 and 4 are deltas; 0 and 3 (the cadence) are checkpoints.
+    ?assertEqual(
+        [false, true, true, false, true],
+        [ maps:is_key(<<"cache-format">>, Raw(N)) || N <- lists:seq(0, 4) ]
+    ),
+    Read = fun(N) ->
+        {ok, M} = read(ProcID, N, Opts),
+        hb_cache:ensure_all_loaded(M, Opts)
+    end,
+    Same = fun(N) ->
+        E = lists:nth(N + 1, Expected),
+        maps:with([<<"count">>, <<"keep">>], E) =:=
+            maps:with([<<"count">>, <<"keep">>], Read(N))
+    end,
+    ?assert(lists:all(Same, lists:seq(0, 4))),
+    ets:delete_all_objects(?HOT),
+    ?assert(lists:all(Same, lists:seq(0, 4))),
+    {ok, 4, Latest} = latest(ProcID, Opts),
+    ?assertEqual(<<"4">>, hb_maps:get(<<"count">>, hb_cache:ensure_all_loaded(Latest, Opts), Opts)).
+
 
 process_cache_suite_test_() ->
     hb_store:generate_test_suite(
