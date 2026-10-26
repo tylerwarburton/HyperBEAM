@@ -407,11 +407,12 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                 ),
             % Force a snapshot of the target slot so the terminal state is
             % restorable; intermediate slots snapshot per the configured interval.
+            % See `snapshot_target/3' for turning the forced snapshot off.
             {StoreTimeMicroSecs, ProcStateWithSnapshot} =
                 timer:tc(
                     fun() ->
                         store_result(
-                            Slot == TargetSlot,
+                            snapshot_target(Slot, TargetSlot, Opts),
                             ProcID,
                             Slot,
                             NewProcStateMsgWithSlot,
@@ -491,7 +492,14 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                     },
                     Opts
                 ),
-            store_result(Slot == TargetSlot, ProcID, Slot, ErrState, InitReq, Opts),
+            store_result(
+                snapshot_target(Slot, TargetSlot, Opts),
+                ProcID,
+                Slot,
+                ErrState,
+                InitReq,
+                Opts
+            ),
             {ok, ErrState};
         {failure, Failure} ->
             % A failure of this node -- a failed read or fetch -- is not a
@@ -593,6 +601,17 @@ dispatch_push(Process, Slot, MaxDepth, Req, Opts) ->
 %% @doc Store the resulting state in the cache, potentially with the snapshot
 %% key. The write is synchronous: callers may notify waiters or run push hooks
 %% as soon as this returns, so the slot must already be cache-visible.
+%% @doc Whether the target slot of a computation is snapshotted whatever the
+%% configured interval. A request computes one new slot at a time under live
+%% traffic, so the forced snapshot is a whole Lua VM image written for every
+%% message. `process-snapshot-target => false' leaves snapshots to
+%% `process-snapshot-slots' and `process-snapshot-time': less storage and a
+%% cheaper slot, against a cold start that replays the slots since the last
+%% interval snapshot.
+snapshot_target(Slot, TargetSlot, Opts) ->
+    Slot == TargetSlot
+        andalso hb_opts:get(<<"process-snapshot-target">>, true, Opts) =/= false.
+
 store_result(ForceSnapshot, ProcID, Slot, Res, Req, RawOpts) ->
     Opts = lib_process:execution_opts(RawOpts),
     % Cache the `Snapshot' key as frequently as the node is configured to.
@@ -929,3 +948,35 @@ process_id_verifies_once_test() ->
         lib_process:process_id(#{ <<"process">> => Tampered }, #{}, Opts)
     ).
 
+
+%% @doc The target slot is snapshotted by default; with
+%% `process-snapshot-target => false' only the configured interval snapshots.
+snapshot_target_option_test() ->
+    application:ensure_all_started(hb),
+    lists:foreach(
+        fun({Setting, Expected}) ->
+            Opts = #{
+                <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+                <<"priv-wallet">> => ar_wallet:new(),
+                <<"process-snapshot-slots">> => 1000,
+                <<"process-snapshot-time">> => false,
+                <<"process-snapshot-target">> => Setting
+            },
+            Base = hb_process_test_vectors:aos_process(Opts),
+            ProcID = hb_message:id(Base, all),
+            hb_process_test_vectors:schedule_aos_call(Base, <<"return 1">>, Opts),
+            hb_process_test_vectors:schedule_aos_call(Base, <<"return 2">>, Opts),
+            {ok, _} =
+                hb_ao:resolve(
+                    Base,
+                    #{ <<"path">> => <<"compute">>, <<"slot">> => 1 },
+                    Opts
+                ),
+            {ok, Stored} = lib_process_cache:read(ProcID, 1, Opts),
+            ?assertEqual(
+                {Setting, Expected},
+                {Setting, hb_maps:is_key(<<"snapshot">>, Stored, Opts)}
+            )
+        end,
+        [{true, true}, {false, false}]
+    ).
