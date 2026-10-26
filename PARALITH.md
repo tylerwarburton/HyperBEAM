@@ -46,7 +46,11 @@ the numbers below with the reason they moved.
 7. **Stores**: crash-safe LMDB sync, `hb_store_irreplaceable`,
    `hb_store_offsite_journal`, `hb_store_retention`. RC7 rewrote the storage
    layout (no links or groups), so these are rewritten, not copied.
-8. **`bridge-attestor@1.0`**, `evm-rpc@1.0`, chain signing.
+8. **`bridge-attestor@1.0`**, `evm-rpc@1.0`, chain signing. Carry the
+   2026-10-26 polling fix (uncommitted in the old fork and monorepo when
+   noted): 2-minute idle scan, nudges still give 1 s scans for 2 minutes, a
+   fixed 15 s nudge cooldown, one fewer `eth_blockNumber` per Base scan in
+   `dev_eth_client`. It ships with the next node deploy either way.
 9. **Clients and contracts** (monorepo): httpsig keyids are base64url, and
    the committer is the `publickey:` URI, not an address, so `signer()` has to
    map it. Lands with the fresh deploy.
