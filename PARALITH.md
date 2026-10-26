@@ -25,6 +25,19 @@ them belong to the old node and are replaced at the next fresh deploy.
 | `hb_store_gc` | `hb_store_retention` | Retention planning: which computed slots can be collected |
 | `hb_process_delta` | `hb_state_patch` | The patch-list format shared by `lua-patch@1.0` and the process cache |
 
+## Node config the port requires
+
+Settings our v0.11 nodes run with, each one decided or measured:
+
+| Key | Value | Why |
+|---|---|---|
+| `scheduler-publish-remote` | `false` | RC7 otherwise uploads every message and assignment to Arweave inside the scheduler loop (8 msg/s) |
+| `spawn-worker` | `true` | process workers on (decided 2026-10-26) |
+| `process-workers` | `true` | group process computes under one worker |
+| `process-worker-spawn` | `true` | without it no process worker ever starts on RC7 |
+| `scheduler-lookahead` | `false` | with workers live, lookahead waits 1.5 s per request |
+| `process-snapshot-target` | `false` | no whole-VM snapshot per message once a worker holds the VM (decided 2026-10-26) |
+
 ## Port order
 
 Safe and small first. Every step: port, run its tests, re-run the bench, record
