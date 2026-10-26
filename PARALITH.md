@@ -39,6 +39,7 @@ Settings our v0.11 nodes run with, each one decided or measured:
 | `process-snapshot-target` | `false` | no whole-VM snapshot per message once a worker holds the VM (decided 2026-10-26) |
 | `match-index` | `false` | RC7 indexes every key/value for `~match@1.0`, which we do not use: 23 of 100 rows a message. Off: 23.7 -> 18.1 KB/msg, 84 -> 78.5 ms |
 | `process-delta-cache` | `true` | store a slot as its patches between checkpoints: store 50 -> 4 ms a slot, disk -63% (2026-10-26) |
+| `rate-limit-requests` / `-period` / `-max` / `-min` / `-exempt` | as prod (`node-config.base.json`: 60000 per 60 s; exempt our servers' IPs) | RC7's default limiter allows a burst of 1,000 then ~17/s per client, and refuses beyond: game backends, indexers and bots get 429s under load. Same keys as the old fork |
 
 ## Port order
 
