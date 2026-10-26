@@ -13,11 +13,6 @@ RUN git config --global user.email b@b && git config --global user.name b \
     && git config --global --add safe.directory /app \
     && git init -q && git add -A && git commit -qm v0.11-RC7 \
     && printf '%s\n' 'port = 8734.' > /app/config.flat
-# Luerl collects incrementally and with little garbage (patches/, from the old
-# fork); --forward makes a rebuild with the patch already applied a no-op.
-RUN rebar3 get-deps \
-    && patch --forward --batch -p1 -d _build/default/lib/luerl \
-        < patches/luerl-incremental-gc.patch
 RUN rebar3 release 2>&1 | tail -40; test -x /app/_build/default/rel/hb/bin/hb
 VOLUME /data
 WORKDIR /data
