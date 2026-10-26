@@ -46,20 +46,13 @@ apply(Base, Patches, Results, Opts) ->
     apply(Base, Patches, Results, undefined, Opts).
 apply(Base, Patches, Results, Slot, Opts)
         when is_list(Patches), is_map(Results) ->
-    Prepared = hb_ao:set(Base, <<"results">>, unset, Opts),
+    Prepared = base_set(Base, <<"results">>, unset, Opts),
     case apply_patches(Prepared, Patches, Opts) of
         {ok, Patched} ->
-            WithResults = hb_ao:set(Patched, <<"results">>, Results, Opts),
+            WithResults = base_set(Patched, <<"results">>, Results, Opts),
             case Slot of
                 undefined -> {ok, WithResults};
-                _ ->
-                    {ok,
-                        hb_ao:set(
-                            WithResults,
-                            <<"at-slot">>,
-                            Slot,
-                            Opts
-                        )}
+                _ -> {ok, base_set(WithResults, <<"at-slot">>, Slot, Opts)}
             end;
         Error -> Error
     end;
@@ -109,9 +102,15 @@ apply_patches(Base, [Patch | Rest], Opts) ->
     end.
 
 set_in(Msg, [Key], delete, Opts) ->
-    message_set(Msg, Key, unset, <<"deep">>, Opts);
+    case is_plain(Msg, Key) of
+        true -> {ok, maps:remove(Key, Msg)};
+        false -> message_set(Msg, Key, unset, <<"deep">>, Opts)
+    end;
 set_in(Msg, [Key], {set, Value}, Opts) ->
-    message_set(Msg, Key, Value, <<"deep">>, Opts);
+    case is_plain(Msg, Key) andalso not is_map(Value) andalso not is_list(Value) of
+        true -> {ok, Msg#{ Key => Value }};
+        false -> message_set(Msg, Key, Value, <<"deep">>, Opts)
+    end;
 set_in(Msg, [Key | Rest], Op, Opts) ->
     case child(Msg, Key, Opts) of
         not_found ->
@@ -122,7 +121,11 @@ set_in(Msg, [Key | Rest], Op, Opts) ->
         Child when is_map(Child); is_list(Child) ->
             case set_in(hb_ao:normalize_keys(Child, Opts), Rest, Op, Opts) of
                 {ok, NewChild} ->
-                    message_set(Msg, Key, NewChild, <<"explicit">>, Opts);
+                    case is_plain(Msg, Key) of
+                        true -> {ok, Msg#{ Key => NewChild }};
+                        false ->
+                            message_set(Msg, Key, NewChild, <<"explicit">>, Opts)
+                    end;
                 Error -> Error
             end;
         _ ->
@@ -134,6 +137,33 @@ child(Msg, Key, Opts) ->
     case hb_maps:get(Key, Msg, not_found, Opts) of
         not_found -> hb_maps:get(hb_util:to_lower(Key), Msg, not_found, Opts);
         Value -> Value
+    end.
+
+%% @doc Whether `Key' of `Msg' can be set or removed as a plain map key.
+%% `message@1.0''s `set' walks every key of the message and works out which keys
+%% its commitments cover; on a process state, with one key per player, that was
+%% most of a patch's cost (28 ms a slot for the game). A level with no
+%% commitments and no stored link for the key has nothing for it to do beyond
+%% the put or remove itself, so both give the same message
+%% (`fast_set_matches_message_set_test'). Everything else still goes through
+%% `message@1.0'.
+is_plain(Msg, Key) ->
+    not is_map_key(<<"commitments">>, Msg)
+        andalso not is_map_key(<<Key/binary, "+link">>, Msg).
+
+%% @doc `hb_ao:set/4' for the per-slot keys `apply/5' writes, plain when the
+%% base allows it (`is_plain/2'). `results' is set only after it was unset, so
+%% a deep merge has nothing to merge with.
+base_set(Base, Key, unset, Opts) ->
+    case is_plain(Base, Key) of
+        true -> maps:remove(Key, Base);
+        false -> hb_ao:set(Base, Key, unset, Opts)
+    end;
+base_set(Base, Key, Value, Opts) ->
+    case is_plain(Base, Key)
+            andalso (not is_map(Value) orelse not is_map_key(Key, Base)) of
+        true -> Base#{ Key => Value };
+        false -> hb_ao:set(Base, Key, Value, Opts)
     end.
 
 message_set(Msg, Key, Value, Mode, Opts) ->
@@ -291,6 +321,59 @@ is_link_key(Key) when byte_size(Key) >= 5 ->
 is_link_key(_) -> false.
 
 %%% Tests
+
+%% @doc The plain-map fast path gives the message `message@1.0' gives.
+fast_set_matches_message_set_test() ->
+    Opts = #{ <<"hashpath">> => ignore },
+    Base = #{
+        <<"keep">> => <<"k">>,
+        <<"player-a">> => <<"{\"gold\":1}">>,
+        <<"count">> => 7,
+        <<"nested">> => #{ <<"inner">> => <<"i">>, <<"other">> => <<"o">> }
+    },
+    Patches = [
+        [set(<<"/player-a">>, <<"{\"gold\":2}">>)],
+        [set(<<"/player-b">>, <<"{\"gold\":3}">>)],
+        [#{ <<"path">> => <<"/player-a">>, <<"delete">> => true }],
+        [#{ <<"path">> => <<"/absent">>, <<"delete">> => true }],
+        [set(<<"/count">>, 8)],
+        [set(<<"/nested/inner">>, <<"changed">>)],
+        [#{ <<"path">> => <<"/nested/other">>, <<"delete">> => true }],
+        [set(<<"/fresh/deep/key">>, <<"v">>)],
+        [set(<<"/player-a">>, <<"x">>), set(<<"/player-a">>, <<"y">>),
+            #{ <<"path">> => <<"/keep">>, <<"delete">> => true }]
+    ],
+    lists:foreach(
+        fun(PatchList) ->
+            {ok, Fast} = apply_patches(Base, PatchList, Opts),
+            {ok, Slow} = reference_apply(Base, PatchList, Opts),
+            ?assertEqual({PatchList, Slow}, {PatchList, Fast})
+        end,
+        Patches
+    ).
+
+%% The same patches applied through `message@1.0' alone, as before the fast
+%% path existed.
+reference_apply(Msg, [], _Opts) -> {ok, Msg};
+reference_apply(Msg, [Patch | Rest], Opts) ->
+    {ok, Parts, Op} = parse_patch(Patch, Opts),
+    {ok, Next} = reference_set_in(Msg, Parts, Op, Opts),
+    reference_apply(Next, Rest, Opts).
+
+reference_set_in(Msg, [Key], delete, Opts) ->
+    message_set(Msg, Key, unset, <<"deep">>, Opts);
+reference_set_in(Msg, [Key], {set, Value}, Opts) ->
+    message_set(Msg, Key, Value, <<"deep">>, Opts);
+reference_set_in(Msg, [Key | Rest], Op, Opts) ->
+    case child(Msg, Key, Opts) of
+        not_found ->
+            {ok, NewChild} = reference_set_in(#{}, Rest, Op, Opts),
+            {ok, Msg#{ Key => NewChild }};
+        Child ->
+            {ok, NewChild} =
+                reference_set_in(hb_ao:normalize_keys(Child, Opts), Rest, Op, Opts),
+            message_set(Msg, Key, NewChild, <<"explicit">>, Opts)
+    end.
 
 store_opts() ->
     #{

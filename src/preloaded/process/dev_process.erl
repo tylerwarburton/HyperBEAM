@@ -495,6 +495,9 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                         )
                     end
                 ),
+            hb_phase_timer:record(slot_prep, PrepTimeMicroSecs),
+            hb_phase_timer:record(slot_execution, RuntimeMicroSecs),
+            hb_phase_timer:record(slot_store, StoreTimeMicroSecs),
             ?event(compute_short,
                 {computed_slot,
                     {proc_id, ProcID},

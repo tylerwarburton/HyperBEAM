@@ -202,7 +202,10 @@ times the several requests each action makes; it is the same on both. A worker's
 timing for worker-computed slots is still to do.
 
 Where a game slot's time goes inside the worker (dbg trace of outermost calls,
-70 game slots, RC7 branch):
+70 game slots, RC7 branch). **Inflated, do not use:** dbg copies a traced
+call's arguments into each trace message, and these phases take the whole
+process state as an argument, so the trace itself costs most of what it
+measures. Superseded by `hb_phase_timer` (below):
 
 | Phase | Per slot |
 |---|---:|
@@ -218,6 +221,21 @@ ms; Luerl runs it at ~48). Across all request processes,
 `normalize_commitments` was called 53,092 times in one run: it adds an
 unsigned (hmac) commitment to every nested message that has no signed one,
 hashing each.
+
+Per game slot, measured with `hb_phase_timer` (no tracing), 72 game slots,
+two alternating runs per build:
+
+| Phase | Before patch fast path | With it |
+|---|---:|---:|
+| store (`slot_store`) | 50-52 ms | 50-51 ms |
+| Lua (`lua_patch_lua`) | 32-33 ms | 31 ms |
+| patch apply | 1.0-1.1 ms | 0.25-0.45 ms |
+| decode | 1.5 ms | 1.5 ms |
+| prep | 1.2 ms | 1.2-1.5 ms |
+| whole execution | 44-45 ms | 41-42 ms |
+
+Store is the largest cost of a slot: RC7 writes the whole process state every
+slot. Next is delta persistence.
 
 RC7's built-in benchmarks on the same box: scheduler alone 258 msg/s (no
 compute, no HTTP; this is where "200-400 msg/s" comes from), pure Lua process
