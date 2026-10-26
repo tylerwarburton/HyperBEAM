@@ -235,7 +235,10 @@ decode_table([{Key, Value} | Rest], Opts, Acc) ->
 encode(Map, Opts) when is_map(Map) ->
     case hb_util:is_ordered_list(Map, Opts) of
         true -> encode(hb_util:message_to_ordered_list(Map), Opts);
-        false -> maps:to_list(maps:map(fun(_, Value) -> encode(Value, Opts) end, Map))
+        false ->
+            maps:to_list(
+                maps:map(fun(Key, Value) -> encode_value(Key, Value, Opts) end, Map)
+            )
     end;
 encode(List, Opts) when is_list(List) ->
     lists:map(fun(Value) -> encode(Value, Opts) end, List);
@@ -244,6 +247,31 @@ encode(Link, Opts) when ?IS_LINK(Link) ->
 encode(Atom, _Opts) when is_atom(Atom) andalso Atom =/= false andalso Atom =/= true ->
     hb_util:bin(Atom);
 encode(Value, _Opts) -> Value.
+
+%% @doc Lua sees only the signed commitments of a message, each with its
+%% committer as an address, as `lua@5.3a' gives them. v0.11 holds a committer
+%% as a URI (`uri-did-ar-...'); a contract that took that for an account id
+%% would give every player a second, empty account. Unsigned commitments are
+%% hidden because each node makes its own, so a script reading them could
+%% compute differently on two nodes.
+encode_value(<<"commitments">>, Commitments, Opts) when is_map(Commitments) ->
+    Signed =
+        maps:fold(
+            fun(ID, Commitment = #{ <<"committer">> := Committer }, Acc) ->
+                    Acc#{
+                        ID => Commitment#{
+                            <<"committer">> => hb_util:committer_address(Committer)
+                        }
+                    };
+               (_ID, _Unsigned, Acc) ->
+                    Acc
+            end,
+            #{},
+            Commitments
+        ),
+    encode(Signed, Opts);
+encode_value(_Key, Value, Opts) ->
+    encode(Value, Opts).
 
 %%% Tests
 
@@ -513,6 +541,29 @@ snapshot_restores_live_heap_test() ->
     ?assertEqual(<<"2">>, hb_ao:get(<<"count">>, LiveNext, Opts)).
 
 %% @doc Deletes work, while runtime-owned paths are refused.
+%% @doc Lua identifies a signer by its address, not by v0.11's committer URI,
+%% and never sees an unsigned commitment.
+committer_is_address_test() ->
+    hb:init(),
+    Wallet = ar_wallet:new(),
+    Opts = #{ <<"hashpath">> => ignore, <<"priv-wallet">> => Wallet },
+    Script =
+        <<
+            "function compute(req) "
+            "local seen = {} "
+            "for _, c in pairs(req.body.commitments or {}) do "
+            "seen[#seen + 1] = tostring(c.committer) end "
+            "return { patches = {{ path = '/who', value = table.concat(seen, ',') }}, "
+            "results = {} } end"
+        >>,
+    Body = hb_message:commit(#{ <<"action">> => <<"Ping">> }, Opts),
+    Req = #{ <<"path">> => <<"compute">>, <<"body">> => Body },
+    {ok, Out} = hb_ao:resolve(base(<<"lua-patch@1.0">>, Script), Req, Opts),
+    ?assertEqual(
+        hb_util:human_id(ar_wallet:to_address(Wallet)),
+        hb_ao:get(<<"who">>, Out, Opts)
+    ).
+
 patch_validation_test() ->
     hb:init(),
     Opts = #{ <<"hashpath">> => ignore },
