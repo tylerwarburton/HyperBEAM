@@ -1,0 +1,21 @@
+# paralith/v0.11 at a given tree (git archive -> src.tar), default profile. Bench only.
+FROM erlang:27
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake git pkg-config libssl-dev libncurses-dev ca-certificates curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+COPY src.tar /src.tar
+RUN mkdir /app && tar -xf /src.tar -C /app && rm /src.tar
+WORKDIR /app
+# Makefile's buildinfo needs a git HEAD; the zip has none.
+RUN git config --global user.email b@b && git config --global user.name b \
+    && git config --global --add safe.directory /app \
+    && git init -q && git add -A && git commit -qm v0.11-RC7 \
+    && printf '%s\n' 'port = 8734.' > /app/config.flat
+RUN rebar3 release 2>&1 | tail -40
+VOLUME /data
+WORKDIR /data
+EXPOSE 8734
+ENV HB_KEY=/data/hyperbeam-key.json HB_CONFIG=/data/config.json
+CMD ["/app/_build/default/rel/hb/bin/hb", "foreground"]
