@@ -37,6 +37,7 @@ Settings our v0.11 nodes run with, each one decided or measured:
 | `process-worker-spawn` | `true` | without it no process worker ever starts on RC7 |
 | `scheduler-lookahead` | `false` | with workers live, lookahead waits 1.5 s per request |
 | `process-snapshot-target` | `false` | no whole-VM snapshot per message once a worker holds the VM (decided 2026-10-26) |
+| `match-index` | `false` | RC7 indexes every key/value for `~match@1.0`, which we do not use: 23 of 100 rows a message. Off: 23.7 -> 18.1 KB/msg, 84 -> 78.5 ms |
 
 ## Port order
 
@@ -141,6 +142,22 @@ attributed. For the game, whose snapshot is megabytes, off should matter a
 lot.
 
 Every bench now prints `worker_starts`, so a run without workers is visible.
+
+Where a message's storage goes on RC7 (LMDB census before and after 200
+messages, workers live, snapshot-target off): 12 KB and 100 rows a message,
+logically (~24 KB on disk with B-tree overhead). By row kind:
+
+| Rows/msg | Bytes/msg | What |
+|---:|---:|---|
+| 23 | 2,785 | `~match@1.0` reverse index |
+| 21 | 2,542 | each signed message's `committed` key list, one row per key |
+| 3 | 1,726 | message data blobs |
+| ~40 | ~3,500 | each commitment's fields (signature, committer, type, owner, keyid, ...), one row each |
+| rest | | assignment, computed-slot links, hashpaths |
+
+The counter's own state is a few bytes of this. RC7 stores every field of every
+message and commitment as its own row; that layout is what the storage unit has
+to change. Tool: `bench/census.erl` (run via `hb eval`), diffed per row kind.
 
 RC7's built-in benchmarks on the same box: scheduler alone 258 msg/s (no
 compute, no HTTP; this is where "200-400 msg/s" comes from), pure Lua process
