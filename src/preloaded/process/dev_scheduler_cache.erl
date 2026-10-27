@@ -62,7 +62,35 @@ flush(RawOpts) ->
 %% @doc Write the initial assignment message to the cache.
 write_spawn(RawInitMessage, Opts) ->
     InitMessage = hb_cache:ensure_all_loaded(RawInitMessage, Opts),
-    hb_cache:write(InitMessage, opts(Opts)).
+    case hb_cache:write(InitMessage, opts(Opts)) of
+        {ok, _} = Res ->
+            ok = write_referenced(InitMessage, Opts),
+            Res;
+        Error -> Error
+    end.
+
+%% @doc A definition that names its code by ID (a WASM `image', an aos
+%% `module') cannot be recomputed without it: copy that message into the
+%% scheduler's store too. A reference the node cannot read (a remote module
+%% not cached here) is logged; the spawn goes on.
+write_referenced(InitMessage, Opts) ->
+    lists:foreach(
+        fun(Key) ->
+            case hb_maps:get(Key, InitMessage, undefined, Opts) of
+                ID when ?IS_ID(ID) ->
+                    case hb_cache:read(ID, Opts) of
+                        {ok, Msg} ->
+                            {ok, _} =
+                                hb_cache:write(hb_cache:ensure_all_loaded(Msg, Opts), opts(Opts));
+                        Other ->
+                            ?event(warning,
+                                {spawn_reference_not_kept, {key, Key}, {id, ID}, {read, Other}})
+                    end;
+                _ -> ok
+            end
+        end,
+        [<<"image">>, <<"module">>]
+    ).
 
 %% @doc Get an assignment message from the cache.
 read(ProcID, Slot, Opts) when is_integer(Slot) ->
@@ -561,3 +589,22 @@ assignment_restores_from_offsite_journal_test() ->
         end,
         Assignments
     ).
+
+%% @doc A definition whose code is named by ID carries that code into the
+%% scheduler's store: readable from it alone.
+spawn_carries_referenced_image_test() ->
+    Main = hb_test_utils:test_store(hb_store_lmdb, <<"img-main">>),
+    Irr = hb_test_utils:test_store(hb_store_lmdb, <<"img-irr">>),
+    ok = hb_store:start([Main, Irr], #{}, #{}),
+    Opts = #{ <<"store">> => [Main], <<"scheduler-store">> => [Irr],
+              <<"priv-wallet">> => ar_wallet:new() },
+    Image = hb_message:commit(#{ <<"data">> => crypto:strong_rand_bytes(500),
+                                 <<"content-type">> => <<"application/wasm">> }, Opts),
+    {ok, _} = hb_cache:write(Image, Opts),
+    ImageID = hb_message:id(Image, signed, Opts),
+    Proc = hb_message:commit(#{ <<"type">> => <<"Process">>, <<"image">> => ImageID,
+                                <<"device">> => <<"process@1.0">> }, Opts),
+    {ok, _} = write_spawn(Proc, Opts),
+    {ok, Read} = hb_cache:read(ImageID, #{ <<"store">> => [Irr] }),
+    ?assertEqual(hb_maps:get(<<"data">>, Image, Opts),
+                 hb_maps:get(<<"data">>, hb_cache:ensure_all_loaded(Read, #{ <<"store">> => [Irr] }), Opts)).
