@@ -68,9 +68,13 @@ start(Opts = #{ <<"name">> := DataDir }, _Req, _NodeOpts) ->
         % the tree is corrupt (the old fork's main node, 2026-10-20: 13.3M
         % entries, ~7k readable, an `mdb_page_dirty' assertion on every
         % start). Commits are grouped, so the sync is paid per commit, not
-        % per write.
-        case hb_util:atom(maps:get(<<"sync">>, Opts, true)) of
+        % per write. `sync: data' syncs each commit's data pages but not the
+        % meta page (MDB_NOMETASYNC): a crash can lose the last commit, never
+        % the tree's consistency. With `sync: false', `sync-every' (ms) has
+        % the flusher sync the store on that interval instead of never.
+        case sync_mode(Opts) of
             false -> [no_sync];
+            data -> [no_meta_sync];
             _ -> []
         end ++
         case maps:get(<<"read-ahead">>, Opts, true) of
@@ -101,28 +105,62 @@ start(_Store, _Req, _NodeOpts) ->
 %% @doc Start the store's flusher, one process per store, which commits the
 %% writes that `elmdb' holds in memory every `flush-every' milliseconds, so that
 %% a crash of the node loses at most the writes of the last interval. A
-%% `flush-every' of 0 starts none, and a read-only store has no writes.
+%% `flush-every' of 0 starts none, and a read-only store has no writes. A store
+%% that does not sync every commit may set `sync-every' (ms): the flusher then
+%% also syncs it to disk on that interval, a group fsync.
 start_flusher(Opts = #{ <<"name">> := DataDir }, Instance) ->
     FlushEvery =
         hb_util:int(maps:get(<<"flush-every">>, Opts, ?DEFAULT_FLUSH_EVERY)),
-    case maps:get(<<"read-only">>, Opts, false) orelse FlushEvery == 0 of
+    SyncEvery =
+        case sync_mode(Opts) of
+            true -> 0;
+            _ -> hb_util:int(maps:get(<<"sync-every">>, Opts, 0))
+        end,
+    case maps:get(<<"read-only">>, Opts, false)
+            orelse (FlushEvery == 0 andalso SyncEvery == 0) of
         true -> ok;
         false ->
+            Now = erlang:monotonic_time(millisecond),
             hb_name:singleton(
                 {?MODULE, DataDir},
-                fun() -> flusher(Instance, FlushEvery) end
+                fun() -> flusher(Instance, FlushEvery, SyncEvery, Now) end
             ),
             ok
     end.
 
 %% @doc Commit the store's buffered writes every `FlushEvery' milliseconds,
-%% until the store stops.
-flusher(Instance, FlushEvery) ->
+%% and sync it to disk every `SyncEvery' milliseconds when that is set, until
+%% the store stops.
+flusher(Instance, FlushEvery, SyncEvery, LastSync) ->
+    Tick =
+        case {FlushEvery, SyncEvery} of
+            {_, 0} -> FlushEvery;
+            {0, _} -> SyncEvery;
+            _ -> min(FlushEvery, SyncEvery)
+        end,
     receive
         stop -> ok
-    after FlushEvery ->
+    after Tick ->
         commit(Instance),
-        flusher(Instance, FlushEvery)
+        Now = erlang:monotonic_time(millisecond),
+        case SyncEvery > 0 andalso Now - LastSync >= SyncEvery of
+            true ->
+                #{ <<"env">> := Env } = Instance,
+                elmdb:env_sync(Env),
+                flusher(Instance, FlushEvery, SyncEvery, Now);
+            false ->
+                flusher(Instance, FlushEvery, SyncEvery, LastSync)
+        end
+    end.
+
+%% @doc How the store syncs commits: `true' (every commit, the default),
+%% `data' (every commit's data pages, not the meta page) or `false' (only on a
+%% flush, or every `sync-every' ms).
+sync_mode(Opts) ->
+    case maps:get(<<"sync">>, Opts, true) of
+        <<"data">> -> data;
+        data -> data;
+        Other -> hb_util:atom(Other)
     end.
 
 %% @doc Ensure that the database directory exists.
@@ -396,10 +434,12 @@ stop_flusher(DataDir) ->
 %% committed in batches of `batch-size', and a halt of the node before then
 %% loses them. A store syncs every commit to disk unless `sync' is `false';
 %% such a store commits to the OS page cache only, so the flush syncs it, and
-%% a loss of power can lose (or corrupt) its commits since the last flush.
+%% a loss of power can lose (or corrupt) its commits since the last flush. A
+%% `sync: data' store syncs data pages per commit but not the meta page, so the
+%% flush syncs it too, making its last commit durable.
 flush(Opts, _Req, _NodeOpts) ->
-    case hb_util:atom(maps:get(<<"sync">>, Opts, true)) of
-        false ->
+    case sync_mode(Opts) of
+        Mode when Mode == false; Mode == data ->
             Instance = #{ <<"env">> := Env } = find_env(Opts),
             maybe
                 ok ?= commit(Instance),
@@ -519,6 +559,35 @@ basic_test() ->
     {ok, Value} = test_read(StoreOpts, <<"Hello">>),
     ?assertEqual(Value, <<"World2">>),
     ok = test_stop(StoreOpts).
+
+%% @doc Every sync mode opens, writes, flushes and reads back: `data' (data
+%% pages per commit, no meta sync), and `false' with a `sync-every' group sync.
+%% The binary forms are what a JSON config delivers.
+sync_modes_test() ->
+    lists:foreach(
+        fun({N, Extra}) ->
+            StoreOpts = maps:merge(
+                #{
+                    <<"store-module">> => ?MODULE,
+                    <<"name">> => <<"/tmp/store-sync-", (integer_to_binary(N))/binary>>
+                },
+                Extra
+            ),
+            test_reset(StoreOpts),
+            ?assertEqual(ok, test_write(StoreOpts, <<"k">>, <<"v">>)),
+            ?assertEqual(ok, flush(StoreOpts, #{}, #{})),
+            ?assertEqual({ok, <<"v">>}, test_read(StoreOpts, <<"k">>)),
+            ok = test_stop(StoreOpts)
+        end,
+        [
+            {1, #{ <<"sync">> => <<"data">> }},
+            {2, #{ <<"sync">> => data }},
+            {3, #{ <<"sync">> => false, <<"sync-every">> => 200 }},
+            {4, #{ <<"sync">> => <<"false">>, <<"sync-every">> => <<"200">> }}
+        ]
+    ),
+    ?assertEqual(data, sync_mode(#{ <<"sync">> => <<"data">> })),
+    ?assertEqual(true, sync_mode(#{})).
 
 %% @doc A 511-byte key is written, a 512-byte key returns an error, and the
 %% store still reads the first key afterwards.

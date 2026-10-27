@@ -1,0 +1,37 @@
+diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
+--- a/native/elmdb_nif/src/lib.rs	2026-10-27 17:21:33.509415200 -0400
++++ b/native/elmdb_nif/src/lib.rs	2026-10-27 17:21:34.042469100 -0400
+@@ -119,6 +119,7 @@
+         max_readers,
+         no_mem_init,
+         no_sync,
++        no_meta_sync,
+         write_map,
+         no_readahead,
+         create,
+@@ -321,6 +322,9 @@
+     if options.no_sync {
+         flags |= EnvironmentFlags::NO_SYNC;
+     }
++    if options.no_meta_sync {
++        flags |= EnvironmentFlags::NO_META_SYNC;
++    }
+     if options.no_lock {
+         flags |= EnvironmentFlags::NO_LOCK;
+     }
+@@ -2275,6 +2279,7 @@
+             match name {
+                 "no_mem_init" => env_opts.no_mem_init = true,
+                 "no_sync" => env_opts.no_sync = true,
++                "no_meta_sync" => env_opts.no_meta_sync = true,
+                 "no_lock" => env_opts.no_lock = true,
+                 "write_map" => env_opts.write_map = true,
+                 "no_readahead" => env_opts.no_readahead = true,
+@@ -2309,6 +2314,7 @@
+     batch_size: Option<usize>,
+     no_mem_init: bool,
+     no_sync: bool,
++    no_meta_sync: bool,
+     no_lock: bool,
+     write_map: bool,
+     no_readahead: bool,
