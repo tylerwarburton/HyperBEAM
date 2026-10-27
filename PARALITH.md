@@ -97,6 +97,29 @@ the numbers below with the reason they moved.
      result, compared in a test); every Lua device uses it. lua-atomic runs
      at most one collection per compute, when the Lua call returns. Found
      by the monorepo's native atomic preflight, which hit nginx's 300 s.
+     On the real game bundle (offline Luerl, after 200 messages of play):
+
+     | Players | Live tables | Luerl's collector | `hb_luerl_gc` |
+     |---:|---:|---:|---:|
+     | 28 | 1,095 | 95 ms | 9 ms |
+     | 1,000 | 7,965 | 1,790 ms | 117 ms |
+
+     On lua-patch the game collects in full only on checkpoint slots
+     (`lua53b.lua`); its per-slot `collectgarbage("step")` is a no-op on
+     stock Luerl, so ordinary slots do not pay this, but every checkpoint
+     slot did, quadratically in players. lua@5.3a collects after every call.
+   - **Direct computes have a deadline.** `lua-compute-deadline` (ms,
+     default 120000, `infinity`/`false` off) stops a direct call to
+     lua-patch or lua-atomic with a 504; the Lua runs in its own process and
+     is killed, so nothing keeps computing after the client has gone.
+     Process slots never have one: a slot must compute the same on every
+     node, whatever its speed.
+   - **Host crashes.** Outside a slot, an `ao.*` call that crashes on the
+     node is a Lua error (`ao.<name> failed on this node`) the contract's
+     `pcall` catches. Inside a slot it still fails the slot: catching a
+     node-dependent failure would let that node's state differ.
+     `hb_store_arweave` answers `not_found` for a non-canonical 43-character
+     id instead of crashing.
    - **Published keys are lowercase.** RC7 stores and reads every message
      key lowercased, and `message@1.0` looks a key up by its lowercase form
      only. `hb_state_patch` now lowercases patch paths, value keys at every
