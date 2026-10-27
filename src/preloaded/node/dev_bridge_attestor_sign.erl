@@ -15,7 +15,7 @@
 -export([base_release/6, base_attestors/4, base_sign/2, base_address/1]).
 -export([solana_release/5, solana_attestors/3]).
 -export([sui_release/5, sui_attestors/3]).
--export([ed25519_sign/2, ed25519_public/1, threshold/1]).
+-export([ed25519_sign/2, ed25519_public/1, threshold/1, address/2]).
 -export([base58_encode/1, base58_decode/1, hex/1, unhex/1]).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -31,17 +31,17 @@ threshold(N) -> (3 * N + 4) div 5.
 base_release(ChainId, Bridge, WithdrawalId, Token, To, Amount) ->
     hb_keccak:keccak_256(<<
         (hb_keccak:keccak_256(?RELEASE))/binary,
-        (word(ChainId))/binary, (address(Bridge))/binary, (word(WithdrawalId))/binary,
-        (address(Token))/binary, (address(To))/binary, (word(Amount))/binary
+        (word(ChainId))/binary, (evm(Bridge))/binary, (word(WithdrawalId))/binary,
+        (evm(Token))/binary, (evm(To))/binary, (word(Amount))/binary
     >>).
 
 %% @doc The inner hash of `ParaBridge.attestorsDigest`: the set is the one
 %% dynamic argument, so its head slot holds the offset of its tail (5 words).
 base_attestors(ChainId, Bridge, Epoch, Set) ->
-    Tail = << <<(address(A))/binary>> || A <- Set >>,
+    Tail = << <<(evm(A))/binary>> || A <- Set >>,
     hb_keccak:keccak_256(<<
         (hb_keccak:keccak_256(?ATTESTORS))/binary,
-        (word(ChainId))/binary, (address(Bridge))/binary, (word(Epoch))/binary,
+        (word(ChainId))/binary, (evm(Bridge))/binary, (word(Epoch))/binary,
         (word(5 * 32))/binary, (word(length(Set)))/binary, Tail/binary
     >>).
 
@@ -60,41 +60,62 @@ base_address(Priv) ->
 word(N) when is_integer(N) -> <<N:256>>;
 word(N) when is_binary(N) -> word(binary_to_integer(N)).
 
-address(<<"0x", Hex:40/binary>>) -> <<0:96, (unhex(Hex))/binary>>;
-address(<<Raw:20/binary>>) -> <<0:96, Raw/binary>>.
+%% An address as an ABI word.
+evm(Text) -> <<0:96, (address(base, Text))/binary>>.
 
 %%% Solana --------------------------------------------------------------------
 
 %% @doc `D || program id || withdrawal_id u64le || mint || recipient || amount u64le`
 solana_release(Program, WithdrawalId, Mint, Recipient, Amount) ->
-    <<?RELEASE/binary, (key(Program))/binary, (int(WithdrawalId)):64/little,
-      (key(Mint))/binary, (key(Recipient))/binary, (int(Amount)):64/little>>.
+    <<?RELEASE/binary, (address(solana, Program))/binary, (int(WithdrawalId)):64/little,
+      (address(solana, Mint))/binary, (address(solana, Recipient))/binary, (int(Amount)):64/little>>.
 
 %% @doc `D || program id || epoch u64le || n u8 || pubkey * n`
 solana_attestors(Program, Epoch, Set) ->
-    <<?ATTESTORS/binary, (key(Program))/binary, (int(Epoch)):64/little,
-      (length(Set)):8, << <<(key(K))/binary>> || K <- Set >>/binary>>.
-
-key(<<Raw:32/binary>>) -> Raw;
-key(Base58) -> base58_decode(Base58).
+    <<?ATTESTORS/binary, (address(solana, Program))/binary, (int(Epoch)):64/little,
+      (length(Set)):8, << <<(address(solana, K))/binary>> || K <- Set >>/binary>>.
 
 %%% Sui -----------------------------------------------------------------------
 
 %% @doc `D || bridge object id || withdrawal_id u64le || coin type || to || amount u64le`
 sui_release(BridgeId, WithdrawalId, CoinType, To, Amount) ->
-    <<?RELEASE/binary, (sui_id(BridgeId))/binary, (int(WithdrawalId)):64/little,
-      CoinType/binary, (sui_id(To))/binary, (int(Amount)):64/little>>.
+    <<?RELEASE/binary, (address(sui, BridgeId))/binary, (int(WithdrawalId)):64/little,
+      CoinType/binary, (address(sui, To))/binary, (int(Amount)):64/little>>.
 
 %% @doc `D || bridge object id || epoch u64le || n u8 || pubkey * n`
 sui_attestors(BridgeId, Epoch, Set) ->
-    <<?ATTESTORS/binary, (sui_id(BridgeId))/binary, (int(Epoch)):64/little,
-      (length(Set)):8, << <<(sui_id(K))/binary>> || K <- Set >>/binary>>.
+    <<?ATTESTORS/binary, (address(sui, BridgeId))/binary, (int(Epoch)):64/little,
+      (length(Set)):8, << <<(address(sui, K))/binary>> || K <- Set >>/binary>>.
 
-sui_id(<<"0x", Hex/binary>>) ->
-    % Sui shortens addresses (`0xd'), so the hex can be any length.
-    Raw = unhex(<<(binary:copy(<<"0">>, byte_size(Hex) rem 2))/binary, Hex/binary>>),
-    <<0:((32 - byte_size(Raw)) * 8), Raw/binary>>;
-sui_id(<<Raw:32/binary>>) -> Raw.
+%%% Addresses -----------------------------------------------------------------
+
+%% @doc An address's bytes, read in its chain's one text form, the rule PUSD's
+%% `ADDRESS' table applies before it burns:
+%%
+%%   base    `0x' and 40 hex, not all zero        20 bytes
+%%   solana  base58, 33 to 44 characters          exactly 32 bytes
+%%   sui     `0x' and 64 hex                      32 bytes
+%%
+%% Anything else raises: nothing is read by its length alone, so 32 base58
+%% characters are never taken for 32 raw bytes. The signed bytes of every
+%% address in these forms are what they always were.
+address(base, <<"0x", Hex:40/binary>> = Text) when Hex =/= <<"0000000000000000000000000000000000000000">> ->
+    from_hex(base, Text, Hex);
+address(solana, Text) when is_binary(Text), byte_size(Text) > 32, byte_size(Text) =< 44 ->
+    case catch base58_decode(Text) of
+        <<Key:32/binary>> -> Key;
+        _ -> erlang:error({bad_address, solana, Text})
+    end;
+address(sui, <<"0x", Hex:64/binary>> = Text) ->
+    from_hex(sui, Text, Hex);
+address(Chain, Text) ->
+    erlang:error({bad_address, Chain, Text}).
+
+from_hex(Chain, Text, Hex) ->
+    case catch unhex(Hex) of
+        Bytes when is_binary(Bytes) -> Bytes;
+        _ -> erlang:error({bad_address, Chain, Text})
+    end.
 
 %%% ed25519 -------------------------------------------------------------------
 
@@ -178,7 +199,8 @@ sui_release_test() ->
           "0100000000000000",
           "3078303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303a3a746573745f757364633a3a544553545f55534443",
           "000000000000000000000000000000000000000000000000000000000000000d0100000000000000">>,
-        hex(sui_release(Bridge, 1, CoinType, <<"0xd">>, 1))).
+        hex(sui_release(Bridge, 1, CoinType,
+            <<"0x000000000000000000000000000000000000000000000000000000000000000d">>, 1))).
 
 base58_test() ->
     Key = <<"9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin">>,
@@ -187,7 +209,32 @@ base58_test() ->
     ?assertEqual(binary:copy(<<0>>, 32), base58_decode(binary:copy(<<"1">>, 32))).
 
 solana_release_test() ->
-    Program = binary:copy(<<1>>, 32),
-    Msg = solana_release(Program, 9, binary:copy(<<2>>, 32), binary:copy(<<3>>, 32), 5),
+    B58 = fun(Byte) -> base58_encode(binary:copy(<<Byte>>, 32)) end,
+    Msg = solana_release(B58(1), 9, B58(2), B58(3), 5),
+    ?assertEqual(<<?RELEASE/binary, (binary:copy(<<1>>, 32))/binary, 9:64/little,
+        (binary:copy(<<2>>, 32))/binary, (binary:copy(<<3>>, 32))/binary, 5:64/little>>, Msg),
     ?assertEqual(byte_size(?RELEASE) + 32 + 8 + 32 + 32 + 8, byte_size(Msg)),
     ?assertMatch(<<_:19/binary, _:32/binary, 9:64/little, _/binary>>, Msg).
+
+%% Each chain's one form, and nothing else: a 32-character base58 text (32
+%% '1's) is not 32 raw bytes, and a short or raw form is refused, not guessed.
+address_forms_test() ->
+    Bad = fun(Chain, Text) -> ?assertError({bad_address, Chain, Text}, address(Chain, Text)) end,
+    Bad(solana, binary:copy(<<"1">>, 32)),
+    Bad(solana, binary:copy(<<1>>, 32)),
+    Bad(solana, <<"0OIl", (binary:copy(<<"1">>, 40))/binary>>),
+    Bad(solana, binary:copy(<<"z">>, 44)),
+    Bad(solana, binary:copy(<<"1">>, 33)),
+    Bad(base, binary:copy(<<1>>, 20)),
+    Bad(base, <<"0x0000000000000000000000000000000000000000">>),
+    Bad(base, <<"0xzz22222222222222222222222222222222222222">>),
+    Bad(sui, <<"0xd">>),
+    Bad(sui, binary:copy(<<1>>, 32)),
+    ?assertEqual(binary:copy(<<16#22>>, 20), address(base, ?TOKEN)),
+    ?assertEqual(<<0:248, 13>>,
+        address(sui, <<"0x000000000000000000000000000000000000000000000000000000000000000d">>)),
+    Key = <<"9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin">>,
+    ?assertEqual(base58_decode(Key), address(solana, Key)),
+    % A release to a malformed address is never signed.
+    ?assertError({bad_address, solana, _},
+        solana_release(Key, 1, Key, binary:copy(<<"1">>, 32), 1)).
