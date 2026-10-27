@@ -368,6 +368,29 @@ the numbers below with the reason they moved.
    content-addressed rows (on this bench far smaller: 878 vs 6,327 MiB);
    a read below the floor recomputes from the start; LMDB keeps its
    high-water mark.
+
+   Re-audit fixes (each with a test that failed first):
+   - The journal wrapper sets `max-retries => 0`: `hb_store` treated a
+     refused write as a store failure and restarted the writer to retry it,
+     about once a second on a full disk. A writer that cannot journal its
+     start marker (or reconcile, or rebase) stays up, refuses and tries
+     again at the next call; disk-full test: refused, never crashed, runs
+     once space is back.
+   - A poisoning is written to `<journal>/poisoned` and refuses every later
+     run until `hb_store_offsite_journal:clear_poison(Store)`, after which
+     the next run journals every row of the irreplaceable store again (a
+     rebase) before it takes a write. An inner-store flush failure poisons
+     too, so a full irreplaceable disk needs `clear_poison` once space is
+     back.
+   - Full-state processes (`lua@5.3a`, WASM, `token@1.0`, `carrier@1.0`)
+     now write `pstate/.../f` rows too; retention keeps their newest 2
+     snapshot checkpoints and newest `store-retention-recent-slots` (32)
+     states. Game-shaped `lua@5.3a`, 1,000 slots, two runs each: 96-97 ->
+     89-90 ms a slot, main store 12.8 -> 4.1-4.2 MiB per 1,000 slots; one
+     retention run then deleted 989 of 1,024 rows.
+   - A failed delete is logged at error level as leaving the main store
+     refusing writes until restart (as a failed flush does), and kept in
+     the retention status.
 8. **`bridge-attestor@1.0`**, `evm-rpc@1.0`, chain signing: ported
    (2026-10-27) from `dev_bridge`, `hb_bridge_sign`, `hb_bridge_chains` and
    `dev_eth_client`, with the 2026-10-26 polling fix (fixed 15 s nudge
