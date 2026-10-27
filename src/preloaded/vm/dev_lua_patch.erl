@@ -22,8 +22,13 @@
 -export([head_to_head_benchmark/2, incremental_gc_benchmark/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("luerl/include/luerl.hrl").
 
 -define(LEGACY_LUA, <<"lua@5.3a">>).
+%% Measured on the game bundle (PARALITH.md): the game leaves ~390 dead
+%% tables a slot, so 25 slots keep the heap within ~2x live at 1,000 players
+%% for ~2 ms a slot amortised.
+-define(GC_INTERVAL_SLOTS, 25).
 %% @doc Expose Lua functions as device keys, using this module's compute path.
 device_info(_Base) ->
     #{
@@ -131,7 +136,50 @@ compute(Key, RawBase, RawReq, Opts) ->
     ),
     hb_phase_timer:record(lua_patch_prep, T1 - T0),
     hb_phase_timer:record(lua_patch_lua, T2 - T1),
-    process_response(Response, Base, OldPriv, Opts).
+    process_response(collect(InSlot, Base, Req, Response, Opts), Base, OldPriv, Opts).
+
+%% @doc Collect the VM's garbage after every `lua-gc-interval-slots'th slot.
+%% Contracts on this device collect in full only on checkpoint slots
+%% (`collectgarbage("step")' is a no-op on Luerl), so without this the heap
+%% grows for a whole checkpoint interval. The cadence is the slot number, so
+%% every node collects at the same slots. That matters: a collection frees
+%% table slots that later tables reuse, and Lua can see a table's slot number
+%% (`tostring' of a table, the order `pairs' visits table keys). So the
+%% interval must be the same on every node computing a process: a process
+%% that sets `lua-gc-interval-slots' in its definition fixes it for all of
+%% them; otherwise it is the node option, then the default.
+collect(true, Base, Req, {ok, Values, State}, Opts) ->
+    Interval = gc_interval(Base, Opts),
+    case Interval > 0 andalso slot(Req, Opts) of
+        Slot when is_integer(Slot), Slot rem Interval == 0 ->
+            {Micros, Collected} = timer:tc(fun() -> hb_luerl_gc:gc(State) end),
+            hb_phase_timer:record(lua_patch_gc, Micros),
+            {ok, Values, Collected};
+        _ -> {ok, Values, State}
+    end;
+collect(_InSlot, _Base, _Req, Response, _Opts) ->
+    Response.
+
+gc_interval(Base, Opts) ->
+    Raw =
+        case hb_maps:get(<<"lua-gc-interval-slots">>, Base, not_found, Opts) of
+            not_found -> hb_opts:get(<<"lua-gc-interval-slots">>, ?GC_INTERVAL_SLOTS, Opts);
+            Set -> Set
+        end,
+    case catch hb_util:int(Raw) of
+        N when is_integer(N), N >= 0 -> N;
+        _ -> ?GC_INTERVAL_SLOTS
+    end.
+
+slot(Req, Opts) ->
+    case hb_maps:get(<<"slot">>, Req, not_found, Opts) of
+        not_found -> undefined;
+        Raw ->
+            case catch hb_util:int(Raw) of
+                N when is_integer(N) -> N;
+                _ -> undefined
+            end
+    end.
 
 %% @doc Whether the call computes a slot of a `process@1.0' process, which
 %% marks the state it initializes (`dev_process:init/3') privately, out of
@@ -648,6 +696,90 @@ ao_library_test() ->
         >>,
     {ok, Out} = hb_ao:resolve(base(<<"lua-patch@1.0">>, Script), request(1), Opts),
     ?assertEqual(<<"world">>, hb_ao:get(<<"got">>, Out, Opts)).
+
+%% @doc The VM's heap stays bounded over many slots although the contract
+%% never collects: the device collects every `lua-gc-interval-slots'th slot.
+%% Without it, 5,000 slots each leaving 20 dead tables leave 100,000.
+gc_interval_bounds_heap_test_() ->
+    {timeout, 300, fun() ->
+        hb:init(),
+        Opts = #{ <<"hashpath">> => ignore },
+        Script =
+            <<
+                "Live = Live or {}\n"
+                "function compute(req)\n"
+                "  if #Live == 0 then for i = 1, 100 do Live[i] = { i } end end\n"
+                "  for i = 1, 20 do local dead = { i } end\n"
+                "  return { patches = {}, results = {} }\n"
+                "end\n"
+            >>,
+        Base0 =
+            hb_private:set(
+                base(<<"lua-patch@1.0">>, Script), <<"initialized">>, <<"true">>, Opts),
+        Final =
+            lists:foldl(
+                fun(Slot, Base) ->
+                    {ok, Next} =
+                        hb_ao:resolve(
+                            Base,
+                            #{ <<"path">> => <<"compute">>, <<"slot">> => Slot,
+                                <<"body">> => #{ <<"action">> => <<"Tick">> } },
+                            Opts
+                        ),
+                    Next
+                end,
+                Base0,
+                lists:seq(1, 5000)
+            ),
+        #luerl{ tabs = #tstruct{ data = Tables } } =
+            hb_private:get(<<"state">>, Final, Opts),
+        ?assert(map_size(Tables) < 10000)
+    end}.
+
+%% @doc Lua can see a collection: a table freed by one is reused, and
+%% `tostring' of a table shows its slot number. So the collection cadence is
+%% fixed by the slot number and the interval: two VMs computing the same slots
+%% with the same interval publish the same strings, and a different interval
+%% does not.
+gc_cadence_visible_but_deterministic_test_() ->
+    {timeout, 120, fun() ->
+        hb:init(),
+        Opts = #{ <<"hashpath">> => ignore },
+        Script =
+            <<
+                "function compute(req)\n"
+                "  for i = 1, 5 do local dead = { i } end\n"
+                "  return { patches = {{ path = '/t', value = tostring({}) }}, results = {} }\n"
+                "end\n"
+            >>,
+        Run =
+            fun(Interval) ->
+                Base0 =
+                    hb_private:set(
+                        (base(<<"lua-patch@1.0">>, Script))#{
+                            <<"lua-gc-interval-slots">> => Interval
+                        },
+                        <<"initialized">>, <<"true">>, Opts),
+                {_, Seen} =
+                    lists:foldl(
+                        fun(Slot, {Base, Acc}) ->
+                            {ok, Next} =
+                                hb_ao:resolve(
+                                    Base,
+                                    #{ <<"path">> => <<"compute">>, <<"slot">> => Slot,
+                                        <<"body">> => #{ <<"action">> => <<"Tick">> } },
+                                    Opts
+                                ),
+                            {Next, [hb_ao:get(<<"t">>, Next, Opts) | Acc]}
+                        end,
+                        {Base0, []},
+                        lists:seq(1, 30)
+                    ),
+                Seen
+            end,
+        ?assertEqual(Run(10), Run(10)),
+        ?assertNotEqual(Run(10), Run(0))
+    end}.
 
 %% @doc A direct call that runs past `lua-compute-deadline' answers 504 and
 %% its Luerl work stops: no process is left running Lua.
