@@ -100,6 +100,7 @@ set_functions(Base, State, Opts) ->
                 {Encoded, StateEnc} =
                     luerl:encode(
                         fun(RawArgs, ImportState) ->
+                          guarded(FuncName, ImportState, fun() ->
                             ?event(lua_import, {calling_import, {func, FuncName}}),
                             % Get the node message of the invocation from the
                             % private data of the Lua state.
@@ -138,6 +139,7 @@ set_functions(Base, State, Opts) ->
                                 ),
                             % Encode the response for return to Lua
                             return(Res, ResState, ImportOpts)
+                          end)
                         end,
                         StateIn
                     ),
@@ -152,6 +154,36 @@ set_functions(Base, State, Opts) ->
             ?LIBRARY_FUNCTIONS
         )
     }.
+
+%% @doc Run a library call. A Lua error passes through. Any other error is
+%% raised, failing the call, unless the device set `host-errors' to `lua' in
+%% the state's private data: then it is a Lua error with a fixed message, which
+%% the contract's `pcall' catches. The message never carries the reason, which
+%% can depend on the node. `lua-patch@1.0' asks for `lua' only outside a
+%% process slot, where nothing is kept: inside one, catching an error that
+%% another node does not have would let the two states differ.
+guarded(FuncName, State, Call) ->
+    try Call()
+    catch
+        error:{lua_error, _, _} = LuaError:Stack -> erlang:raise(error, LuaError, Stack);
+        Class:Reason:Stack ->
+            case host_errors(State) of
+                lua ->
+                    luerl_lib:lua_error(
+                        {error_call,
+                            [<<"ao.", (atom_to_binary(FuncName))/binary, " failed on this node">>]},
+                        State
+                    );
+                raise -> erlang:raise(Class, Reason, Stack)
+            end
+    end.
+
+host_errors(State) ->
+    try luerl:get_private(<<"host-errors">>, State) of
+        lua -> lua;
+        _ -> raise
+    catch error:{badkey, _} -> raise
+    end.
 
 %% @doc Helper function for returning a result from a Lua function.
 return(Result, ExecState, Opts) ->

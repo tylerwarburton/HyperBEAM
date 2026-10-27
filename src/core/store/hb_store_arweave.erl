@@ -162,6 +162,21 @@ read_remote_offset(_, _, _) -> not_found.
 %% `~arweave@2.9' reads return messages, not data, and `store-module', as in
 %% `hb_store_remote_node:read/3'.
 read(StoreOpts, #{ <<"read">> := ID }, NodeOpts) when ?IS_ID(ID) ->
+    case canonical_id(ID) of
+        true -> read_id(StoreOpts, ID, NodeOpts);
+        % 43 characters that are not the form `hb_util:human_id/1' gives name
+        % no item, and `hb_util:native_id/1' raises on them.
+        false -> {error, not_found}
+    end;
+read(_StoreOpts, #{ <<"read">> := _ID }, _NodeOpts) ->
+    {error, not_found}.
+
+canonical_id(ID) ->
+    try hb_util:native_id(ID) of _ -> true
+    catch _:_ -> false
+    end.
+
+read_id(StoreOpts, ID, NodeOpts) ->
     Opts =
         maps:without(
             [<<"store-module">>, <<"force-message">>],
@@ -179,9 +194,7 @@ read(StoreOpts, #{ <<"read">> := ID }, NodeOpts) when ?IS_ID(ID) ->
                 not_found -> {error, not_found};
                 Result -> Result
             end
-    end;
-read(_StoreOpts, #{ <<"read">> := _ID }, _NodeOpts) ->
-    {error, not_found}.
+    end.
 
 %% @doc Read the data at the given key, reading the provided Arweave index store
 %% as a source of offsets. After offsets have been found, the data is loaded
