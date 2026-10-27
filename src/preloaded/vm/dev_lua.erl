@@ -253,21 +253,32 @@ initialize(Base, Modules, Opts) ->
     {ok, hb_private:set(Base, <<"state">>, State3, Opts)}.
 
 %% @doc Create a Lua state with no modules, in the node's minimum sandbox and
-%% the sandbox that `requires-determinism' asks for.
+%% the sandbox that `requires-determinism' asks for. A device built on this one
+%% adds its own mandatory entries through `lua-device-sandbox', on top of the
+%% node's minimum rather than in place of it.
 create_state(Base, Opts) ->
     DeterministicSpec =
         case hb_util:bool(hb_maps:get(<<"requires-determinism">>, Base, false, Opts)) of
             true -> ?DETERMINISTIC_SANDBOX;
             false -> []
         end,
-    case hb_opts:get(<<"lua-minimum-sandbox">>, ?DEFAULT_MIN_SANDBOX, Opts) of
-        false -> sandbox(luerl:init(), DeterministicSpec, Opts);
-        MinSpec ->
+    DeviceSpec = hb_opts:get(<<"lua-device-sandbox">>, [], Opts),
+    case {hb_opts:get(<<"lua-minimum-sandbox">>, ?DEFAULT_MIN_SANDBOX, Opts), DeviceSpec} of
+        {false, []} -> sandbox(luerl:init(), DeterministicSpec, Opts);
+        {MinSpec, _} ->
             dev_lua_require:install(
-                sandbox(luerl:init(), MinSpec ++ DeterministicSpec, Opts),
+                sandbox(
+                    luerl:init(),
+                    sandbox_list(MinSpec) ++ DeterministicSpec ++ DeviceSpec,
+                    Opts
+                ),
                 Opts
             )
     end.
+
+sandbox_list(false) -> [];
+sandbox_list(Map) when is_map(Map) -> maps:to_list(Map);
+sandbox_list(List) when is_list(List) -> List.
 
 %%% @doc Return a list of all functions in the Lua environment.
 -spec functions(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
