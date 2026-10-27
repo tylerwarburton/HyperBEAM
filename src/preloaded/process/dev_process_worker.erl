@@ -113,13 +113,18 @@ server(GroupName, RawBase, Opts) ->
                     {listener, Listener}
                 }
             ),
-            Res =
-                execute(
-                    Base,
-                    Req,
-                    TargetSlot,
-                    hb_maps:merge(ListenerOpts, ServerOpts, Opts)
-                ),
+            {ExecMicros, Res} =
+                timer:tc(fun() ->
+                    execute(
+                        Base,
+                        Req,
+                        TargetSlot,
+                        slot_opts(hb_maps:merge(ListenerOpts, ServerOpts, Opts))
+                    )
+                end),
+            % The worker's busy time per request: what every message to this
+            % process queues behind (`bench/game_slot_bench.erl').
+            hb_phase_timer:record(worker_execute, ExecMicros),
             ?event(worker, {work_done, {group, GroupName}, {req, Req}, {res, Res}}),
             send_notification(Listener, GroupName, TargetSlot, Res),
             server(GroupName, next_base(Base, Res), Opts);
@@ -137,6 +142,21 @@ server(GroupName, RawBase, Opts) ->
         % Return the current process state.
         {ok, Base}
     end.
+
+%% @doc The options a slot computes under. A computed slot is stored and read
+%% by slot number (`lib_process_cache'), never by ID or hashpath, so the
+%% resolutions that compute it do not content-address the process state:
+%% with `hashpath => update' every nested resolution (`set', `next',
+%% `execution', `at-slot') committed the whole state with httpsig to look up
+%% a result that is never stored, to normalize its inputs and its result, and
+%% to generate a hashpath. Both options survive nesting, unlike
+%% `cache-control'. Measured on the test-net game (1 MB, 300 players) under a
+%% swarm, 2026-10-27: 59% of the worker's time, one commit 18-39 ms.
+slot_opts(Opts) ->
+    Opts#{
+        <<"hashpath">> => ignore,
+        <<"result-cache-lookup">> => false
+    }.
 
 %% @doc Execute one request against the worker's live state.
 %%
