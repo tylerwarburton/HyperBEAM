@@ -330,7 +330,21 @@ do_assign(State, Message, ReplyPID) ->
 %% @doc Commit to the assignment using all of our appropriate wallets.
 commit_assignment(BaseAssignment, State) ->
     Wallets = maps:get(wallets, State),
-    Opts = maps:get(opts, State),
+    % Signing writes the nested messages it links (the body) to the first
+    % store of its options. Give it the scheduler's store, where the
+    % assignment and its body are written next anyway, so no copy of the
+    % body lands in the node's store (the irreplaceable store, when one is
+    % set, is the scheduler's).
+    RawOpts = maps:get(opts, State),
+    Opts =
+        RawOpts#{
+            <<"store">> =>
+                hb_opts:get(
+                    scheduler_store,
+                    hb_opts:get(store, no_viable_store, RawOpts),
+                    RawOpts
+                )
+        },
     CommittmentSpec = maps:get(committment_spec, State),
     lists:foldr(
         fun(Wallet, Assignment) ->
