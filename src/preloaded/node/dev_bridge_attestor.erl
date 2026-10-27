@@ -69,21 +69,28 @@ device_info(_) ->
 
 %% @doc The node `start' hook: spawn the loop once, hand the node message back.
 %% Never fails: a bridge problem must not stop the node from booting.
+%%
+%% The configuration and the loop's options come from `Opts', the node's own
+%% message, never from the request: `start' is also reachable over HTTP, and a
+%% request must not choose what the loop runs or where it writes. The hook's
+%% `hashpath' override is dropped, so the loop runs with the node message as
+%% the hook was given it.
 start(_Base, Req, Opts) ->
     NodeMsg = hb_maps:get(<<"body">>, Req, Opts, Opts),
     try
-        case config(NodeMsg) of
+        LoopOpts = maps:remove(<<"hashpath">>, Opts),
+        case config(LoopOpts) of
             #{ <<"pusd">> := _ } = Cfg ->
                 case hb_name:lookup(?NAME) of
                     Pid when is_pid(Pid) -> ok;
                     _ ->
-                        Pid = spawn(fun() -> init(Cfg, NodeMsg) end),
+                        Pid = spawn(fun() -> init(Cfg, LoopOpts) end),
                         hb_name:register(?NAME, Pid)
                 end;
             _ ->
                 ?event(bridge, {not_configured})
         end
-    catch C:R:T -> ?event(bridge, {start_failed, C, R, T})
+    catch C:R:T -> ?event(bridge, {start_failed, element(2, failure(C, R, T))})
     end,
     {ok, #{ <<"body">> => NodeMsg }}.
 
@@ -141,7 +148,8 @@ initial_state(Cfg0, Opts) ->
         cfg => Cfg, opts => Opts, keys => Keys, me => Me,
         cursors => Cursors, deposits => Deposits, releases => Releases, sent => #{},
         last_pass => 0, last_error => null, member => false, namespace => 0,
-        timer => undefined, pass_at => 0, fast_until => 0, fast_since => 0, nudge_at => 0
+        timer => undefined, pass_at => 0, fast_until => 0, fast_since => 0, nudge_at => 0,
+        skipped => #{}
     }.
 
 loop(St) ->
@@ -151,8 +159,9 @@ loop(St) ->
             St1 = St#{ timer => undefined, pass_at => Start },
             St2 = try pass(St1)
                   catch C:R:T ->
-                      ?event(bridge, {pass_failed, C, R, T}),
-                      St1#{ last_error => iolist_to_binary(io_lib:format("~p:~p", [C, R])) }
+                      {LastError, Log} = failure(C, R, T),
+                      ?event(bridge, Log),
+                      St1#{ last_error => LastError }
                   end,
             Next = next_interval(maps:get(cfg, St2), maps:get(fast_until, St2), os:system_time(millisecond)),
             loop(St2#{ timer => erlang:send_after(Next, self(), pass) });
@@ -180,6 +189,34 @@ loop(St) ->
             From ! {Ref, {ok, public_keys(St)}},
             loop(St)
     end.
+
+%% A failed pass: what `status' shows, and what is logged. Neither carries a
+%% URL (RPC URLs hold API keys), a map (the node's options hold its wallet) or
+%% a call's arguments: class, reason and module:function/arity:line only.
+failure(C, R, T) ->
+    Reason = scrub(R),
+    Shown = iolist_to_binary(io_lib:format("~0p:~0p", [C, Reason])),
+    {binary:part(Shown, 0, min(512, byte_size(Shown))),
+        {pass_failed, C, Reason, [frame(F) || F <- T]}}.
+
+frame({M, F, A, Loc}) ->
+    Arity = case A of N when is_integer(N) -> N; Args -> length(Args) end,
+    {M, F, Arity, proplists:get_value(line, Loc)};
+frame(_) -> unknown.
+
+scrub(B) when is_binary(B) ->
+    case binary:match(B, <<"://">>) of
+        nomatch -> B;
+        _ ->
+            case catch uri_string:parse(B) of
+                #{ host := H } when is_binary(H) -> <<"<url ", H/binary, ">">>;
+                _ -> <<"<url>">>
+            end
+    end;
+scrub(M) when is_map(M) -> {map, maps:size(M)};
+scrub([H | T]) -> [scrub(H) | scrub(T)];
+scrub(T) when is_tuple(T) -> list_to_tuple(scrub(tuple_to_list(T)));
+scrub(X) -> X.
 
 %% Fast while a nudge is recent, idle otherwise.
 next_interval(Cfg, FastUntil, Now) when Now < FastUntil -> cfg_ms(Cfg, <<"fast-interval">>, 1000);
@@ -220,7 +257,8 @@ attest(Info, St = #{ cfg := Cfg, me := Me }) ->
         true ->
             {Found, Cursors} = scan(Cfg, maps:get(cursors, St), maps:get(opts, St)),
             Ns = hb_util:int(maps:get(<<"namespace">>, Info, 0)),
-            St1 = remember(Found, St#{ cursors => Cursors, member => true, namespace => Ns }),
+            St1 = remember(Found, St#{ cursors => Cursors, member => true, namespace => Ns,
+                skipped => #{} }),
             % What was found is on disk before the cursors pass it.
             save_state(Cfg, St1),
             St2 = attest_deposits(Info, St1),
@@ -228,8 +266,10 @@ attest(Info, St = #{ cfg := Cfg, me := Me }) ->
             St4 = acknowledge(Withdrawals, St3),
             St5 = lists:foldl(
                 fun(P, S) ->
-                    Id = hb_util:int(maps:get(<<"id">>, P)),
-                    once(<<"vote:", (integer_to_binary(Id))/binary>>, S, fun() -> vote(P, S) end)
+                    guard(<<"proposal:", (item_id(P))/binary>>, S, fun() ->
+                        Id = hb_util:int(maps:get(<<"id">>, P)),
+                        once(<<"vote:", (integer_to_binary(Id))/binary>>, S, fun() -> vote(P, S) end)
+                    end)
                 end, St4, proposals_to_vote(Info, Me)),
             save_state(Cfg, St5),
             St5#{ last_pass => os:system_time(millisecond), last_error => null }
@@ -242,25 +282,22 @@ scan(Cfg, Cursors, Opts) ->
             case maps:get(Chain, Cfg, undefined) of
                 undefined -> {Acc, Cur};
                 C ->
-                    case scan_chain(Chain, C, maps:get(Chain, Cur, undefined), Opts) of
+                    % A chain that raises fails alone: the others still scan.
+                    Res = try scan_chain(Chain, C, maps:get(Chain, Cur, undefined), Opts)
+                          catch Class:Reason:Trace ->
+                              {error, element(2, failure(Class, Reason, Trace))}
+                          end,
+                    case Res of
                         {ok, Events, Next} -> {Acc ++ Events, Cur#{ Chain => Next }};
-                        Error -> ?event(bridge, {scan_failed, Chain, Error}), {Acc, Cur}
+                        Error -> ?event(bridge, {scan_failed, Chain, scrub(Error)}), {Acc, Cur}
                     end
             end
         end, {[], Cursors}, [<<"base">>, <<"solana">>, <<"sui">>]).
 
 scan_chain(<<"base">>, C, Cursor, Opts) ->
-    {ok, Head} = dev_bridge_attestor_chains:base_head(C, Opts),
-    Safe = Head - hb_util:int(maps:get(<<"confirmations">>, C, 12)),
-    From = case Cursor of undefined -> hb_util:int(maps:get(<<"from-block">>, C, Safe)); N -> N + 1 end,
-    To = min(Safe, From + hb_util:int(maps:get(<<"log-range">>, C, 2000)) - 1),
-    case To < From of
-        true -> {ok, [], Cursor};
-        false ->
-            case dev_bridge_attestor_chains:base_scan(C, From, To, Opts) of
-                {ok, Events} -> {ok, Events, To};
-                Error -> Error
-            end
+    case dev_bridge_attestor_chains:base_head(C, Opts) of
+        {ok, Head} -> scan_base(C, Cursor, Head, Opts);
+        Error -> Error
     end;
 scan_chain(<<"solana">>, C, Cursor, Opts) ->
     Until = case Cursor of undefined -> undefined; null -> undefined; S -> S end,
@@ -274,6 +311,19 @@ scan_chain(<<"sui">>, C, Cursor, Opts) ->
         {ok, Events, #{ deposit := D2, released := R2 }} ->
             {ok, Events, #{ <<"deposit">> => null_if(D2), <<"released">> => null_if(R2) }};
         Error -> Error
+    end.
+
+scan_base(C, Cursor, Head, Opts) ->
+    Safe = Head - hb_util:int(maps:get(<<"confirmations">>, C, 12)),
+    From = case Cursor of undefined -> hb_util:int(maps:get(<<"from-block">>, C, Safe)); N -> N + 1 end,
+    To = min(Safe, From + hb_util:int(maps:get(<<"log-range">>, C, 2000)) - 1),
+    case To < From of
+        true -> {ok, [], Cursor};
+        false ->
+            case dev_bridge_attestor_chains:base_scan(C, From, To, Opts) of
+                {ok, Events} -> {ok, Events, To};
+                Error -> Error
+            end
     end.
 
 undef(null) -> undefined;
@@ -313,7 +363,7 @@ attest_deposits(Info, St = #{ deposits := Deps }) ->
 
 sign_withdrawals(Withdrawals, St = #{ me := Me }) ->
     lists:foldl(
-        fun(W, S) ->
+        fun(W, S) -> guard(<<"withdrawal:", (item_id(W))/binary>>, S, fun() ->
             Sigs = maps:get(<<"sigs">>, W, #{}),
             Pending = maps:get(<<"status">>, W, <<>>) =:= <<"pending">>,
             Signed = is_map(Sigs) andalso maps:is_key(Me, Sigs),
@@ -331,7 +381,7 @@ sign_withdrawals(Withdrawals, St = #{ me := Me }) ->
                             <<"releasesig">> => Sig }, S)
                     end)
             end
-        end, St, Withdrawals).
+        end) end, St, Withdrawals).
 
 acknowledge(Withdrawals, St = #{ releases := Rel }) ->
     Pending = maps:from_list([{maps:get(<<"id">>, W), true} || W <- Withdrawals,
@@ -347,6 +397,21 @@ acknowledge(Withdrawals, St = #{ releases := Rel }) ->
                     end)
             end
         end, St, Rel).
+
+%% One withdrawal or proposal PUSD published that this node cannot sign (a
+%% malformed address, a chain it does not run) is skipped and shown in
+%% `status', instead of failing every pass and halting the rest.
+guard(Key, St, Fun) ->
+    try Fun()
+    catch C:R:T ->
+        {Why, Log} = failure(C, R, T),
+        ?event(bridge, {skipped, Key, Log}),
+        St#{ skipped := (maps:get(skipped, St))#{ Key => Why } }
+    end.
+
+item_id(#{ <<"id">> := Id }) when is_binary(Id) -> Id;
+item_id(#{ <<"id">> := Id }) when is_integer(Id) -> integer_to_binary(Id);
+item_id(_) -> <<"?">>.
 
 %% Send at most once per RESEND_MS per key: PUSD is idempotent, but every
 %% message is a slot.
@@ -639,6 +704,8 @@ status_view(St) ->
         <<"waiting-acks">> => maps:size(maps:get(releases, St)),
         <<"last-pass">> => maps:get(last_pass, St),
         <<"last-error">> => maps:get(last_error, St),
+        <<"skipped">> => [#{ <<"item">> => K, <<"reason">> => V }
+            || {K, V} <- lists:sort(maps:to_list(maps:get(skipped, St, #{})))],
         <<"rpcs">> => rpc_hosts(maps:get(cfg, St))
     }.
 
@@ -901,9 +968,70 @@ start_hook_test_() ->
                 <<"sui">> := <<"0x", _:64/binary>> }, Keys),
             {ok, _} = hb_http:get(Node, <<"/~bridge-attestor@1.0/status">>, Opts)
         after
-            case hb_name:lookup(?NAME) of
-                Pid when is_pid(Pid) -> hb_name:unregister(?NAME), exit(Pid, kill);
-                _ -> ok
-            end
+            stop_loop()
         end
     end}.
+
+stop_loop() ->
+    case hb_name:lookup(?NAME) of
+        Pid when is_pid(Pid) -> hb_name:unregister(?NAME), exit(Pid, kill);
+        _ -> ok
+    end.
+
+%%% Hardening -----------------------------------------------------------------
+
+%% `start' is reachable over HTTP, so it takes its configuration from the
+%% node's own options, never from the request: a request cannot start a loop
+%% or make a keys file at a path it chose.
+start_ignores_request_config_test() ->
+    stop_loop(),
+    Dir = <<"/tmp/bridge-start-req">>,
+    _ = file:make_dir(Dir),
+    File = <<Dir/binary, "/keys.json">>,
+    _ = file:delete(File),
+    Body = #{ <<"bridge">> => #{ <<"pusd">> => <<"p">>, <<"keys-file">> => File } },
+    {ok, #{ <<"body">> := Body }} =
+        start(#{}, #{ <<"body">> => Body }, #{ <<"only">> => local }),
+    timer:sleep(500),
+    Running = hb_name:lookup(?NAME),
+    stop_loop(),
+    ?assertNot(is_pid(Running)),
+    ?assertEqual({error, enoent}, file:read_file_info(File)).
+
+%% One chain raising (here Base, with no `rpc') fails that chain alone: the
+%% others still scan, and its cursor stays where it was.
+scan_isolates_a_crashing_chain_test() ->
+    Cursors = #{ <<"base">> => 7 },
+    ?assertEqual({[], Cursors}, scan(#{ <<"base">> => #{} }, Cursors, #{})),
+    ?assertEqual({[], Cursors},
+        scan(#{ <<"base">> => #{ <<"rpc">> => 1 } }, Cursors, #{})).
+
+%% A failed pass shows and logs no URL (RPC URLs carry API keys) and no
+%% call arguments, only class, reason and where.
+failure_hides_urls_and_args_test() ->
+    Url = <<"https://base-mainnet.g.alchemy.com/v2/SECRET">>,
+    T = [{maps, get, [<<"pusd">>, #{ <<"rpc">> => Url }], []},
+        {?MODULE, pass, 1, [{file, "dev_bridge_attestor.erl"}, {line, 211}]}],
+    {Shown, Logged} = failure(error, {badmatch, {error, {post_json, Url, x}}}, T),
+    Text = iolist_to_binary([Shown, io_lib:format("~p", [Logged])]),
+    ?assertEqual(nomatch, binary:match(Text, <<"SECRET">>)),
+    ?assertNotEqual(nomatch, binary:match(Text, <<"base-mainnet.g.alchemy.com">>)),
+    ?assertNotEqual(nomatch, binary:match(Text, <<"211">>)).
+
+%% A withdrawal PUSD publishes that cannot be signed (a bad `to', a chain this
+%% node does not run) is skipped and reported; the rest still sign.
+malformed_withdrawal_is_skipped_test() ->
+    W = fun(Id, Chain, To) -> #{ <<"id">> => Id, <<"chain">> => Chain,
+        <<"status">> => <<"pending">>, <<"amount">> => <<"1">>, <<"to">> => To,
+        <<"token">> => <<"0x2222222222222222222222222222222222222222">> } end,
+    St = #{ me => <<"me">>, namespace => 0, sent => #{}, skipped => #{},
+        keys => #{ base => binary:copy(<<1>>, 32) },
+        cfg => #{ <<"pusd">> => <<"p">>, <<"base">> => #{ <<"chain-id">> => 8453,
+            <<"contract">> => <<"0x1111111111111111111111111111111111111111">> } } },
+    St1 = sign_withdrawals([W(<<"9">>, <<"base">>, <<"0xnot-an-address">>),
+        W(<<"10">>, <<"eth">>, <<"0x3333333333333333333333333333333333333333">>), not_a_map], St),
+    ?assertEqual(3, maps:size(maps:get(skipped, St1))),
+    ?assertEqual(#{}, maps:get(sent, St1)),
+    ?assertMatch(#{ <<"skipped">> := [_, _, _] },
+        status_view(St1#{ cursors => #{}, deposits => #{}, releases => #{}, member => true,
+            last_pass => 0, last_error => null })).
