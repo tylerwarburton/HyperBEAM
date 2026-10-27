@@ -85,11 +85,38 @@ the numbers below with the reason they moved.
 7. **Stores**: crash-safe LMDB sync, `hb_store_irreplaceable`,
    `hb_store_offsite_journal`, `hb_store_retention`. RC7 rewrote the storage
    layout (no links or groups), so these are rewritten, not copied.
-8. **`bridge-attestor@1.0`**, `evm-rpc@1.0`, chain signing. Carry the
-   2026-10-26 polling fix (uncommitted in the old fork and monorepo when
-   noted): 2-minute idle scan, nudges still give 1 s scans for 2 minutes, a
-   fixed 15 s nudge cooldown, one fewer `eth_blockNumber` per Base scan in
-   `dev_eth_client`. It ships with the next node deploy either way.
+8. **`bridge-attestor@1.0`**, `evm-rpc@1.0`, chain signing: ported
+   (2026-10-27) from `dev_bridge`, `hb_bridge_sign`, `hb_bridge_chains` and
+   `dev_eth_client`, with the 2026-10-26 polling fix (fixed 15 s nudge
+   cooldown; Base `range` scans skip `eth_blockNumber`; the 2-minute idle
+   `interval` is set by the monorepo's config). What it signs and sends is
+   unchanged: same digests (the viem/node/Move vectors pass), PUSD actions,
+   tags, epoch and namespace handling, config and state files.
+   - Signing and chain scanning are the device's helpers
+     (`dev_bridge_attestor_sign`, `dev_bridge_attestor_chains`), packaged
+     with it. Base goes to `evm-rpc@1.0` by name through `hb_ao:raw`.
+   - On v0.11 the node's httpsig committer is a `publickey:` URI;
+     `lua-patch@1.0` hands Lua the address, so a PUSD on lua-patch (or
+     lua-atomic) sees the attestor as before. Tested end to end.
+   - v0.11's relay refuses internal hosts (`hosts-block-internal`, on by
+     default): a `pusd-node` or RPC URL on localhost or a private IP is
+     refused. Ours are public.
+
+   Node config for an attestor: `on.start.device` = `bridge-attestor@1.0`
+   (was `bridge@1.0`); the `bridge` block is unchanged (`pusd`, `pusd-node`,
+   `interval`, `fast-interval`, `fast-window`, `keys-file`, `state-file`,
+   `follow-file`, `base`, `solana`, `sui`). Endpoints moved to
+   `/~bridge-attestor@1.0/{keys,status,nudge}`.
+
+   Tests (`hb-v11-dev`, `--module=dev_bridge_attestor,
+   dev_bridge_attestor_sign,dev_bridge_attestor_chains,dev_evm_rpc`): 35/35,
+   twice. They include a stand-in PUSD on lua-patch@1.0 (one pass reads its
+   `bridgeinfo`, votes, and PUSD records the node's address as committer),
+   locally and through `pusd-node` over HTTP, and the start hook serving
+   `/keys`. Base head/getLogs and Sui GraphQL were also scanned live from
+   the box through v0.11's relay (public endpoints; Solana not, as its RPC
+   is private). `evm-rpc`'s network tests use publicnode: eth.merkle.io
+   refuses the box.
 9. **Clients and contracts** (monorepo): httpsig keyids are base64url, and
    the committer is the `publickey:` URI, not an address, so `signer()` has to
    map it. Lands with the fresh deploy.
