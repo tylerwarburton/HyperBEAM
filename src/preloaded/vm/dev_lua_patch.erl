@@ -145,9 +145,10 @@ compute(Key, RawBase, RawReq, Opts) ->
 %% every node collects at the same slots. That matters: a collection frees
 %% table slots that later tables reuse, and Lua can see a table's slot number
 %% (`tostring' of a table, the order `pairs' visits table keys). So the
-%% interval must be the same on every node computing a process: a process
-%% that sets `lua-gc-interval-slots' in its definition fixes it for all of
-%% them; otherwise it is the node option, then the default.
+%% interval must be the same on every node computing a process. It comes
+%% from the process definition (`lua-gc-interval-slots'), else the default,
+%% and never from the node's options: no node setting may change a computed
+%% result.
 collect(true, Base, Req, {ok, Values, State}, Opts) ->
     Interval = gc_interval(Base, Opts),
     case Interval > 0 andalso slot(Req, Opts) of
@@ -161,11 +162,7 @@ collect(_InSlot, _Base, _Req, Response, _Opts) ->
     Response.
 
 gc_interval(Base, Opts) ->
-    Raw =
-        case hb_maps:get(<<"lua-gc-interval-slots">>, Base, not_found, Opts) of
-            not_found -> hb_opts:get(<<"lua-gc-interval-slots">>, ?GC_INTERVAL_SLOTS, Opts);
-            Set -> Set
-        end,
+    Raw = hb_maps:get(<<"lua-gc-interval-slots">>, Base, ?GC_INTERVAL_SLOTS, Opts),
     case catch hb_util:int(Raw) of
         N when is_integer(N), N >= 0 -> N;
         _ -> ?GC_INTERVAL_SLOTS
@@ -741,6 +738,128 @@ gc_interval_bounds_heap_test_() ->
 %% fixed by the slot number and the interval: two VMs computing the same slots
 %% with the same interval publish the same strings, and a different interval
 %% does not.
+layout_script() ->
+    <<
+        "Keys = Keys or {}\n"
+        "function compute(req)\n"
+        "  for i = 1, 7 do local dead = { i } end\n"
+        "  Keys[{}] = true\n"
+        "  local order = {}\n"
+        "  for key in pairs(Keys) do order[#order + 1] = tostring(key) end\n"
+        "  return { patches = {\n"
+        "    { path = '/t', value = tostring({}) },\n"
+        "    { path = '/order', value = table.concat(order, ',') }\n"
+        "  }, results = {} }\n"
+        "end\n"
+    >>.
+
+%% @doc A node's options cannot change the collection cadence, and with it
+%% what Lua sees: only the process definition sets `lua-gc-interval-slots'.
+node_option_cannot_change_gc_interval_test_() ->
+    {timeout, 120, fun() ->
+        hb:init(),
+        Run =
+            fun(Opts) ->
+                Base0 =
+                    hb_private:set(
+                        base(<<"lua-patch@1.0">>, layout_script()),
+                        <<"initialized">>, <<"true">>, Opts),
+                {_, Seen} =
+                    lists:foldl(
+                        fun(Slot, {Base, Acc}) ->
+                            {ok, Next} =
+                                hb_ao:resolve(
+                                    Base,
+                                    #{ <<"path">> => <<"compute">>, <<"slot">> => Slot,
+                                        <<"body">> => #{ <<"action">> => <<"Tick">> } },
+                                    Opts
+                                ),
+                            {Next, [hb_ao:get(<<"t">>, Next, Opts) | Acc]}
+                        end,
+                        {Base0, []},
+                        lists:seq(1, 30)
+                    ),
+                Seen
+            end,
+        ?assertEqual(
+            Run(#{ <<"hashpath">> => ignore }),
+            Run(#{ <<"hashpath">> => ignore, <<"lua-gc-interval-slots">> => 1 })
+        )
+    end}.
+
+%% @doc A VM restored from a checkpoint lays its heap out as the VM that
+%% never stopped: the same slots give the same `tostring' of fresh tables and
+%% the same `pairs' order over table keys, collections included.
+restored_vm_same_heap_layout_test_() ->
+    {timeout, 120, fun() ->
+        hb:init(),
+        Slots = 12,
+        Run =
+            fun(Mode) ->
+                Opts = #{
+                    <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+                    <<"priv-wallet">> => ar_wallet:new(),
+                    <<"spawn-worker">> => false,
+                    <<"process-workers">> => false,
+                    <<"process-delta-cache">> => true,
+                    <<"process-snapshot-target">> => false,
+                    <<"process-snapshot-slots">> => 4,
+                    <<"process-delta-checkpoint-slots">> => 4,
+                    <<"process-hot-cache-slots">> => 0
+                },
+                Process =
+                    delta_process(Opts, layout_script(),
+                        #{ <<"lua-gc-interval-slots">> => 3 }),
+                {ok, _} = hb_cache:write(Process, Opts),
+                [
+                    {ok, _} = hb_ao:resolve(Process, schedule_request(Process, N, Opts), Opts)
+                ||
+                    N <- lists:seq(1, Slots)
+                ],
+                Compute =
+                    fun(Base, Slot) ->
+                        {ok, State} =
+                            hb_ao:resolve(
+                                Base,
+                                #{ <<"path">> => <<"compute">>, <<"slot">> => Slot },
+                                Opts
+                            ),
+                        State
+                    end,
+                Last =
+                    case Mode of
+                        live ->
+                            % One VM, never restored, each slot from the last.
+                            lists:foldl(
+                                fun(Slot, State) -> Compute(State, Slot) end,
+                                Compute(Process, 0),
+                                lists:seq(1, Slots - 1)
+                            );
+                        restored ->
+                            % Up to slot 4, then a cold compute of the last
+                            % slot from the process definition alone: restore
+                            % the slot-4 VM and replay the rest.
+                            _ = Compute(Process, 4),
+                            Self = self(),
+                            {ok, _} =
+                                dbg:tracer(process,
+                                    {fun({trace, _, call, _}, Acc) ->
+                                            Self ! internalized, Acc;
+                                        (_, Acc) -> Acc
+                                    end, ok}),
+                            dbg:p(all, c),
+                            dbg:tpl(luerl, internalize, 1, []),
+                            Restored = Compute(Process, Slots - 1),
+                            dbg:stop(),
+                            % The VM really came from a snapshot.
+                            ?assert(receive internalized -> true after 2000 -> false end),
+                            Restored
+                    end,
+                {hb_ao:get(<<"t">>, Last, Opts), hb_ao:get(<<"order">>, Last, Opts)}
+            end,
+        ?assertEqual(Run(live), Run(restored))
+    end}.
+
 gc_cadence_visible_but_deterministic_test_() ->
     {timeout, 120, fun() ->
         hb:init(),
@@ -1591,10 +1710,12 @@ finish_gc_cycle(State, Number, Limit) ->
 delta_process(Opts) ->
     delta_process(Opts, equivalent_script()).
 delta_process(Opts, Script) ->
+    delta_process(Opts, Script, #{}).
+delta_process(Opts, Script, Extra) ->
     Wallet = hb_opts:get(<<"priv-wallet">>, hb:wallet(), Opts),
     Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
     hb_message:commit(
-        #{
+        Extra#{
             <<"device">> => <<"process@1.0">>,
             <<"type">> => <<"Process">>,
             <<"scheduler-device">> => <<"scheduler@1.0">>,

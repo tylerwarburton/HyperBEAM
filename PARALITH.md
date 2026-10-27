@@ -112,7 +112,7 @@ the numbers below with the reason they moved.
      slot did, quadratically in players. lua@5.3a collects after every call.
 
      So lua-patch now collects every `lua-gc-interval-slots` slots (default
-     25; a process may set it in its definition, else the node option). The
+     25, or the process definition's value; never a node option). The
      game leaves ~390 dead tables a slot. 1,000 slots of play (alternating
      `User.Info` and `Monster.Feed`, game's own collect off as on lua-patch),
      offline Luerl on the shared bench box (GC times noisy):
@@ -141,7 +141,13 @@ the numbers below with the reason they moved.
      slot numbers. Luerl has no weak tables, finalizers or `count`, so that
      is the only channel, but it is enough: every node computing a process
      must use the same interval, which is why it follows the slot number
-     and a process can fix it in its definition.
+     and only the process definition can set it. A VM restored from a
+     checkpoint has the same heap layout as one that never stopped
+     (externalize/internalize keep the free lists; restore writes host
+     functions into existing keys), checked slot by slot across collections
+     in `restored_vm_same_heap_layout_test_`. One edge: lua-atomic gives a
+     restored VM whose contract set `ao` to a non-table a new `ao` table,
+     which the live VM does not have.
    - **Collection inside running Lua is safe.** Luerl's collector missed the
      values a suspended frame's instructions hold, so collecting from inside
      an open `for ... in ipairs(...)` freed the iterated table (`badkey`).
