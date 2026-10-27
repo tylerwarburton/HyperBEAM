@@ -759,6 +759,7 @@ apply_store_function(Mod, Store, Function, Args, AttemptsRemaining) ->
                 {stacktrace, {trace, Stacktrace}}
             }
         ),
+        _ = code:ensure_loaded(Mod),
         case erlang:function_exported(Mod, Function, length(Args) + 1) of
             true ->
                 retry(
@@ -844,6 +845,8 @@ call_store_start(Mod, Store, Req, Opts) ->
     end.
 
 call_store_stop(Mod, Store) ->
+    % `function_exported' is false for a module not loaded yet.
+    _ = code:ensure_loaded(Mod),
     case erlang:function_exported(Mod, stop, 3) of
         true -> Mod:stop(Store, #{}, Store);
         false -> Mod:stop(Store)
@@ -1867,3 +1870,30 @@ get_store_scope_access_test() ->
     ?assertEqual(remote, get_store_scope(WriteStore)),
     AdminStore = #{<<"store-module">> => hb_store_remote_node, <<"access">> => [<<"admin">>]},
     ?assertEqual(remote, get_store_scope(AdminStore)).
+
+%% @doc A flush reaches a store whose module is not loaded yet: on a fresh
+%% node `erlang:function_exported/3' is false for it until something loads
+%% it, and the flush was skipped.
+flush_reaches_unloaded_module_test() ->
+    N = integer_to_list(erlang:unique_integer([positive])),
+    Mod = list_to_atom("hb_store_flush_probe_" ++ N),
+    Name = list_to_atom("hb_store_flush_probe_listener_" ++ N),
+    Dir = "cache-TEST/flush-probe-" ++ N,
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    File = filename:join(Dir, atom_to_list(Mod) ++ ".erl"),
+    ok = file:write_file(File, io_lib:format(
+        "-module(~s).~n-export([flush/3, scope/0]).~n"
+        "scope() -> local.~n"
+        "flush(_, _, _) -> ~s ! {flushed, ?MODULE}, ok.~n", [Mod, Name])),
+    {ok, Mod} = compile:file(File, [{outdir, Dir}]),
+    true = code:add_patha(Dir),
+    true = register(Name, self()),
+    try
+        ?assertEqual(false, code:is_loaded(Mod)),
+        ok = flush(#{ <<"store-module">> => Mod, <<"name">> => <<"probe">> }, #{}),
+        ?assertEqual(flushed,
+            receive {flushed, Mod} -> flushed after 2000 -> skipped end)
+    after
+        unregister(Name),
+        code:del_path(Dir)
+    end.
