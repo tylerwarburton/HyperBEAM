@@ -16,6 +16,8 @@
 -module(dev_lua_atomic).
 -implements(<<"lua-atomic@1.0">>).
 -export([device_info/1, init/3, compute/4, snapshot/3, normalize/3, functions/3]).
+%% Called by Luerl as `#erl_mfa{}' host functions, never as device keys.
+-export([lua_atomic/3, lua_collect/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("luerl/include/luerl.hrl").
@@ -24,26 +26,40 @@
 -define(VERSION, {lua_atomic, version}).
 -define(DEPTH, {lua_atomic, depth}).
 -define(HOST_FUNCTIONS, [<<"get">>, <<"resolve">>, <<"set">>, <<"event">>]).
+-define(ATOMIC_MFA, #erl_mfa{ m = ?MODULE, f = lua_atomic, a = nil }).
+-define(COLLECT_MFA, #erl_mfa{ m = ?MODULE, f = lua_collect, a = nil }).
 
 %% @doc Install raw closure callbacks without decoding the closure environment.
 %% Every read and write is raw, so no metamethod a module set on `_G' or `ao'
 %% runs while the host functions are in hand.
 install_atomic(State) ->
-    S0 = luerl:put_private(?VERSION, 1, State),
+    S0 = luerl:put_private(?VERSION, 1, ensure_ao(State)),
     S1 = lists:foldl(
         fun guard_host/2,
         luerl:put_private(?DEPTH, 0, S0),
         ?HOST_FUNCTIONS
     ),
-    S2 = raw_set(raw_ao(S1), <<"atomic">>, fun atomic/2, S1),
+    S2 = luerl_heap:raw_set_table_key(raw_ao(S1), <<"atomic">>, ?ATOMIC_MFA, S1),
     S3 = raw_set(raw_ao(S2), <<"atomic_version">>, 1, S2),
     preload(S3).
 
+%% @doc A contract can replace the global `ao' with something that is not a
+%% table; the VM is then armed with a new, empty one rather than refused.
+ensure_ao(State) ->
+    case raw_ao(State) of
+        #tref{} -> State;
+        _ -> raw_set(State#luerl.g, <<"ao">>, #{}, State)
+    end.
+
 %% @doc Replace `collectgarbage' (`lua-device-preload'). It runs before any
-%% module code, so no module can keep Luerl's own, and again on a restored VM,
-%% whose copy the restore dropped.
+%% module code, so no module can keep Luerl's own. `ao.atomic' and this
+%% `collectgarbage' are `#erl_mfa{}' values, and the preloaded state names
+%% both, so restore (which allows the host functions of a new state and drops
+%% every other) keeps them wherever a contract keeps them, and drops Luerl's
+%% own `collectgarbage'.
 preload(State) ->
-    raw_set(State#luerl.g, <<"collectgarbage">>, fun collect/2, State).
+    S1 = luerl:put_private({lua_atomic, host}, [?ATOMIC_MFA, ?COLLECT_MFA], State),
+    luerl_heap:raw_set_table_key(S1#luerl.g, <<"collectgarbage">>, ?COLLECT_MFA, S1).
 
 raw_ao(State) ->
     luerl_heap:raw_get_table_key(State#luerl.g, <<"ao">>, State).
@@ -66,7 +82,7 @@ in_batch(State) ->
 %% v0.11 runs stock Luerl, so the batch skips it and the next collection
 %% outside a batch does the work. Outside a batch this is Luerl's own
 %% `collectgarbage', called on the current state so its stack stays a root.
-collect(Args, State) ->
+lua_collect(_, Args, State) ->
     case in_batch(State) of
         true -> {[], State};
         false -> luerl_lib_basic:collectgarbage(nil, Args, State)
@@ -79,7 +95,12 @@ collect(Args, State) ->
 %% devices are rejected by `init/3'.
 guard_host(Name, State) ->
     AO = raw_ao(State),
-    Original = luerl_heap:raw_get_table_key(AO, Name, State),
+    case luerl_heap:raw_get_table_key(AO, Name, State) of
+        nil -> State;
+        Original -> guard_host(AO, Name, Original, State)
+    end.
+
+guard_host(AO, Name, Original, State) ->
     Wrapper = fun(Args, Current) ->
         case in_batch(Current) of
             true -> luerl_lib:lua_error(
@@ -105,7 +126,7 @@ private(Key, State) ->
     catch error:{badkey, Key} -> undefined end.
 
 %% @doc Keep savepoints on the Erlang stack, never in serializable VM metadata.
-atomic([Closure], Before) ->
+lua_atomic(_, [Closure], Before) ->
     Depth = private(?DEPTH, Before),
     case Depth < 16 of
         true ->
@@ -113,7 +134,7 @@ atomic([Closure], Before) ->
             finish(luerl:call_function(Closure, [], Working), Before, Depth);
         false -> {[false, <<"Atomic nesting limit exceeded">>], Before}
     end;
-atomic(_, Before) ->
+lua_atomic(_, _, Before) ->
     {[false, <<"ao.atomic expects one function">>], Before}.
 
 %% @doc Only committed return references belong to the returned VM. Failures
@@ -146,7 +167,9 @@ device_info(_Base) ->
                 <<"remove">>,
                 <<"verify">>,
                 <<"encode">>,
-                <<"decode">>
+                <<"decode">>,
+                <<"lua_atomic">>,
+                <<"lua_collect">>
             ]
     }.
 
@@ -384,6 +407,47 @@ module_sandbox_test() ->
     Opts = #{ <<"hashpath">> => ignore, <<"lua-minimum-sandbox">> => false },
     {ok, Result} = hb_ao:resolve(Base, <<"compute">>, Opts),
     ?assertEqual(<<"yes">>, hb_ao:get(<<"safe">>, Result, Opts)).
+
+%% @doc `collectgarbage' kept from module load and `ao.atomic' kept from a
+%% compute work the same on a live VM and on a restored one.
+host_aliases_survive_restore_test() ->
+    hb:init(),
+    Opts = #{ <<"hashpath">> => ignore },
+    Script = <<"""
+        local gc = collectgarbage
+        function compute(req)
+            Atomic = Atomic or ao.atomic
+            local collected = pcall(gc, 'collect')
+            local ran, committed = pcall(Atomic, function() return true end)
+            return { patches = {{ path = '/seen',
+                value = tostring(collected) .. ' ' .. tostring(ran and committed) }} }
+        end
+        """>>,
+    {ok, First} = hb_ao:resolve(base(Script), <<"compute">>, Opts),
+    ?assertEqual(<<"true true">>, hb_ao:get(<<"seen">>, First, Opts)),
+    {ok, Snapshot} = hb_ao:resolve(First, <<"snapshot">>, Opts),
+    Cold = hb_ao:set(hb_private:reset(First), <<"snapshot">>, Snapshot, Opts),
+    {ok, Restored} = hb_ao:resolve(Cold, <<"normalize">>, Opts),
+    {ok, Second} = hb_ao:resolve(Restored, <<"compute">>, Opts),
+    ?assertEqual(<<"true true">>, hb_ao:get(<<"seen">>, Second, Opts)).
+
+%% @doc A contract that replaced the global `ao' with a number still restores.
+non_table_ao_restores_test() ->
+    hb:init(),
+    Opts = #{ <<"hashpath">> => ignore },
+    Script = <<"""
+        function compute(req)
+            local kind = type(ao)
+            ao = 5
+            return { patches = {{ path = '/kind', value = kind }} }
+        end
+        """>>,
+    {ok, First} = hb_ao:resolve(base(Script), <<"compute">>, Opts),
+    {ok, Snapshot} = hb_ao:resolve(First, <<"snapshot">>, Opts),
+    Cold = hb_ao:set(hb_private:reset(First), <<"snapshot">>, Snapshot, Opts),
+    {ok, Restored} = hb_ao:resolve(Cold, <<"normalize">>, Opts),
+    {ok, Second} = hb_ao:resolve(Restored, <<"compute">>, Opts),
+    ?assertEqual(<<"table">>, hb_ao:get(<<"kind">>, Second, Opts)).
 
 %% @doc `math.random' is unavailable even to a base that does not ask for
 %% determinism, from module load on.
