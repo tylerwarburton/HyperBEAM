@@ -9,6 +9,9 @@
 %%%       retention; recompute the head, a slot below the floor and the next
 %%%       slot, from an empty main store and from what retention kept, and
 %%%       compare every published key.
+%%%   full:<legacy|blobs>:<slots>:<dir>   the same game shape on
+%%%       `lua@5.3a' (a full-state process: the whole state in and out each
+%%%       slot); slot time, main-store size, then (blobs) one retention run.
 %%%   long:<legacy|blobs|retention>:<slots>:<dir>   checkpoint and snapshot
 %%%       every 1,000 slots; retention (if on) in its server every 60 s;
 %%%       main-store size every 2,000 slots, and slot time split by whether
@@ -79,13 +82,34 @@ script() ->
         "end\n"
     >>.
 
-process(Opts) ->
+script_full() ->
+    <<
+        "local pad = string.rep('x', 2400)
+"
+        "function compute(base, req, opts)
+"
+        "  base.count = math.tointeger((base.count or 0) + 1)
+"
+        "  local i = base.count % 28
+"
+        "  base['player-' .. i] = '{\"slot\":' .. base.count .. ',\"pad\":\"' .. pad .. '\"}'
+"
+        "  base.results = { output = { data = tostring(base.count) } }
+"
+        "  return base
+"
+        "end
+"
+    >>.
+
+process(Opts) -> process(Opts, <<"lua-patch@1.0">>, script()).
+process(Opts, Device, Script) ->
     Address = hb_util:human_id(ar_wallet:to_address(hb_opts:get(<<"priv-wallet">>, undefined, Opts))),
     hb_message:commit(#{
         <<"device">> => <<"process@1.0">>, <<"type">> => <<"Process">>,
         <<"scheduler-device">> => <<"scheduler@1.0">>,
-        <<"execution-device">> => <<"lua-patch@1.0">>,
-        <<"module">> => #{ <<"content-type">> => <<"application/lua">>, <<"body">> => script() },
+        <<"execution-device">> => Device,
+        <<"module">> => #{ <<"content-type">> => <<"application/lua">>, <<"body">> => Script },
         <<"authority">> => [Address], <<"scheduler-location">> => Address,
         <<"test-random-seed">> => rand:uniform(1000000)
     }, Opts).
@@ -114,8 +138,8 @@ compute(Process, N, Opts) ->
     {ok, State} = hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => N }, Opts),
     State.
 
-spawn_process(Opts) ->
-    Process = process(Opts),
+spawn_process(Opts) -> spawn_process(Opts, process(Opts)).
+spawn_process(Opts, Process) ->
     Sched = hb_opts:get(<<"scheduler-store">>, [], Opts),
     {ok, _} = hb_cache:write(Process, Opts#{ <<"store">> => Sched }),
     Process.
@@ -195,6 +219,37 @@ run(["recompute", N0, Dir]) ->
     say("RECOMPUTE slot ~p below the floor: equal_to_fresh=~p count=~p",
         [Low, LowKept == LowFresh, maps:get(<<"count">>, LowFresh)]),
     say("RECOMPUTE main store before/after retention: ~p / ~p KiB", [MainBefore, du(Dir ++ "/main")]);
+run(["full", Variant, N0, Dir0]) ->
+    hb:init(),
+    N = list_to_integer(N0),
+    Dir = Dir0 ++ "/full-" ++ Variant,
+    os:cmd("rm -rf " ++ Dir),
+    Opts = opts(Dir, "main", Variant, 1000),
+    Process = spawn_process(Opts, process(Opts, <<"lua@5.3a">>, script_full())),
+    ProcID = hb_util:human_id(hb_message:id(Process, all, Opts)),
+    [Main | _] = hb_opts:get(<<"store">>, [], Opts),
+    lists:foreach(fun(I) -> schedule(Process, I, Opts), compute(Process, I, Opts) end,
+                  lists:seq(0, 20)),
+    D0 = du(Dir ++ "/main"),
+    Times =
+        [ begin
+              {T, _} = timer:tc(fun() -> schedule(Process, I, Opts), compute(Process, I, Opts) end),
+              T div 1000
+          end
+        || I <- lists:seq(21, 20 + N) ],
+    D1 = du(Dir ++ "/main"),
+    Med = lists:nth(length(Times) div 2 + 1, lists:sort(Times)),
+    Rows = {pstate(Main, ProcID, <<"s">>), pstate(Main, ProcID, <<"f">>)},
+    Ret =
+        case Variant of
+            "blobs" -> maps:with([deleted, duration_ms], hb_store_retention:retain(Opts));
+            _ -> none
+        end,
+    Head = maps:get(<<"count">>, published(compute(Process, 20 + N, Opts), Opts)),
+    say("FULL ~s slots=~p slot_med=~p ms main_kib_per_1000=~p pstate(s,f)=~p retain=~p "
+        "after=~p count=~p",
+        [Variant, N, Med, (D1 - D0) * 1000 div N, Rows, Ret,
+         {pstate(Main, ProcID, <<"s">>), pstate(Main, ProcID, <<"f">>)}, Head]);
 run(["long", Variant, N0, Dir0]) ->
     hb:init(),
     N = list_to_integer(N0),
