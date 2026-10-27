@@ -514,6 +514,7 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
             % A definition belongs with its assignments, in the scheduler's
             % store (the node's store when none is set).
             {ok, _} = dev_scheduler_cache:write_spawn(Req, Opts),
+            ok = dev_scheduler_cache:flush(Opts),
             case hb_opts:get(scheduler_publish_remote, true, Opts) of
                 false -> ok;
                 _ ->
@@ -1135,7 +1136,13 @@ cache_remote_schedule(_, ProcID, Schedule, Opts) ->
                             {assignment, hb_maps:get(<<"slot">>, Assignment, undefined, Opts)}
                         }
                     ),
-                    dev_scheduler_cache:write(ProcID, Assignment, Opts)
+                    case dev_scheduler_cache:write(ProcID, Assignment, Opts) of
+                        ok -> ok;
+                        Error ->
+                            ?event(error,
+                                {remote_schedule_cache_write_failed,
+                                    {proc_id, ProcID}, {error, Error}})
+                    end
                 end,
                 AssignmentList =
                     hb_util:message_to_ordered_list(
@@ -2300,3 +2307,20 @@ benchmark_suite() ->
             desc => <<"100xRocksDB store, aggressive conf, http/3.">>
         }
     ].
+
+%% @doc A process definition POSTed to the scheduler is committed to the
+%% scheduler's store before the POST is answered.
+spawn_is_flushed_before_answer_test() ->
+    start(),
+    Wallet = hb:wallet(),
+    Sched = (hb_test_utils:test_store(hb_store_lmdb, <<"spawn-flush">>))#{
+        <<"flush-every">> => 0, <<"batch-size">> => 1000000 },
+    Main = hb_test_utils:test_store(hb_store_lmdb, <<"spawn-flush-main">>),
+    Opts = #{ <<"priv-wallet">> => Wallet, <<"store">> => [Main],
+              <<"scheduler-store">> => [Sched] },
+    ok = hb_store:start([Sched, Main], #{}, Opts),
+    Base = hb_message:commit(test_process(Opts), Opts),
+    {ok, _} = hb_ao:resolve(Base, #{ <<"method">> => <<"POST">>,
+        <<"path">> => <<"schedule">>, <<"body">> => Base }, Opts),
+    #{ <<"db">> := DB } = hb_store:find(Sched),
+    ?assertEqual(0, elmdb:overlay_count(DB)).

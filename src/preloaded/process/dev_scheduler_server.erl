@@ -50,7 +50,8 @@ start(ProcID, Proc, Opts) ->
             end,
             % Write the process to the cache. We are the provider-of-last-resort
             % for this data.
-            dev_scheduler_cache:write_spawn(Proc, Opts),
+            {ok, _} = dev_scheduler_cache:write_spawn(Proc, Opts),
+            ok = dev_scheduler_cache:flush(Opts),
             HashpathAlg = hb_path:hashpath_alg(Proc, Opts),
             {CurrentSlot, BaseStateHashpath} =
                 try dev_scheduler_cache:latest(ProcID, Opts) of
