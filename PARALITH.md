@@ -110,6 +110,42 @@ the numbers below with the reason they moved.
      (`lua53b.lua`); its per-slot `collectgarbage("step")` is a no-op on
      stock Luerl, so ordinary slots do not pay this, but every checkpoint
      slot did, quadratically in players. lua@5.3a collects after every call.
+
+     So lua-patch now collects every `lua-gc-interval-slots` slots (default
+     25; a process may set it in its definition, else the node option). The
+     game leaves ~390 dead tables a slot. 1,000 slots of play (alternating
+     `User.Info` and `Monster.Feed`, game's own collect off as on lua-patch),
+     offline Luerl on the shared bench box (GC times noisy):
+
+     | Players | N | GC per slot (amortised) | GC avg / max | Max tables (x live) | Snapshot before GC / live |
+     |---:|---:|---:|---:|---:|---:|
+     | 1,000 | none | 0 | - | 395,469 (50x) | 9.9 / 2.4 MB |
+     | 1,000 | 1 | 14.8 ms | 15 / 46 ms | 8,478 (1.06x) | 2.4 / 2.4 MB |
+     | 1,000 | 25 | 1.6 ms | 40 / 118 ms | 17,778 (2.2x) | 2.6 / 2.4 MB |
+     | 1,000 | 100 | 1.0 ms | 100 / 320 ms | 46,719 (5.9x) | 3.1 / 2.4 MB |
+     | 1,000 | 250 | 0.2 ms | 53 / 65 ms | 104,844 (13x) | 4.3 / 2.4 MB |
+     | 1,000 | 1000 | 0.2 ms | 160 ms | 395,469 (50x) | 9.9 / 2.4 MB |
+     | 5,000 | none | 0 | - | 423,549 (12x) | 58.9 / 51.4 MB |
+     | 5,000 | 1 | 71.8 ms | 72 / 112 ms | 36,558 (1.01x) | 51.5 / 51.4 MB |
+     | 5,000 | 25 | 2.4 ms | 61 / 99 ms | 45,858 (1.27x) | 51.6 / 51.4 MB |
+     | 5,000 | 100 | 1.8 ms | 181 / 479 ms | 74,799 (2.1x) | 52.2 / 51.4 MB |
+     | 5,000 | 250 | 0.3 ms | 78 / 86 ms | 132,924 (3.7x) | 53.3 / 51.4 MB |
+     | 5,000 | 1000 | 0.3 ms | 302 ms | 423,549 (12x) | 58.9 / 51.4 MB |
+
+     25 is the largest interval that keeps the heap near 2x live at 1,000
+     players, with the smallest spike among those that do (~100 ms). The game
+     slot itself is 24-70 ms here, so ~2 ms is a few percent.
+
+     The cadence is visible to Lua: a freed table slot is reused, and
+     `tostring` of a table and the order `pairs` visits table keys show
+     slot numbers. Luerl has no weak tables, finalizers or `count`, so that
+     is the only channel, but it is enough: every node computing a process
+     must use the same interval, which is why it follows the slot number
+     and a process can fix it in its definition.
+   - **Collection inside running Lua is safe.** Luerl's collector missed the
+     values a suspended frame's instructions hold, so collecting from inside
+     an open `for ... in ipairs(...)` freed the iterated table (`badkey`).
+     `hb_luerl_gc` marks them.
    - **Direct computes have a deadline.** `lua-compute-deadline` (ms,
      default 120000, `infinity`/`false` off) stops a direct call to
      lua-patch or lua-atomic with a 504; the Lua runs in its own process and
