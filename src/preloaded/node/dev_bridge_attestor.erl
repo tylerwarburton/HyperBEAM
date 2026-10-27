@@ -4,7 +4,8 @@
 %%%
 %%% A background loop, started by the node's `start' hook, that on every pass:
 %%%
-%%%   1. reads PUSD's published `bridgeinfo' and `withdrawals';
+%%%   1. computes PUSD (`bridgeinfo', `withdrawals') from assignments it
+%%%      verified itself;
 %%%   2. scans Base (through `evm-rpc@1.0'), Solana and Sui for deposits and
 %%%      releases since its cursors;
 %%%   3. attests each unminted deposit with `Bridge-Mint';
@@ -42,17 +43,16 @@
 %%% The cursors and the deposits and releases still waiting are kept in the
 %%% `state-file', so a restart picks up where the node left off.
 %%%
-%%% What PUSD holds (its set, proposals, minted deposits and withdrawals) comes
-%%% from this node's own computation of PUSD, never from another node's
-%%% published state. When PUSD runs elsewhere (`pusd-node'), the node keeps a
-%%% verified replica of it (`dev_bridge_attestor_replica'): the scheduler's
-%%% signed, hash-chained assignments, each message's own signature checked,
-%%% computed here. A replica that is behind, cannot verify a slot or breaks
-%%% the chain stops the pass: nothing is minted, signed or voted on.
+%%% One rule: the node acts (attests a deposit, signs a release, acknowledges,
+%%% votes, follows a successor) only on PUSD state it computed itself from
+%%% assignments it verified (`dev_bridge_attestor_replica'). It trusts nothing
+%%% another node publishes, its own scheduler's included: every attestor,
+%%% wherever PUSD runs, reads PUSD the same way. Until a slot verifies there is
+%%% nothing to act on; a slot that does not verify is where the replica stays.
 %%%
 %%% Configuration, under the node option `bridge':
-%%%   pusd, pusd-node (the URL of the node that runs PUSD's scheduler; omit when
-%%%   it is this node), replica-dir (where the replica is kept, default
+%%%   pusd, scheduler-url (where PUSD's scheduler is reached: transport only,
+%%%   nothing it serves is used unverified), replica-dir (default
 %%%   `bridge-replica'), interval, fast-interval, fast-window (ms), keys-file,
 %%%   state-file, follow-file,
 %%%   base => #{ rpc, contract, chain-id, confirmations, from-block, log-range },
@@ -90,7 +90,7 @@ start(_Base, Req, Opts) ->
     try
         LoopOpts = maps:remove(<<"hashpath">>, Opts),
         case config(LoopOpts) of
-            #{ <<"pusd">> := _ } = Cfg ->
+            #{ <<"pusd">> := _, <<"scheduler-url">> := _ } = Cfg ->
                 case hb_name:lookup(?NAME) of
                     Pid when is_pid(Pid) -> ok;
                     _ ->
@@ -167,7 +167,7 @@ loop(St) ->
         pass ->
             Start = os:system_time(millisecond),
             St1 = St#{ timer => undefined, pass_at => Start },
-            St2 = try maps:remove(views, pass(St1))
+            St2 = try pass(St1)
                   catch C:R:T ->
                       {LastError, Log} = failure(C, R, T),
                       ?event(bridge, Log),
@@ -250,23 +250,22 @@ nudge_arm(Now, Cfg, St = #{ nudge_at := NudgeAt, fast_since := Since0, fast_unti
         false -> {ok, St#{ nudge_at := Now, fast_since := Since, fast_until := Until }}
     end.
 
-pass(St0) ->
-    case replica_view(St0) of
-        {ok, St} -> pass_verified(St);
-        {error, Why} ->
-            St0#{ last_error => <<"replica: ", Why/binary>>,
-                last_pass => os:system_time(millisecond) }
+%% Everything a pass does, it does on `View': PUSD as this node computed it.
+pass(St = #{ cfg := Cfg }) ->
+    case view(maps:get(<<"pusd">>, Cfg), St) of
+        {ok, View, Replica} -> act(View, St#{ replica => Replica });
+        {not_yet, Why} -> St#{ last_error => Why, last_pass => os:system_time(millisecond) }
     end.
 
-pass_verified(St) ->
-    Info = published(<<"bridgeinfo">>, St),
+act(View, St) ->
+    Info = key(<<"bridgeinfo">>, View),
     case maps:get(<<"successor">>, Info, <<>>) of
-        Succ when is_binary(Succ), byte_size(Succ) =:= 43 -> follow(Succ, Info, St);
-        _ -> attest(Info, St)
+        Succ when is_binary(Succ), byte_size(Succ) =:= 43 -> follow(Succ, Info, View, St);
+        _ -> attest(Info, View, St)
     end.
 
-attest(Info, St = #{ cfg := Cfg, me := Me }) ->
-    Withdrawals = case published(<<"withdrawals">>, St) of L when is_list(L) -> L; _ -> [] end,
+attest(Info, View, St = #{ cfg := Cfg, me := Me }) ->
+    Withdrawals = case key(<<"withdrawals">>, View) of L when is_list(L) -> L; _ -> [] end,
     Member = lists:any(fun(A) -> maps:get(<<"ao">>, A, <<>>) =:= Me end,
         maps:get(<<"attestors">>, Info, [])),
     case Member of
@@ -507,9 +506,12 @@ vote(P, St = #{ cfg := Cfg, keys := Keys }) ->
 
 %% Move to the successor if it checks out; otherwise stay, say why, and keep
 %% attesting here (this PUSD still owes its pending withdrawals).
-follow(Succ, Info, St = #{ cfg := Cfg }) ->
+follow(Succ, Info, View, St = #{ cfg := Cfg }) ->
     Here = maps:get(<<"pusd">>, Cfg),
-    Next = published(<<"bridgeinfo">>, St#{ cfg := Cfg#{ <<"pusd">> => Succ } }),
+    Next = case view(Succ, St) of
+        {ok, SuccView, _} -> key(<<"bridgeinfo">>, SuccView);
+        {not_yet, _} -> #{}
+    end,
     case successor_ok(Info, Next, Here) of
         true ->
             Cfg2 = Cfg#{ <<"pusd">> => Succ },
@@ -518,7 +520,7 @@ follow(Succ, Info, St = #{ cfg := Cfg }) ->
             St#{ cfg := Cfg2, deposits := #{}, releases := #{}, sent := #{}, namespace := 0,
                 last_pass := os:system_time(millisecond), last_error := null };
         {false, Why} ->
-            St2 = attest(Info, St),
+            St2 = attest(Info, View, St),
             St2#{ last_error := <<"not following ", Succ/binary, ": ", Why/binary>> }
     end.
 
@@ -564,83 +566,37 @@ save_follow(Cfg) ->
 
 %%% AO ------------------------------------------------------------------------
 
-%% Commit with the node's wallet and schedule onto PUSD: locally as dev_push
-%% does when PUSD runs here, else by posting the signed message to the
-%% scheduler of the node that runs it, as any wallet client does.
+%% Commit with the node's wallet and post to PUSD's scheduler, as any wallet
+%% client does. What becomes of it, the node learns from its replica.
 send(Tags, #{ cfg := Cfg, opts := Opts }) ->
     Pusd = maps:get(<<"pusd">>, Cfg),
-    Res = case maps:get(<<"pusd-node">>, Cfg, undefined) of
-        undefined ->
-            Signed = hb_message:commit(Tags#{ <<"target">> => Pusd }, Opts, <<"httpsig@1.0">>),
-            {ok, _} = hb_cache:write(Signed, Opts),
-            {ok, Proc} = hb_cache:read(Pusd, Opts),
-            hb_ao:resolve({as, <<"process@1.0">>, Proc},
-                #{ <<"path">> => <<"schedule">>, <<"method">> => <<"POST">>, <<"body">> => Signed }, Opts);
-        Node ->
-            % `subject: self' or the scheduler schedules the request body.
-            Signed = hb_message:commit(Tags#{ <<"target">> => Pusd, <<"type">> => <<"Message">>,
-                <<"subject">> => <<"self">> }, Opts, <<"httpsig@1.0">>),
-            hb_http:post(Node, <<"/", Pusd/binary, "~process@1.0/schedule">>, Signed, Opts)
-    end,
+    % `subject: self' or the scheduler schedules the request body.
+    Signed = hb_message:commit(Tags#{ <<"target">> => Pusd, <<"type">> => <<"Message">>,
+        <<"subject">> => <<"self">> }, Opts, <<"httpsig@1.0">>),
+    Res = hb_http:post(maps:get(<<"scheduler-url">>, Cfg),
+        <<"/", Pusd/binary, "~process@1.0/schedule">>, Signed, Opts),
     ?event(bridge, {sent, maps:get(<<"action">>, Tags), Res}),
     Res.
 
-%% A key of PUSD's state as decoded JSON, or #{} when absent. Where PUSD runs
-%% here, from its own computation; otherwise from this node's replica, as of
-%% the slot this pass verified up to.
-published(Key, St = #{ cfg := Cfg, opts := Opts }) ->
-    Pusd = maps:get(<<"pusd">>, Cfg),
-    case maps:get(<<"pusd-node">>, Cfg, undefined) of
-        undefined ->
-            {ok, Proc} = hb_cache:read(Pusd, Opts),
-            json_value(hb_ao:get(<<"now/", Key/binary>>, Proc, not_found, Opts));
-        _ ->
-            case maps:find(Pusd, maps:get(views, St, #{})) of
-                {ok, {State, ROpts}} -> json_value(hb_ao:get(Key, State, not_found, ROpts));
-                error ->
-                    % A PUSD this pass has not verified (a successor): verify it now.
-                    case replica_view(St) of
-                        {ok, St1} -> published(Key, St1);
-                        {error, _} -> #{}
-                    end
-            end
+%% PUSD (`Pusd', the configured one or a successor) as this node computed it:
+%% `{ok, View, Replica}' with the replica's slot and where it stopped, if it
+%% did; `{not_yet, Why}' while no slot has verified.
+view(Pusd, #{ cfg := Cfg, opts := Opts }) ->
+    Dir = hb_util:bin(maps:get(<<"replica-dir">>, Cfg, <<"bridge-replica">>)),
+    case dev_bridge_attestor_replica:view(Pusd, maps:get(<<"scheduler-url">>, Cfg),
+            #{ opts => Opts, dir => Dir }) of
+        {ok, State, ROpts, Replica} -> {ok, {State, ROpts}, Replica};
+        {not_yet, Why} -> {not_yet, Why}
     end.
 
-%% Bring the replica of the configured PUSD up to its scheduler's head and
-%% compute it there. Only when PUSD runs on another node.
-replica_view(St = #{ cfg := Cfg, opts := Opts }) ->
-    case maps:get(<<"pusd-node">>, Cfg, undefined) of
-        undefined -> {ok, St};
-        Node ->
-            Pusd = maps:get(<<"pusd">>, Cfg),
-            Dir = hb_util:bin(maps:get(<<"replica-dir">>, Cfg, <<"bridge-replica">>)),
-            Start = os:system_time(millisecond),
-            R0 = dev_bridge_attestor_replica:new(Pusd, Node, #{ opts => Opts, dir => Dir }),
-            case dev_bridge_attestor_replica:sync(R0) of
-                {ok, R} ->
-                    case dev_bridge_attestor_replica:state(R) of
-                        {ok, State} ->
-                            ?event(bridge, {replica, {slot, dev_bridge_attestor_replica:slot(R)},
-                                {ms, os:system_time(millisecond) - Start}}),
-                            Views = maps:get(views, St, #{}),
-                            {ok, St#{ views => Views#{ Pusd =>
-                                {State, maps:get(opts, R)} },
-                                replica_slot => dev_bridge_attestor_replica:slot(R) }};
-                        {error, Why} -> {error, Why}
-                    end;
-                {error, Why, _} -> {error, Why}
-            end
-    end.
+%% One key of a view, as decoded JSON; #{} when absent.
+key(Key, {State, ROpts}) -> json_value(hb_ao:get(Key, State, not_found, ROpts)).
 
-%% A published value as decoded JSON. It may arrive as JSON text, as JSON text
-%% inside a JSON string, or wrapped in a `body'; an HTML page means absent.
-json_value(V) when is_map(V), is_map_key(<<"body">>, V) -> json_value(maps:get(<<"body">>, V));
+%% A key of PUSD's state as decoded JSON: PUSD keeps its tables as JSON text.
 json_value(V) when is_map(V); is_list(V) -> V;
-json_value(<<"<", _/binary>>) -> #{};
 json_value(Bin) when is_binary(Bin) ->
     case catch hb_json:decode(Bin) of
-        S when is_binary(S) -> json_value(S);
-        V when is_map(V); is_list(V) -> json_value(V);
+        V when is_map(V); is_list(V) -> V;
         _ -> #{}
     end;
 json_value(_) -> #{}.
@@ -740,7 +696,7 @@ rpc_hosts(Cfg) ->
     end,
     maps:from_list(Rpc(<<"base">>, <<"rpc">>, null) ++ Rpc(<<"solana">>, <<"rpc">>, null)
         ++ Rpc(<<"sui">>, <<"graphql">>, <<"https://graphql.mainnet.sui.io/graphql">>)
-        ++ [{<<"pusd-node">>, Host(N)} || N <- [maps:get(<<"pusd-node">>, Cfg, undefined)],
+        ++ [{<<"scheduler-url">>, Host(N)} || N <- [maps:get(<<"scheduler-url">>, Cfg, undefined)],
             N =/= undefined]).
 
 status_view(St) ->
@@ -753,7 +709,7 @@ status_view(St) ->
         <<"waiting-acks">> => maps:size(maps:get(releases, St)),
         <<"last-pass">> => maps:get(last_pass, St),
         <<"last-error">> => maps:get(last_error, St),
-        <<"replica-slot">> => maps:get(replica_slot, St, null),
+        <<"replica">> => maps:get(replica, St, null),
         <<"skipped">> => [#{ <<"item">> => K, <<"reason">> => V }
             || {K, V} <- lists:sort(maps:to_list(maps:get(skipped, St, #{})))],
         <<"rpcs">> => rpc_hosts(maps:get(cfg, St))
@@ -812,13 +768,13 @@ key_file_mode_test() ->
     ?assertEqual(K, load_keys(File)).
 
 rpc_hosts_test() ->
-    Cfg = #{ <<"pusd-node">> => <<"https://hyperbeam.tylerw.ai">>,
+    Cfg = #{ <<"scheduler-url">> => <<"https://hyperbeam.tylerw.ai">>,
         <<"base">> => #{ <<"rpc">> => <<"https://base-mainnet.g.alchemy.com/v2/SECRET">> },
         <<"solana">> => #{ <<"rpc">> => <<"https://solana-mainnet.g.alchemy.com/v2/SECRET?x=1">> },
         <<"sui">> => #{ <<"package">> => <<"0x1">> } },
     ?assertEqual(#{ <<"base">> => <<"base-mainnet.g.alchemy.com">>,
         <<"solana">> => <<"solana-mainnet.g.alchemy.com">>, <<"sui">> => <<"graphql.mainnet.sui.io">>,
-        <<"pusd-node">> => <<"hyperbeam.tylerw.ai">> }, rpc_hosts(Cfg)).
+        <<"scheduler-url">> => <<"hyperbeam.tylerw.ai">> }, rpc_hosts(Cfg)).
 
 proposals_to_vote_test() ->
     Me = <<"me">>,
@@ -865,9 +821,8 @@ json_value_test() ->
     Info = #{ <<"epoch">> => 2 },
     Text = hb_json:encode(Info),
     ?assertEqual(Info, json_value(Text)),
-    ?assertEqual(Info, json_value(hb_json:encode(Text))),
-    ?assertEqual(Info, json_value(#{ <<"body">> => Text })),
-    ?assertEqual(#{}, json_value(<<"<!doctype html><html>">>)),
+    ?assertEqual(Info, json_value(Info)),
+    ?assertEqual(#{}, json_value(<<"not json">>)),
     ?assertEqual(#{}, json_value(not_found)).
 
 minted_test() ->
@@ -983,13 +938,14 @@ vote_reaches_pusd(Cfg0, Opts) ->
     Me = maps:get(me, St0),
     % A first message, so PUSD has computed and published something.
     {ok, _} = send(#{ <<"action">> => <<"Ping">> }, St0),
-    ?assertMatch(#{ <<"epoch">> := 2 }, published(<<"bridgeinfo">>, St0)),
+    {ok, View, _} = view(maps:get(<<"pusd">>, Cfg0), St0),
+    ?assertMatch(#{ <<"epoch">> := 2 }, key(<<"bridgeinfo">>, View)),
     St1 = pass(St0),
     ?assertMatch(#{ member := true, last_error := null }, St1),
-    ?assertEqual({ok, <<"1:", Me/binary, ";">>}, votes(St1)),
+    ?assertEqual(<<"1:", Me/binary, ";">>, raw(<<"votes">>, St1)),
     % Within RESEND_MS the vote is not sent again.
     _ = pass(St1),
-    ?assertEqual({ok, <<"1:", Me/binary, ";">>}, votes(St1)).
+    ?assertEqual(<<"1:", Me/binary, ";">>, raw(<<"votes">>, St1)).
 
 %% A plain-string key of the real PUSD, read where it runs.
 raw(Key, #{ cfg := Cfg, opts := Opts }) ->
@@ -999,38 +955,19 @@ raw(Key, #{ cfg := Cfg, opts := Opts }) ->
         _ -> <<>>
     end.
 
-%% `votes' is a plain string, so it is read raw rather than as JSON.
-votes(#{ cfg := Cfg, opts := Opts }) ->
-    Pusd = maps:get(<<"pusd">>, Cfg),
-    case maps:get(<<"pusd-node">>, Cfg, undefined) of
-        undefined ->
-            {ok, Proc} = hb_cache:read(Pusd, Opts),
-            hb_ao:resolve(Proc, <<"now/votes">>, Opts);
-        Node ->
-            dev_bridge_attestor_chains:get_body(
-                <<Node/binary, "/", Pusd/binary, "~process@1.0/now/votes">>, Opts)
-    end.
-
-local_pusd_test_() ->
-    {timeout, 60, fun() ->
-        hb:init(),
-        Opts = ao_test_opts(),
-        Me = hb_util:human_id(ar_wallet:to_address(hb_opts:get(<<"priv-wallet">>, none, Opts))),
-        Pusd = fake_pusd(Me, Opts),
-        vote_reaches_pusd(ao_test_cfg(Pusd, <<"/tmp/bridge-ao-local">>), Opts)
-    end}.
-
-%% The same through `pusd-node': signed messages posted to its scheduler and
-%% published keys read over HTTP, as when PUSD runs on another node.
-remote_pusd_test_() ->
+%% Signed messages posted to PUSD's scheduler, PUSD read from this node's own
+%% replica of it.
+pusd_vote_test_() ->
     {timeout, 60, fun() ->
         hb:init(),
         Opts = ao_test_opts(),
         Node = hb_http_server:start_node(Opts),
         Me = hb_util:human_id(ar_wallet:to_address(hb_opts:get(<<"priv-wallet">>, none, Opts))),
         Pusd = fake_pusd(Me, Opts),
-        Cfg = (ao_test_cfg(Pusd, <<"/tmp/bridge-ao-remote">>))#{
-            <<"pusd-node">> => hb_util:bin(string:trim(hb_util:list(Node), trailing, "/")) },
+        Dir = <<"/tmp/bridge-ao-vote">>,
+        _ = os:cmd("rm -rf " ++ binary_to_list(Dir)),
+        Cfg = (ao_test_cfg(Pusd, Dir))#{ <<"scheduler-url">> => url(Node),
+            <<"replica-dir">> => <<Dir/binary, "/replica">> },
         vote_reaches_pusd(Cfg, Opts)
     end}.
 
@@ -1043,7 +980,8 @@ start_hook_test_() ->
         Dir = <<"/tmp/bridge-ao-start">>,
         Node = hb_http_server:start_node(Opts#{
             <<"on">> => #{ <<"start">> => #{ <<"device">> => <<"bridge-attestor@1.0">> } },
-            <<"bridge">> => ao_test_cfg(<<"no-such-pusd">>, Dir)
+            <<"bridge">> => (ao_test_cfg(<<"no-such-pusd">>, Dir))#{
+                <<"scheduler-url">> => <<"http://127.0.0.1:1">> }
         }),
         try
             {ok, Res} = hb_http:get(Node, <<"/~bridge-attestor@1.0/keys">>, Opts),
@@ -1134,7 +1072,7 @@ schedule_as(Wallet, Tags, Pusd, Opts) ->
 
 %% A scheduler node running PUSD, whose HTTP replies pass through `Hostile'
 %% first (identity for an honest node), and an attestor that reads it as its
-%% `pusd-node'. PUSD holds one pending Base withdrawal: 5 to TEST_TO.
+%% `scheduler-url'. PUSD holds one pending Base withdrawal: 5 to TEST_TO.
 replica_setup(Name, MakeHostile) ->
     hb:init(),
     Opts = ao_test_opts(),
@@ -1150,7 +1088,7 @@ replica_setup(Name, MakeHostile) ->
     Dir = <<"/tmp/bridge-replica-", Name/binary>>,
     _ = os:cmd("rm -rf " ++ binary_to_list(Dir)),
     Cfg = (ao_test_cfg(Pusd, Dir))#{
-        <<"pusd-node">> => hb_util:bin(string:trim(hb_util:list(Node), trailing, "/")),
+        <<"scheduler-url">> => url(Node),
         <<"replica-dir">> => <<Dir/binary, "/replica">>,
         <<"base">> => #{ <<"rpc">> => <<"http://127.0.0.1:1">>, <<"chain-id">> => 8453,
             <<"contract">> => <<"0x1111111111111111111111111111111111111111">> } },
@@ -1159,6 +1097,8 @@ replica_setup(Name, MakeHostile) ->
     schedule_as(ar_wallet:new(), #{ <<"action">> => <<"Redeem">>, <<"to">> => ?TEST_TO,
         <<"amount">> => <<"5">> }, Pusd, Opts),
     St.
+
+url(Node) -> hb_util:bin(string:trim(hb_util:list(Node), trailing, "/")).
 
 honest(_Wallet) -> fun(_Path, Body) -> Body end.
 
@@ -1227,8 +1167,8 @@ bad_scheduler_signature_halts_replica_test_() ->
             fun(_) -> tamper_redeem(fun(A) -> A#{ <<"timestamp">> => 1 } end) end),
         St1 = pass(St),
         ?assertEqual(<<>>, raw(<<"signs">>, St1)),
-        ?assertMatch(<<"replica: assignment not signed by the scheduler", _/binary>>,
-            maps:get(last_error, St1))
+        ?assertMatch(#{ stopped := <<"assignment not signed by the scheduler", _/binary>> },
+            maps:get(replica, St1))
     end}.
 
 %% A compromised scheduler re-signs an assignment whose message it altered:
@@ -1244,6 +1184,7 @@ forged_message_halts_replica_test_() ->
         St = replica_setup(<<"forged">>, fun(W) -> tamper_redeem(Forge(W)) end),
         St1 = pass(St),
         ?assertEqual(<<>>, raw(<<"signs">>, St1)),
-        ?assertMatch(<<"replica: message signature does not verify", _/binary>>,
-            maps:get(last_error, St1))
+        ?assertMatch(#{ stopped := <<"message signature does not verify", _/binary>> },
+            maps:get(replica, St1))
     end}.
+

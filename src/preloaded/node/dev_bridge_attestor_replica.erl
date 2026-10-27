@@ -1,45 +1,59 @@
-%%% @doc This attestor's own replica of PUSD: what it signs comes from here,
-%%% never from the published state of the node that runs PUSD.
+%%% @doc This attestor's own computation of PUSD. The attestor acts only on
+%%% the state this module computes, from assignments it verified itself; it
+%%% trusts nothing another node publishes.
 %%%
-%%% Each `sync/1' fetches the assignments after its cursor from PUSD's
-%%% scheduler (the `pusd-node') and accepts one only when:
+%%% `view/3' brings the replica forward and returns PUSD's state after the
+%%% last verified slot. It fetches the process and its assignments from the
+%%% scheduler's URL, which is transport only: nothing it serves is used until
+%%% it verifies.
 %%%
-%%%   - it is the next slot of this process;
-%%%   - one of the process's schedulers signed it;
-%%%   - its `base-hashpath' continues the chain of the slots before it, so a
-%%%     scheduler cannot show this node one history and replace part of it;
-%%%   - its body carries a signed commitment, and every commitment on it
-%%%     verifies: the scheduler can order messages, not write them.
+%%%   - The process is accepted when its ID is PUSD's.
+%%%   - An assignment is accepted when it is the next slot of PUSD, one of the
+%%%     schedulers PUSD names signed it, its `base-hashpath' continues the
+%%%     chain of the slots before it, and its message carries a signed
+%%%     commitment and every commitment on it verifies. The scheduler orders
+%%%     messages; it cannot write them.
 %%%
-%%% Slot 0's body is the process itself, accepted only if its ID is PUSD's.
-%%% Accepted assignments go to a store of the replica's own; `state/1'
-%%% computes PUSD there with the same device as everywhere else. That store
-%%% is never written by anything else on the node: the replica's options turn
-%%% off workers, the shared hot cache and look-ahead, and point the scheduler
-%%% cache at it. Its cursor (slot, chain, last assignment) is kept beside it
-%%% and checked against the store on every start.
-%%%
-%%% Anything that does not verify halts the replica at the last good slot,
-%%% and a replica that could not reach the scheduler's head is behind: either
-%%% way `sync/1' says so and the attestor signs nothing.
+%%% The first assignment that is not accepted ends the replica there: it keeps
+%%% the state before it and says why. Accepted assignments go to a store of the
+%%% replica's own, which nothing else on the node writes (the replica's options
+%%% turn off workers, the shared hot cache and look-ahead, and give the
+%%% scheduler cache that store), and PUSD is computed there with its own
+%%% device. The cursor (slot, chain, last assignment) is kept beside the store.
 -module(dev_bridge_attestor_replica).
--export([new/3, sync/1, state/1, slot/1]).
+-export([view/3]).
 -include("include/hb.hrl").
--include_lib("eunit/include/eunit.hrl").
 
-%% Batches fetched per sync before it reports itself still behind.
--define(MAX_BATCHES, 50).
+%% Assignments verified per call, at most: a replica far behind catches up
+%% over several passes, acting meanwhile on the verified state it has.
+-define(MAX_SLOTS, 5000).
 
-%% @doc A replica of `Pusd', fed from `Node', kept under `Dir'.
-new(Pusd, Node, #{ opts := NodeOpts, dir := Dir }) ->
-    Store = #{ <<"store-module">> => hb_store_lmdb,
-        <<"name">> => <<Dir/binary, "/", Pusd/binary>> },
-    ok = filelib:ensure_dir(binary_to_list(<<Dir/binary, "/", Pusd/binary, "/">>)),
+%% @doc `{ok, State, Opts, Info}' with PUSD's state after the last verified
+%% slot, the options to read it with, and `#{slot, stopped}'; or
+%% `{not_yet, Why}' when no slot has verified yet.
+view(Pusd, Url, #{ opts := NodeOpts, dir := Dir }) ->
+    R = forward(load(Pusd, Url, NodeOpts, Dir)),
+    Info = #{ slot => maps:get(slot, R), stopped => maps:get(stopped, R) },
+    case R of
+        #{ slot := -1 } -> {not_yet, maps:get(stopped, R)};
+        #{ proc := Proc, slot := Slot, opts := ROpts } ->
+            case hb_ao:resolve(Proc, #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, ROpts) of
+                {ok, State} -> {ok, State, ROpts, Info};
+                _ -> {not_yet, <<"PUSD did not compute at slot ", (integer_to_binary(Slot))/binary>>}
+            end
+    end.
+
+%%% The replica -----------------------------------------------------------------
+
+load(Pusd, Url, NodeOpts, Dir) ->
+    Base = <<Dir/binary, "/", Pusd/binary>>,
+    Store = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => Base },
+    ok = filelib:ensure_dir(binary_to_list(<<Base/binary, "/">>)),
     ok = hb_store:start([Store]),
     ROpts = (maps:remove(<<"hashpath">>, NodeOpts))#{
         <<"store">> => [Store],
         <<"scheduler-store">> => [Store],
-        <<"process-store">> => [],
+        <<"process-store">> => [Store],
         <<"process-workers">> => false,
         <<"spawn-worker">> => false,
         <<"process-worker-spawn">> => false,
@@ -48,159 +62,135 @@ new(Pusd, Node, #{ opts := NodeOpts, dir := Dir }) ->
         <<"scheduler-lookahead">> => false,
         <<"scheduler-follow-redirects">> => false
     },
-    R = #{ pusd => Pusd, node => Node, opts => ROpts, http_opts => NodeOpts,
-        cursor_file => <<Dir/binary, "/", Pusd/binary, ".cursor.json">>,
-        slot => -1, chain => Pusd, last => undefined, proc => undefined,
-        schedulers => [] },
-    load_cursor(R).
+    R = #{ pusd => Pusd, url => Url, opts => ROpts, http => NodeOpts,
+        cursor => <<Base/binary, ".cursor.json">>,
+        proc => undefined, schedulers => [], slot => -1, chain => Pusd, last => none,
+        stopped => null },
+    resume(process(R)).
+
+%% The process: from the replica's store, or fetched and accepted by its ID.
+process(R = #{ pusd := Pusd, url := Url, opts := ROpts, http := Opts }) ->
+    Proc = case hb_cache:read(Pusd, ROpts) of
+        {ok, P} -> hb_cache:ensure_all_loaded(P, ROpts);
+        _ ->
+            case catch hb_http:get(Url, <<"/", Pusd/binary>>, Opts) of
+                {ok, P} ->
+                    Loaded = hb_cache:ensure_all_loaded(P, Opts),
+                    {ok, Clean} = hb_message:with_only_committed(Loaded, Opts),
+                    case catch hb_message:id(Clean, all, Opts) of
+                        Pusd -> {ok, _} = hb_cache:write(Clean, ROpts), Clean;
+                        _ -> undefined
+                    end;
+                _ -> undefined
+            end
+    end,
+    case Proc of
+        undefined -> R#{ stopped := <<"PUSD's process is not available yet">> };
+        _ -> R#{ proc := Proc, schedulers := schedulers(Proc, ROpts) }
+    end.
+
+%% Pick up at the cursor, which names the last assignment it accepted.
+resume(R = #{ proc := undefined }) -> R;
+resume(R = #{ cursor := File, pusd := Pusd, opts := ROpts }) ->
+    case file:read_file(File) of
+        {ok, Bin} ->
+            #{ <<"slot">> := Slot, <<"chain">> := Chain, <<"last">> := Last } = hb_json:decode(Bin),
+            Held = case hb_cache:read(slot_path(Pusd, Slot), ROpts) of
+                {ok, A} -> hb_message:id(hb_cache:ensure_all_loaded(A, ROpts), signed, ROpts);
+                _ -> none
+            end,
+            case Held of
+                Last -> R#{ slot := Slot, chain := Chain, last := Last };
+                _ -> R#{ stopped := <<"the replica's store does not hold its cursor">>, done => true }
+            end;
+        _ -> R
+    end.
+
+%% Accept assignments until one is refused, the scheduler has no more, or
+%% this call's share is used.
+forward(R = #{ proc := undefined }) -> R;
+forward(R = #{ done := true }) -> R;
+forward(R) -> forward(R, ?MAX_SLOTS).
+
+forward(R, 0) -> R;
+forward(R = #{ slot := Slot }, Left) ->
+    case fetch(R, Slot + 1) of
+        [] -> R;
+        As -> forward_each(As, R, Left)
+    end.
+
+forward_each([], R, Left) -> forward(R, Left);
+forward_each(_, R, 0) -> R;
+forward_each([A | Rest], R, Left) ->
+    case refusal(A, R) of
+        none -> forward_each(Rest, accept(A, R), Left - 1);
+        Why ->
+            ?event(bridge, {replica_stopped, slot(R) + 1, Why}),
+            R#{ stopped := <<Why/binary, " at slot ", (integer_to_binary(slot(R) + 1))/binary>> }
+    end.
 
 slot(#{ slot := Slot }) -> Slot.
 
-%% @doc Catch up with the scheduler. `{ok, R}' when every slot it serves has
-%% been verified; `{error, Why, R}' when it halted or is behind, with `R'
-%% holding what did verify.
-sync(R = #{ halted := Why }) -> {error, Why, R};
-sync(R) -> sync(R, ?MAX_BATCHES).
-
-sync(R, 0) -> {error, <<"behind: the scheduler has more slots than one sync takes">>, R};
-sync(R = #{ slot := Slot }, Batches) ->
-    case fetch(R, Slot + 1) of
-        {ok, [], _} -> {ok, R};
-        {ok, Assignments, More} ->
-            case accept(Assignments, R) of
-                {ok, R1} when More -> sync(R1, Batches - 1);
-                {ok, R1} -> sync(R1, Batches - 1);
-                {halt, Why, R1} ->
-                    ?event(bridge, {replica_halted, slot(R1) + 1, Why}),
-                    {error, Why, R1#{ halted => Why }}
-            end;
-        {error, Why} ->
-            {error, <<"behind: ", Why/binary>>, R}
-    end.
-
-%% @doc PUSD's state after the replica's last verified slot.
-state(#{ proc := undefined }) -> {error, <<"replica is empty">>};
-state(#{ proc := Proc, slot := Slot, opts := ROpts }) ->
-    case hb_ao:resolve(Proc, #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, ROpts) of
-        {ok, State} -> {ok, State};
-        Other -> {error, iolist_to_binary(io_lib:format("compute failed at ~p: ~0P", [Slot, Other, 6]))}
-    end.
-
-%%% Fetching -----------------------------------------------------------------
-
-%% The assignments from `From' on, in slot order, and whether the scheduler
-%% said there are more.
-fetch(#{ pusd := Pusd, node := Node, http_opts := Opts }, From) ->
+%% The assignments the scheduler serves from `From' on, in slot order; none
+%% when it cannot be read.
+fetch(#{ pusd := Pusd, url := Url, http := Opts }, From) ->
     Path = <<"/", Pusd/binary, "~process@1.0/schedule?from=", (integer_to_binary(From))/binary>>,
-    try hb_http:get(Node, Path, Opts#{ <<"http-client">> => httpc, <<"protocol">> => http2 }) of
+    case catch hb_http:get(Url, Path, Opts#{ <<"http-client">> => httpc, <<"protocol">> => http2 }) of
         {ok, Res} ->
-            case hb_util:int(hb_ao:get(<<"status">>, Res, 200, Opts)) of
-                200 ->
-                    Raw = hb_cache:ensure_all_loaded(
-                        hb_ao:get(<<"assignments">>, Res, #{}, Opts#{ <<"hashpath">> => ignore }), Opts),
-                    List = case is_map(Raw) of
-                        true ->
-                            [A || {K, A} <- lists:keysort(1,
-                                    [{hb_util:int(K), V} || {K, V} <- maps:to_list(Raw),
-                                        K =/= <<"priv">>, K =/= <<"commitments">>]),
-                                K >= From];
-                        false -> []
-                    end,
-                    More = hb_util:atom(hb_ao:get(<<"continues">>, Res, false, Opts)) =:= true,
-                    {ok, List, More};
-                Status -> {error, <<"schedule status ", (integer_to_binary(Status))/binary>>}
+            case catch hb_cache:ensure_all_loaded(
+                    hb_ao:get(<<"assignments">>, Res, #{}, Opts#{ <<"hashpath">> => ignore }), Opts) of
+                As when is_map(As) ->
+                    [A || {N, A} <- lists:keysort(1, [{catch hb_util:int(K), V} || {K, V} <- maps:to_list(As)]),
+                        is_integer(N), N >= From];
+                _ -> []
             end;
-        {error, _} -> {error, <<"schedule unreachable">>}
-    catch _:_ -> {error, <<"schedule unreadable">>}
-    end.
-
-%%% Verifying ----------------------------------------------------------------
-
-accept([], R) -> {ok, R};
-accept([A | Rest], R) ->
-    case verify(A, R) of
-        {ok, R1} -> accept(Rest, R1);
-        {halt, Why} -> {halt, Why, R}
-    end.
-
-%% @doc Accept the next assignment, or say why not.
-verify(A, R = #{ pusd := Pusd, slot := Slot, chain := Chain, opts := ROpts,
-        http_opts := Opts }) ->
-    Next = Slot + 1,
-    Get = fun(K) -> hb_ao:get(K, A, not_found, Opts#{ <<"hashpath">> => ignore }) end,
-    Body = hb_cache:ensure_all_loaded(Get(<<"body">>), Opts),
-    R1 = case Next of 0 -> R#{ proc => Body }; _ -> R end,
-    Schedulers = case Next of 0 -> schedulers(Body, Opts); _ -> maps:get(schedulers, R) end,
-    Checks = [
-        {fun() -> catch hb_util:int(Get(<<"slot">>)) =:= Next end, <<"slot out of order">>},
-        {fun() -> hb_util:human_id(Get(<<"process">>)) =:= Pusd end, <<"assignment is for another process">>},
-        {fun() -> Next =/= 0 orelse signed_id(Body, Opts) =:= Pusd end, <<"slot 0 is not this process">>},
-        {fun() -> Schedulers =/= [] andalso
-            lists:any(fun(S) -> hb_message:verify(A, [S], Opts) end, Schedulers) end,
-            <<"assignment not signed by the scheduler">>},
-        {fun() -> Get(<<"base-hashpath">>) =:= Chain end, <<"assignment breaks the hash chain">>},
-        {fun() -> body_ok(Body, Opts) end, <<"message signature does not verify">>}
-    ],
-    case failed(Checks) of
-        none ->
-            ok = dev_scheduler_cache:write(Pusd, A, ROpts),
-            Id = hb_util:human_id(hb_message:id(A, all, Opts)),
-            Alg = hb_path:hashpath_alg(maps:get(proc, R1), Opts),
-            R2 = R1#{ slot := Next, last := Id, schedulers := Schedulers,
-                chain := hb_path:hashpath(Chain, Id, Alg, Opts) },
-            ok = save_cursor(R2),
-            {ok, R2};
-        Why ->
-            {halt, <<Why/binary, " at slot ", (integer_to_binary(Next))/binary>>}
-    end.
-
-failed([]) -> none;
-failed([{Check, Why} | Rest]) ->
-    case catch Check() of
-        true -> failed(Rest);
-        _ -> Why
-    end.
-
-%% Some commitment on the message is a real signature, and all of them verify.
-body_ok(Body, Opts) when is_map(Body) ->
-    hb_message:signers(Body, Opts) =/= [] andalso hb_message:verify(Body, all, Opts);
-body_ok(_, _) -> false.
-
-signed_id(Msg, Opts) -> hb_util:human_id(hb_message:id(Msg, signed, Opts)).
-
-schedulers(Proc, Opts) ->
-    case catch dev_scheduler:parse_schedulers(
-            hb_ao:get_first([{Proc, <<"scheduler">>}, {Proc, <<"scheduler-location">>}], [], Opts)) of
-        L when is_list(L) -> L;
         _ -> []
     end.
 
-%%% The cursor ----------------------------------------------------------------
+%% Why `A' cannot be the next slot, or `none'.
+refusal(A, #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers, http := Opts }) ->
+    Get = fun(K) -> hb_ao:get(K, A, not_found, Opts#{ <<"hashpath">> => ignore }) end,
+    Checks = [
+        {fun() -> hb_util:int(Get(<<"slot">>)) =:= Slot + 1 end, <<"slot out of order">>},
+        {fun() -> hb_util:human_id(Get(<<"process">>)) =:= Pusd end, <<"assignment for another process">>},
+        {fun() -> lists:any(fun(S) -> hb_message:verify(A, [S], Opts) end, Schedulers) end,
+            <<"assignment not signed by the scheduler">>},
+        {fun() -> Get(<<"base-hashpath">>) =:= Chain end, <<"assignment breaks the hash chain">>},
+        {fun() -> signed_message(hb_cache:ensure_all_loaded(Get(<<"body">>), Opts), Opts) end,
+            <<"message signature does not verify">>}
+    ],
+    hd([Why || {Check, Why} <- Checks, (catch Check()) =/= true] ++ [none]).
 
-save_cursor(#{ cursor_file := File, slot := Slot, chain := Chain, last := Last }) ->
+%% A real signature is on the message, and every commitment on it verifies.
+signed_message(Msg, Opts) ->
+    is_map(Msg) andalso hb_message:signers(Msg, Opts) =/= [] andalso hb_message:verify(Msg, all, Opts).
+
+accept(A, R = #{ pusd := Pusd, slot := Slot, chain := Chain, proc := Proc, opts := ROpts,
+        http := Opts, cursor := File }) ->
+    % Kept where the scheduler cache keeps a slot, so PUSD computes from it.
+    {ok, _} = hb_cache:write(A, ROpts),
+    Signed = hb_message:id(A, signed, ROpts),
+    ok = hb_cache:link(Signed, slot_path(Pusd, Slot + 1), ROpts),
+    ok = hb_store:flush(hb_opts:get(store, [], ROpts), ROpts),
+    Id = hb_message:id(A, all, Opts),
+    Next = R#{ slot := Slot + 1, last := Signed,
+        chain := hb_path:hashpath(Chain, Id, hb_path:hashpath_alg(Proc, Opts), Opts) },
     Tmp = <<File/binary, ".tmp">>,
-    ok = file:write_file(Tmp, hb_json:encode(#{ <<"slot">> => Slot, <<"chain">> => Chain,
-        <<"last">> => Last })),
-    file:rename(Tmp, File).
+    ok = file:write_file(Tmp, hb_json:encode(#{ <<"slot">> => Slot + 1,
+        <<"chain">> => maps:get(chain, Next), <<"last">> => Signed })),
+    ok = file:rename(Tmp, File),
+    Next.
 
-%% Resume from the cursor, if the store still holds the assignment it names.
-%% Otherwise the replica is halted: the store has changed under it.
-load_cursor(R = #{ cursor_file := File, pusd := Pusd, opts := ROpts }) ->
-    case file:read_file(File) of
-        {error, enoent} -> R;
-        {ok, Bin} ->
-            #{ <<"slot">> := Slot, <<"chain">> := Chain, <<"last">> := Last } = hb_json:decode(Bin),
-            Held = case dev_scheduler_cache:read(Pusd, Slot, ROpts) of
-                {ok, A} -> hb_util:human_id(hb_message:id(hb_cache:ensure_all_loaded(A, ROpts), all, ROpts));
-                _ -> none
-            end,
-            Proc = case dev_scheduler_cache:read(Pusd, 0, ROpts) of
-                {ok, A0} -> hb_cache:ensure_all_loaded(hb_ao:get(<<"body">>, A0, ROpts), ROpts);
-                _ -> undefined
-            end,
-            case Held =:= Last andalso Proc =/= undefined of
-                true -> R#{ slot := Slot, chain := Chain, last := Last, proc := Proc,
-                    schedulers := schedulers(Proc, ROpts) };
-                false -> R#{ halted => <<"replica store does not hold its cursor">> }
-            end
-    end.
+%% Where the scheduler cache keeps a slot (dev_scheduler_cache's layout; that
+%% module is another package, so it is not called).
+slot_path(Pusd, Slot) ->
+    hb_path:to_binary([<<"~scheduler@1.0">>, <<"assignments">>, Pusd, integer_to_binary(Slot)]).
+
+%% The schedulers PUSD names, as committer URIs.
+schedulers(Proc, Opts) ->
+    List = case hb_ao:get_first([{Proc, <<"scheduler">>}, {Proc, <<"scheduler-location">>}], [], Opts) of
+        L when is_list(L) -> L;
+        B when is_binary(B) -> binary:split(B, <<",">>, [global, trim_all]);
+        _ -> []
+    end,
+    [hb_committer:uri(string:trim(S)) || S <- List].
