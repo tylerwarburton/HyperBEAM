@@ -729,6 +729,110 @@ process_delta_restore_test_() ->
         )
     end}.
 
+%% @doc A key written with capitals is one key through every slot: written in
+%% one slot and again in later ones, through delta and checkpoint slots, a
+%% cold read of an old slot, a VM restore, and an HTTP read in both forms.
+%% v0.11 stores and reads every message key lowercased, so the key is
+%% published lowercased and read by any spelling. Every `player-<address>'
+%% and `balance-<address>' key is mixed-case; before this, a second write in a
+%% later slot made the key a list.
+mixed_case_keys_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Opts = #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"port">> => 10000 + rand:uniform(20000),
+            <<"spawn-worker">> => false,
+            <<"process-workers">> => false,
+            <<"process-now-from-cache">> => true,
+            <<"process-delta-cache">> => true,
+            <<"process-snapshot-target">> => false,
+            <<"process-delta-checkpoint-slots">> => 3
+        },
+        Node = hb_http_server:start_node(Opts),
+        Script =
+            <<
+                "N = N or 0\n"
+                "function compute(req)\n"
+                "  N = N + 1\n"
+                "  return { patches = {\n"
+                "    { path = '/Mixed-Key', value = 'm-' .. N },\n"
+                "    { path = '/once', value = 'v-' .. N }\n"
+                "  }, results = {} }\n"
+                "end\n"
+            >>,
+        Process = delta_process(Opts, Script),
+        {ok, _} = hb_cache:write(Process, Opts),
+        ProcID = hb_util:human_id(hb_message:id(Process, all, Opts)),
+        lists:foreach(
+            fun(N) ->
+                {ok, _} = hb_ao:resolve(Process, schedule_request(Process, N, Opts), Opts)
+            end,
+            lists:seq(1, 6)
+        ),
+        Compute =
+            fun(Base, Slot) ->
+                hb_ao:resolve(
+                    Base,
+                    #{ <<"path">> => <<"compute">>, <<"slot">> => Slot },
+                    Opts
+                )
+            end,
+        Exact =
+            fun(State, Value) ->
+                Public = hb_private:reset(hb_cache:ensure_all_loaded(State, Opts)),
+                ?assertEqual(
+                    {Value, false, Value},
+                    {
+                        maps:get(<<"mixed-key">>, Public, missing),
+                        maps:is_key(<<"Mixed-Key">>, Public),
+                        hb_ao:get(<<"Mixed-Key">>, Public, Opts)
+                    }
+                )
+            end,
+        % Slots 1, 2, 4 are deltas and 3 a checkpoint.
+        {ok, State4} = Compute(Process, 4),
+        Exact(State4, <<"m-5">>),
+        % Cold reads of a delta slot and a checkpoint, from the cache.
+        {ok, Cached2} = Compute(Process, 2),
+        Exact(Cached2, <<"m-3">>),
+        {ok, Cached3} = Compute(Process, 3),
+        Exact(Cached3, <<"m-4">>),
+        % The next slot restores the VM from the cached public state.
+        {ok, Cached4} = Compute(Process, 4),
+        {ok, State5} = Compute(Cached4, 5),
+        Exact(State5, <<"m-6">>),
+        % Read as a client does: plain HTTP, the key spelt as it was written.
+        {ok, _} = application:ensure_all_started(inets),
+        Get =
+            fun(Path, Accept) ->
+                {ok, {{_, Status, _}, _, Body}} =
+                    httpc:request(
+                        get,
+                        {
+                            hb_util:list(Node) ++ hb_util:list(ProcID)
+                                ++ "~process@1.0/" ++ Path,
+                            [{"accept", Accept}]
+                        },
+                        [{timeout, 30000}],
+                        [{body_format, binary}]
+                    ),
+                {Status, Body}
+            end,
+        ?assertEqual({200, <<"m-6">>}, Get("now/Mixed-Key", "text/plain")),
+        ?assertEqual({200, <<"m-6">>}, Get("now/mixed-key", "text/plain")),
+        {200, JSON} = Get("now", "application/json"),
+        Decoded = hb_json:decode(JSON),
+        ?assertEqual(
+            {<<"m-6">>, false},
+            {
+                maps:get(<<"mixed-key">>, Decoded, missing),
+                maps:is_key(<<"Mixed-Key">>, Decoded)
+            }
+        )
+    end}.
+
 %% @doc A persistent process worker that is asked for a slot it has already
 %% computed answers from the process cache. That cached state is public only:
 %% it carries no Luerl VM. The worker must keep its own live state rather than
@@ -1158,6 +1262,8 @@ finish_gc_cycle(State, Number, Limit) ->
     end.
 
 delta_process(Opts) ->
+    delta_process(Opts, equivalent_script()).
+delta_process(Opts, Script) ->
     Wallet = hb_opts:get(<<"priv-wallet">>, hb:wallet(), Opts),
     Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
     hb_message:commit(
@@ -1168,7 +1274,7 @@ delta_process(Opts) ->
             <<"execution-device">> => <<"lua-patch@1.0">>,
             <<"module">> => #{
                 <<"content-type">> => <<"application/lua">>,
-                <<"body">> => equivalent_script()
+                <<"body">> => Script
             },
             <<"authority">> => [Address],
             <<"scheduler-location">> => Address,

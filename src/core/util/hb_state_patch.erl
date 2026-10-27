@@ -44,17 +44,18 @@
 %% optional so the Lua device can patch before process@1.0 assigns the slot.
 apply(Base, Patches, Results, Opts) ->
     apply(Base, Patches, Results, undefined, Opts).
-apply(Base, Patches, Results, Slot, Opts)
-        when is_list(Patches), is_map(Results) ->
+apply(Base, Patches, RawResults, Slot, Opts)
+        when is_list(Patches), is_map(RawResults) ->
     Prepared = base_set(Base, <<"results">>, unset, Opts),
-    case apply_patches(Prepared, Patches, Opts) of
-        {ok, Patched} ->
+    case {apply_patches(Prepared, Patches, Opts), lower_value(RawResults)} of
+        {_, {error, _} = Error} -> Error;
+        {{ok, Patched}, {ok, Results}} ->
             WithResults = base_set(Patched, <<"results">>, Results, Opts),
             case Slot of
                 undefined -> {ok, WithResults};
                 _ -> {ok, base_set(WithResults, <<"at-slot">>, Slot, Opts)}
             end;
-        Error -> Error
+        {Error, _} -> Error
     end;
 apply(_Base, _Patches, _Results, _Slot, _Opts) ->
     patch_error(<<"Delta requires list `patches' and message `results'.">>).
@@ -181,7 +182,11 @@ parse_patch(Patch, Opts) when is_map(Patch) ->
         {{ok, Parts}, {ok, delete}} -> {ok, Parts, delete};
         {{ok, Parts}, {ok, {set, Value}}} ->
             case check_value(Value) of
-                ok -> {ok, Parts, {set, Value}};
+                ok ->
+                    case lower_value(Value) of
+                        {ok, Lower} -> {ok, Parts, {set, Lower}};
+                        Error -> Error
+                    end;
                 Error -> Error
             end;
         {Error = {error, _}, _} -> Error;
@@ -243,8 +248,46 @@ patch_parts([], _Root, Acc) ->
     {ok, lists:reverse(Acc)};
 patch_parts([Part | Rest], Root, Acc) ->
     case segment_error(Part, Root) of
-        ok -> patch_parts(Rest, false, [Part | Acc]);
+        ok -> patch_parts(Rest, false, [hb_util:lowercase_key(Part) | Acc]);
         Error -> Error
+    end.
+
+%% @doc Lowercase every key of a patch value, as v0.11 stores and reads every
+%% message key (`dev_structured:decode_keys/1', `dev_message:get/4'). A
+%% mixed-case key would read back lowercased from the cache, and two writes to
+%% it in different slots would then become two keys that the codec joins into
+%% a list. Keys that differ only in case are refused rather than joined.
+%% Runtime-added `commitments' and private messages are kept as they are.
+lower_value(Value) when is_map(Value) ->
+    lower_entries(maps:to_list(Value), #{});
+lower_value(Value) when is_list(Value) ->
+    lower_list(Value, []);
+lower_value(Value) ->
+    {ok, Value}.
+
+lower_list([], Acc) -> {ok, lists:reverse(Acc)};
+lower_list([Value | Rest], Acc) ->
+    case lower_value(Value) of
+        {ok, Lower} -> lower_list(Rest, [Lower | Acc]);
+        Error -> Error
+    end.
+
+lower_entries([], Acc) -> {ok, Acc};
+lower_entries([{Key, Value} | Rest], Acc) ->
+    Kept =
+        is_binary(Key) andalso
+            (Key =:= <<"commitments">> orelse hb_private:is_private(Key)),
+    LowerKey = hb_util:lowercase_key(Key),
+    LowerValue =
+        case Kept of
+            true -> {ok, Value};
+            false -> lower_value(Value)
+        end,
+    case {is_map_key(LowerKey, Acc), LowerValue} of
+        {true, _} ->
+            patch_error(<<"Patch value has keys that differ only in case.">>);
+        {false, {ok, Lower}} -> lower_entries(Rest, Acc#{ LowerKey => Lower });
+        {false, Error} -> Error
     end.
 
 segment_error(<<>>, _Root) ->
@@ -525,4 +568,41 @@ patch_semantics_test() ->
     ?assertMatch(
         {error, #{ <<"status">> := 422 }},
         apply(Base, [set(<<"/s/x">>, <<"1">>)], #{}, Opts)
+    ).
+
+%% @doc Keys are lowercased as the cache stores them: a mixed-case path
+%% replaces the lowercase key a cached base holds, value and result keys are
+%% lowercased at every depth, and keys that differ only in case are refused.
+lowercase_keys_test() ->
+    Opts = #{ <<"hashpath">> => ignore },
+    Cached = #{ <<"mixed-key">> => <<"m-1">> },
+    {ok, Next} =
+        apply(
+            Cached,
+            [
+                #{ <<"path">> => <<"/Mixed-Key">>, <<"value">> => <<"m-2">> },
+                #{
+                    <<"path">> => <<"/Player-A/Stats">>,
+                    <<"value">> => #{ <<"Gold">> => <<"1">> }
+                }
+            ],
+            #{ <<"Output">> => #{ <<"Data">> => <<"x">> } },
+            Opts
+        ),
+    ?assertEqual(
+        #{
+            <<"mixed-key">> => <<"m-2">>,
+            <<"player-a">> => #{ <<"stats">> => #{ <<"gold">> => <<"1">> } },
+            <<"results">> => #{ <<"output">> => #{ <<"data">> => <<"x">> } }
+        },
+        Next
+    ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 422 }},
+        apply(
+            #{},
+            [#{ <<"path">> => <<"/k">>, <<"value">> => #{ <<"A">> => <<"1">>, <<"a">> => <<"2">> } }],
+            #{},
+            Opts
+        )
     ).
