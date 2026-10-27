@@ -70,19 +70,24 @@ the numbers below with the reason they moved.
    - The `ao` library and the guards are installed with raw table writes
      (`dev_lua_lib` too, so every Lua device): a `__newindex` on `_G` or
      `ao` used to receive the unguarded host functions.
-   - `math.random` and `math.randomseed` are in the mandatory sandbox.
-     Elsewhere `requires-determinism` governs them: `process@1.0` sets it
-     to `true` unless the process message says otherwise, and no monorepo
-     spawn sets it, so lua-patch processes do not get `math.random` either.
-     A spawn with `requires-determinism: false`, or a direct device call
-     outside a process, would.
+   - `math.random`, `math.randomseed`, `os.time`, `os.clock` and `os.date`
+     are gone from every `lua-patch@1.0` and `lua-atomic@1.0` VM, whatever
+     `requires-determinism` says (lua-atomic also removes all of `os`). The
+     only use in the monorepo's contracts is `battle.lua:596`, the `rand()`
+     fallback for an unseeded stream; the game seeds at load (`game.lua:31`)
+     and the hunt and battle workers seed before every roll, so it is never
+     reached.
    - `dev_lua` takes `lua-device-sandbox` again, on top of the node's
      minimum sandbox.
-   - **Contract rule:** do not keep `ao.atomic`, `ao.get`/`resolve`/`set`/
-     `event` or `collectgarbage` in a variable or table of your own. They
-     are host functions, and a restore sets them to `nil` everywhere except
-     in `ao` and `_G`, so a live VM and a restored one would behave
-     differently. Call them through `ao.` and `_G` each time.
+   - **Contract rule:** do not keep `ao.get`/`resolve`/`set`/`event` in a
+     variable or table of your own. They are host closures, and a restore
+     sets them to `nil` everywhere except in `ao`, so a live VM and a
+     restored one would behave differently. Call them through `ao.` each
+     time. `ao.atomic` and `collectgarbage` are `#erl_mfa{}` values and do
+     survive a restore on the same build; a build whose module name differs
+     drops them too, so the rule holds for them as well.
+   - A contract that sets the global `ao` to a non-table is armed with a new
+     empty `ao` on restore instead of failing it.
    - Found on the way: `lua-patch@1.0` never gave RC7's `ao` library its
      node message, so every `ao.get`/`resolve`/`set`/`event` from a
      lua-patch contract failed. Fixed, with a test.
@@ -92,9 +97,10 @@ the numbers below with the reason they moved.
      is never exactly `lua-atomic-v1-ready`. The test covers both.
 
    Tests (`hb-v11-dev`, `--module=dev_lua_atomic,dev_lua_patch,
-   hb_state_patch,lib_process_cache`): 57 passed, 1 failed. The failure is
-   `incremental_gc_step_test` (needs the reverted Luerl patch). All 12
-   `lua-atomic@1.0` tests pass; the 5 guard tests fail on the first port.
+   hb_state_patch,lib_process_cache`): 60 passed, 1 failed. The failure is
+   `incremental_gc_step_test` (needs the reverted Luerl patch). All 14
+   `lua-atomic@1.0` tests pass; each guard and restore test fails on the
+   code before its fix.
    `dev_lua,dev_lua_test`: two timing benchmarks fail on the shared box,
    with or without this port: `pure_lua_process_benchmark_test_` every run
    (30 slots in 666-880 ms, limit 500 ms) and
