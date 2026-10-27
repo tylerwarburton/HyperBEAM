@@ -1621,6 +1621,89 @@ worker_compute_does_not_store_whole_state_test_() ->
         exit(Worker, kill)
     end}.
 
+%% @doc A worker computing a slot never content-addresses the process state.
+%% The slot is stored by slot number (`lib_process_cache'), so nothing reads
+%% the state's ID or hashpath, yet every nested resolution of RC7 committed
+%% the whole state (httpsig, ~20-40 ms for the 1 MB test-net game) to look up
+%% a result that is never stored, to normalize its inputs and its result, and
+%% to generate a hashpath: 59% of the game worker's time under a swarm,
+%% 2026-10-27.
+worker_slot_does_not_hash_state_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Opts = #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"spawn-worker">> => true,
+            <<"process-worker-spawn">> => true,
+            <<"process-workers">> => true,
+            <<"await-inprogress">> => named,
+            <<"process-delta-cache">> => true,
+            <<"process-snapshot-target">> => false,
+            <<"process-delta-checkpoint-slots">> => 1000
+        },
+        Process = delta_process(Opts),
+        {ok, _} = hb_cache:write(Process, Opts),
+        Group = hb_util:human_id(hb_message:id(Process, all, Opts)),
+        [
+            {ok, _} = hb_ao:resolve(Process, schedule_request(Process, N, Opts), Opts)
+        ||
+            N <- lists:seq(1, 3)
+        ],
+        {ok, _} =
+            hb_ao:resolve(
+                Process,
+                #{ <<"path">> => <<"compute">>, <<"slot">> => 1 },
+                Opts
+            ),
+        Worker = wait_for_worker(Group, 50),
+        {Res, Hashes} =
+            count_state_hashes(
+                fun() ->
+                    Worker !
+                        {
+                            resolve,
+                            self(),
+                            Group,
+                            #{ <<"path">> => <<"compute">>, <<"slot">> => 2 },
+                            Opts
+                        },
+                    receive
+                        {resolved, _, Group, {slot, 2}, R} -> R
+                    after 20000 -> erlang:error(worker_did_not_answer)
+                    end
+                end
+            ),
+        {ok, State} = Res,
+        ?assertEqual(<<"3">>, hb_ao:get(<<"count">>, State, Opts)),
+        ?assertEqual(0, Hashes),
+        exit(Worker, kill)
+    end}.
+
+%% @doc Count `hb_message:id' and `hb_message:commit' calls, local or remote,
+%% whose message is a computed process state (it carries `last-action').
+count_state_hashes(Fun) ->
+    MatchSpec =
+        [{['$1', '_', '_'],
+            [{is_map, '$1'}, {is_map_key, <<"last-action">>, '$1'}],
+            []}],
+    Patterns = [{hb_message, id, 3}, {hb_message, commit, 3}],
+    [ erlang:trace_pattern(P, MatchSpec, [local]) || P <- Patterns ],
+    erlang:trace(all, true, [call, {tracer, self()}]),
+    Res =
+        try Fun()
+        after
+            erlang:trace(all, false, [call]),
+            [ erlang:trace_pattern(P, false, [local]) || P <- Patterns ]
+        end,
+    {Res, count_hash_messages(0)}.
+
+count_hash_messages(N) ->
+    receive
+        {trace, _, call, {hb_message, _, _}} -> count_hash_messages(N + 1)
+    after 100 -> N
+    end.
+
 %% @doc A public state -- a cache hit, or what a worker now sends its
 %% listeners -- carries no VM. Computing onward from one must restore the VM
 %% from the process, not run the next slot against a fresh one.

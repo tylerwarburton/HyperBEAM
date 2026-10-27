@@ -223,7 +223,17 @@ maybe_set(Map1, Map2, Opts) ->
 %% which leads to the result not being cached (as it may be stored with an 
 %% incorrect hashpath).
 cache_source_to_cache_settings({opts, Opts}, _) ->
-    CCMap = specifiers_to_cache_settings(hb_opts:get(cache_control, [], Opts)),
+    CCMap0 = specifiers_to_cache_settings(hb_opts:get(cache_control, [], Opts)),
+    % `cache-control' is a temporary option: every nested resolution drops it.
+    % `result-cache-lookup => false' survives nesting, so a caller that knows
+    % no result of its whole subtree is ever in the result cache (a process
+    % worker computing slots) can stop every nested resolution from hashing
+    % its base to look one up.
+    CCMap =
+        case hb_opts:get(<<"result-cache-lookup">>, true, Opts) of
+            false -> CCMap0#{ <<"lookup">> => false };
+            _ -> CCMap0
+        end,
     case hb_opts:get(hashpath, update, Opts) of
         ignore -> CCMap#{ <<"store">> => false };
         _ -> CCMap
@@ -340,6 +350,18 @@ hashpath_ignore_prevents_storage_test() ->
     Opts = (opts_with_cc([]))#{<<"hashpath">> => ignore},
     Result = derive_cache_settings([], Opts),
     ?assertEqual(#{<<"store">> => ?DEFAULT_STORE_OPT, <<"lookup">> => ?DEFAULT_LOOKUP_OPT}, Result).
+
+%% `result-cache-lookup => false' turns lookups off from the options, and
+%% unlike `cache-control' it survives into nested resolutions.
+result_cache_lookup_off_test() ->
+    Opts = (opts_with_cc([]))#{ <<"result-cache-lookup">> => false },
+    ?assertEqual(
+        #{ <<"store">> => ?DEFAULT_STORE_OPT, <<"lookup">> => false },
+        derive_cache_settings([], Opts)
+    ),
+    % A nested resolution drops `cache-control' (hb_ao's TEMP_OPTS).
+    Nested = maps:remove(<<"cache-control">>, Opts),
+    ?assertEqual(false, maps:get(<<"lookup">>, derive_cache_settings([], Nested))).
 
 %% Test multiple directives
 multiple_directives_test() ->
