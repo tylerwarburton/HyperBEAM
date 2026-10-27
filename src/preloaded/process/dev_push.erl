@@ -642,6 +642,14 @@ schedule(Base, Req, Opts) ->
                         MsgToPush,
                         #{
                             <<"process">> => ProcessID,
+                            <<"from-slot">> =>
+                                hb_util:int(hb_maps:get(<<"slot">>, Req, [], Opts)),
+                            <<"from-entry">> =>
+                                hb_message:id(
+                                    hb_cache:ensure_all_loaded(RawMsg, Opts),
+                                    all,
+                                    Opts
+                                ),
                             <<"from-base">> => calculate_base_id(Process, Opts),
                             <<"from-uncommitted">> =>
                                 lib_process:process_id(
@@ -781,7 +789,10 @@ schedule_result(TargetProcess, MsgToPush, Codec, Origin, Opts) ->
     end.
 
 %% @doc Set the necessary keys in order for the recipient to know where the
-%% message came from.
+%% message came from. `from-slot' is the sender's slot whose computation
+%% emitted the message, and `from-entry' the ID of that outbox entry as
+%% emitted, before these keys were added: recomputing the sender at
+%% `from-slot' yields an outbox entry with ID `from-entry'.
 augment_message(Origin, ToSched, Opts) ->
     ?event(push, {adding_keys, {origin, Origin}, {to, ToSched}}, Opts),
     hb_message:uncommitted(
@@ -792,6 +803,8 @@ augment_message(Origin, ToSched, Opts) ->
                 <<"variant">> => <<"ao.N.1">>,
                 <<"type">> => <<"Message">>,
                 <<"from-process">> => maps:get(<<"process">>, Origin),
+                <<"from-slot">> => maps:get(<<"from-slot">>, Origin),
+                <<"from-entry">> => maps:get(<<"from-entry">>, Origin),
                 <<"from-uncommitted">> => maps:get(<<"from-uncommitted">>, Origin),
                 <<"from-base">> => maps:get(<<"from-base">>, Origin),
                 <<"from-scheduler">> => maps:get(<<"from-scheduler">>, Origin),
@@ -997,6 +1010,7 @@ dev_push_test_() ->
 core_push_test_cases() ->
     [
         {timeout, 30, fun test_full_push/0},
+        {timeout, 30, fun test_push_stamps_provenance/0},
         {timeout, 90, fun test_push_as_identity/0},
         {timeout, 30, fun test_multi_process_push/0},
         {timeout, 60, fun test_remote_routed_push/0},
@@ -1088,6 +1102,87 @@ test_full_push() ->
     ?assertEqual(
         {ok, <<"Done.">>},
         hb_ao:resolve(Base, <<"now/results/data">>, Opts)
+    ).
+
+%% @doc A pushed message names the slot and the outbox entry that emitted it:
+%% `from-slot' is the sender's slot, recomputing the sender there yields an
+%% outbox entry whose ID is `from-entry', and both are under the pusher's
+%% signature, so altering either breaks it.
+test_push_stamps_provenance() ->
+    hb_process_test_vectors:init(),
+    Opts = #{
+        <<"priv-wallet">> => hb:wallet(),
+        <<"cache-control">> => <<"always">>,
+        <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)],
+        <<"push-max-depth">> => 0
+    },
+    Base = hb_process_test_vectors:aos_process(Opts),
+    hb_cache:write(Base, Opts),
+    {ok, _} =
+        hb_ao:resolve(
+            Base,
+            #{
+                <<"method">> => <<"POST">>,
+                <<"path">> => <<"schedule">>,
+                <<"body">> => Base
+            },
+            Opts
+        ),
+    {ok, Req} =
+        hb_process_test_vectors:schedule_aos_call(Base, ping_pong_script(2), Opts),
+    {ok, Slot} = hb_ao:resolve(Req, #{ <<"path">> => <<"slot">> }, Opts),
+    {ok, Pushed} =
+        hb_ao:resolve(Base, #{ <<"path">> => <<"push">>, <<"slot">> => Slot }, Opts),
+    PushedID = hb_util:deep_get(<<"1/id">>, Pushed, Opts),
+    {ok, RawPushedMsg} = hb_cache:read(PushedID, Opts),
+    PushedMsg = hb_cache:ensure_all_loaded(RawPushedMsg, Opts),
+    % The stamps name the sender's slot and the entry it emitted.
+    ?assertEqual(
+        lib_process:process_id(Base, #{}, Opts),
+        hb_maps:get(<<"from-process">>, PushedMsg, Opts)
+    ),
+    ?assertEqual(
+        hb_util:int(Slot),
+        hb_util:int(hb_maps:get(<<"from-slot">>, PushedMsg, Opts))
+    ),
+    {ok, Results} =
+        hb_ao:resolve(
+            Base,
+            #{ <<"path">> => <<"compute/results">>, <<"slot">> => Slot },
+            Opts
+        ),
+    Outbox =
+        hb_ao:normalize_keys(
+            hb_private:reset(hb_ao:get(<<"outbox">>, Results, Opts))
+        ),
+    Entry = hb_cache:ensure_all_loaded(hb_maps:get(<<"1">>, Outbox, Opts), Opts),
+    EntryID = hb_message:id(Entry, all, Opts),
+    ?assertEqual(EntryID, hb_maps:get(<<"from-entry">>, PushedMsg, Opts)),
+    % The stamp identifies the entry before augmentation, not the pushed
+    % message itself.
+    ?assertNotEqual(EntryID, PushedID),
+    % Both stamps are committed by the pusher's signature.
+    ?assert(hb_message:verify(PushedMsg, all, Opts)),
+    Committed = hb_message:committed(PushedMsg, all, Opts),
+    ?assert(lists:member(<<"from-slot">>, Committed)),
+    ?assert(lists:member(<<"from-entry">>, Committed)),
+    ?assertEqual(
+        [hb_opts:committer(Opts)],
+        hb_message:signers(PushedMsg, Opts)
+    ),
+    ?assertNot(
+        hb_message:verify(
+            PushedMsg#{ <<"from-slot">> => hb_util:int(Slot) + 1 },
+            all,
+            Opts
+        )
+    ),
+    ?assertNot(
+        hb_message:verify(
+            PushedMsg#{ <<"from-entry">> => PushedID },
+            all,
+            Opts
+        )
     ).
 
 test_push_as_identity() ->
