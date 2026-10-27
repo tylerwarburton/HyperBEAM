@@ -544,7 +544,110 @@ decode_snapshot(Serialized, Base, Opts) ->
     % Collect the garbage of the new state first: sandboxing `package.searchers'
     % leaves the disk searchers in its table store.
     Allowed = sets:from_list(collect_mfas(luerl:gc(create_state(Base, Opts)))),
-    strip_host_functions(binary_to_term(Serialized, [safe]), Allowed).
+    strip_host_functions(safe_binary_to_term(Serialized), Allowed).
+
+%% @doc `binary_to_term(Bin, [safe])', except that an atom this node does not
+%% have becomes `?UNKNOWN_ATOM' instead of failing the whole decode.
+%%
+%% A snapshot names the modules of its host functions, and the build renames
+%% every preloaded device module after a hash of its code
+%% (`_hb_device_lua_5_3a_<hash>'). So a snapshot written by one build names
+%% modules the next build does not have, and `[safe]' refused it: after the
+%% 2026-10-27 rebuild of the test node every process on it failed its first
+%% compute with `badarg' in `binary_to_term/2'. The functions those atoms name
+%% are not in `Allowed', so `strip_host_functions/2' turns them into `nil',
+%% and restore installs the current build's again, which is what a snapshot
+%% from this build gets too. No atom is ever created.
+safe_binary_to_term(Bin) ->
+    try binary_to_term(Bin, [safe])
+    catch error:badarg ->
+        <<131, Term/binary>> = Bin,
+        binary_to_term(
+            iolist_to_binary([131, existing_atoms(Term)]),
+            [safe]
+        )
+    end.
+
+-define(UNKNOWN_ATOM, hb_snapshot_unknown_atom).
+
+%% Rewrite an external term format body (without the version byte), replacing
+%% each atom that does not exist with `?UNKNOWN_ATOM'.
+existing_atoms(<<80, _Size:32, Z/binary>>) ->
+    existing_atoms(zlib:uncompress(Z));
+existing_atoms(Bin) ->
+    {Out, <<>>} = etf(Bin),
+    Out.
+
+etf(<<Tag, Len:16, Name:Len/binary, R/binary>>) when Tag == 100; Tag == 118 ->
+    {atom_out(Name, Tag == 100), R};
+etf(<<Tag, Len, Name:Len/binary, R/binary>>) when Tag == 115; Tag == 119 ->
+    {atom_out(Name, Tag == 115), R};
+etf(<<97, V, R/binary>>) -> {[97, V], R};
+etf(<<98, V:4/binary, R/binary>>) -> {[98, V], R};
+etf(<<70, V:8/binary, R/binary>>) -> {[70, V], R};
+etf(<<99, V:31/binary, R/binary>>) -> {[99, V], R};
+etf(<<106, R/binary>>) -> {[106], R};
+etf(<<107, Len:16, S:Len/binary, R/binary>>) -> {[107, <<Len:16>>, S], R};
+etf(<<109, Len:32, D:Len/binary, R/binary>>) -> {[109, <<Len:32>>, D], R};
+etf(<<77, Len:32, Bits, D:Len/binary, R/binary>>) -> {[77, <<Len:32, Bits>>, D], R};
+etf(<<110, N, Sign, D:N/binary, R/binary>>) -> {[110, N, Sign, D], R};
+etf(<<111, N:32, Sign, D:N/binary, R/binary>>) -> {[111, <<N:32, Sign>>, D], R};
+etf(<<104, Arity, R/binary>>) -> etf_n(Arity, R, [104, Arity]);
+etf(<<105, Arity:32, R/binary>>) -> etf_n(Arity, R, [105, <<Arity:32>>]);
+etf(<<116, Arity:32, R/binary>>) -> etf_n(2 * Arity, R, [116, <<Arity:32>>]);
+etf(<<108, Len:32, R/binary>>) -> etf_n(Len + 1, R, [108, <<Len:32>>]);
+etf(<<88, R0/binary>>) ->
+    {Node, <<Rest:12/binary, R/binary>>} = etf(R0),
+    {[88, Node, Rest], R};
+etf(<<103, R0/binary>>) ->
+    {Node, <<Rest:9/binary, R/binary>>} = etf(R0),
+    {[103, Node, Rest], R};
+etf(<<89, R0/binary>>) ->
+    {Node, <<Rest:8/binary, R/binary>>} = etf(R0),
+    {[89, Node, Rest], R};
+etf(<<120, R0/binary>>) ->
+    {Node, <<Rest:12/binary, R/binary>>} = etf(R0),
+    {[120, Node, Rest], R};
+etf(<<102, R0/binary>>) ->
+    {Node, <<Rest:5/binary, R/binary>>} = etf(R0),
+    {[102, Node, Rest], R};
+etf(<<101, R0/binary>>) ->
+    {Node, <<Rest:5/binary, R/binary>>} = etf(R0),
+    {[101, Node, Rest], R};
+etf(<<90, Len:16, R0/binary>>) ->
+    IDs = 4 * Len,
+    {Node, <<Rest:(4 + IDs)/binary, R/binary>>} = etf(R0),
+    {[90, <<Len:16>>, Node, Rest], R};
+etf(<<114, Len:16, R0/binary>>) ->
+    IDs = 4 * Len,
+    {Node, <<Rest:(1 + IDs)/binary, R/binary>>} = etf(R0),
+    {[114, <<Len:16>>, Node, Rest], R};
+etf(<<113, R0/binary>>) ->
+    % Module, function, arity.
+    etf_n(3, R0, [113]);
+etf(<<112, _Size:32, Arity, Uniq:16/binary, Index:32, NumFree:32, R0/binary>>) ->
+    % Module, old index, old uniq, pid, then the free variables. The size
+    % covers the whole fun, so it is recomputed for the rewritten body.
+    {Body, R} = etf_n(4 + NumFree, R0, []),
+    Fun = iolist_to_binary([Arity, Uniq, <<Index:32, NumFree:32>>, Body]),
+    {[112, <<(byte_size(Fun) + 4):32>>, Fun], R}.
+
+etf_n(0, R, Acc) -> {Acc, R};
+etf_n(N, Bin, Acc) ->
+    {Out, R} = etf(Bin),
+    etf_n(N - 1, R, [Acc, Out]).
+
+atom_out(Name, Latin1) ->
+    Encoding = case Latin1 of true -> latin1; false -> utf8 end,
+    Atom =
+        try binary_to_existing_atom(Name, Encoding)
+        catch error:badarg -> ?UNKNOWN_ATOM
+        end,
+    UTF8 = atom_to_binary(Atom, utf8),
+    case byte_size(UTF8) of
+        Small when Small < 256 -> [119, Small, UTF8];
+        Large -> [118, <<Large:16>>, UTF8]
+    end.
 
 %% @doc Collect the Erlang functions in a term.
 collect_mfas(#erl_mfa{} = MFA) -> [MFA];
@@ -1235,6 +1338,50 @@ snapshot_excludes_node_wallet_test() ->
             #{
                 <<"device">> => <<"lua@5.3a">>,
                 <<"snapshot">> => #{ <<"body">> => Snapshot }
+            },
+            <<"normalize">>,
+            Opts
+        ),
+    ?assertEqual(
+        {ok, <<"Hello, AO world!">>},
+        hb_ao:resolve(Restored, <<"ao_resolve">>, Opts)
+    ).
+
+%% @doc A snapshot written by another build restores. The build names every
+%% preloaded device module after a hash of its code, so a snapshot's host
+%% functions name modules this build does not have; `[safe]' decoding refused
+%% the whole snapshot, and every process on the test node failed its first
+%% compute after the 2026-10-27 rebuild. Here the module names are made
+%% unknown by changing one byte of each, keeping their length.
+snapshot_from_another_build_restores_test() ->
+    Opts = #{
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"store">> => [hb_test_utils:test_store()]
+    },
+    {ok, Script} = file:read_file("test/test.lua"),
+    {ok, ModuleID} =
+        hb_cache:write(
+            #{ <<"content-type">> => <<"application/lua">>, <<"body">> => Script },
+            Opts
+        ),
+    Node = hb_http_server:start_node(Opts),
+    {ok, Snapshot} =
+        hb_http:get(
+            Node,
+            <<
+                "/~lua@5.3a&module=", ModuleID/binary,
+                "/init/hello~lua@5.3a/snapshot~lua@5.3a/body"
+            >>,
+            #{}
+        ),
+    ?assertNotEqual([], binary:matches(Snapshot, <<"_hb_device_">>)),
+    Foreign = binary:replace(Snapshot, <<"_hb_device_">>, <<"_hb_dexice_">>, [global]),
+    ?assertError(badarg, binary_to_term(Foreign, [safe])),
+    {ok, Restored} =
+        hb_ao:resolve(
+            #{
+                <<"device">> => <<"lua@5.3a">>,
+                <<"snapshot">> => #{ <<"body">> => Foreign }
             },
             <<"normalize">>,
             Opts
