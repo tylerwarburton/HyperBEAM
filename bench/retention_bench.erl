@@ -92,11 +92,23 @@ process(Opts) ->
 
 schedule(Process, N, Opts) ->
     ProcID = hb_message:id(Process, all, Opts),
+    % The client signs with a store of its own, as a real client does: what
+    % signing writes must not be counted against the node's stores.
+    C = client_opts(Opts),
     {ok, _} = hb_ao:resolve(Process, hb_message:commit(#{
         <<"path">> => <<"schedule">>, <<"method">> => <<"POST">>,
         <<"body">> => hb_message:commit(#{
             <<"target">> => ProcID, <<"type">> => <<"Message">>,
-            <<"action">> => <<"Play">>, <<"number">> => N }, Opts) }, Opts), Opts).
+            <<"action">> => <<"Play">>, <<"number">> => N }, C) }, C), Opts).
+
+client_opts(Opts) ->
+    case get(client_store) of
+        undefined ->
+            S = hb_test_utils:test_store(hb_store_lmdb, <<"bench-client">>),
+            put(client_store, S);
+        _ -> ok
+    end,
+    Opts#{ <<"store">> => [get(client_store)] }.
 
 compute(Process, N, Opts) ->
     {ok, State} = hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => N }, Opts),
