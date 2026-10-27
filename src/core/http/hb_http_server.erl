@@ -348,7 +348,11 @@ new_server(RawNodeMsg) ->
     HookMsg = #{ <<"body">> => RawNodeMsgWithDefaults },
     NodeMsg =
         case hb_hook:on(<<"start">>, HookMsg, RawNodeMsgWithDefaults) of
-            {ok, #{ <<"body">> := NodeMsgAfterHook }} -> NodeMsgAfterHook;
+            {ok, #{ <<"body">> := NodeMsgAfterHook }} ->
+                % With an `irreplaceable-store', start it, make it the
+                % scheduler's store and add it (read-only) to the node's
+                % store list. Unchanged otherwise.
+                hb_store_irreplaceable:node_message(NodeMsgAfterHook);
             Unexpected ->
                 ?event(http,
                     {failed_to_start_server,
