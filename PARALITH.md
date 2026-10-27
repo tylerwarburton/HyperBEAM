@@ -91,6 +91,12 @@ the numbers below with the reason they moved.
      drops them too, so the rule holds for them as well.
    - A contract that sets the global `ao` to a non-table is armed with a new
      empty `ao` on restore instead of failing it.
+   - **Garbage collection is linear.** Luerl's own collector keeps its seen
+     sets in `ordsets`, so it is quadratic in live tables (5-10 s for
+     20,000). `hb_luerl_gc` is the same collector with map sets (same
+     result, compared in a test); every Lua device uses it. lua-atomic runs
+     at most one collection per compute, when the Lua call returns. Found
+     by the monorepo's native atomic preflight, which hit nginx's 300 s.
    - **Published keys are lowercase.** RC7 stores and reads every message
      key lowercased, and `message@1.0` looks a key up by its lowercase form
      only. `hb_state_patch` now lowercases patch paths, value keys at every
