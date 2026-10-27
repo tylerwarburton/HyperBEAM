@@ -63,9 +63,15 @@ start(Opts = #{ <<"name">> := DataDir }, _Req, _NodeOpts) ->
             },
             no_mem_init
         ] ++
-        case maps:get(<<"sync">>, Opts, false) of
-            true -> [];
-            false -> [no_sync]
+        % Every commit is synced unless `sync' is `false'. Without the sync a
+        % host crash can leave LMDB's meta page ahead of its data pages, and
+        % the tree is corrupt (the old fork's main node, 2026-10-20: 13.3M
+        % entries, ~7k readable, an `mdb_page_dirty' assertion on every
+        % start). Commits are grouped, so the sync is paid per commit, not
+        % per write.
+        case hb_util:atom(maps:get(<<"sync">>, Opts, true)) of
+            false -> [no_sync];
+            _ -> []
         end ++
         case maps:get(<<"read-ahead">>, Opts, true) of
             true -> [];
@@ -388,16 +394,18 @@ stop_flusher(DataDir) ->
 %% @doc Commit the writes that `elmdb' holds in memory, and sync them to disk.
 %% `elmdb:put_batch/2' returns before its writes are committed: writes are
 %% committed in batches of `batch-size', and a halt of the node before then
-%% loses them. A store with `sync' set to `true' syncs every commit to disk.
-%% Any other store commits to the OS page cache only, and a loss of power can
-%% lose its commits since the last flush.
-flush(Opts = #{ <<"sync">> := true }, _Req, _NodeOpts) ->
-    commit(find_env(Opts));
+%% loses them. A store syncs every commit to disk unless `sync' is `false';
+%% such a store commits to the OS page cache only, so the flush syncs it, and
+%% a loss of power can lose (or corrupt) its commits since the last flush.
 flush(Opts, _Req, _NodeOpts) ->
-    Instance = #{ <<"env">> := Env } = find_env(Opts),
-    maybe
-        ok ?= commit(Instance),
-        lmdb_result(elmdb:env_sync(Env))
+    case hb_util:atom(maps:get(<<"sync">>, Opts, true)) of
+        false ->
+            Instance = #{ <<"env">> := Env } = find_env(Opts),
+            maybe
+                ok ?= commit(Instance),
+                lmdb_result(elmdb:env_sync(Env))
+            end;
+        _ -> commit(find_env(Opts))
     end.
 
 %% @doc Commit the writes that `elmdb' holds in memory.
