@@ -71,7 +71,7 @@
 %%%   <li>`fsync-ms' (200): sync an unsynced journal at least this often.</li>
 %%% </ul>
 -module(hb_store_offsite_journal).
--export([wrap/2, status/1, restore/2, restore/3, ship_now/1]).
+-export([wrap/2, status/1, restore/2, restore/3, ship_now/1, clear_poison/1]).
 -export([start/3, stop/3, reset/3, flush/3, scope/0, scope/1]).
 -export([read/3, write/3, list/3, match/3]).
 -include("include/hb.hrl").
@@ -98,7 +98,11 @@ wrap(Inner = #{ <<"store-module">> := Mod }, Export) ->
         <<"name">> => maps:get(<<"name">>, Inner, hb_util:bin(Mod)),
         <<"inner">> => Inner,
         <<"export">> => Export,
-        <<"store-failure">> => throw
+        <<"store-failure">> => throw,
+        % A refusal is final for that call: `hb_store' must not stop and
+        % restart the store to retry it (that restarted the writer every
+        % second on a full disk).
+        <<"max-retries">> => 0
     }.
 
 inner(#{ <<"inner">> := Inner }) -> Inner.
@@ -235,68 +239,113 @@ target_dir(Store) -> hb_util:list(maps:get(<<"path">>, export(Store))).
 compress(Store) -> hb_util:atom(cfg(<<"compress">>, true, Store)) =/= false.
 
 %%% The writer.
+%%%
+%%% It never crashes on a refusal. Three states:
+%%% - running: appends and confirms;
+%%% - not started: the start marker (or the reconcile, or a rebase) could not
+%%%   be journaled, as on a full disk: every call is refused and tries the
+%%%   start again, so the writer runs once space is back;
+%%% - refusing: a local segment is damaged, or the journal is poisoned. A
+%%%   poisoning is written to `poisoned' in the journal directory and holds
+%%%   across restarts until `clear_poison/1', which journals the whole inner
+%%%   store again (a rebase) before the next write is taken.
 
 writer_init(Store) ->
     process_flag(trap_exit, true),
     Dir = journal_dir(Store),
     ok = filelib:ensure_dir(filename:join(Dir, "x")),
-    Clean = filelib:is_regular(filename:join(Dir, "clean")),
-    _ = file:delete(filename:join(Dir, "clean")),
-    {Sealed, Marks0, Token} = read_marks(Dir),
-    % Every local file newer than the last seal (or not sealed at all) may
-    % hold assignments the marks do not: read them, cut torn tails, seal. A
-    % file damaged anywhere but its tail stops the writer here.
-    {MaxN, Marks1} = recover_local(Dir, Sealed, Marks0),
-    S0 = #{
-        store => Store,
-        dir => Dir,
-        token => Token,
-        seg => max(Sealed, MaxN) + 1,
-        marks => Marks1,
-        pending => #{},
-        unflushed => false,
-        sealed => max(Sealed, MaxN),
-        fd => undefined,
-        off => 0,
-        opened => erlang:monotonic_time(millisecond),
-        dirty => false,
-        poisoned => false,
-        appended => 0,
-        reconciled => 0,
-        errors => 0,
-        clean_start => Clean
-    },
-    S1 = write_marks(open_segment(S0)),
-    % A new run: whatever the last one wrote and never confirmed is dropped
-    % by a restore from here on.
-    {ok, S2} = append({start, Clean}, S1),
-    S3 =
-        case Clean of
-            true -> S2;
-            false -> reconcile(S2)
-        end,
-    _ = shipper(Store),
-    erlang:send_after(cfg(<<"fsync-ms">>, ?FSYNC_MS, Store), self(), fsync_tick),
-    erlang:send_after(1000, self(), roll_tick),
-    writer_loop(S3).
+    case read_poison(Dir) of
+        {poisoned, Reason} ->
+            ?event(error, {offsite_journal_refusing, {poisoned, Reason}}),
+            writer_refusing(Store, {journal_poisoned, Reason});
+        none ->
+            Clean = filelib:is_regular(filename:join(Dir, "clean")),
+            _ = file:delete(filename:join(Dir, "clean")),
+            {Sealed, Marks0, Token} = read_marks(Dir),
+            % Every local file newer than the last seal (or not sealed at
+            % all) may hold assignments the marks do not: read them, cut
+            % torn tails, seal. A damaged file refuses the journal.
+            case catch recover_local(Dir, Sealed, Marks0) of
+                {'EXIT', {{offsite_journal_corrupt, File, Off}, _}} ->
+                    writer_refusing(Store, {journal_corrupt, File, Off});
+                {MaxN, Marks1} ->
+                    S0 = #{
+                        store => Store,
+                        dir => Dir,
+                        token => Token,
+                        seg => max(Sealed, MaxN) + 1,
+                        marks => Marks1,
+                        pending => #{},
+                        unflushed => false,
+                        sealed => max(Sealed, MaxN),
+                        fd => undefined,
+                        off => 0,
+                        opened => erlang:monotonic_time(millisecond),
+                        dirty => false,
+                        poisoned => false,
+                        started => false,
+                        appended => 0,
+                        reconciled => 0,
+                        rebased => 0,
+                        errors => 0,
+                        clean_start => Clean
+                    },
+                    S1 = ensure_started(write_marks(open_segment(S0))),
+                    _ = shipper(Store),
+                    erlang:send_after(cfg(<<"fsync-ms">>, ?FSYNC_MS, Store), self(), fsync_tick),
+                    erlang:send_after(1000, self(), roll_tick),
+                    writer_loop(S1)
+            end
+    end.
+
+%% @doc Open the run: the start marker (whatever the last run wrote and never
+%% confirmed is dropped by a restore from here on), then, after an unclean
+%% stop, the reconcile, and a rebase when one is pending. A failure leaves the
+%% writer not started, to try again at the next call.
+ensure_started(S = #{ started := true }) -> S;
+ensure_started(S = #{ poisoned := P }) when P =/= false -> S;
+ensure_started(S = #{ clean_start := Clean, dir := Dir }) ->
+    try
+        S1 = case append({start, Clean}, S) of
+                 {ok, SA} -> SA;
+                 {error, R1, _} -> throw({start_refused, R1})
+             end,
+        S2 = case Clean of
+                 true -> S1;
+                 false -> reconcile(S1)
+             end,
+        S3 = case filelib:is_regular(filename:join(Dir, "rebase")) of
+                 true -> rebase(S2);
+                 false -> S2
+             end,
+        S3#{ started => true }
+    catch
+        throw:Why -> not_started(S, Why);
+        error:{offsite_journal_reconcile_failed, Why} -> not_started(S, {reconcile, Why})
+    end.
+
+%% The attempt may have sealed or broken the segment it was writing: drop
+%% it, so the next attempt opens a new one.
+not_started(S, Why) ->
+    ?event(error, {offsite_journal_not_started, Why}),
+    case maps:get(fd, S) of
+        undefined -> ok;
+        Fd -> catch file:close(Fd)
+    end,
+    S#{ fd => undefined, dirty => false, errors => maps:get(errors, S) + 1 }.
 
 writer_loop(S = #{ store := Store }) ->
     receive
-        {call, From, Ref, {append, Pairs}} ->
-            {Reply, S1} = append_and_write(Pairs, S),
-            From ! {Ref, Reply},
-            writer_loop(maybe_roll(S1));
-        {call, From, Ref, flush} ->
-            {Reply, S1} = do_flush(S),
-            From ! {Ref, Reply},
-            writer_loop(S1);
-        {call, From, Ref, seal} ->
-            S1 = roll(S),
-            From ! {Ref, refusal(S1, ok)},
-            writer_loop(S1);
+        {call, From, Ref, Msg} when Msg =/= status, Msg =/= stop ->
+            case ensure_started(S) of
+                S1 = #{ started := true } -> handle(From, Ref, Msg, S1);
+                S1 ->
+                    From ! {Ref, refusal(S1, {error, journal_not_started})},
+                    writer_loop(S1)
+            end;
         {call, From, Ref, status} ->
             Status = maps:with([dir, token, seg, sealed, off, appended, poisoned,
-                                reconciled, errors, clean_start], S),
+                                started, reconciled, rebased, errors, clean_start], S),
             From ! {Ref, Status#{ processes => map_size(maps:get(marks, S)) }},
             writer_loop(S);
         {call, From, Ref, stop} ->
@@ -315,14 +364,131 @@ writer_loop(S = #{ store := Store }) ->
             writer_loop(S)
     end.
 
-%% A poisoned journal refuses everything, for the rest of this run.
+handle(From, Ref, {append, Pairs}, S) ->
+    {Reply, S1} = append_and_write(Pairs, S),
+    From ! {Ref, Reply},
+    writer_loop(maybe_roll(S1));
+handle(From, Ref, flush, S) ->
+    {Reply, S1} = do_flush(S),
+    From ! {Ref, Reply},
+    writer_loop(S1);
+handle(From, Ref, seal, S) ->
+    S1 = roll(S),
+    From ! {Ref, refusal(S1, ok)},
+    writer_loop(S1);
+handle(From, Ref, _Other, S) ->
+    From ! {Ref, {error, unknown_call}},
+    writer_loop(S).
+
+%% @doc A writer that refuses every call (a damaged segment, or a poisoning
+%% from an earlier run), without crashing: answering keeps it registered, so
+%% nothing restarts it in a loop.
+writer_refusing(Store, Reason) ->
+    receive
+        {call, From, Ref, status} ->
+            From ! {Ref, #{ refusing => Reason }},
+            writer_refusing(Store, Reason);
+        {call, From, Ref, stop} ->
+            From ! {Ref, ok};
+        {call, From, Ref, _} ->
+            From ! {Ref, {error, Reason}},
+            writer_refusing(Store, Reason);
+        _ ->
+            writer_refusing(Store, Reason)
+    end.
+
+%% A poisoned journal refuses everything.
 refusal(#{ poisoned := false }, Reply) -> Reply;
 refusal(#{ poisoned := Reason }, _Reply) -> {error, {journal_poisoned, Reason}}.
 
-poison(S = #{ poisoned := false }, Reason) ->
+%% @doc Poison the journal: refuse everything from now on, and, through the
+%% `poisoned' file, in every later run until `clear_poison/1'.
+poison(S = #{ poisoned := false, dir := Dir }, Reason) ->
     ?event(error, {offsite_journal_poisoned, Reason}),
+    case write_synced(filename:join(Dir, "poisoned"), term_to_binary({poisoned, Reason})) of
+        ok -> sync_dir(Dir);
+        Err -> ?event(error, {offsite_journal_poison_marker_failed, Err})
+    end,
     S#{ poisoned => Reason, errors => maps:get(errors, S) + 1 };
 poison(S, _Reason) -> S.
+
+read_poison(Dir) ->
+    case file:read_file(filename:join(Dir, "poisoned")) of
+        {ok, Bin} ->
+            case catch binary_to_term(Bin) of
+                {poisoned, Reason} -> {poisoned, Reason};
+                _ -> {poisoned, unreadable_marker}
+            end;
+        _ -> none
+    end.
+
+%% @doc Clear a poisoning, after the cause is fixed. What was written while
+%% the journal was failing cannot be told apart, so the next run journals
+%% every row of the inner store again (a rebase) before it takes a write.
+clear_poison(Store) ->
+    Dir = journal_dir(Store),
+    _ = (catch call(Store, stop, 30000)),
+    stop_writer_process(Store),
+    ok = write_synced(filename:join(Dir, "rebase"), <<>>),
+    sync_dir(Dir),
+    ok = case file:delete(filename:join(Dir, "poisoned")) of
+             ok -> ok;
+             {error, enoent} -> ok;
+             E -> E
+         end,
+    sync_dir(Dir),
+    ok.
+
+stop_writer_process(#{ <<"name">> := Name }) ->
+    case hb_name:lookup({?MODULE, writer, Name}) of
+        undefined -> ok;
+        Pid ->
+            Ref = erlang:monitor(process, Pid),
+            exit(Pid, kill),
+            receive {'DOWN', Ref, process, Pid, _} -> ok end,
+            hb_name:unregister({?MODULE, writer, Name})
+    end.
+
+%% @doc Journal every row of the inner store, then confirm them.
+rebase(S = #{ store := Store, dir := Dir }) ->
+    Inner = inner(Store),
+    case maps:get(<<"store-module">>, Inner) of
+        hb_store_lmdb -> ok;
+        Other -> throw({rebase_unsupported, Other})
+    end,
+    #{ <<"db">> := DB } = hb_store:find(Inner),
+    ok = elmdb:flush(DB),
+    {ok, {S1, Batch, N}} =
+        elmdb:fold(DB,
+            fun(K, V, {SA, B, C}) when length(B) >= 500 ->
+                    {append_rebase(B, SA), [{K, V}], C + 1};
+               (K, V, {SA, B, C}) ->
+                    {SA, [{K, V} | B], C + 1}
+            end,
+            {S, [], 0}),
+    S2 = append_rebase(Batch, S1),
+    S3 = case append({flushed}, S2) of
+             {ok, SF} -> sync_journal(SF);
+             {error, R, _} -> throw({rebase_failed, R})
+         end,
+    case maps:get(poisoned, S3) of
+        false -> ok;
+        Why -> throw({rebase_failed, Why})
+    end,
+    ok = file:delete(filename:join(Dir, "rebase")),
+    sync_dir(Dir),
+    ?event(warning, {offsite_journal_rebased, {rows, N}}),
+    S3#{ rebased => N,
+         marks => merge_marks(maps:get(pending, S3), maps:get(marks, S3)),
+         pending => #{} }.
+
+append_rebase([], S) -> S;
+append_rebase(Rows, S) ->
+    Pairs = lists:reverse(Rows),
+    case append({w, Pairs}, S) of
+        {ok, S1} -> S1#{ pending => mark(Pairs, maps:get(pending, S1)) };
+        {error, R, _} -> throw({rebase_failed, R})
+    end.
 
 %% @doc Append the rows, then write them to the inner store. A refused append
 %% writes nothing. The rows count as confirmed at the next flush.
@@ -354,7 +520,7 @@ append(Rec, S = #{ fd := undefined }) ->
     end;
 append(Rec, S = #{ fd := Fd, off := Off }) ->
     Frame = frame(Rec),
-    case file:write(Fd, Frame) of
+    case write_frame(Fd, Frame) of
         ok -> {ok, S#{ off => Off + byte_size(Frame), dirty => true }};
         {error, Reason} ->
             ?event(error, {offsite_journal_append_failed, Reason}),
@@ -365,6 +531,12 @@ append(Rec, S = #{ fd := Fd, off := Off }) ->
             S1 = seal_current(S),
             {error, Reason, S1#{ fd => undefined,
                                  errors => maps:get(errors, S1) + 1 }}
+    end.
+
+write_frame(Fd, Frame) ->
+    case persistent_term:get({?MODULE, fail_write}, false) of
+        true -> {error, enospc};   % test hook
+        false -> file:write(Fd, Frame)
     end.
 
 frame(Rec) ->
@@ -1410,3 +1582,60 @@ closure_follows_commitments_path_test() ->
     }, #{}),
     Keys = [ K || {K, _} <- closure(Inner, <<"k">>) ],
     ?assert(lists:member(<<U/binary, "/data">>, Keys)).
+
+writer_pid(#{ <<"name">> := Name }) -> hb_name:lookup({?MODULE, writer, Name}).
+
+%% @doc A refused write is final: `hb_store' does not stop and restart the
+%% store to retry it, and a writer that cannot even journal its start marker
+%% (a full disk) refuses calls without crashing, then runs once it can.
+refusal_does_not_restart_writer_test() ->
+    {Store, _Inner, _Target} = test_setup(<<"oj-noretry">>, #{}),
+    ok = hb_store:write([Store], #{ <<"r/1">> => <<"1">> }, #{}),
+    Pid = writer_pid(Store),
+    persistent_term:put({?MODULE, fail_write}, true),
+    R1 = (catch hb_store:write([Store], #{ <<"r/2">> => <<"2">> }, #{})),
+    Same = writer_pid(Store),
+    % A restart while the disk is still full: refused, not crashed.
+    kill_writer(Store),
+    R2 = write(Store, #{ <<"r/3">> => <<"3">> }, #{}),
+    Pid2 = writer_pid(Store),
+    R3 = write(Store, #{ <<"r/3">> => <<"3">> }, #{}),
+    Pid3 = writer_pid(Store),
+    persistent_term:erase({?MODULE, fail_write}),
+    ?assertMatch({failure, _}, R1),
+    ?assertEqual(Pid, Same),
+    ?assertMatch({failure, _}, R2),
+    ?assert(is_pid(Pid2)),
+    ?assertMatch({failure, _}, R3),
+    ?assertEqual(Pid2, Pid3),
+    % Space is back: the same writer starts and takes writes.
+    ?assertEqual(ok, write(Store, #{ <<"r/4">> => <<"4">> }, #{})),
+    ?assertEqual(Pid2, writer_pid(Store)),
+    kill_writer(Store).
+
+%% @doc A poisoning holds across restarts until it is cleared, and clearing
+%% it journals the whole inner store again: a row written in the failing
+%% window, whose journal record was never synced, is restored.
+poison_is_sticky_until_cleared_test() ->
+    {Store, Inner, Target} = test_setup(<<"oj-sticky">>, #{}),
+    ok = write(Store, #{ <<"s/1">> => <<"1">> }, #{}),
+    ok = flush(Store, #{}, #{}),
+    ok = write(Store, #{ <<"s/window">> => <<"w">> }, #{}),
+    persistent_term:put({?MODULE, fail_sync}, true),
+    try ?assertMatch({failure, _}, flush(Store, #{}, #{}))
+    after persistent_term:erase({?MODULE, fail_sync})
+    end,
+    kill_writer(Store),
+    % A new run is still poisoned.
+    ?assertMatch({failure, _}, write(Store, #{ <<"s/2">> => <<"2">> }, #{})),
+    ?assertMatch({failure, _}, flush(Store, #{}, #{})),
+    ok = clear_poison(Store),
+    ?assertEqual(ok, write(Store, #{ <<"s/3">> => <<"3">> }, #{})),
+    ok = flush(Store, #{}, #{}),
+    ?assertMatch(#{ rebased := N } when N >= 2, status(Store)),
+    ?assertEqual({ok, <<"w">>}, hb_store:read([Inner], <<"s/window">>, #{})),
+    idle = ship_now(Store),
+    Fresh = fresh_store(<<"oj-sticky-r">>),
+    {ok, _} = restore(Target, Fresh),
+    assert_rows(Fresh, #{ <<"s/1">> => <<"1">>, <<"s/window">> => <<"w">>,
+                          <<"s/3">> => <<"3">> }).
