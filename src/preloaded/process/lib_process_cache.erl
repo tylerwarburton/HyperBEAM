@@ -18,10 +18,14 @@ read(ProcID, SlotRef, RawOpts) ->
     case is_integer(SlotRef) andalso hot_get(ProcID, SlotRef) of
         {ok, Hot} -> {ok, Hot};
         _ ->
-            Path = path(ProcID, SlotRef, Opts),
-            case hb_cache:read(Path, Opts) of
-                {ok, Stored} -> materialize(ProcID, Stored, Opts);
-                Other -> Other
+            case is_integer(SlotRef) andalso blob_read(ProcID, SlotRef, Opts) of
+                {ok, Blob} -> materialize(ProcID, Blob, Opts);
+                _ ->
+                    Path = path(ProcID, SlotRef, Opts),
+                    case hb_cache:read(Path, Opts) of
+                        {ok, Stored} -> materialize(ProcID, Stored, Opts);
+                        Other -> Other
+                    end
             end
     end.
 
@@ -30,14 +34,17 @@ write(ProcID, Slot, Msg, RawOpts) ->
     Opts = lib_process:cache_opts(RawOpts),
     Public = hb_private:reset(Msg),
     Result =
-        case delta(Msg, Opts) of
-            {ok, Patches, Results} ->
+        case {delta(Msg, Opts), blob_store(Opts)} of
+            {{ok, Patches, Results}, Store} when Store =/= none, is_integer(Slot),
+                                                 Slot >= 0 ->
+                write_blob(ProcID, Slot, Msg, Patches, Results, Store, Opts);
+            {{ok, Patches, Results}, _} ->
                 case checkpoint_due(ProcID, Slot, Msg, Opts) of
                     true -> write_full(ProcID, Slot, Msg, Opts);
                     false ->
                         write_delta(ProcID, Slot, Patches, Results, Opts)
                 end;
-            not_found -> write_full(ProcID, Slot, Msg, Opts)
+            {not_found, _} -> write_full(ProcID, Slot, Msg, Opts)
         end,
     hot_put(ProcID, Slot, Public, Opts),
     Result.
@@ -230,6 +237,12 @@ checkpoint_slots(Opts) ->
 base_exists(ProcID, Slot, Opts) ->
     case hot_get(ProcID, Slot) of
         {ok, _} -> true;
+        not_found when Slot >= 0 ->
+            blob_exists(ProcID, Slot, Opts) orelse
+                case hb_cache:read(path(ProcID, Slot, Opts), Opts) of
+                    {ok, _} -> true;
+                    _ -> false
+                end;
         not_found ->
             case hb_cache:read(path(ProcID, Slot, Opts), Opts) of
                 {ok, _} -> true;
@@ -426,7 +439,13 @@ latest(ProcID, RawRequiredPath, Limit, RawOpts) ->
 %% @doc The latest stored slot, listing every slot of the process.
 latest_stored(ProcID, RequiredPath, Limit, Opts) ->
     Path = path(ProcID, slot_root, Opts),
-    AllSlots = slots(ProcID, Opts),
+    AllSlots =
+        case {RequiredPath, blob_store(Opts)} of
+            {[<<"snapshot">>], Store} when Store =/= none ->
+                % Only a checkpoint with a VM snapshot can satisfy it.
+                legacy_slots(ProcID, Opts) ++ blob_slots(ProcID, <<"s">>, Store);
+            _ -> slots(ProcID, Opts)
+        end,
     ?event({all_slots, {proc_id, ProcID}, {slots, AllSlots}}),
     CappedSlots =
         case Limit of
@@ -472,7 +491,12 @@ first_with_path(ProcID, RequiredPath, [Slot | Rest], Opts) ->
 read_candidate(ProcID, RequiredPath, Slot, Rest, Opts) ->
     RawPath = path(ProcID, Slot, Opts),
     ?event({trying_slot, {slot, Slot}, {path, RawPath}}),
-    case hb_cache:read(RawPath, Opts) of
+    Read =
+        case blob_read(ProcID, Slot, Opts) of
+            {ok, Blob} -> {ok, Blob};
+            _ -> hb_cache:read(RawPath, Opts)
+        end,
+    case Read of
         {error, not_found} ->
             first_with_path(ProcID, RequiredPath, Rest, Opts);
         {failure, _} = Failure ->
@@ -502,7 +526,147 @@ latest_slot(ProcID, Opts) ->
     end.
 
 slots(ProcID, Opts) ->
+    case blob_store(Opts) of
+        none -> legacy_slots(ProcID, Opts);
+        Store ->
+            lists:usort(
+                legacy_slots(ProcID, Opts) ++
+                blob_slots(ProcID, <<"d">>, Store) ++
+                blob_slots(ProcID, <<"f">>, Store))
+    end.
+
+legacy_slots(ProcID, Opts) ->
     hb_cache:list_numbered(path(ProcID, slot_root, Opts), Opts).
+
+%%% Process state blobs (`process-state-blobs').
+%%%
+%%% RC7 writes a computed slot through `hb_cache:write': content-addressed,
+%%% every field its own row, shared with any other message holding the same
+%%% value (a checkpoint and the process definition share the module), so no
+%%% row of it can be deleted without proving nothing else uses it. With
+%%% `process-state-blobs => true', a slot of a delta process is one row in a
+%%% namespace owned by that process and slot, shared with nothing:
+%%%
+%%%   pstate/<proc>/d/<slot>   the delta envelope (patches + results)
+%%%   pstate/<proc>/f/<slot>   a full public state (a checkpoint)
+%%%   pstate/<proc>/s/<slot>   empty marker, written after `f': that state
+%%%                            carries a VM snapshot, so a worker can resume
+%%%                            from it
+%%%
+%%% Slots are zero-padded to 12 digits. Values are `term_to_binary' of fully
+%%% loaded terms, compressed. `hb_store_retention' deletes rows of this
+%%% namespace, and only of it, below the newest checkpoints it keeps.
+%%% Full-state processes (no delta) and negative slots keep RC7's layout.
+
+-define(BLOB_NS, <<"pstate">>).
+-define(BLOB_VSN, 1).
+
+blob_store(Opts) ->
+    case hb_util:atom(hb_opts:get(<<"process-state-blobs">>, false, Opts)) of
+        true ->
+            Stores =
+                case hb_opts:get(<<"store">>, [], Opts) of
+                    M when is_map(M) -> [M];
+                    L when is_list(L) -> L;
+                    _ -> []
+                end,
+            case [ S || S = #{ <<"store-module">> := hb_store_lmdb } <- Stores,
+                        not is_map_key(<<"access">>, S),
+                        maps:get(<<"read-only">>, S, false) =/= true ] of
+                [Store | _] -> Store;
+                [] -> none
+            end;
+        _ -> none
+    end.
+
+blob_key(ProcID, Kind, Slot) ->
+    <<(blob_prefix(ProcID, Kind))/binary, "/", (pad_slot(Slot))/binary>>.
+
+blob_prefix(ProcID, Kind) ->
+    <<?BLOB_NS/binary, "/", (hb_util:human_id(ProcID))/binary, "/", Kind/binary>>.
+
+pad_slot(Slot) ->
+    iolist_to_binary(io_lib:format("~12..0B", [Slot])).
+
+blob_put(Store, Key, Value, Opts) ->
+    case hb_store:write([Store], #{ Key => Value }, Opts) of
+        ok -> ok;
+        Error -> erlang:error({process_state_blob_write_failed, Key, Error})
+    end.
+
+blob_get(Store, Key, Opts) ->
+    case hb_store:read([Store], #{ <<"read">> => Key }, Opts) of
+        {ok, Bin} when is_binary(Bin) -> {ok, Bin};
+        _ -> not_found
+    end.
+
+%% @doc The stored form of a slot from the blob namespace: its full state when
+%% there is one, else its delta envelope.
+blob_read(ProcID, Slot, Opts) when is_integer(Slot), Slot >= 0 ->
+    case blob_store(Opts) of
+        none -> not_found;
+        Store ->
+            case blob_get(Store, blob_key(ProcID, <<"f">>, Slot), Opts) of
+                {ok, Full} -> {ok, blob_decode(Full)};
+                not_found ->
+                    case blob_get(Store, blob_key(ProcID, <<"d">>, Slot), Opts) of
+                        {ok, Delta} -> {ok, blob_decode(Delta)};
+                        not_found -> not_found
+                    end
+            end
+    end;
+blob_read(_ProcID, _Slot, _Opts) ->
+    not_found.
+
+blob_exists(ProcID, Slot, Opts) ->
+    case blob_store(Opts) of
+        none -> false;
+        Store ->
+            blob_get(Store, blob_key(ProcID, <<"d">>, Slot), Opts) =/= not_found
+                orelse blob_get(Store, blob_key(ProcID, <<"f">>, Slot), Opts) =/= not_found
+    end.
+
+%% @doc The slots of `Kind' (`d', `f' or `s') a process holds, ascending.
+blob_slots(ProcID, Kind, Store) ->
+    case hb_store:list([Store], blob_prefix(ProcID, Kind), #{}) of
+        {ok, Names} ->
+            lists:sort([ binary_to_integer(N) || N <- Names,
+                         is_integer(catch binary_to_integer(N)) ]);
+        _ -> []
+    end.
+
+blob_encode(Term) -> term_to_binary({?BLOB_VSN, Term}, [{compressed, 1}]).
+blob_decode(Bin) -> {?BLOB_VSN, Term} = binary_to_term(Bin), Term.
+
+%% @doc Write a delta process's slot as one row. A checkpoint is the whole
+%% public state; one carrying a VM snapshot also gets its `s' marker, written
+%% after the state so a marker never names a state that is not there.
+write_blob(ProcID, Slot, Msg, Patches, Results, Store, Opts) ->
+    Key =
+        case checkpoint_due(ProcID, Slot, Msg, Opts) of
+            false ->
+                Envelope = #{
+                    <<"cache-format">> => ?DELTA_FORMAT,
+                    <<"slot">> => Slot,
+                    <<"base-slot">> => Slot - 1,
+                    <<"patches">> => hb_cache:ensure_all_loaded(Patches, Opts),
+                    <<"results">> => hb_cache:ensure_all_loaded(Results, Opts)
+                },
+                K = blob_key(ProcID, <<"d">>, Slot),
+                ok = blob_put(Store, K, blob_encode(Envelope), Opts),
+                K;
+            true ->
+                Loaded = hb_cache:ensure_all_loaded(hb_private:reset(Msg), Opts),
+                K = blob_key(ProcID, <<"f">>, Slot),
+                ok = blob_put(Store, K, blob_encode(Loaded), Opts),
+                case is_map_key(<<"snapshot">>, Loaded) of
+                    true -> ok = blob_put(Store, blob_key(ProcID, <<"s">>, Slot), <<>>, Opts);
+                    false -> ok
+                end,
+                K
+        end,
+    ok = refresh(ProcID, Slot, Opts),
+    {ok, Key}.
 
 path_exists([], _Msg, _Opts) ->
     true;
@@ -847,3 +1011,54 @@ linked_trie_process_store_test() ->
             lib_process:cache_opts(Opts)
         )
     ).
+
+%% @doc With `process-state-blobs', a delta process's slots are one row each
+%% under `pstate/', read back as computed (from the store, hot cache empty),
+%% and a checkpoint with a snapshot gets its marker and is found by `latest'.
+state_blobs_layout_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb),
+    Opts = #{
+        <<"store">> => Store,
+        <<"process-delta-cache">> => true,
+        <<"process-state-blobs">> => true,
+        <<"process-delta-checkpoint-slots">> => 3,
+        <<"process-hot-cache-slots">> => 0
+    },
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    State0 = #{ <<"count">> => <<"0">>, <<"at-slot">> => 0 },
+    Delta = fun(Msg, P, R) ->
+        Msg#{ <<"priv">> => #{ <<"process-cache-delta">> =>
+            #{ <<"patches">> => P, <<"results">> => R } } }
+    end,
+    {ok, _} = write(ProcID, 0, Delta(State0#{ <<"snapshot">> => <<"vm0">> }, [], #{}), Opts),
+    States =
+        lists:foldl(
+            fun(N, Acc = [Prev | _]) ->
+                Bin = integer_to_binary(N),
+                Patches = [#{ <<"path">> => <<"/count">>, <<"value">> => Bin }],
+                Results = #{ <<"output">> => #{ <<"data">> => Bin } },
+                {ok, Next} = hb_state_patch:apply(Prev, Patches, Results, N, Opts),
+                Msg = case N of 3 -> Next#{ <<"snapshot">> => <<"vm3">> }; _ -> Next end,
+                {ok, _} = write(ProcID, N, Delta(Msg, Patches, Results), Opts),
+                [Next | Acc]
+            end,
+            [State0],
+            lists:seq(1, 5)),
+    Keys =
+        lists:sort(
+            [ K || K <- element(2, hb_store:list([Store], <<"pstate/", ProcID/binary, "/d">>, #{})) ]),
+    ?assertEqual([pad_slot(N) || N <- [1, 2, 4, 5]], Keys),
+    ?assertEqual([0, 3], blob_slots(ProcID, <<"s">>, Store)),
+    ?assertEqual([0, 3], blob_slots(ProcID, <<"f">>, Store)),
+    % Nothing of it went through the content-addressed layout.
+    ?assertEqual([], legacy_slots(ProcID, Opts)),
+    lists:foreach(
+        fun({N, Expected}) ->
+            {ok, Read} = read(ProcID, N, Opts),
+            ?assertEqual(hb_maps:get(<<"count">>, Expected), hb_maps:get(<<"count">>, Read))
+        end,
+        lists:zip(lists:seq(0, 5), lists:reverse(States))),
+    ?assertMatch({ok, 3, #{ <<"snapshot">> := <<"vm3">> }},
+                 latest(ProcID, [<<"snapshot">>], undefined, Opts)),
+    ?assertMatch({ok, 0, _}, latest(ProcID, [<<"snapshot">>], 2, Opts)),
+    ?assertEqual({ok, 5}, latest_slot(ProcID, Opts)).
