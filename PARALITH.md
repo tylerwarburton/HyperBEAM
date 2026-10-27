@@ -40,6 +40,9 @@ Settings our v0.11 nodes run with, each one decided or measured:
 | `match-index` | `false` | RC7 indexes every key/value for `~match@1.0`, which we do not use: 23 of 100 rows a message. Off: 23.7 -> 18.1 KB/msg, 84 -> 78.5 ms |
 | `process-delta-cache` | `true` | store a slot as its patches between checkpoints: store 50 -> 4 ms a slot, disk -63% (2026-10-26) |
 | `rate-limit-requests` / `-period` / `-max` / `-min` / `-exempt` | as prod (`node-config.base.json`: 60000 per 60 s; exempt our servers' IPs) | RC7's default limiter allows a burst of 1,000 then ~17/s per client, and refuses beyond: game backends, indexers and bots get 429s under load. Same keys as the old fork |
+| `irreplaceable-store` | a local `hb_store_lmdb` (was `essentials-store`), e.g. `/app/cache-mainnet/irreplaceable` | assignments, their messages and process definitions in their own store, so a damaged or wiped main store loses nothing that cannot be recomputed. Never on a network filesystem |
+| `irreplaceable-export` | `{path, journal, max-fill-pct}` (was `essentials-export`, same three keys) | journals every irreplaceable write and ships it to the backup mount. Main only |
+| LMDB `sync` | leave unset (now `true` by default; `false` opts out) | RC7 opened every LMDB `no_sync`: a host crash could corrupt the tree, as on the old fork's main node 2026-10-20. +3 ms a game slot |
 
 ## Port order
 
@@ -116,9 +119,102 @@ the numbers below with the reason they moved.
    250 ms).
 5. **Worker, process cache, `hb_persistent`**: each measured on its own.
 6. **Push**.
-7. **Stores**: crash-safe LMDB sync, `hb_store_irreplaceable`,
-   `hb_store_offsite_journal`, `hb_store_retention`. RC7 rewrote the storage
-   layout (no links or groups), so these are rewritten, not copied.
+7. **Stores**: ported (2026-10-27), rewritten for RC7's layout (plain
+   key/value writes, no links or groups):
+   - **LMDB sync**: every commit is synced unless a store sets
+     `sync: false` (RC7 defaulted to `no_sync`). A synced store's flush is
+     its commit, without RC7's second `env_sync`.
+   - **`hb_store_irreplaceable`** (from `hb_store_essentials`, ~100 lines
+     instead of ~240). RC7 already routes the scheduler cache, location
+     cache and spawn definitions through `scheduler-store`, so the module
+     only points `scheduler-store` at the irreplaceable store (after the
+     start hook) and adds it read-only after the node's first store. A
+     definition POSTed to `/schedule` now goes through the scheduler cache
+     too. Not ported: `migrate`/`verify` (v0.11 lands on a fresh deploy
+     only) and routing for the bundler and Arweave block caches (unused on
+     our nodes; regenerable).
+   - **`hb_store_offsite_journal`** (from `hb_store_export`, ~860 lines plus tests,
+     instead of ~2,400). Write-ahead: the writer appends a write to the
+     local journal, then writes the inner store; `flush` (the scheduler's,
+     before it confirms a slot) syncs the journal, then flushes the inner
+     store. A separate shipper copies sealed segments to the target
+     (`.tmp`, sync, rename, then `manifest.log` with size and CRC), never
+     above `max-fill-pct`, and deletes the local copy. Torn and zero-filled
+     tails are cut on start; a failed append is truncated away and the write
+     refused. An unclean start journals every assignment the inner store
+     holds above the per-process marks, with its closure (the one gap a
+     power loss can leave). `restore/2,3` replays the manifest, then any
+     unshipped local segments. Not ported: base images and gap marks (the
+     write-ahead order and the reconcile replace them), local pruning after
+     export, the target-op gate.
+   - **`hb_store_retention` not ported.** It is not redundant: nothing in
+     RC7 ever deletes a row, and with delta storage the main store still
+     grows ~16 MiB per 1,000 game slots, the irreplaceable store ~14 MiB.
+     But it cannot be built on RC7 as it is: the pinned `elmdb` (94f6d30)
+     has no delete, and the fork's collector stood on an 851-line `elmdb`
+     patch (delete, guarded delete, write tracking, reference scans), on
+     the fork's link/group layout and on `process-state-blobs`, none of
+     which exist here. **Decision for Tyler**: port a delete into `elmdb`
+     and write a v0.11 retention, or launch main without one and watch
+     disk (the old fork's main ran `store-retention: false` anyway, and
+     pruned essentials to 6 h only because they were exported).
+
+   Tests (`hb-v11-dev`, `--with-core --module=hb_store_offsite_journal,
+   hb_store_irreplaceable,dev_scheduler_cache`): 17/17 (5 journal, 2
+   routing, 2 new scheduler-cache: an assignment lands whole in the
+   irreplaceable store, and one shipped and restored into an empty store
+   reads back and verifies). `hb_store_lmdb,hb_store,hb_cache,dev_scheduler`:
+   115/117; the two failures (`http_get_schedule_redirect`,
+   `redirect_from_graphql`) fail identically without this unit.
+
+   Crash tests (outside eunit, `kill -9` of the whole VM):
+   - 30 kills at random points, writing assignment-shaped rows (assignment
+     link, message rows, a 2 KiB blob) with a flush per slot, segments
+     sealed and shipped every 300 ms, a zero-filled tail appended to the
+     open segment on every fourth kill: 6,674 confirmed slots, none missing
+     from the inner store or from a restore of target plus journal; slots
+     written but not yet confirmed restored too. LMDB opened every time.
+   - Disk full (tmpfs): journal disk full: the write is refused, the inner
+     store does not have it, the writer survives, writes resume once space
+     is freed, and the journal restores everything. Target disk really
+     full: shipping fails with `enospc`, no `.tmp` left, the manifest still
+     restores cleanly, target plus journal restore everything.
+     `max-fill-pct` 50: shipping stopped at 50% with the rest held locally.
+     Inner LMDB disk full: refused with `transaction_error`, confirmed rows
+     intact, all of them there after a restart.
+   - Not testable in a container: a real power loss. That is what the LMDB
+     sync and the journal sync before each confirmation are for.
+
+   Cost, `bench/durability_bench.erl`, game-shaped `lua-patch@1.0`
+   process, 1,000 slots each scheduled then computed in the VM, two runs
+   each, medians:
+
+   | Mode | Slot | Schedule | Compute | p95 | Main | Irreplaceable | Offsite |
+   |---|---:|---:|---:|---:|---:|---:|---:|
+   | RC7 (`no_sync`) | 95.8-97.0 ms | 46.2-46.7 | 50.0-50.8 | 110-112 | 25.0 MiB | | |
+   | sync | 99.8-99.9 ms | 46.6-47.3 | 53.3 | 112-122 | 24.8-25.0 MiB | | |
+   | + irreplaceable store | 105.1-105.3 ms | 47.0-47.6 | 57.8-58.3 | 120-125 | 16.2 MiB | 13.8-13.9 MiB | |
+   | + offsite journal | 106.9-109.4 ms | 48.8-49.9 | 58.0-59.6 | 119-133 | 16.0 MiB | 13.8-14.0 MiB | ~1.25 MiB gz |
+
+   (disk per 1,000 slots; Schedule includes the bench signing two RSA
+   messages.) Memory: no difference, BEAM 121-132 MiB and RSS 236-253 MiB
+   at the end of every run. The local journal stays at about one segment
+   (8 MiB) plus whatever the target has not taken.
+
+   **Trade-offs, for Tyler:**
+   - Sync: +3 ms a slot (+3%), all in compute (its lists commit the
+     overlay, now synced). The scheduler already synced every slot in RC7.
+   - Irreplaceable store: +5 ms a slot. A traced slot makes ~40 more LMDB
+     reads and one more list: reads that used to hit the main store first
+     now miss it and fall to the second store. Not fsync (an unsynced
+     irreplaceable store measured the same) and not order (reading it
+     first measured the same).
+   - Irreplaceable store: +20% disk (30 vs 25 MiB per 1,000 slots), as
+     signing the assignment leaves a copy of the body in the main store.
+   - Offsite journal: +2-4 ms a slot (an `fdatasync` per confirmed slot,
+     and the write-ahead hop through the writer). The offsite copy is ~9%
+     of the irreplaceable store's size (gzip).
+   - Everything at once: ~97 -> ~108 ms a game slot in the VM (+11%).
 8. **`bridge-attestor@1.0`**, `evm-rpc@1.0`, chain signing: ported
    (2026-10-27) from `dev_bridge`, `hb_bridge_sign`, `hb_bridge_chains` and
    `dev_eth_client`, with the 2026-10-26 polling fix (fixed 15 s nudge
