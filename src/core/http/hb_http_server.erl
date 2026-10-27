@@ -352,7 +352,10 @@ new_server(RawNodeMsg) ->
                 % With an `irreplaceable-store', start it, make it the
                 % scheduler's store and add it (read-only) to the node's
                 % store list. Unchanged otherwise.
-                hb_store_irreplaceable:node_message(NodeMsgAfterHook);
+                % Then start store retention, if it is on.
+                NodeMsgIrr = hb_store_irreplaceable:node_message(NodeMsgAfterHook),
+                _ = hb_store_retention:maybe_start(NodeMsgIrr),
+                NodeMsgIrr;
             Unexpected ->
                 ?event(http,
                     {failed_to_start_server,
