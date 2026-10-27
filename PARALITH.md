@@ -118,6 +118,11 @@ the numbers below with the reason they moved.
    - On v0.11 the node's httpsig committer is a `publickey:` URI;
      `lua-patch@1.0` hands Lua the address, so a PUSD on lua-patch (or
      lua-atomic) sees the attestor as before. Tested end to end.
+   - Hardened after audit (f8b9c43ff): `start` reads config only from the
+     node message, never a request; one chain's crash fails that chain
+     only; failures show and log no URLs, maps or call arguments; an
+     unsignable withdrawal or proposal is skipped and listed in `status`
+     under `skipped` instead of failing every pass.
    - v0.11's relay refuses internal hosts (`hosts-block-internal`, on by
      default): a `pusd-node` or RPC URL on localhost or a private IP is
      refused. Ours are public.
@@ -129,7 +134,7 @@ the numbers below with the reason they moved.
    `/~bridge-attestor@1.0/{keys,status,nudge}`.
 
    Tests (`hb-v11-dev`, `--module=dev_bridge_attestor,
-   dev_bridge_attestor_sign,dev_bridge_attestor_chains,dev_evm_rpc`): 35/35,
+   dev_bridge_attestor_sign,dev_bridge_attestor_chains,dev_evm_rpc`): 39/39,
    twice. They include a stand-in PUSD on lua-patch@1.0 (one pass reads its
    `bridgeinfo`, votes, and PUSD records the node's address as committer),
    locally and through `pusd-node` over HTTP, and the start hook serving
