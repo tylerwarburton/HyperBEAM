@@ -63,9 +63,26 @@ the numbers below with the reason they moved.
      the host-call guards again. A `lua-patch@1.0` VM or snapshot is refused.
    - `collectgarbage` does nothing inside a batch. Stock Luerl (the GC
      patch is reverted) cannot see the suspended caller's frames from a
-     nested call, and a collection there freed the caller's locals.
+     nested call, and a collection there freed the caller's locals. The
+     replacement is installed before any module code (`lua-device-preload`),
+     so a module cannot keep Luerl's own, and a restore drops Luerl's own
+     wherever a snapshot holds it.
+   - The `ao` library and the guards are installed with raw table writes
+     (`dev_lua_lib` too, so every Lua device): a `__newindex` on `_G` or
+     `ao` used to receive the unguarded host functions.
+   - `math.random` and `math.randomseed` are in the mandatory sandbox.
+     Elsewhere `requires-determinism` governs them: `process@1.0` sets it
+     to `true` unless the process message says otherwise, and no monorepo
+     spawn sets it, so lua-patch processes do not get `math.random` either.
+     A spawn with `requires-determinism: false`, or a direct device call
+     outside a process, would.
    - `dev_lua` takes `lua-device-sandbox` again, on top of the node's
      minimum sandbox.
+   - **Contract rule:** do not keep `ao.atomic`, `ao.get`/`resolve`/`set`/
+     `event` or `collectgarbage` in a variable or table of your own. They
+     are host functions, and a restore sets them to `nil` everywhere except
+     in `ao` and `_G`, so a live VM and a restored one would behave
+     differently. Call them through `ao.` and `_G` each time.
    - Found on the way: `lua-patch@1.0` never gave RC7's `ao` library its
      node message, so every `ao.get`/`resolve`/`set`/`event` from a
      lua-patch contract failed. Fixed, with a test.
@@ -75,11 +92,14 @@ the numbers below with the reason they moved.
      is never exactly `lua-atomic-v1-ready`. The test covers both.
 
    Tests (`hb-v11-dev`, `--module=dev_lua_atomic,dev_lua_patch,
-   hb_state_patch,lib_process_cache`): 52 passed, 1 failed, twice. The
-   failure is `incremental_gc_step_test` (needs the reverted Luerl patch).
-   All 7 `lua-atomic@1.0` tests pass. `dev_lua,dev_lua_test`: 30 passed,
-   1 failed: `pure_lua_process_benchmark_test_` (38 slots/s, limit 500 ms
-   for 30 slots), a timing limit that fails the same without this port.
+   hb_state_patch,lib_process_cache`): 57 passed, 1 failed. The failure is
+   `incremental_gc_step_test` (needs the reverted Luerl patch). All 12
+   `lua-atomic@1.0` tests pass; the 5 guard tests fail on the first port.
+   `dev_lua,dev_lua_test`: two timing benchmarks fail on the shared box,
+   with or without this port: `pure_lua_process_benchmark_test_` every run
+   (30 slots in 666-880 ms, limit 500 ms) and
+   `aos_process_benchmark_test_` sometimes (6 slots in 178-316 ms, limit
+   250 ms).
 5. **Worker, process cache, `hb_persistent`**: each measured on its own.
 6. **Push**.
 7. **Stores**: crash-safe LMDB sync, `hb_store_irreplaceable`,
