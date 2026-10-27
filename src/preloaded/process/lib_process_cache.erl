@@ -44,6 +44,8 @@ write(ProcID, Slot, Msg, RawOpts) ->
                     false ->
                         write_delta(ProcID, Slot, Patches, Results, Opts)
                 end;
+            {not_found, Store} when Store =/= none, is_integer(Slot), Slot >= 0 ->
+                write_full_blob(ProcID, Slot, Msg, Store, Opts);
             {not_found, _} -> write_full(ProcID, Slot, Msg, Opts)
         end,
     hot_put(ProcID, Slot, Public, Opts),
@@ -556,7 +558,8 @@ legacy_slots(ProcID, Opts) ->
 %%% Slots are zero-padded to 12 digits. Values are `term_to_binary' of fully
 %%% loaded terms, compressed. `hb_store_retention' deletes rows of this
 %%% namespace, and only of it, below the newest checkpoints it keeps.
-%%% Full-state processes (no delta) and negative slots keep RC7's layout.
+%%% A full-state process (no delta: `lua@5.3a', WASM, native devices) writes
+%%% every slot as an `f' row. Negative slots keep RC7's layout.
 
 -define(BLOB_NS, <<"pstate">>).
 -define(BLOB_VSN, 1).
@@ -655,18 +658,28 @@ write_blob(ProcID, Slot, Msg, Patches, Results, Store, Opts) ->
                 K = blob_key(ProcID, <<"d">>, Slot),
                 ok = blob_put(Store, K, blob_encode(Envelope), Opts),
                 K;
-            true ->
-                Loaded = hb_cache:ensure_all_loaded(hb_private:reset(Msg), Opts),
-                K = blob_key(ProcID, <<"f">>, Slot),
-                ok = blob_put(Store, K, blob_encode(Loaded), Opts),
-                case is_map_key(<<"snapshot">>, Loaded) of
-                    true -> ok = blob_put(Store, blob_key(ProcID, <<"s">>, Slot), <<>>, Opts);
-                    false -> ok
-                end,
-                K
+            true -> full_blob(ProcID, Slot, Msg, Store, Opts)
         end,
     ok = refresh(ProcID, Slot, Opts),
     {ok, Key}.
+
+%% @doc Write a slot of a full-state process (one without patches: `lua@5.3a',
+%% WASM, native devices) as one full-state row. Each row stands alone, so
+%% retention can drop any of them but the ones it keeps.
+write_full_blob(ProcID, Slot, Msg, Store, Opts) ->
+    Key = full_blob(ProcID, Slot, Msg, Store, Opts),
+    ok = refresh(ProcID, Slot, Opts),
+    {ok, Key}.
+
+full_blob(ProcID, Slot, Msg, Store, Opts) ->
+    Loaded = hb_cache:ensure_all_loaded(hb_private:reset(Msg), Opts),
+    K = blob_key(ProcID, <<"f">>, Slot),
+    ok = blob_put(Store, K, blob_encode(Loaded), Opts),
+    case is_map_key(<<"snapshot">>, Loaded) of
+        true -> ok = blob_put(Store, blob_key(ProcID, <<"s">>, Slot), <<>>, Opts);
+        false -> ok
+    end,
+    K.
 
 path_exists([], _Msg, _Opts) ->
     true;
@@ -1062,3 +1075,24 @@ state_blobs_layout_test() ->
                  latest(ProcID, [<<"snapshot">>], undefined, Opts)),
     ?assertMatch({ok, 0, _}, latest(ProcID, [<<"snapshot">>], 2, Opts)),
     ?assertEqual({ok, 5}, latest_slot(ProcID, Opts)).
+
+%% @doc With `process-state-blobs', a full-state process (no patches) writes
+%% each slot as one `f' row too, never RC7's content-addressed layout.
+state_blobs_full_state_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb),
+    Opts = #{ <<"store">> => Store, <<"process-state-blobs">> => true,
+              <<"process-delta-cache">> => true, <<"process-hot-cache-slots">> => 0 },
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    lists:foreach(
+        fun(N) ->
+            Msg = #{ <<"count">> => integer_to_binary(N), <<"at-slot">> => N },
+            Msg1 = case N of 2 -> Msg#{ <<"snapshot">> => <<"vm">> }; _ -> Msg end,
+            {ok, _} = write(ProcID, N, Msg1, Opts)
+        end,
+        lists:seq(0, 3)),
+    ?assertEqual([0, 1, 2, 3], blob_slots(ProcID, <<"f">>, Store)),
+    ?assertEqual([2], blob_slots(ProcID, <<"s">>, Store)),
+    ?assertEqual([], legacy_slots(ProcID, Opts)),
+    {ok, R} = read(ProcID, 1, Opts),
+    ?assertEqual(<<"1">>, hb_maps:get(<<"count">>, R)),
+    ?assertMatch({ok, 2, _}, latest(ProcID, [<<"snapshot">>], undefined, Opts)).
