@@ -22,25 +22,38 @@
 %%% scheduler calls before it confirms a slot, syncs the journal before it
 %%% flushes the inner store, so a confirmed slot is on disk in both.
 %%%
-%%% The one gap left is a host crash (power loss) after the inner store
-%%% committed a write on its own (its flusher, a list, a full batch) but
-%%% before the journal was synced: the inner store then has a row the journal
-%%% lost. That row belongs to a slot that was never confirmed. An unclean
-%%% start (no `clean' marker) closes such gaps: the writer keeps, per process,
-%%% the highest assignment slot it has journaled, and journals again, with its
-%%% whole closure, every assignment above it that the inner store holds, and
-%%% the definition of every process it has never journaled.
+%%% Confirmation. A flush appends a `flushed' marker before it syncs, and
+%%% only writes a `flushed' marker follows count: a restore drops what a run
+%%% wrote and never confirmed (a `start' marker opens every run), and a
+%%% `revoke' marker withdraws a confirmation whose inner flush failed. Any
+%%% failed sync poisons the journal: it is never retried (on Linux a retry
+%%% can report success for pages the kernel dropped), and every later write
+%%% and flush of the run is refused.
 %%%
-%%% A torn journal tail (a frame cut short, or the zero-filled tail a host
-%%% crash leaves on ext4) is cut back to its last whole frame on start, and
-%%% the writer starts a new segment, so nothing is ever appended after damage.
-%%% A failed append (a full local disk) is truncated away and refused: the
-%%% write fails, the inner store is not written, and the slot is not
-%%% confirmed.
+%%% The gap left is a host crash (power loss) after the inner store committed
+%%% a write on its own (its flusher, a list, a full batch) but before the
+%%% journal was synced: the inner store then has a row the journal lost, from
+%%% a slot that was never confirmed. An unclean start (no `clean' marker)
+%%% closes it: the writer keeps, per process, the highest confirmed
+%%% assignment slot, and journals again, with its whole closure, every
+%%% assignment above it that the inner store holds (so a slot reassigned
+%%% after a crash restores as the inner store has it), and the definition of
+%%% every process it has never journaled.
+%%%
+%%% Frames carry a magic, so a torn tail (nothing intact after the damage:
+%%% a frame cut short, the zero fill a host crash leaves) is told from damage
+%%% in the middle (an intact frame follows). A torn tail of the open segment
+%%% is cut on start; anything else stops the writer, and stops a restore,
+%%% with the file and offset. A failed append (a full local disk) is
+%%% truncated away and refused: the write fails and the inner store is not
+%%% written.
 %%%
 %%% The writer never touches the target. A shipper process copies each sealed
-%%% segment to it (`.tmp', sync, rename), then appends the file's name, size
-%%% and CRC to `manifest.log' (synced), then deletes the local copy. A slow,
+%%% segment to it (`.tmp', sync, rename, directory sync), then appends the
+%%% file's name, size, CRC and a hash chain over every shipped file to
+%%% `manifest.log' (synced; a torn last line is cut), then deletes the local
+%%% copy. A restore checks size, CRC and chain, and refuses a result whose
+%%% assignments skip a slot. A slow,
 %%% stalled or full target only grows the local backlog; nothing is dropped.
 %%% It never takes the target's filesystem above `max-fill-pct': at the
 %%% ceiling, shipping pauses (`offsite_journal_ceiling' events) and resumes
@@ -73,6 +86,7 @@
 -define(MAX_BACKOFF_MS, 300000).
 -define(CALL_MS, 120000).
 -define(ASSIGNMENTS, <<"~scheduler@1.0/assignments">>).
+-define(MAGIC, <<"HBJ1">>).
 
 %% @doc A store message that wraps `Inner' with an offsite journal configured
 %% by `Export'. It carries the inner store's name, so it names one writer per
@@ -157,7 +171,7 @@ status(Store) ->
 
 %% @doc Ship every sealed segment now and wait for the round to finish.
 ship_now(Store) ->
-    ok = call(Store, seal, ?CALL_MS),
+    _ = call(Store, seal, ?CALL_MS),
     Pid = shipper(Store),
     Ref = make_ref(),
     Pid ! {ship_now, self(), Ref},
@@ -230,7 +244,8 @@ writer_init(Store) ->
     _ = file:delete(filename:join(Dir, "clean")),
     {Sealed, Marks0, Token} = read_marks(Dir),
     % Every local file newer than the last seal (or not sealed at all) may
-    % hold assignments the marks do not: read them, cut torn tails, seal.
+    % hold assignments the marks do not: read them, cut torn tails, seal. A
+    % file damaged anywhere but its tail stops the writer here.
     {MaxN, Marks1} = recover_local(Dir, Sealed, Marks0),
     S0 = #{
         store => Store,
@@ -238,27 +253,32 @@ writer_init(Store) ->
         token => Token,
         seg => max(Sealed, MaxN) + 1,
         marks => Marks1,
+        pending => #{},
+        unflushed => false,
         sealed => max(Sealed, MaxN),
         fd => undefined,
         off => 0,
         opened => erlang:monotonic_time(millisecond),
         dirty => false,
-        broken => false,
+        poisoned => false,
         appended => 0,
         reconciled => 0,
         errors => 0,
         clean_start => Clean
     },
     S1 = write_marks(open_segment(S0)),
-    S2 =
+    % A new run: whatever the last one wrote and never confirmed is dropped
+    % by a restore from here on.
+    {ok, S2} = append({start, Clean}, S1),
+    S3 =
         case Clean of
-            true -> S1;
-            false -> reconcile(S1)
+            true -> S2;
+            false -> reconcile(S2)
         end,
     _ = shipper(Store),
     erlang:send_after(cfg(<<"fsync-ms">>, ?FSYNC_MS, Store), self(), fsync_tick),
     erlang:send_after(1000, self(), roll_tick),
-    writer_loop(S2).
+    writer_loop(S3).
 
 writer_loop(S = #{ store := Store }) ->
     receive
@@ -272,11 +292,11 @@ writer_loop(S = #{ store := Store }) ->
             writer_loop(S1);
         {call, From, Ref, seal} ->
             S1 = roll(S),
-            From ! {Ref, ok},
+            From ! {Ref, refusal(S1, ok)},
             writer_loop(S1);
         {call, From, Ref, status} ->
-            Status = maps:with([dir, token, seg, sealed, off, appended,
-                                reconciled, errors, clean_start, broken], S),
+            Status = maps:with([dir, token, seg, sealed, off, appended, poisoned,
+                                reconciled, errors, clean_start], S),
             From ! {Ref, Status#{ processes => map_size(maps:get(marks, S)) }},
             writer_loop(S);
         {call, From, Ref, stop} ->
@@ -295,8 +315,19 @@ writer_loop(S = #{ store := Store }) ->
             writer_loop(S)
     end.
 
+%% A poisoned journal refuses everything, for the rest of this run.
+refusal(#{ poisoned := false }, Reply) -> Reply;
+refusal(#{ poisoned := Reason }, _Reply) -> {error, {journal_poisoned, Reason}}.
+
+poison(S = #{ poisoned := false }, Reason) ->
+    ?event(error, {offsite_journal_poisoned, Reason}),
+    S#{ poisoned => Reason, errors => maps:get(errors, S) + 1 };
+poison(S, _Reason) -> S.
+
 %% @doc Append the rows, then write them to the inner store. A refused append
-%% writes nothing.
+%% writes nothing. The rows count as confirmed at the next flush.
+append_and_write(_Pairs, S = #{ poisoned := P }) when P =/= false ->
+    {refusal(S, ok), S};
 append_and_write(Pairs, S = #{ store := Store }) ->
     case append({w, Pairs}, S) of
         {ok, S1} ->
@@ -306,21 +337,23 @@ append_and_write(Pairs, S = #{ store := Store }) ->
                 try Mod:write(Inner, maps:from_list(Pairs), #{})
                 catch C:R -> {error, {C, R}}
                 end,
-            {Res, S1#{ marks => mark(Pairs, maps:get(marks, S1)),
+            {Res, S1#{ pending => mark(Pairs, maps:get(pending, S1)),
+                       unflushed => true,
                        appended => maps:get(appended, S1) + 1 }};
         {error, Reason, S1} ->
             {{error, Reason}, S1}
     end.
 
-append(_Rec, S = #{ fd := undefined }) ->
+append(_Rec, S = #{ poisoned := P }) when P =/= false ->
+    {error, {journal_poisoned, P}, S};
+append(Rec, S = #{ fd := undefined }) ->
     % The previous segment broke; start a new one.
     case catch open_segment(S#{ seg => maps:get(seg, S) + 1 }) of
-        S1 = #{ fd := Fd } when Fd =/= undefined -> append(_Rec, S1);
+        S1 = #{ fd := Fd } when Fd =/= undefined -> append(Rec, S1);
         _ -> {error, journal_unavailable, S#{ errors => maps:get(errors, S) + 1 }}
     end;
 append(Rec, S = #{ fd := Fd, off := Off }) ->
-    Bin = term_to_binary(Rec),
-    Frame = <<(byte_size(Bin)):32, (erlang:crc32(Bin)):32, Bin/binary>>,
+    Frame = frame(Rec),
     case file:write(Fd, Frame) of
         ok -> {ok, S#{ off => Off + byte_size(Frame), dirty => true }};
         {error, Reason} ->
@@ -329,27 +362,66 @@ append(Rec, S = #{ fd := Fd, off := Off }) ->
             % ever appended after a failure in the same file.
             _ = file:position(Fd, Off),
             _ = file:truncate(Fd),
-            S1 = seal_current(S#{ broken => true }),
+            S1 = seal_current(S),
             {error, Reason, S1#{ fd => undefined,
-                                 errors => maps:get(errors, S) + 1 }}
+                                 errors => maps:get(errors, S1) + 1 }}
     end.
 
+frame(Rec) ->
+    Bin = term_to_binary(Rec),
+    <<?MAGIC/binary, (byte_size(Bin)):32, (erlang:crc32(Bin)):32, Bin/binary>>.
+
+%% @doc Confirm what was written since the last flush: append a `flushed'
+%% marker, sync the journal, then flush the inner store. If the inner flush
+%% fails, a `revoke' marker withdraws the confirmation and the journal stops.
+do_flush(S = #{ poisoned := P }) when P =/= false -> {refusal(S, ok), S};
 do_flush(S = #{ store := Store }) ->
-    case sync_journal(S) of
-        S1 = #{ dirty := false } ->
-            Inner = inner(Store),
-            {catch hb_store:flush(Inner, #{}), S1};
-        S1 -> {{error, journal_sync_failed}, S1}
+    Marked =
+        case maps:get(unflushed, S) of
+            false -> {ok, S};
+            true -> append({flushed}, S)
+        end,
+    case Marked of
+        {error, Reason, S1} -> {{error, Reason}, S1};
+        {ok, S1} ->
+            case sync_journal(S1) of
+                S2 = #{ poisoned := false } ->
+                    case catch hb_store:flush(inner(Store), #{}) of
+                        ok ->
+                            {ok, S2#{ marks => merge_marks(maps:get(pending, S2),
+                                                           maps:get(marks, S2)),
+                                      pending => #{}, unflushed => false }};
+                        Error ->
+                            S3 = case append({revoke}, S2) of
+                                     {ok, SR} -> sync_journal(SR);
+                                     {error, _, SR} -> SR
+                                 end,
+                            {{error, {inner_flush_failed, Error}},
+                             poison(S3, {inner_flush_failed, Error})}
+                    end;
+                S2 -> {refusal(S2, ok), S2}
+            end
     end.
 
+merge_marks(New, Marks) ->
+    maps:fold(fun(P, N, M) -> M#{ P => max(N, maps:get(P, M, -1)) } end, Marks, New).
+
+%% @doc Sync the journal. A failed sync is never retried (on Linux a retry
+%% can report success for pages the kernel already dropped): it poisons the
+%% journal.
+sync_journal(S = #{ poisoned := P }) when P =/= false -> S;
 sync_journal(S = #{ dirty := false }) -> S;
 sync_journal(S = #{ fd := undefined }) -> S#{ dirty := false };
 sync_journal(S = #{ fd := Fd }) ->
-    case file:datasync(Fd) of
+    case datasync(Fd) of
         ok -> S#{ dirty := false };
-        {error, Reason} ->
-            ?event(error, {offsite_journal_sync_failed, Reason}),
-            S#{ errors := maps:get(errors, S) + 1 }
+        {error, Reason} -> poison(S, {sync_failed, Reason})
+    end.
+
+datasync(Fd) ->
+    case persistent_term:get({?MODULE, fail_sync}, false) of
+        true -> {error, eio};   % test hook
+        false -> file:datasync(Fd)
     end.
 
 maybe_roll(S = #{ fd := undefined }) -> S;
@@ -363,29 +435,43 @@ maybe_roll(S = #{ store := Store, off := Off, opened := Opened }) ->
     end.
 
 %% @doc Seal the active segment (if it holds anything) and open the next.
+roll(S = #{ poisoned := P }) when P =/= false -> S;
 roll(S = #{ off := 0, fd := Fd }) when Fd =/= undefined -> S;
 roll(S) ->
-    S1 = seal_current(S),
-    open_segment(S1#{ seg => maps:get(seg, S1) + 1 }).
+    case seal_current(S) of
+        S1 = #{ poisoned := false } -> open_segment(S1#{ seg => maps:get(seg, S1) + 1 });
+        S1 -> S1
+    end.
 
-%% Seal: sync, close, record the marks as of this segment, then rename it to
-%% its sealed name. A crash between the two leaves an `open-' file at or below
-%% the sealed number, which the next start reads and seals again.
+%% Seal: sync (a failure poisons, and the file stays as it is), close, record
+%% the marks as of this segment, rename it to its sealed name, sync the
+%% directory. A crash between the steps leaves an `open-' file at or below the
+%% sealed number, which the next start reads and seals again.
 seal_current(S = #{ fd := undefined }) -> S;
 seal_current(S = #{ fd := Fd, dir := Dir, seg := N, store := Store }) ->
-    _ = file:datasync(Fd),
+    case S of
+        #{ poisoned := false, dirty := true } ->
+            case datasync(Fd) of
+                ok -> seal_synced(S#{ dirty := false }, Fd, Dir, N, Store);
+                {error, Reason} -> poison(S, {sync_failed, Reason})
+            end;
+        #{ poisoned := false } -> seal_synced(S, Fd, Dir, N, Store);
+        _ -> S
+    end.
+
+seal_synced(S, Fd, Dir, N, Store) ->
     _ = file:close(Fd),
     Open = open_name(Dir, N),
     case maps:get(off, S) of
         0 ->
             _ = file:delete(Open),
-            S#{ fd => undefined, dirty => false };
+            S#{ fd => undefined };
         _ ->
             % The marks only shorten the next start's scan, so a full disk
             % that refuses them does not stop the seal.
             S1 = write_marks(S#{ sealed => N }),
             case file:rename(Open, seg_name(Dir, N)) of
-                ok -> ok;
+                ok -> sync_dir(Dir);
                 {error, Reason} ->
                     ?event(error, {offsite_journal_seal_failed, Reason})
             end,
@@ -393,20 +479,29 @@ seal_current(S = #{ fd := Fd, dir := Dir, seg := N, store := Store }) ->
                 undefined -> ok;
                 Pid -> Pid ! wake
             end,
-            S1#{ fd => undefined, dirty => false }
+            S1#{ fd => undefined }
     end.
 
 open_segment(S = #{ dir := Dir, seg := N }) ->
     case file:open(open_name(Dir, N), [read, write, raw, binary]) of
         {ok, Fd} ->
             {ok, _} = file:position(Fd, eof),
+            sync_dir(Dir),
             S#{ fd => Fd, off => 0, opened => erlang:monotonic_time(millisecond) };
         {error, Reason} ->
             ?event(error, {offsite_journal_open_failed, Reason}),
             S#{ fd => undefined }
     end.
 
-stop_writer(S) ->
+%% @doc Sync a directory, so a rename or a new file in it survives a host
+%% crash. Erlang cannot open a directory, so this is `sync <dir>' (fsync).
+sync_dir(Dir) ->
+    _ = os:cmd("sync " ++ hb_util:list(Dir) ++ " 2>/dev/null"),
+    ok.
+
+stop_writer(S = #{ poisoned := P }) when P =/= false -> S;
+stop_writer(S0) ->
+    {_, S} = do_flush(S0),
     S1 =
         case append({stop}, S) of
             {ok, SA} -> SA;
@@ -415,15 +510,20 @@ stop_writer(S) ->
     S2 = seal_current(sync_journal(S1)),
     _ = write_marks(S2),
     Dir = maps:get(dir, S2),
-    case file:open(filename:join(Dir, "clean"), [write, raw]) of
-        {ok, F} ->
-            _ = file:sync(F),
-            _ = file:close(F);
+    case maps:get(poisoned, S2) of
+        false ->
+            case file:open(filename:join(Dir, "clean"), [write, raw]) of
+                {ok, F} ->
+                    _ = file:sync(F),
+                    _ = file:close(F),
+                    sync_dir(Dir);
+                _ -> ok
+            end;
         _ -> ok
     end,
     S2.
 
-%%% Marks: per process, the highest assignment slot journaled.
+%%% Marks: per process, the highest assignment slot journaled and confirmed.
 
 mark(Pairs, Marks) ->
     lists:foldl(
@@ -462,7 +562,7 @@ write_marks(S = #{ dir := Dir, sealed := Sealed, marks := Marks, token := Token 
     File = filename:join(Dir, "marks"),
     Tmp = File ++ ".tmp",
     case write_synced(Tmp, term_to_binary({marks, Sealed, Marks, Token})) of
-        ok -> ok = file:rename(Tmp, File);
+        ok -> ok = file:rename(Tmp, File), sync_dir(Dir);
         {error, Reason} -> ?event(error, {offsite_journal_marks_failed, Reason})
     end,
     S.
@@ -472,44 +572,84 @@ new_token() -> hb_util:to_hex(crypto:strong_rand_bytes(4)).
 token_bin(T) -> hb_util:bin(T).
 
 %% @doc Recover local journal files: every `open-' file, and `seg-' files
-%% above the last seal. Cut each to its whole frames, fold its assignments
-%% into the marks, and seal it. Returns the highest segment number seen.
+%% above the last seal. Cut a torn tail; refuse (raise) on damage anywhere
+%% else. Fold the confirmed assignments into the marks, and seal the file.
+%% Returns the highest segment number seen.
 recover_local(Dir, Sealed, Marks) ->
     Files = local_files(Dir),
-    lists:foldl(
-        fun({N, Kind, File}, {Max, M}) ->
-            case Kind =:= open orelse N > Sealed of
-                false -> {max(Max, N), M};
-                true ->
-                    {ok, Bin} = file:read_file(File),
-                    Valid = valid_prefix(Bin, 0),
-                    case Valid < byte_size(Bin) of
-                        true ->
-                            ?event(warning, {offsite_journal_torn_tail,
-                                {file, File}, {kept, Valid}, {size, byte_size(Bin)}}),
-                            {ok, Fd} = file:open(File, [read, write, raw, binary]),
-                            {ok, _} = file:position(Fd, Valid),
-                            ok = file:truncate(Fd),
-                            ok = file:sync(Fd),
-                            ok = file:close(Fd);
-                        false -> ok
-                    end,
-                    M1 = lists:foldl(
-                        fun({w, Pairs}, Acc) -> mark(Pairs, Acc); (_, Acc) -> Acc end,
-                        M,
-                        records(binary:part(Bin, 0, Valid))
-                    ),
-                    case {Kind, Valid} of
-                        {open, 0} -> _ = file:delete(File);
-                        {open, _} -> ok = file:rename(File, seg_name(Dir, N));
-                        _ -> ok
-                    end,
-                    {max(Max, N), M1}
-            end
-        end,
-        {-1, Marks},
-        Files
-    ).
+    {Max, Replay} =
+        lists:foldl(
+            fun({N, Kind, File}, {Max, R}) ->
+                case Kind =:= open orelse N > Sealed of
+                    false ->
+                        % Sealed and not shipped yet: it must still be whole.
+                        {ok, SBin} = file:read_file(File),
+                        case classify_tail(SBin, valid_prefix(SBin, 0)) of
+                            whole -> {max(Max, N), R};
+                            _ ->
+                                ?event(error, {offsite_journal_corrupt, {file, File}}),
+                                erlang:error({offsite_journal_corrupt, File,
+                                              valid_prefix(SBin, 0)})
+                        end;
+                    true ->
+                        {ok, Bin} = file:read_file(File),
+                        Valid = valid_prefix(Bin, 0),
+                        case {classify_tail(Bin, Valid), Kind} of
+                            {whole, _} -> ok;
+                            {torn, open} ->
+                                ?event(warning, {offsite_journal_torn_tail,
+                                    {file, File}, {kept, Valid}, {size, byte_size(Bin)}}),
+                                {ok, Fd} = file:open(File, [read, write, raw, binary]),
+                                {ok, _} = file:position(Fd, Valid),
+                                ok = file:truncate(Fd),
+                                ok = file:sync(Fd),
+                                ok = file:close(Fd);
+                            % A sealed segment was synced whole: anything
+                            % short of whole is damage.
+                            _ ->
+                                ?event(error, {offsite_journal_corrupt, {file, File},
+                                               {offset, Valid}}),
+                                erlang:error({offsite_journal_corrupt, File, Valid})
+                        end,
+                        R1 = replay(records(binary:part(Bin, 0, Valid)), R),
+                        case {Kind, Valid} of
+                            {open, 0} -> _ = file:delete(File);
+                            {open, _} -> ok = file:rename(File, seg_name(Dir, N));
+                            _ -> ok
+                        end,
+                        {max(Max, N), R1}
+                end
+            end,
+            {-1, replay_init(fun(Pairs, M) -> mark(Pairs, M) end, Marks)},
+            Files
+        ),
+    sync_dir(Dir),
+    {Max, replay_finish(Replay)}.
+
+%%% Replay: what a journal confirms. Rows count once a `flushed' marker
+%%% follows them and no `revoke' follows that; rows written before a new run
+%%% (`start'), a clean `stop' or the end of the journal without a `flushed'
+%%% were never confirmed and are dropped.
+
+replay_init(Apply, Acc) ->
+    #{ apply => Apply, acc => Acc, pending => [], held => [], dropped => 0, records => 0 }.
+
+replay(Recs, R) -> lists:foldl(fun replay_step/2, R, Recs).
+
+replay_step(Rec, R = #{ records := C }) -> step(Rec, R#{ records => C + 1 }).
+
+step({w, Pairs}, R = #{ pending := P }) -> R#{ pending => [Pairs | P] };
+step({flushed}, R = #{ pending := P }) -> (apply_held(R))#{ held => P, pending => [] };
+step({revoke}, R) -> R#{ held => [] };
+step(_StartOrStop, R) -> drop_pending(apply_held(R)).
+
+apply_held(R = #{ held := H, apply := F, acc := Acc }) ->
+    R#{ acc => lists:foldl(F, Acc, lists:reverse(H)), held => [] }.
+
+drop_pending(R = #{ pending := P, dropped := D }) ->
+    R#{ pending => [], dropped => D + length(P) }.
+
+replay_finish(R) -> maps:get(acc, drop_pending(apply_held(R))).
 
 %% @doc The journal files in a directory, oldest first.
 local_files(Dir) ->
@@ -544,27 +684,44 @@ open_name(Dir, N) -> filename:join(Dir, "open-" ++ pad(N) ++ ".log").
 seg_name(Dir, N) -> filename:join(Dir, "seg-" ++ pad(N) ++ ".log").
 pad(N) -> lists:flatten(io_lib:format("~12..0B", [N])).
 
-%%% Frames.
+%%% Frames: `HBJ1', length, CRC32, term. The magic lets a reader tell a torn
+%%% tail from damage in the middle: after the last whole frame, a torn tail
+%%% holds no intact frame; damage in the middle is followed by one.
 
-%% A zero-length frame is never written: it is the zero-filled tail a host
-%% crash leaves, and its CRC (crc32(<<>>) = 0) would match.
 valid_prefix(Bin, Off) ->
     case Bin of
-        <<_:Off/binary, Len:32, Crc:32, Frame:Len/binary, _/binary>> when Len > 0 ->
+        <<_:Off/binary, "HBJ1", Len:32, Crc:32, Frame:Len/binary, _/binary>> when Len > 0 ->
             case erlang:crc32(Frame) of
-                Crc -> valid_prefix(Bin, Off + 8 + Len);
+                Crc -> valid_prefix(Bin, Off + 12 + Len);
                 _ -> Off
             end;
         _ -> Off
     end.
 
-records(<<Len:32, _Crc:32, Bin:Len/binary, Rest/binary>>) when Len > 0 ->
+%% @doc What follows the whole frames of a file: nothing (`whole'), a torn
+%% tail (no intact frame anywhere after: zeros, a frame cut short, the zero
+%% fill a host crash leaves), or damage in the middle (`corrupt': an intact
+%% frame follows the first bad one).
+classify_tail(Bin, Valid) when Valid == byte_size(Bin) -> whole;
+classify_tail(Bin, Valid) ->
+    <<_:Valid/binary, Rest/binary>> = Bin,
+    Later = [ Pos || {Pos, _} <- binary:matches(Rest, ?MAGIC), Pos > 0 ],
+    case lists:any(fun(Pos) -> valid_prefix(Rest, Pos) > Pos end, Later) of
+        true -> corrupt;
+        false -> torn
+    end.
+
+records(<<"HBJ1", Len:32, _Crc:32, Bin:Len/binary, Rest/binary>>) when Len > 0 ->
     [binary_to_term(Bin) | records(Rest)];
 records(_) -> [].
 
 %%% Reconcile: after an unclean start, journal every assignment the inner
-%%% store holds above the marks, with its closure, and the definition of every
-%%% process with no mark.
+%%% store holds above the confirmed marks, with its closure, and the
+%%% definition of every process with no mark, then confirm them: they are
+%%% what the inner store, which survived, holds. A slot that was journaled
+%%% but never confirmed (the run before was killed while assigning it) is
+%%% therefore journaled again as the inner store has it -- reassigned, or
+%%% not there at all, in which case no restore brings it back.
 
 reconcile(S = #{ store := Store, marks := Marks }) ->
     Inner = inner(Store),
@@ -610,18 +767,28 @@ reconcile(S = #{ store := Store, marks := Marks }) ->
         0 -> ok;
         _ -> ?event(warning, {offsite_journal_reconciled, {assignments, Count}})
     end,
-    sync_journal(S1#{ reconciled => Count }).
+    S2 = case append({flushed}, S1) of
+             {ok, SF} -> sync_journal(SF);
+             {error, Reason, _} -> erlang:error({offsite_journal_reconcile_failed, Reason})
+         end,
+    case maps:get(poisoned, S2) of
+        false -> ok;
+        Why -> erlang:error({offsite_journal_reconcile_failed, Why})
+    end,
+    S2#{ reconciled => Count,
+         marks => merge_marks(maps:get(pending, S2), maps:get(marks, S2)),
+         pending => #{} }.
 
 journal_rows([], S) -> S;
 journal_rows(Rows, S) ->
     case append({w, Rows}, S) of
-        {ok, S1} -> S1#{ marks => mark(Rows, maps:get(marks, S1)) };
+        {ok, S1} -> S1#{ pending => mark(Rows, maps:get(pending, S1)) };
         {error, Reason, _} -> erlang:error({offsite_journal_reconcile_failed, Reason})
     end.
 
 %% @doc Every raw row reachable from `Path' in a store: the row itself or the
-%% rows below it, and, through each `ao:<ID>' and `ni:' value, the rows they
-%% name.
+%% rows below it, and, through each `ao:<ID>', `ao://with-commitments=' and
+%% `ni:' value, the rows they name.
 closure(Store, Path) ->
     {Rows, _} = closure(Store, Path, {[], #{}}),
     lists:reverse(Rows).
@@ -648,6 +815,13 @@ closure(Store, Path, {Rows, Seen0}) ->
         _ -> {Rows, Seen}
     end.
 
+follow(Store, <<"ao://with-commitments=", IDs/binary>>, Acc) ->
+    lists:foldl(
+        fun(ID, A) when ?IS_ID(ID) -> closure(Store, ID, A);
+           (_, A) -> A
+        end,
+        Acc,
+        binary:split(IDs, <<",">>, [global]));
 follow(Store, <<"ao:", ID/binary>>, Acc) when ?IS_ID(ID) -> closure(Store, ID, Acc);
 follow(Store, Name = <<"ni:", _/binary>>, Acc) ->
     closure(Store, hb_escape:encode_path_component(Name), Acc);
@@ -657,13 +831,13 @@ follow(_Store, _Value, Acc) -> Acc.
 
 shipper_init(Store) ->
     erlang:send_after(0, self(), tick),
-    shipper_loop(Store, #{ shipped => 0, backoff => 0, state => idle }).
+    shipper_loop(Store, #{ shipped => 0, backoff => 0, state => idle, chain => undefined }).
 
 shipper_loop(Store, St) ->
     receive
         stop -> ok;
         {status, From, Ref} ->
-            From ! {Ref, #{ shipper => St#{ backlog => backlog(Store) } }},
+            From ! {Ref, #{ shipper => maps:without([chain], St#{ backlog => backlog(Store) }) }},
             shipper_loop(Store, St);
         {ship_now, From, Ref} ->
             St1 = ship_round(Store, St),
@@ -693,35 +867,91 @@ backlog(Store) ->
 ship_round(Store, St) ->
     try
         Segs = [ {N, F} || {N, seg, F} <- local_files(journal_dir(Store)) ],
-        ship_segs(Segs, Store, St#{ state => idle })
+        Chain =
+            case maps:get(chain, St) of
+                undefined -> manifest_tip(target_dir(Store));
+                Known -> Known
+            end,
+        ship_segs(Segs, Store, St#{ state => idle, chain => Chain })
     catch C:R ->
         ?event(error, {offsite_journal_ship_failed, C, R}),
-        failed(St, {C, R})
+        failed(St#{ chain => undefined }, {C, R})
     end.
 
 ship_segs([], _Store, St) -> St#{ backoff => 0 };
 ship_segs([{N, File} | Rest], Store, St) ->
-    case ship_one(N, File, Store) of
-        ok -> ship_segs(Rest, Store, St#{ shipped => maps:get(shipped, St) + 1 });
+    case ship_one(N, File, Store, maps:get(chain, St)) of
+        {ok, Chain} ->
+            ship_segs(Rest, Store, St#{ shipped => maps:get(shipped, St) + 1, chain => Chain });
         {ceiling, Info} ->
             ?event(warning, {offsite_journal_ceiling, Info}),
             St#{ state => {ceiling, Info}, backoff => ?MAX_BACKOFF_MS div 10 };
         {error, Reason} ->
             ?event(error, {offsite_journal_ship_failed, Reason}),
-            failed(St, Reason)
+            % The manifest's tip is read again before the next attempt.
+            failed(St#{ chain => undefined }, Reason)
     end.
 
 failed(St, Reason) ->
     B = case maps:get(backoff, St) of 0 -> 1000; B0 -> min(B0 * 2, ?MAX_BACKOFF_MS) end,
     St#{ state => {error, Reason}, backoff => B }.
 
-ship_one(N, File, Store) ->
+%% @doc The hash chain's tip: the last whole line of the target's manifest.
+%% A torn last line (a crash in the middle of an append) is cut away here,
+%% so the next line starts on a line of its own.
+manifest_tip(Target) ->
+    File = filename:join(Target, "manifest.log"),
+    case file:read_file(File) of
+        {ok, <<>>} -> <<>>;
+        {ok, Bin} ->
+            {Lines, Torn} = manifest_lines(Bin),
+            case Torn of
+                <<>> -> ok;
+                _ ->
+                    ?event(warning, {offsite_journal_torn_manifest_line, Torn}),
+                    {ok, F} = file:open(File, [read, write, raw, binary]),
+                    {ok, _} = file:position(F, byte_size(Bin) - byte_size(Torn)),
+                    ok = file:truncate(F),
+                    ok = file:sync(F),
+                    ok = file:close(F)
+            end,
+            case Lines of
+                [] -> <<>>;
+                _ -> element(4, parse_line(lists:last(Lines)))
+            end;
+        {error, enoent} -> <<>>;
+        {error, Reason} -> erlang:error({manifest_unreadable, Reason})
+    end.
+
+%% Whole lines, and the torn fragment after the last newline.
+manifest_lines(Bin) ->
+    Parts = binary:split(Bin, <<"\n">>, [global]),
+    {lists:droplast(Parts) -- [<<>>], lists:last(Parts)}.
+
+parse_line(Line) ->
+    case binary:split(Line, <<" ">>, [global]) of
+        [Name, Size, Crc, Chain] ->
+            {Name, binary_to_integer(Size), binary_to_integer(Crc), Chain};
+        _ -> erlang:error({manifest_line, Line})
+    end.
+
+chain(Prev, Body) ->
+    hb_util:to_hex(crypto:hash(sha256, <<Prev/binary, (crypto:hash(sha256, Body))/binary>>)).
+
+ship_one(N, File, Store, Prev) ->
     Target = target_dir(Store),
     {ok, Raw} = file:read_file(File),
+    % Never ship a damaged segment: the offsite copy would carry the damage
+    % under a matching CRC.
+    case classify_tail(Raw, valid_prefix(Raw, 0)) of
+        whole -> ok;
+        _ -> erlang:error({offsite_journal_corrupt, File, valid_prefix(Raw, 0)})
+    end,
     Body = case compress(Store) of true -> zlib:gzip(Raw); false -> Raw end,
     {_, _, Token} = read_marks(journal_dir(Store)),
     Name = "seg-" ++ hb_util:list(Token) ++ "-" ++ pad(N) ++ ".log" ++
         case compress(Store) of true -> ".gz"; false -> "" end,
+    Chain = chain(Prev, Body),
     maybe
         ok ?= filelib:ensure_dir(filename:join(Target, "x")),
         ok ?= space_ok(Target, byte_size(Body),
@@ -730,9 +960,13 @@ ship_one(N, File, Store) ->
         Tmp = Final ++ ".tmp",
         ok ?= write_synced(Tmp, Body),
         ok ?= file:rename(Tmp, Final),
-        Line = io_lib:format("~s ~B ~B~n", [Name, byte_size(Body), erlang:crc32(Body)]),
+        ok ?= sync_dir(Target),
+        Line = io_lib:format("~s ~B ~B ~s~n",
+                             [Name, byte_size(Body), erlang:crc32(Body), Chain]),
         ok ?= append_synced(filename:join(Target, "manifest.log"), Line),
-        ok ?= file:delete(File)
+        ok ?= sync_dir(Target),
+        ok ?= file:delete(File),
+        {ok, Chain}
     end.
 
 %% @doc Whether `Bytes' more fit on the filesystem of `Dir' below `MaxPct'.
@@ -790,53 +1024,96 @@ append_synced(File, Data) ->
 %%% Restore.
 
 %% @doc Replay an export into a store: every segment the target's manifest
-%% lists, in order, each checked against its size and CRC, then any local
-%% journal segments not yet shipped. Returns counts, or the first error.
+%% lists, in order, each checked against its size, CRC and the manifest's
+%% hash chain, then any local journal segments not yet shipped. Only
+%% confirmed writes are applied (see Replay above). Stops with an error on
+%% damage anywhere but the torn tail of a local segment, and after the
+%% replay refuses a result whose assignments skip a slot for any process.
 restore(Sources, TargetStore) -> restore(Sources, TargetStore, #{}).
 restore(Source, TargetStore, Opts)
         when is_binary(Source); is_list(Source), is_integer(hd(Source)) ->
     restore([Source], TargetStore, Opts);
 restore(Sources, TargetStore, Opts) when is_list(Sources) ->
-    Files = lists:append([ source_files(hb_util:list(Src)) || Src <- Sources ]),
-    {_Seen, Ordered} =
-        lists:foldl(
-            fun(F = {Key, _, _}, {Sn, Acc}) ->
-                case is_map_key(Key, Sn) of
-                    true -> {Sn, Acc};
-                    false -> {Sn#{ Key => true }, [F | Acc]}
-                end
+    try
+        Files = lists:append([ source_files(hb_util:list(Src)) || Src <- Sources ]),
+        {_Seen, Ordered} =
+            lists:foldl(
+                fun(F = {Key, _, _}, {Sn, Acc}) ->
+                    case is_map_key(Key, Sn) of
+                        true -> {Sn, Acc};
+                        false -> {Sn#{ Key => true }, [F | Acc]}
+                    end
+                end,
+                {#{}, []},
+                Files
+            ),
+        Apply =
+            fun(Pairs, {Rows, Procs}) ->
+                ok = hb_store:write(TargetStore, maps:from_list(Pairs), Opts),
+                {Rows + length(Pairs), mark(Pairs, Procs)}
             end,
-            {#{}, []},
-            Files
-        ),
-    Result =
-        lists:foldl(
-            fun(_, {error, _} = E) -> E;
-               ({_, File, Check}, Acc) -> restore_file(File, Check, TargetStore, Opts, Acc)
-            end,
-            #{ files => 0, records => 0, rows => 0, torn => 0 },
-            lists:reverse(Ordered)
-        ),
-    case Result of
-        {error, _} -> Result;
-        _ ->
-            _ = hb_store:flush(TargetStore, Opts),
-            {ok, Result}
+        R0 = replay_init(Apply, {0, #{}}),
+        {R1, Counts} =
+            lists:foldl(
+                fun({_, File, Check}, {R, C}) -> restore_file(File, Check, R, C) end,
+                {R0, #{ files => 0, torn => 0 }},
+                lists:reverse(Ordered)
+            ),
+        R2 = drop_pending(apply_held(R1)),
+        {Rows, Procs} = maps:get(acc, R2),
+        _ = hb_store:flush(TargetStore, Opts),
+        Report = Counts#{ rows => Rows, records => maps:get(records, R2),
+                          unconfirmed => maps:get(dropped, R2) },
+        case gaps(TargetStore, maps:keys(Procs)) of
+            [] -> {ok, Report};
+            Gaps -> {error, {gaps, Gaps}}
+        end
+    catch throw:{restore_error, Error} -> {error, Error}
     end.
+
+%% @doc Processes whose assignments in a store skip a slot between their
+%% lowest and highest, with the missing slots.
+gaps(Store, Procs) ->
+    lists:filtermap(
+        fun(P) ->
+            Slots =
+                case hb_store:list([Store], <<?ASSIGNMENTS/binary, "/", P/binary>>, #{}) of
+                    {ok, L} -> lists:sort([ binary_to_integer(X) || X <- L,
+                                            is_integer(catch binary_to_integer(X)) ]);
+                    _ -> []
+                end,
+            case Slots of
+                [] -> false;
+                _ ->
+                    case lists:seq(hd(Slots), lists:last(Slots)) -- Slots of
+                        [] -> false;
+                        Missing -> {true, {P, Missing}}
+                    end
+            end
+        end,
+        Procs).
 
 %% A source is an export directory (it has a manifest) or a local journal.
 source_files(Dir) ->
     case file:read_file(filename:join(Dir, "manifest.log")) of
         {ok, Manifest} ->
-            [ begin
-                  [Name, Size, Crc] = string:lexemes(hb_util:list(Line), " "),
-                  {shipped_key(Name), filename:join(Dir, Name),
-                   {list_to_integer(Size), list_to_integer(Crc)}}
-              end
-            || Line <- binary:split(Manifest, <<"\n">>, [global, trim_all]) ];
+            {Lines, _Torn} = manifest_lines(Manifest),
+            {Files, _} =
+                lists:mapfoldl(
+                    fun(Line, Prev) ->
+                        {Name, Size, Crc, Chain} =
+                            try parse_line(Line)
+                            catch _:_ -> throw({restore_error, {manifest_line, Line}})
+                            end,
+                        {{shipped_key(Name), filename:join(Dir, Name), {Size, Crc, Prev, Chain}},
+                         Chain}
+                    end,
+                    <<>>,
+                    Lines),
+            Files;
         _ ->
             {_, _, Token} = read_marks(Dir),
-            [ {{token_bin(Token), N}, F, local} || {N, _, F} <- local_files(Dir) ]
+            [ {{token_bin(Token), N}, F, {local, Kind}} || {N, Kind, F} <- local_files(Dir) ]
     end.
 
 shipped_key(Name) ->
@@ -844,41 +1121,37 @@ shipped_key(Name) ->
         binary:split(hb_util:bin(Name), [<<"-">>, <<".">>], [global]),
     {Token, binary_to_integer(Num)}.
 
-restore_file(File, Check, Target, Opts, Acc) ->
-    case file:read_file(File) of
-        {ok, Body} ->
-            case Check of
-                local -> apply_body(Body, Target, Opts, Acc);
-                {Size, _} when byte_size(Body) =/= Size -> {error, {bad_size, File}};
-                {_, Crc} ->
-                    case erlang:crc32(Body) of
-                        Crc -> apply_body(Body, Target, Opts, Acc);
-                        _ -> {error, {bad_crc, File}}
-                    end
-            end;
-        Error -> {error, {File, Error}}
-    end.
-
-apply_body(Body0, Target, Opts, Acc) ->
-    Body = case Body0 of <<31, 139, _/binary>> -> zlib:gunzip(Body0); _ -> Body0 end,
-    Valid = valid_prefix(Body, 0),
-    Recs = records(binary:part(Body, 0, Valid)),
-    Rows =
-        lists:foldl(
-            fun({w, Pairs}, N) ->
-                    ok = hb_store:write(Target, maps:from_list(Pairs), Opts),
-                    N + length(Pairs);
-               (_, N) -> N
+restore_file(File, Check, R, C) ->
+    Body =
+        case file:read_file(File) of
+            {ok, B} -> B;
+            Error -> throw({restore_error, {File, Error}})
+        end,
+    case Check of
+        {local, _} -> ok;
+        {Size, _, _, _} when byte_size(Body) =/= Size -> throw({restore_error, {bad_size, File}});
+        {_, Crc, Prev, Chain} ->
+            case erlang:crc32(Body) of
+                Crc -> ok;
+                _ -> throw({restore_error, {bad_crc, File}})
             end,
-            0,
-            Recs
-        ),
-    Acc#{
-        files => maps:get(files, Acc) + 1,
-        records => maps:get(records, Acc) + length(Recs),
-        rows => maps:get(rows, Acc) + Rows,
-        torn => maps:get(torn, Acc) + case Valid < byte_size(Body) of true -> 1; false -> 0 end
-    }.
+            case chain(Prev, Body) of
+                Chain -> ok;
+                _ -> throw({restore_error, {manifest_chain, File}})
+            end
+    end,
+    Plain = case Body of <<31, 139, _/binary>> -> zlib:gunzip(Body); _ -> Body end,
+    Valid = valid_prefix(Plain, 0),
+    Torn =
+        case {classify_tail(Plain, Valid), Check} of
+            {whole, _} -> 0;
+            % Only the segment being written can be torn; a sealed one was
+            % synced whole, and a shipped one checked against its manifest.
+            {torn, {local, open}} -> 1;
+            _ -> throw({restore_error, {corrupt, File, Valid}})
+        end,
+    {replay(records(binary:part(Plain, 0, Valid)), R),
+     C#{ files => maps:get(files, C) + 1, torn => maps:get(torn, C) + Torn }}.
 
 %%% Tests
 
@@ -939,8 +1212,9 @@ torn_tail_test() ->
     Dir = journal_dir(Store),
     [{_, open, Open}] = [ F || F = {_, open, _} <- local_files(Dir) ],
     {ok, Fd} = file:open(Open, [append, raw, binary]),
-    ok = file:write(Fd, <<0:32, 0:32, 0:4096>>),
+    % A frame cut short, then the zero fill a host crash leaves.
     ok = file:write(Fd, <<200:32, 12345:32, "partial">>),
+    ok = file:write(Fd, <<0:4096>>),
     ok = file:close(Fd),
     After = rows(<<"b/">>, 1, 50),
     write_rows(Store, After),
@@ -1014,3 +1288,125 @@ bad_crc_test() ->
     ok = file:write_file(Seg, <<(binary:part(Bin, 0, byte_size(Bin) - 1))/binary,
                                 (Last bxor 1)>>),
     ?assertMatch({error, {bad_crc, _}}, restore(Target, fresh_store(<<"oj-crc-r">>))).
+
+akey(P, N) -> <<?ASSIGNMENTS/binary, "/", P/binary, "/", (integer_to_binary(N))/binary>>.
+
+inner_delete(Inner, Keys) ->
+    #{ <<"db">> := DB } = hb_store:find(Inner),
+    {ok, _} = elmdb:delete_batch(DB, Keys).
+
+%% @doc A failed sync poisons the journal: the flush after it fails, even
+%% when a roll came between, and every later write and flush fails too,
+%% though syncing works again. Nothing is retried.
+sync_error_poisons_test() ->
+    {Store, _Inner, _Target} = test_setup(<<"oj-poison">>, #{}),
+    write_rows(Store, rows(<<"p/">>, 1, 3)),
+    persistent_term:put({?MODULE, fail_sync}, true),
+    try
+        _ = call(Store, seal, 5000),
+        ?assertMatch({failure, _}, flush(Store, #{}, #{}))
+    after
+        persistent_term:erase({?MODULE, fail_sync})
+    end,
+    ?assertMatch({failure, _}, write(Store, #{ <<"p/4">> => <<"x">> }, #{})),
+    ?assertMatch({failure, _}, flush(Store, #{}, #{})),
+    kill_writer(Store).
+
+%% @doc Only confirmed (flushed) writes are restored, and an unclean start
+%% journals again every assignment the inner store holds above the last
+%% confirmed one: a slot written but never confirmed, lost from the inner
+%% store and reassigned with different content, restores as the inner store
+%% has it, and one never reassigned is not resurrected.
+unconfirmed_never_restored_test() ->
+    {Store, Inner, Target} = test_setup(<<"oj-unconf">>, #{}),
+    P = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Q = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ok = write(Store, #{ akey(P, 0) => <<"p0">>, akey(Q, 0) => <<"q0">> }, #{}),
+    ok = flush(Store, #{}, #{}),
+    % In flight at the crash: journaled, never confirmed.
+    ok = write(Store, #{ akey(P, 1) => <<"old">> }, #{}),
+    ok = write(Store, #{ akey(Q, 1) => <<"never">> }, #{}),
+    kill_writer(Store),
+    % The inner store lost both; the scheduler then reassigned P's slot 1,
+    % whose journal record a power loss took while LMDB kept it.
+    inner_delete(Inner, [akey(P, 1), akey(Q, 1)]),
+    ok = hb_store:write([Inner], #{ akey(P, 1) => <<"new">> }, #{}),
+    ok = hb_store:flush([Inner], #{}),
+    ok = flush(Store, #{}, #{}),
+    ?assertEqual(idle, ship_now(Store)),
+    Fresh = fresh_store(<<"oj-unconf-r">>),
+    {ok, _} = restore(Target, Fresh),
+    ?assertEqual({ok, <<"new">>}, hb_store:read([Fresh], akey(P, 1), #{})),
+    ?assertMatch({error, _}, hb_store:read([Fresh], akey(Q, 1), #{})),
+    ?assertEqual({ok, <<"q0">>}, hb_store:read([Fresh], akey(Q, 0), #{})).
+
+%% @doc Damage in the middle of a journal segment is not a torn tail: the
+%% writer refuses to start and restore stops with an error naming the file.
+mid_file_corruption_halts_test() ->
+    {Store, _Inner, _Target} = test_setup(<<"oj-mid">>, #{ <<"max-fill-pct">> => 0 }),
+    write_rows(Store, rows(<<"m/">>, 1, 30)),
+    ok = flush(Store, #{}, #{}),
+    ok = call(Store, seal, 5000),
+    kill_writer(Store),
+    Dir = journal_dir(Store),
+    [{_, seg, Seg} | _] = local_files(Dir),
+    {ok, Bin} = file:read_file(Seg),
+    Mid = byte_size(Bin) div 2,
+    <<Head:Mid/binary, B, Tail/binary>> = Bin,
+    ok = file:write_file(Seg, <<Head/binary, (B bxor 16#55), Tail/binary>>),
+    ?assertMatch({error, {corrupt, _, _}}, restore(list_to_binary(Dir), fresh_store(<<"oj-mid-r">>))),
+    ?assertMatch({failure, _}, write(Store, #{ <<"m/x">> => <<"x">> }, #{})),
+    % The damaged file is left as it was.
+    ?assertEqual({ok, <<Head/binary, (B bxor 16#55), Tail/binary>>}, file:read_file(Seg)).
+
+%% @doc A torn last manifest line is ignored; a shipped file replaced with
+%% different content, its manifest line rewritten to match, breaks the
+%% manifest's hash chain and is refused.
+manifest_chain_test() ->
+    {Store, _Inner, Target} = test_setup(<<"oj-chain">>, #{ <<"compress">> => false }),
+    Rows = rows(<<"c/">>, 1, 10),
+    write_rows(Store, Rows),
+    ok = flush(Store, #{}, #{}),
+    idle = ship_now(Store),
+    write_rows(Store, rows(<<"c2/">>, 1, 10)),
+    ok = flush(Store, #{}, #{}),
+    idle = ship_now(Store),
+    Manifest = filename:join(hb_util:list(Target), "manifest.log"),
+    {ok, M} = file:read_file(Manifest),
+    ok = file:write_file(Manifest, <<M/binary, "seg-torn-0000">>),
+    {ok, _} = restore(Target, fresh_store(<<"oj-chain-r1">>)),
+    % Rewrite the first shipped file, and its line, consistently.
+    [First | _] = binary:split(M, <<"\n">>),
+    [Name, _, _ | Chain] = binary:split(First, <<" ">>, [global]),
+    File = filename:join(hb_util:list(Target), Name),
+    Forged = frame({w, [{<<"c/1">>, <<"forged">>}]}),
+    ok = file:write_file(File, Forged),
+    Line = iolist_to_binary([Name, " ", integer_to_binary(byte_size(Forged)), " ",
+                             integer_to_binary(erlang:crc32(Forged)), [ [" ", C] || C <- Chain ]]),
+    ok = file:write_file(Manifest, binary:replace(M, First, Line)),
+    ?assertMatch({error, {manifest_chain, _}}, restore(Target, fresh_store(<<"oj-chain-r2">>))).
+
+%% @doc A restore whose assignments for a process skip a slot is refused.
+gap_refused_test() ->
+    {Store, _Inner, Target} = test_setup(<<"oj-gap">>, #{}),
+    P = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ok = write(Store, #{ akey(P, 0) => <<"0">>, akey(P, 2) => <<"2">> }, #{}),
+    ok = flush(Store, #{}, #{}),
+    idle = ship_now(Store),
+    ?assertMatch({error, {gaps, [{P, [1]}]}}, restore(Target, fresh_store(<<"oj-gap-r">>))).
+
+%% @doc The closure of a message stored with several commitments follows the
+%% `ao://with-commitments=' value to each commitment's ID.
+closure_follows_commitments_path_test() ->
+    Inner = fresh_store(<<"oj-clos">>),
+    A = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    S1 = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    U = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ok = hb_store:write([Inner], #{
+        <<"k">> => <<"ao:", A/binary>>,
+        A => <<"ao://with-commitments=", S1/binary>>,
+        S1 => <<"ao:", U/binary>>,
+        <<U/binary, "/data">> => <<"x">>
+    }, #{}),
+    Keys = [ K || {K, _} <- closure(Inner, <<"k">>) ],
+    ?assert(lists:member(<<U/binary, "/data">>, Keys)).
