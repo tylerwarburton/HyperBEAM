@@ -381,8 +381,14 @@ seal_current(S = #{ fd := Fd, dir := Dir, seg := N, store := Store }) ->
             _ = file:delete(Open),
             S#{ fd => undefined, dirty => false };
         _ ->
+            % The marks only shorten the next start's scan, so a full disk
+            % that refuses them does not stop the seal.
             S1 = write_marks(S#{ sealed => N }),
-            ok = file:rename(Open, seg_name(Dir, N)),
+            case file:rename(Open, seg_name(Dir, N)) of
+                ok -> ok;
+                {error, Reason} ->
+                    ?event(error, {offsite_journal_seal_failed, Reason})
+            end,
             case hb_name:lookup({?MODULE, shipper, maps:get(<<"name">>, Store)}) of
                 undefined -> ok;
                 Pid -> Pid ! wake
@@ -409,9 +415,12 @@ stop_writer(S) ->
     S2 = seal_current(sync_journal(S1)),
     _ = write_marks(S2),
     Dir = maps:get(dir, S2),
-    {ok, F} = file:open(filename:join(Dir, "clean"), [write, raw]),
-    _ = file:sync(F),
-    _ = file:close(F),
+    case file:open(filename:join(Dir, "clean"), [write, raw]) of
+        {ok, F} ->
+            _ = file:sync(F),
+            _ = file:close(F);
+        _ -> ok
+    end,
     S2.
 
 %%% Marks: per process, the highest assignment slot journaled.
@@ -452,8 +461,10 @@ read_marks(Dir) ->
 write_marks(S = #{ dir := Dir, sealed := Sealed, marks := Marks, token := Token }) ->
     File = filename:join(Dir, "marks"),
     Tmp = File ++ ".tmp",
-    ok = write_synced(Tmp, term_to_binary({marks, Sealed, Marks, Token})),
-    ok = file:rename(Tmp, File),
+    case write_synced(Tmp, term_to_binary({marks, Sealed, Marks, Token})) of
+        ok -> ok = file:rename(Tmp, File);
+        {error, Reason} -> ?event(error, {offsite_journal_marks_failed, Reason})
+    end,
     S.
 
 new_token() -> hb_util:to_hex(crypto:strong_rand_bytes(4)).
