@@ -88,6 +88,14 @@ the numbers below with the reason they moved.
      drops them too, so the rule holds for them as well.
    - A contract that sets the global `ao` to a non-table is armed with a new
      empty `ao` on restore instead of failing it.
+   - **Published keys are lowercase.** RC7 stores and reads every message
+     key lowercased, and `message@1.0` looks a key up by its lowercase form
+     only. `hb_state_patch` now lowercases patch paths, value keys at every
+     depth and result keys, and refuses keys that differ only in case.
+     Before, a mixed-case key (every `player-<address>`) turned into a list
+     on its second write in a later slot. `/now/<key>` reads by any
+     spelling. Clients that index a whole-state JSON body, or a published
+     map value keyed by addresses, must lowercase the key first.
    - Found on the way: `lua-patch@1.0` never gave RC7's `ao` library its
      node message, so every `ao.get`/`resolve`/`set`/`event` from a
      lua-patch contract failed. Fixed, with a test.
