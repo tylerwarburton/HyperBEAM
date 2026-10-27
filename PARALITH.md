@@ -76,8 +76,21 @@ Baseline, paralith box, 2026-10-27, two runs each:
 
 The monorepo's deploy runs the matching live check against the target node
 (`backend/native/load-gate.mjs`, `npm run load:gate`): a throwaway game with
-300 players, `Sprite.Update` at 20 msg/s for 60 s from 20 burners, failing on
-round trip p95 or confirmed throughput.
+300 players, `Sprite.Update` at 15 msg/s for 60 s from 20 burners, failing on
+round trip p95 over 2,000 ms or under 14 confirmed msg/s. On hb-test:
+
+| Build | Offered | Confirmed | Round trip p50 | p95 |
+|---|---:|---:|---:|---:|
+| 5d5dbbf90 | 20 msg/s | 0.6 msg/s | >= 30 s | >= 30 s |
+| 3a83a1509 | 20 msg/s | 18.4 msg/s | 3.9 s | 7.7 s |
+| 3a83a1509 | 15 msg/s | 14.9 msg/s | 435 ms | 685 ms |
+
+With the hashing gone, the real game's own Lua is most of a worker slot
+(live: ~30 ms of ~51 ms for `Sprite.Update` at 300 players), so one game
+process tops out near 20 msg/s. Neither check covers a restart onto a new
+build: after deploying 3a83a1509 every existing Lua process failed to restore
+its snapshot (fixed in b91066290, `dev_lua:safe_binary_to_term/1`). After any
+node build lands, compute one slot of an existing process before trusting it.
 
 ## Port order
 
