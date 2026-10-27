@@ -511,7 +511,9 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
                 }
             };
         {true, <<"Process">>} ->
-            {ok, _} = hb_cache:write(Req, Opts),
+            % A definition belongs with its assignments, in the scheduler's
+            % store (the node's store when none is set).
+            {ok, _} = dev_scheduler_cache:write_spawn(Req, Opts),
             case hb_opts:get(scheduler_publish_remote, true, Opts) of
                 false -> ok;
                 _ ->

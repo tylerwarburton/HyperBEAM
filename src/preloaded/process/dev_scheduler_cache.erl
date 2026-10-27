@@ -474,3 +474,90 @@ volatile_store_corruption_test() ->
             { list, length(SlotsAfterCorruption) }, 
             { latest, LatestAfterCorruption }
     }).
+
+%% @doc An assignment written by the scheduler cache lands in the
+%% irreplaceable store with its whole message, readable from that store
+%% alone, and reads back through the node's store list.
+assignment_lands_in_irreplaceable_store_test() ->
+    Main = hb_test_utils:test_store(hb_store_lmdb, <<"irr-main2">>),
+    Irr = hb_test_utils:test_store(hb_store_lmdb, <<"irr-irr2">>),
+    hb_store:start(Main),
+    Node = hb_store_irreplaceable:node_message(#{ <<"store">> => [Main], <<"irreplaceable-store">> => Irr,
+                           <<"priv-wallet">> => ar_wallet:new() }),
+    Body = hb_message:commit(#{ <<"type">> => <<"Message">>,
+                                <<"data">> => crypto:strong_rand_bytes(200) }, Node),
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Assignment = hb_message:commit(#{ <<"variant">> => <<"ao.N.1">>, <<"process">> => ProcID,
+                                      <<"slot">> => 0, <<"body">> => Body }, Node),
+    ok = write(ProcID, Assignment, Node),
+    ok = flush(Node),
+    Path = <<"~scheduler@1.0/assignments/", ProcID/binary, "/0">>,
+    ?assertMatch({ok, _}, hb_store:read([Irr], Path, #{})),
+    ?assertMatch({error, _}, hb_store:read([Main], Path, #{})),
+    % The irreplaceable store alone holds the whole assignment. (Signing may
+    % also leave a copy of the body in the main store; that copy is derived.)
+    IrrOnly = #{ <<"store">> => [Irr] },
+    {ok, Read} = read(ProcID, 0, IrrOnly),
+    Loaded = hb_cache:ensure_all_loaded(Read, IrrOnly),
+    ?assertEqual(hb_message:id(Assignment, signed, Node),
+                 hb_message:id(Loaded, signed, Node)),
+    ?assert(hb_message:verify(Loaded, all, IrrOnly)),
+    BodyID = hb_message:id(Body, signed, Node),
+    % A message read by ID through the node's own store list finds it.
+    ?assertMatch({ok, _}, hb_cache:read(BodyID, Node)).
+
+%% @doc With an offsite journal, an assignment shipped and restored into an
+%% empty store reads back whole from that store alone.
+assignment_restores_from_offsite_journal_test() ->
+    Main = hb_test_utils:test_store(hb_store_lmdb, <<"irr-main3">>),
+    Irr = hb_test_utils:test_store(hb_store_lmdb, <<"irr-irr3">>),
+    Target = <<(maps:get(<<"name">>, Irr))/binary, "-export">>,
+    hb_store:start(Main),
+    Node =
+        hb_store_irreplaceable:node_message(#{
+            <<"store">> => [Main],
+            <<"irreplaceable-store">> => Irr,
+            <<"irreplaceable-export">> => #{ <<"path">> => Target },
+            <<"priv-wallet">> => ar_wallet:new()
+        }),
+    [Wrapped] = hb_opts:get(<<"scheduler-store">>, undefined, Node),
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Assignments =
+        [
+            hb_message:commit(#{
+                <<"variant">> => <<"ao.N.1">>,
+                <<"process">> => ProcID,
+                <<"slot">> => Slot,
+                <<"body">> =>
+                    hb_message:commit(#{
+                        <<"type">> => <<"Message">>,
+                        <<"data">> => crypto:strong_rand_bytes(300)
+                    }, Node)
+            }, Node)
+        ||
+            Slot <- [0, 1, 2]
+        ],
+    lists:foreach(
+        fun(A) -> ok = write(ProcID, A, Node), ok = flush(Node) end,
+        Assignments
+    ),
+    idle = hb_store_offsite_journal:ship_now(Wrapped),
+    Fresh = hb_test_utils:test_store(hb_store_lmdb, <<"irr-fresh3">>),
+    hb_store:start(Fresh),
+    {ok, _} = hb_store_offsite_journal:restore(Target, Fresh),
+    FreshOpts = #{ <<"store">> => [Fresh] },
+    ?assertEqual([0, 1, 2], lists:sort(list(ProcID, FreshOpts))),
+    lists:foreach(
+        fun(A) ->
+            Slot = hb_ao:get(<<"slot">>, A, Node),
+            {ok, R} = read(ProcID, Slot, FreshOpts),
+            ?assertEqual(hb_message:id(A, signed, Node), hb_message:id(R, signed, Node)),
+            Loaded = hb_cache:ensure_all_loaded(R, FreshOpts),
+            ?assertEqual(
+                hb_ao:get(<<"body/data">>, A, Node),
+                hb_ao:get(<<"body/data">>, Loaded, FreshOpts)
+            ),
+            ?assert(hb_message:verify(Loaded, all, FreshOpts))
+        end,
+        Assignments
+    ).
