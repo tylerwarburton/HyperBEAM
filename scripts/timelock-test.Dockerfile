@@ -1,4 +1,4 @@
-# Test image for `vrf@1.0': this tree (src.tar from scripts/vrf-test.sh),
+# Test image for `timelock@1.0': this tree (src.tar from scripts/timelock-test.sh),
 # compiled with every native library, ready for `rebar3 device test'.
 FROM erlang:27
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -15,5 +15,5 @@ WORKDIR /app
 # The Makefile's buildinfo needs a git HEAD; the archive has none.
 RUN git config --global user.email t@t && git config --global user.name t \
     && git config --global --add safe.directory /app \
-    && git init -q && git add -A && git commit -qm vrf-test
+    && git init -q && git add -A && git commit -qm timelock-test
 RUN rebar3 compile && test -f priv/blst_nif.so
