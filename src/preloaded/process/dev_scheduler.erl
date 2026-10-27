@@ -1688,6 +1688,36 @@ schedule_message_and_get_slot_test_parallel() ->
         hb_ao:resolve(Base, Req, #{ <<"store">> => Raising })
     ).
 
+%% @doc A scheduling mode given as a binary, which is how a JSON config file
+%% delivers it, still confirms every message. Before, a binary matched none of
+%% the confirmation branches and every request waited out the 10 s timeout.
+schedule_with_binary_mode_test_parallel() ->
+    start(),
+    lists:foreach(
+        fun(Mode) ->
+            Opts = #{
+                <<"priv-wallet">> => hb:wallet(),
+                <<"scheduling-mode">> => Mode,
+                <<"scheduler-publish-remote">> => false
+            },
+            Base = hb_message:commit(test_process(), Opts),
+            Req = #{
+                <<"path">> => <<"schedule">>,
+                <<"method">> => <<"POST">>,
+                <<"body">> =>
+                    hb_message:commit(
+                        #{ <<"type">> => <<"Message">>, <<"test-key">> => Mode },
+                        Opts
+                    )
+            },
+            Start = erlang:monotonic_time(millisecond),
+            ?assertMatch({ok, _}, hb_ao:resolve(Base, Req, Opts)),
+            ?assertMatch({ok, _}, hb_ao:resolve(Base, Req, Opts)),
+            ?assert(erlang:monotonic_time(millisecond) - Start < 5000)
+        end,
+        [<<"aggressive">>, <<"local_confirmation">>, <<"remote_confirmation">>]
+    ).
+
 redirect_to_hint_test_parallel() ->
     start(),
     RandAddr = hb_util:human_id(crypto:strong_rand_bytes(32)),

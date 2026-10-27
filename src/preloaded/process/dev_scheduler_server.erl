@@ -22,7 +22,7 @@
 %% caller.
 start(ProcID, Proc, Opts) ->
     ?event(scheduling, {starting_scheduling_server, {proc_id, ProcID}}),
-    case hb_opts:get(scheduling_mode, disabled, Opts) of
+    case mode(Opts, disabled) of
         disabled ->
             throw({scheduling_disabled_on_node, {requested_for, ProcID}});
         _ -> ok
@@ -95,12 +95,7 @@ start(ProcID, Proc, Opts) ->
                     hashpath_alg => HashpathAlg,
                     wallets => commitment_wallets(Proc, Opts),
                     committment_spec => commitment_spec(Proc, Opts),
-                    mode =>
-                        hb_opts:get(
-                            scheduling_mode,
-                            remote_confirmation,
-                            Opts
-                        ),
+                    mode => mode(Opts, remote_confirmation),
                     opts => Opts
                 }
             )
@@ -319,7 +314,7 @@ do_assign(State, Message, ReplyPID) ->
                 State
             )
         end,
-    case hb_opts:get(scheduling_mode, sync, Opts) of
+    case maps:get(mode, State) of
         aggressive ->
             spawn(DispatchFun);
         Other ->
@@ -348,6 +343,24 @@ commit_assignment(BaseAssignment, State) ->
         BaseAssignment,
         Wallets
     ).
+
+%% @doc The node's scheduling mode as an atom. Options set in code carry the
+%% atom, but a JSON or flat config file delivers the same value as a binary,
+%% and the confirmation branches below compare against atoms: a binary matched
+%% none of them, so no client was ever told its message had been scheduled and
+%% every request timed out. An unknown value is refused here instead of
+%% failing the same silent way.
+mode(Opts, Default) ->
+    case hb_opts:get(scheduling_mode, Default, Opts) of
+        Mode when is_atom(Mode) -> Mode;
+        <<"aggressive">> -> aggressive;
+        <<"local_confirmation">> -> local_confirmation;
+        <<"local-confirmation">> -> local_confirmation;
+        <<"remote_confirmation">> -> remote_confirmation;
+        <<"remote-confirmation">> -> remote_confirmation;
+        <<"disabled">> -> disabled;
+        Other -> throw({unknown_scheduling_mode, Other})
+    end.
 
 %% @doc Potentially inform the caller that the assignment has been scheduled.
 %% The main assignment loop calls this function repeatedly at different stages
@@ -466,3 +479,16 @@ benchmark_test() ->
         dev_scheduler_server:info(dev_scheduler_registry:find(ID))
     ),
     ?assert(Iterations > 30).
+
+mode_test() ->
+    ?assertEqual(aggressive, mode(#{ <<"scheduling-mode">> => aggressive }, x)),
+    ?assertEqual(aggressive, mode(#{ <<"scheduling-mode">> => <<"aggressive">> }, x)),
+    ?assertEqual(
+        local_confirmation,
+        mode(#{ <<"scheduling-mode">> => <<"local_confirmation">> }, x)
+    ),
+    ?assertEqual(disabled, mode(#{ <<"scheduling-mode">> => <<"disabled">> }, x)),
+    ?assertThrow(
+        {unknown_scheduling_mode, <<"fast">>},
+        mode(#{ <<"scheduling-mode">> => <<"fast">> }, x)
+    ).
