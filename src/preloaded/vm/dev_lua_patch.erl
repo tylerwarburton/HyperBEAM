@@ -106,14 +106,19 @@ compute(Key, RawBase, RawReq, Opts) ->
             Opts#{ <<"hashpath">> => ignore }
         ),
     T1 = erlang:monotonic_time(microsecond),
-    Response =
-        try luerl:call_function_dec(
-            [Function],
-            encode(Params, Opts),
-            % RC7's `ao' library reads the node message from here, as in
-            % `dev_lua'; `snapshot/3' keeps it out of the snapshot.
+    InSlot = in_slot(OldPriv),
+    % RC7's `ao' library reads the node message from here, as in `dev_lua';
+    % `snapshot/3' keeps it out of the snapshot. Outside a process slot, a
+    % library call that crashes is a Lua error the contract can catch
+    % (`dev_lua_lib:guarded/3').
+    CallState =
+        luerl:put_private(
+            <<"host-errors">>,
+            case InSlot of true -> raise; false -> lua end,
             luerl:put_private(<<"node-message">>, Opts, State)
-        )
+        ),
+    Response =
+        try call_lua(Function, encode(Params, Opts), CallState, deadline(InSlot, Opts))
         catch
             _:Reason:Stacktrace -> {error, Reason, Stacktrace}
         end,
@@ -127,6 +132,64 @@ compute(Key, RawBase, RawReq, Opts) ->
     hb_phase_timer:record(lua_patch_prep, T1 - T0),
     hb_phase_timer:record(lua_patch_lua, T2 - T1),
     process_response(Response, Base, OldPriv, Opts).
+
+%% @doc Whether the call computes a slot of a `process@1.0' process, which
+%% marks the state it initializes (`dev_process:init/3') privately, out of
+%% reach of a request.
+in_slot(Priv) ->
+    is_map_key(<<"initialized">>, Priv).
+
+%% @doc How long a call may run. A slot has no deadline: it must compute the
+%% same on every node, and a deadline would make the result depend on how
+%% fast and how busy each node is. A direct call (`POST /~lua-patch@1.0/...')
+%% keeps nothing, so it is stopped after `lua-compute-deadline' ms (default
+%% two minutes; `infinity' or `false' turns it off).
+deadline(true, _Opts) -> infinity;
+deadline(false, Opts) ->
+    case hb_opts:get(<<"lua-compute-deadline">>, 120000, Opts) of
+        Ms when is_integer(Ms), Ms > 0 -> Ms;
+        false -> infinity;
+        infinity -> infinity;
+        <<"infinity">> -> infinity;
+        Other ->
+            case catch hb_util:int(Other) of
+                Ms when is_integer(Ms), Ms > 0 -> Ms;
+                _ -> infinity
+            end
+    end.
+
+%% @doc Call Lua, within a deadline when there is one. The call runs in its own
+%% process, which is killed when the deadline passes, so Luerl stops working
+%% instead of running on after the client has gone.
+call_lua(Function, Args, State, infinity) ->
+    luerl:call_function_dec([Function], Args, State);
+call_lua(Function, Args, State, Ms) ->
+    Self = self(),
+    Ref = make_ref(),
+    {Pid, Monitor} =
+        spawn_monitor(
+            fun() ->
+                Self !
+                    {Ref,
+                        try {done, luerl:call_function_dec([Function], Args, State)}
+                        catch Class:Reason:Stack -> {raised, Class, Reason, Stack}
+                        end}
+            end
+        ),
+    receive
+        {Ref, {done, Result}} ->
+            erlang:demonitor(Monitor, [flush]),
+            Result;
+        {Ref, {raised, Class, Reason, Stack}} ->
+            erlang:demonitor(Monitor, [flush]),
+            erlang:raise(Class, Reason, Stack);
+        {'DOWN', Monitor, process, Pid, Reason} ->
+            erlang:error({lua_call_exited, Reason})
+    after Ms ->
+        exit(Pid, kill),
+        erlang:demonitor(Monitor, [flush]),
+        {deadline, Ms}
+    end.
 
 %% @doc Normalize the two supported Lua return shapes.
 process_response({ok, [Result], NewState}, Base, Priv, Opts) ->
@@ -166,6 +229,13 @@ process_response({ok, [Status, Encoded], NewState}, Base, Priv, Opts) ->
                 <<"result">> => hb_util:bin(Other)
             }}
     end;
+process_response({deadline, Ms}, _Base, _Priv, _Opts) ->
+    {error, #{
+        <<"status">> => 504,
+        <<"body">> =>
+            <<"Lua compute stopped at the node's lua-compute-deadline of ",
+                (integer_to_binary(Ms))/binary, " ms.">>
+    }};
 process_response({lua_error, RawError, State}, _Base, _Priv, Opts) ->
     Error =
         try decode(luerl:decode(RawError, State), Opts)
@@ -578,6 +648,131 @@ ao_library_test() ->
         >>,
     {ok, Out} = hb_ao:resolve(base(<<"lua-patch@1.0">>, Script), request(1), Opts),
     ?assertEqual(<<"world">>, hb_ao:get(<<"got">>, Out, Opts)).
+
+%% @doc A direct call that runs past `lua-compute-deadline' answers 504 and
+%% its Luerl work stops: no process is left running Lua.
+deadline_stops_direct_compute_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Opts = #{ <<"hashpath">> => ignore, <<"lua-compute-deadline">> => 300 },
+        Script = <<"function compute() while true do end end">>,
+        Self = self(),
+        Caller =
+            spawn(fun() ->
+                Self ! {result, hb_ao:resolve(base(<<"lua-patch@1.0">>, Script), request(1), Opts)}
+            end),
+        Result =
+            receive {result, R} -> R
+            after 10000 -> exit(Caller, kill), no_answer
+            end,
+        ?assertMatch({error, #{ <<"status">> := 504 }}, Result),
+        timer:sleep(100),
+        InLuerl =
+            [
+                P
+            ||
+                P <- erlang:processes(),
+                case erlang:process_info(P, current_function) of
+                    {current_function, {M, _, _}} ->
+                        lists:prefix("luerl", atom_to_list(M));
+                    _ -> false
+                end
+            ],
+        ?assertEqual([], InLuerl)
+    end}.
+
+%% @doc A process slot has no deadline, however small the setting: every node
+%% must compute the same slot, whatever its speed.
+slot_has_no_deadline_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Opts = #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"spawn-worker">> => false,
+            <<"process-workers">> => false,
+            <<"process-delta-cache">> => true,
+            <<"process-snapshot-target">> => false,
+            <<"lua-compute-deadline">> => 1
+        },
+        Script =
+            <<
+                "function compute(req)\n"
+                "  local n = 0\n"
+                "  for i = 1, 200000 do n = n + 1 end\n"
+                "  return { patches = {{ path = '/n', value = tostring(n) }}, results = {} }\n"
+                "end\n"
+            >>,
+        Process = delta_process(Opts, Script),
+        {ok, _} = hb_cache:write(Process, Opts),
+        {ok, _} = hb_ao:resolve(Process, schedule_request(Process, 1, Opts), Opts),
+        {ok, State} =
+            hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => 0 }, Opts),
+        ?assertEqual(<<"200000">>, hb_ao:get(<<"n">>, State, Opts))
+    end}.
+
+%% @doc Outside a process slot, a library call that crashes on the node is a
+%% Lua error with a fixed message, which the contract's `pcall' catches.
+host_crash_is_catchable_test() ->
+    hb:init(),
+    Script =
+        <<
+            "function compute()\n"
+            "  local ok, err = pcall(ao.resolve, 5)\n"
+            "  return { patches = {{ path = '/caught', value = tostring(ok) .. ' ' .. tostring(err) }} }\n"
+            "end\n"
+        >>,
+    {ok, Out} =
+        hb_ao:resolve(base(<<"lua-patch@1.0">>, Script), request(1), #{ <<"hashpath">> => ignore }),
+    ?assertEqual(<<"false ao.resolve failed on this node">>, hb_ao:get(<<"caught">>, Out, #{})).
+
+%% @doc Inside a process slot it still fails the slot: another node may not
+%% crash, and a caught error would let the two states differ.
+host_crash_fails_slot_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Opts = #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"spawn-worker">> => false,
+            <<"process-workers">> => false,
+            <<"process-delta-cache">> => true,
+            <<"process-snapshot-target">> => false
+        },
+        Script =
+            <<
+                "function compute(req)\n"
+                "  local ok = pcall(ao.resolve, 5)\n"
+                "  return { patches = {{ path = '/caught', value = tostring(ok) }}, results = {} }\n"
+                "end\n"
+            >>,
+        Process = delta_process(Opts, Script),
+        {ok, _} = hb_cache:write(Process, Opts),
+        {ok, _} = hb_ao:resolve(Process, schedule_request(Process, 1, Opts), Opts),
+        % The slot's Lua never runs past the crash: whatever the process
+        % records for a failed slot, the contract did not catch it.
+        Caught =
+            case catch hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => 0 }, Opts) of
+                {ok, State} -> hb_ao:get(<<"caught">>, State, not_found, Opts);
+                _ -> not_found
+            end,
+        ?assertEqual(not_found, Caught)
+    end}.
+
+%% @doc An id of 43 characters that is not in canonical form names nothing:
+%% resolving it is `not_found', not a crash in the Arweave store.
+non_canonical_id_not_found_test() ->
+    hb:init(),
+    Script =
+        <<
+            "function compute()\n"
+            "  local ok, status = pcall(ao.resolve, '/PAIRbrokennnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn/pair-vault')\n"
+            "  return { patches = {{ path = '/r', value = tostring(ok) .. ' ' .. tostring(status) }} }\n"
+            "end\n"
+        >>,
+    {ok, Out} =
+        hb_ao:resolve(base(<<"lua-patch@1.0">>, Script), request(1), #{ <<"hashpath">> => ignore }),
+    ?assertEqual(<<"true error">>, hb_ao:get(<<"r">>, Out, #{})).
 
 %% @doc The node's random stream and clock are unavailable even when the base
 %% does not ask for determinism: at module load, at compute, and after a
