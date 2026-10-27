@@ -255,7 +255,10 @@ initialize(Base, Modules, Opts) ->
 %% @doc Create a Lua state with no modules, in the node's minimum sandbox and
 %% the sandbox that `requires-determinism' asks for. A device built on this one
 %% adds its own mandatory entries through `lua-device-sandbox', on top of the
-%% node's minimum rather than in place of it.
+%% node's minimum rather than in place of it. It may also give a
+%% `lua-device-preload' function of the state, which runs last, before any
+%% module code. Restore takes its allowed host functions from this state too,
+%% so a host function the hook replaces cannot come back from a snapshot.
 create_state(Base, Opts) ->
     DeterministicSpec =
         case hb_util:bool(hb_maps:get(<<"requires-determinism">>, Base, false, Opts)) of
@@ -263,17 +266,22 @@ create_state(Base, Opts) ->
             false -> []
         end,
     DeviceSpec = hb_opts:get(<<"lua-device-sandbox">>, [], Opts),
-    case {hb_opts:get(<<"lua-minimum-sandbox">>, ?DEFAULT_MIN_SANDBOX, Opts), DeviceSpec} of
-        {false, []} -> sandbox(luerl:init(), DeterministicSpec, Opts);
-        {MinSpec, _} ->
-            dev_lua_require:install(
-                sandbox(
-                    luerl:init(),
-                    sandbox_list(MinSpec) ++ DeterministicSpec ++ DeviceSpec,
+    State =
+        case {hb_opts:get(<<"lua-minimum-sandbox">>, ?DEFAULT_MIN_SANDBOX, Opts), DeviceSpec} of
+            {false, []} -> sandbox(luerl:init(), DeterministicSpec, Opts);
+            {MinSpec, _} ->
+                dev_lua_require:install(
+                    sandbox(
+                        luerl:init(),
+                        sandbox_list(MinSpec) ++ DeterministicSpec ++ DeviceSpec,
+                        Opts
+                    ),
                     Opts
-                ),
-                Opts
-            )
+                )
+        end,
+    case hb_opts:get(<<"lua-device-preload">>, undefined, Opts) of
+        Preload when is_function(Preload, 1) -> Preload(State);
+        _ -> State
     end.
 
 sandbox_list(false) -> [];
