@@ -1,0 +1,301 @@
+%%% @doc What the PUSD bridge's chain contracts have emitted: deposits to
+%%% attest, and releases to acknowledge. One scanner per chain, each taking a
+%%% cursor and returning what it found plus the next cursor.
+%%%
+%%%   Base    `evm-rpc@1.0' get-data over a confirmed block range
+%%%   Solana  getSignaturesForAddress + getTransaction, Anchor event logs
+%%%   Sui     Sui GraphQL events by Move event type
+%%%
+%%% JSON-RPC goes through `relay@1.0', the node's own HTTP client. A deposit is
+%%% `#{chain, nonce, token, recipient, amount, tx}' and a release is
+%%% `#{chain, id, tx}', with `id' the chain's (namespaced) withdrawal id.
+%%%
+%%% A helper of `bridge-attestor@1.0' (formerly `hb_bridge_chains' on the old
+%%% fork). It reaches `evm-rpc@1.0', another package, by device name.
+-module(dev_bridge_attestor_chains).
+-export([rpc/4, get_body/2, base_head/2, base_scan/4, solana_scan/3, sui_scan/3]).
+-export([anchor_events/2]).
+-include_lib("eunit/include/eunit.hrl").
+
+-define(DEPOSIT_SIG, <<"Deposit(uint64,address,address,uint256,string)">>).
+-define(RELEASED_SIG, <<"Released(uint64,address,address,uint256)">>).
+-define(PAGE, 100).
+
+%% @doc One JSON-RPC call; the decoded `result'.
+rpc(Url, Method, Params, Opts) ->
+    Body = #{ <<"jsonrpc">> => <<"2.0">>, <<"id">> => 1, <<"method">> => Method, <<"params">> => Params },
+    case post_json(Url, Body, Opts) of
+        {ok, #{ <<"result">> := Result }} -> {ok, Result};
+        {ok, #{ <<"error">> := Error }} -> {error, {rpc, Method, Error}};
+        {ok, Other} -> {error, {rpc, Method, Other}};
+        Error -> Error
+    end.
+
+%% @doc GET a URL as JSON through relay@1.0; the raw body.
+get_body(Url, Opts) ->
+    Req = #{ <<"device">> => <<"relay@1.0">>, <<"method">> => <<"GET">>, <<"path">> => Url,
+        <<"accept">> => <<"application/json">> },
+    case hb_ao:resolve(Req, <<"call">>, Opts) of
+        {ok, Res} -> {ok, hb_maps:get(<<"body">>, Res, <<>>, Opts)};
+        Error -> {error, {get, Url, Error}}
+    end.
+
+%% @doc POST a JSON body through relay@1.0, the node's own HTTP client.
+post_json(Url, Body, Opts) ->
+    Req = #{
+        <<"device">> => <<"relay@1.0">>,
+        <<"method">> => <<"POST">>,
+        <<"path">> => Url,
+        <<"content-type">> => <<"application/json">>,
+        <<"body">> => hb_json:encode(Body)
+    },
+    case hb_ao:resolve(Req, <<"call">>, Opts) of
+        {ok, Res} ->
+            case catch hb_json:decode(hb_maps:get(<<"body">>, Res, <<>>, Opts)) of
+                Decoded when is_map(Decoded) -> {ok, Decoded};
+                Other -> {error, {post_json, Url, Other}}
+            end;
+        Error ->
+            {error, {post_json, Url, Error}}
+    end.
+
+%%% Base ----------------------------------------------------------------------
+
+%% @doc The latest block number, through evm-rpc's passthrough.
+base_head(Cfg, Opts) ->
+    case evm_rpc(<<"rpc">>, Cfg, #{ <<"rpc-method">> => <<"eth_blockNumber">> }, Opts) of
+        {ok, #{ <<"body">> := <<"0x", Hex/binary>> }} -> {ok, binary_to_integer(Hex, 16)};
+        {ok, #{ <<"body">> := Body }} when is_binary(Body) ->
+            {ok, binary_to_integer(string:trim(Body, both, "\""), 10)};
+        Other -> {error, {base_head, Other}}
+    end.
+
+%% @doc Deposits and releases in blocks `From..To', decoded by evm-rpc.
+base_scan(Cfg, From, To, Opts) ->
+    Req = #{
+        <<"contract">> => maps:get(<<"contract">>, Cfg),
+        <<"event-signature">> => <<?DEPOSIT_SIG/binary, ",", ?RELEASED_SIG/binary>>,
+        <<"mode">> => <<"range">>,
+        <<"from-block">> => hex_block(From),
+        <<"to-block">> => hex_block(To)
+    },
+    case evm_rpc(<<"get-data">>, Cfg, Req, Opts) of
+        {ok, #{ <<"body">> := #{ <<"data">> := Data } }} ->
+            Events = case Data of
+                Bin when is_binary(Bin) -> hb_json:decode(Bin);
+                List -> List
+            end,
+            {ok, lists:filtermap(fun base_event/1, Events)};
+        Other ->
+            {error, {base_scan, Other}}
+    end.
+
+base_event(#{ <<"event">> := <<"Deposit">>, <<"removed">> := false,
+        <<"args">> := [Nonce, Token, _From, Amount, Ao] } = E) ->
+    {true, #{ kind => deposit, chain => <<"base">>, nonce => binary_to_integer(Nonce),
+        token => Token, recipient => Ao, amount => Amount,
+        tx => maps:get(<<"transaction-hash">>, E, <<>>) }};
+base_event(#{ <<"event">> := <<"Released">>, <<"removed">> := false,
+        <<"args">> := [Id | _] } = E) ->
+    {true, #{ kind => released, chain => <<"base">>, id => binary_to_integer(Id),
+        tx => maps:get(<<"transaction-hash">>, E, <<>>) }};
+base_event(_) ->
+    false.
+
+evm_rpc(Path, Cfg, Req, Opts) ->
+    hb_ao:raw(
+        <<"evm-rpc@1.0">>,
+        Path,
+        #{},
+        Req#{ <<"path">> => Path, <<"rpc-url">> => maps:get(<<"rpc">>, Cfg) },
+        Opts
+    ).
+
+hex_block(N) -> <<"0x", (integer_to_binary(N, 16))/binary>>.
+
+%%% Solana --------------------------------------------------------------------
+
+%% @doc Everything the program logged after signature `Until' (undefined:
+%% from the start), oldest first, and the newest signature fully read. A
+%% transaction the RPC cannot return yet ends the scan there, so the next pass
+%% retries it instead of skipping past a deposit.
+solana_scan(Cfg, Until, Opts) ->
+    Url = maps:get(<<"rpc">>, Cfg),
+    Program = maps:get(<<"program">>, Cfg),
+    Commitment = maps:get(<<"commitment">>, Cfg, <<"confirmed">>),
+    case solana_signatures(Url, Program, Until, undefined, Commitment, [], Opts) of
+        {ok, []} ->
+            {ok, [], Until};
+        {ok, Sigs} ->
+            % Newest first from the node; process oldest first.
+            GetTx = fun(Sig) ->
+                rpc(Url, <<"getTransaction">>, [Sig, #{ <<"encoding">> => <<"json">>,
+                    <<"commitment">> => Commitment, <<"maxSupportedTransactionVersion">> => 0 }], Opts)
+            end,
+            solana_events(GetTx, Program, lists:reverse(Sigs), [], Until);
+        Error ->
+            Error
+    end.
+
+solana_signatures(Url, Program, Until, Before, Commitment, Acc, Opts) ->
+    Cfg0 = #{ <<"limit">> => ?PAGE, <<"commitment">> => Commitment },
+    Cfg1 = case Until of undefined -> Cfg0; _ -> Cfg0#{ <<"until">> => Until } end,
+    Cfg2 = case Before of undefined -> Cfg1; _ -> Cfg1#{ <<"before">> => Before } end,
+    case rpc(Url, <<"getSignaturesForAddress">>, [Program, Cfg2], Opts) of
+        {ok, Page} when length(Page) < ?PAGE -> {ok, Acc ++ Page};
+        {ok, Page} ->
+            Last = maps:get(<<"signature">>, lists:last(Page)),
+            solana_signatures(Url, Program, Until, Last, Commitment, Acc ++ Page, Opts);
+        Error -> Error
+    end.
+
+solana_events(_GetTx, _Program, [], Acc, Last) ->
+    {ok, lists:reverse(Acc), Last};
+solana_events(GetTx, Program, [#{ <<"err">> := Err, <<"signature">> := Sig } | Rest], Acc, _Last)
+        when Err =/= null ->
+    solana_events(GetTx, Program, Rest, Acc, Sig);
+solana_events(GetTx, Program, [#{ <<"signature">> := Sig } | Rest], Acc, Last) ->
+    case GetTx(Sig) of
+        {ok, #{ <<"meta">> := #{ <<"logMessages">> := Logs } }} ->
+            Found = [E#{ tx => Sig } || E <- anchor_events(Program, Logs)],
+            solana_events(GetTx, Program, Rest, lists:reverse(Found) ++ Acc, Sig);
+        {ok, _} ->
+            % Listed but not served yet: stop before it, keep what came first.
+            {ok, lists:reverse(Acc), Last};
+        Error ->
+            Error
+    end.
+
+%% @doc The bridge events in one transaction's logs. A `Program data:' line
+%% counts only while OUR program is the one executing: any program can log
+%% that text, so the invocation stack decides whose event it is.
+anchor_events(Program, Logs) ->
+    Deposit = discriminator(<<"DepositEvent">>),
+    Released = discriminator(<<"ReleasedEvent">>),
+    {_, Found} = lists:foldl(
+        fun(Line, {Stack, Acc}) ->
+            case binary:split(Line, <<" ">>, [global]) of
+                [<<"Program">>, Id, <<"invoke">> | _] -> {[Id | Stack], Acc};
+                [<<"Program">>, Id, Result | _] when Result =:= <<"success">>; Result =:= <<"failed:">> ->
+                    {case Stack of [Id | S] -> S; S -> S end, Acc};
+                [<<"Program">>, <<"data:">>, B64] when Stack =/= [], hd(Stack) =:= Program ->
+                    case anchor_event(base64:decode(B64), Deposit, Released) of
+                        false -> {Stack, Acc};
+                        Event -> {Stack, [Event | Acc]}
+                    end;
+                _ -> {Stack, Acc}
+            end
+        end, {[], []}, Logs),
+    lists:reverse(Found).
+
+anchor_event(<<D:8/binary, Nonce:64/little, Mint:32/binary, _From:32/binary,
+        Amount:64/little, Len:32/little, Ao:Len/binary>>, D, _) ->
+    #{ kind => deposit, chain => <<"solana">>, nonce => Nonce,
+        token => dev_bridge_attestor_sign:base58_encode(Mint), recipient => Ao,
+        amount => integer_to_binary(Amount) };
+anchor_event(<<R:8/binary, Id:64/little, _/binary>>, _, R) ->
+    #{ kind => released, chain => <<"solana">>, id => Id };
+anchor_event(_, _, _) ->
+    false.
+
+discriminator(Name) ->
+    <<D:8/binary, _/binary>> = crypto:hash(sha256, <<"event:", Name/binary>>),
+    D.
+
+%%% Sui -----------------------------------------------------------------------
+
+-define(SUI_GRAPHQL, <<"https://graphql.mainnet.sui.io/graphql">>).
+-define(SUI_EVENTS, <<"query($type: String!, $after: String) { events(first: 50, after: $after, ",
+    "filter: { type: $type }) { pageInfo { hasNextPage endCursor } ",
+    "nodes { contents { json } transaction { digest } } } }">>).
+
+%% @doc Deposits and releases after `Cursors' (`#{deposit, released}' GraphQL
+%% cursors, undefined: from the start), and the advanced cursors. Public Sui
+%% fullnodes no longer serve JSON-RPC, so events come from Sui's GraphQL.
+sui_scan(Cfg, Cursors, Opts) ->
+    Pkg = maps:get(<<"package">>, Cfg),
+    maybe
+        {ok, Deps, DC} ?= sui_events(Cfg, <<Pkg/binary, "::para_bridge::DepositEvent">>,
+            maps:get(deposit, Cursors, undefined), [], Opts),
+        {ok, Rels, RC} ?= sui_events(Cfg, <<Pkg/binary, "::para_bridge::ReleasedEvent">>,
+            maps:get(released, Cursors, undefined), [], Opts),
+        {ok, [sui_deposit(E) || E <- Deps] ++ [sui_released(E) || E <- Rels],
+            #{ deposit => DC, released => RC }}
+    end.
+
+sui_events(Cfg, Type, Cursor, Acc, Opts) ->
+    Vars = #{ <<"type">> => Type, <<"after">> => case Cursor of undefined -> null; _ -> Cursor end },
+    Url = maps:get(<<"graphql">>, Cfg, ?SUI_GRAPHQL),
+    case post_json(Url, #{ <<"query">> => ?SUI_EVENTS, <<"variables">> => Vars }, Opts) of
+        {ok, #{ <<"data">> := #{ <<"events">> := #{ <<"nodes">> := Nodes, <<"pageInfo">> := Page } } }} ->
+            Next = case maps:get(<<"endCursor">>, Page, null) of null -> Cursor; N -> N end,
+            case maps:get(<<"hasNextPage">>, Page, false) of
+                true -> sui_events(Cfg, Type, Next, Acc ++ Nodes, Opts);
+                false -> {ok, Acc ++ Nodes, Next}
+            end;
+        {ok, Other} -> {error, {sui_graphql, Other}};
+        Error -> Error
+    end.
+
+sui_deposit(#{ <<"contents">> := #{ <<"json">> := J }, <<"transaction">> := #{ <<"digest">> := Tx } }) ->
+    #{ kind => deposit, chain => <<"sui">>, nonce => int(maps:get(<<"nonce">>, J)),
+        token => maps:get(<<"coin_type">>, J), recipient => maps:get(<<"ao_recipient">>, J),
+        amount => bin(maps:get(<<"amount">>, J)), tx => Tx }.
+
+sui_released(#{ <<"contents">> := #{ <<"json">> := J }, <<"transaction">> := #{ <<"digest">> := Tx } }) ->
+    #{ kind => released, chain => <<"sui">>, id => int(maps:get(<<"withdrawal_id">>, J)), tx => Tx }.
+
+%% Sui JSON writes u64 as a string.
+int(N) when is_integer(N) -> N;
+int(N) when is_binary(N) -> binary_to_integer(N).
+bin(N) when is_integer(N) -> integer_to_binary(N);
+bin(N) when is_binary(N) -> N.
+
+%%% Tests ---------------------------------------------------------------------
+
+-define(PROG, <<"thXGuX413NPvD7zPrSv658UmVEwdki2Tu3zhbU6LoiM">>).
+
+deposit_bytes(Nonce, Amount, Ao) ->
+    <<(discriminator(<<"DepositEvent">>))/binary, Nonce:64/little, (binary:copy(<<1>>, 32))/binary,
+      (binary:copy(<<2>>, 32))/binary, Amount:64/little, (byte_size(Ao)):32/little, Ao/binary>>.
+
+anchor_events_test() ->
+    Ao = <<"abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123-_Z">>,
+    Data = <<"Program data: ", (base64:encode(deposit_bytes(5, 2500, Ao)))/binary>>,
+    Logs = [
+        <<"Program ", ?PROG/binary, " invoke [1]">>,
+        <<"Program log: Instruction: Deposit">>,
+        Data,
+        <<"Program ", ?PROG/binary, " success">>
+    ],
+    ?assertMatch([#{ kind := deposit, nonce := 5, amount := <<"2500">>, recipient := Ao }],
+        anchor_events(?PROG, Logs)).
+
+%% Another program logging our event's bytes is not our event.
+anchor_events_ignores_other_programs_test() ->
+    Forged = <<"Program data: ",
+        (base64:encode(deposit_bytes(9, 1, <<"abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123-_Z">>)))/binary>>,
+    Logs = [
+        <<"Program ", ?PROG/binary, " invoke [1]">>,
+        <<"Program Evil111111111111111111111111111111111 invoke [2]">>,
+        Forged,
+        <<"Program Evil111111111111111111111111111111111 success">>,
+        <<"Program ", ?PROG/binary, " success">>,
+        Forged
+    ],
+    ?assertEqual([], anchor_events(?PROG, Logs)).
+
+%% A transaction the RPC returns null for stops the scan before it: the cursor
+%% stays on the last one read, so the next pass retries it.
+solana_events_null_test() ->
+    Ao = <<"abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123-_Z">>,
+    Logs = fun(N) -> [<<"Program ", ?PROG/binary, " invoke [1]">>,
+        <<"Program data: ", (base64:encode(deposit_bytes(N, 1, Ao)))/binary>>,
+        <<"Program ", ?PROG/binary, " success">>] end,
+    Txs = #{ <<"a">> => #{ <<"meta">> => #{ <<"logMessages">> => Logs(1) } },
+        <<"c">> => #{ <<"meta">> => #{ <<"logMessages">> => Logs(3) } } },
+    GetTx = fun(Sig) -> {ok, maps:get(Sig, Txs, null)} end,
+    Sigs = [#{ <<"signature">> => S, <<"err">> => null } || S <- [<<"a">>, <<"b">>, <<"c">>]],
+    ?assertMatch({ok, [#{ nonce := 1 }], <<"a">>}, solana_events(GetTx, ?PROG, Sigs, [], <<"u">>)),
+    ?assertMatch({ok, [], <<"u">>}, solana_events(GetTx, ?PROG, tl(Sigs), [], <<"u">>)),
+    ?assertMatch({ok, [#{ nonce := 3 }], <<"c">>}, solana_events(GetTx, ?PROG, [lists:last(Sigs)], [], <<"u">>)).
