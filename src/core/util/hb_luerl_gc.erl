@@ -2,9 +2,11 @@
 %%% its seen sets held in maps instead of `ordsets'. Adding to an ordset is
 %%% linear in its size, so Luerl's own collector is quadratic in the number of
 %%% live tables: 5-10 s for 20,000 of them, and ~300 ms a collection on the
-%%% orderbook's network test. This one visits the same objects in the same
-%%% order and frees the same ones, so it returns the same state
-%%% (`same_result_test'); only the cost changes.
+%%% orderbook's network test. With no Lua running it visits the same objects
+%%% in the same order and frees the same ones, so it returns the same state
+%%% (`same_result_test'). From inside running Lua it also keeps what the
+%%% suspended frames' instructions hold (an open generic `for''s iterator
+%%% state), which Luerl's own collector freed.
 -module(hb_luerl_gc).
 -export([gc/1, collectgarbage/3]).
 %% Luerl is built with full map keys, so its table store is maps.
@@ -77,12 +79,23 @@ mark([#funref{i = F, env = Erefs} | Todo], More, GcT, GcE, GcU,
     end;
 mark([#lua_func{funrefs = Funrefs} | Todo], More, GcT, GcE, GcU, GcF) ->
     mark(Todo, [Funrefs | More], GcT, GcE, GcU, GcF);
-mark([#call_frame{func = Funref, lvs = Lvs, env = Env} | Todo],
+%% A suspended frame's instructions are roots too, which Luerl's collector
+%% misses: an open generic `for' keeps its iterator function, state and
+%% control value inside the loop instructions (`{gfor_call, ...}',
+%% `{gfor_loop, ...}') in the frame's continuation, so a collection from the
+%% loop body freed the table only the iterator referenced. A frame's
+%% arguments are kept as well.
+mark([#call_frame{func = Funref, args = Args, lvs = Lvs, env = Env, is = Is, cont = Cont} | Todo],
      More0, GcT, GcE, GcU, GcF) ->
-    More1 = [tuple_to_list(Lv) || Lv <- Lvs, is_tuple(Lv)] ++ [Env | More0],
+    More1 =
+        [tuple_to_list(Lv) || Lv <- Lvs, is_tuple(Lv)]
+            ++ [Env, code_refs(Is, []), code_refs(Cont, []), list(Args) | More0],
     mark([Funref | Todo], More1, GcT, GcE, GcU, GcF);
-mark([#loop_frame{lvs = Lvs, stk = Stk, env = Env} | Todo], More0, GcT, GcE, GcU, GcF) ->
-    More1 = [tuple_to_list(Lv) || Lv <- Lvs, is_tuple(Lv)] ++ [Stk, Env | More0],
+mark([#loop_frame{lvs = Lvs, stk = Stk, env = Env, is = Is, cont = Cont} | Todo],
+     More0, GcT, GcE, GcU, GcF) ->
+    More1 =
+        [tuple_to_list(Lv) || Lv <- Lvs, is_tuple(Lv)]
+            ++ [Stk, Env, code_refs(Is, []), code_refs(Cont, []) | More0],
     mark(Todo, More1, GcT, GcE, GcU, GcF);
 mark([#erl_func{} | Todo], More, GcT, GcE, GcU, GcF) ->
     mark(Todo, More, GcT, GcE, GcU, GcF);
@@ -100,6 +113,20 @@ mark([], [M | More], GcT, GcE, GcU, GcF) ->
     mark(M, More, GcT, GcE, GcU, GcF);
 mark([], [], #gct{s = St}, #gct{s = Se}, #gct{s = Su}, #gct{s = Sf}) ->
     {St, Se, Su, Sf}.
+
+%% @doc The heap references held in instructions: anything Luerl allocates
+%% that the emulator has put into the code it is running.
+code_refs(#tref{} = Ref, Acc) -> [Ref | Acc];
+code_refs(#funref{} = Ref, Acc) -> [Ref | Acc];
+code_refs(#eref{} = Ref, Acc) -> [Ref | Acc];
+code_refs(#usdref{} = Ref, Acc) -> [Ref | Acc];
+code_refs([Head | Tail], Acc) -> code_refs(Tail, code_refs(Head, Acc));
+code_refs(Tuple, Acc) when is_tuple(Tuple) ->
+    lists:foldl(fun code_refs/2, Acc, tuple_to_list(Tuple));
+code_refs(_, Acc) -> Acc.
+
+list(List) when is_list(List) -> List;
+list(_) -> [].
 
 %% @doc Free what was not seen, adding it to the free list in the order
 %% Luerl's own collector does.
@@ -149,3 +176,26 @@ large_heap_test() ->
         ),
     {Micros, _} = timer:tc(fun() -> gc(St) end),
     ?assert(Micros < 1000000).
+
+%% @doc A collection from inside an open generic `for' keeps what only the
+%% iterator references, whether the body collects directly or through a call.
+collect_inside_generic_for_test() ->
+    Install =
+        fun(St) ->
+            {ok, St1} =
+                luerl:set_table_keys(
+                    [<<"collectgarbage">>],
+                    #erl_mfa{ m = ?MODULE, f = collectgarbage, a = nil },
+                    St
+                ),
+            St1
+        end,
+    Script =
+        <<
+            "local function f() collectgarbage('collect') end\n"
+            "local s = 0\n"
+            "for i, v in ipairs({ 10, 20, 30 }) do f(); s = s + v end\n"
+            "for k, v in pairs({ a = 1, b = 2 }) do collectgarbage('collect'); s = s + v end\n"
+            "return s\n"
+        >>,
+    ?assertMatch({ok, [63], _}, luerl:do_dec(Script, Install(luerl:init()))).
