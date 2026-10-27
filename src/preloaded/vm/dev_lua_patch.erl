@@ -44,17 +44,37 @@ device_info(_Base) ->
             ]
     }.
 
-%% @doc Reuse the stable `lua@5.3a' VM initialization and sandbox.
+%% @doc Reuse the stable `lua@5.3a' VM initialization and sandbox, with the
+%% node-dependent functions always removed.
 init(Base, Req, Opts) ->
-    hb_ao:raw(?LEGACY_LUA, <<"init">>, Base, Req, Opts).
+    hb_ao:raw(?LEGACY_LUA, <<"init">>, Base, Req, deterministic(Opts)).
+
+%% @doc The node options with `math.random' and the clock removed before any
+%% module loads, whatever the process sets `requires-determinism' to: their
+%% results depend on the node, so two nodes would compute different states.
+%% Ahead of any device's own entries (`lua-atomic@1.0' then removes `os').
+deterministic(Opts) ->
+    Device = hb_opts:get(<<"lua-device-sandbox">>, [], Opts),
+    Opts#{
+        <<"lua-device-sandbox">> =>
+            [
+                {[math, random], <<"sandboxed">>},
+                {[math, randomseed], <<"sandboxed">>},
+                {[os, time], <<"sandboxed">>},
+                {[os, clock], <<"sandboxed">>},
+                {[os, date], <<"sandboxed">>}
+            ] ++ Device
+    }.
 
 %% @doc Reuse the stable `lua@5.3a' snapshot representation.
 snapshot(Base, Req, Opts) ->
     hb_ao:raw(?LEGACY_LUA, <<"snapshot">>, Base, Req, Opts).
 
-%% @doc Reuse the stable `lua@5.3a' snapshot restore path.
+%% @doc Reuse the stable `lua@5.3a' snapshot restore path. It builds the host
+%% functions a snapshot may keep from a new state, so it takes the same
+%% sandbox as `init/3': the removed functions cannot return from a snapshot.
 normalize(Base, Req, Opts) ->
-    hb_ao:raw(?LEGACY_LUA, <<"normalize">>, Base, Req, Opts).
+    hb_ao:raw(?LEGACY_LUA, <<"normalize">>, Base, Req, deterministic(Opts)).
 
 %% @doc Reuse the stable `lua@5.3a' function inventory.
 functions(Base, Req, Opts) ->
@@ -558,6 +578,32 @@ ao_library_test() ->
         >>,
     {ok, Out} = hb_ao:resolve(base(<<"lua-patch@1.0">>, Script), request(1), Opts),
     ?assertEqual(<<"world">>, hb_ao:get(<<"got">>, Out, Opts)).
+
+%% @doc The node's random stream and clock are unavailable even when the base
+%% does not ask for determinism: at module load, at compute, and after a
+%% restore.
+no_node_randomness_test() ->
+    hb:init(),
+    Opts = #{ <<"hashpath">> => ignore },
+    Script =
+        <<
+            "local function kinds() "
+            "return table.concat({ type(math.random), type(math.randomseed), "
+            "type(os.time), type(os.clock), type(os.date) }, ' ') end "
+            "local early = kinds() "
+            "function compute(req) "
+            "return { patches = {{ path = '/kinds', value = early .. ' ' .. kinds() }}, "
+            "results = {} } end"
+        >>,
+    Base = (base(<<"lua-patch@1.0">>, Script))#{ <<"requires-determinism">> => false },
+    Expected = iolist_to_binary(lists:join(<<" ">>, lists:duplicate(10, <<"string">>))),
+    {ok, First} = hb_ao:resolve(Base, request(1), Opts),
+    ?assertEqual(Expected, hb_ao:get(<<"kinds">>, First, Opts)),
+    {ok, Snapshot} = hb_ao:resolve(First, <<"snapshot">>, Opts),
+    Cold = hb_ao:set(hb_private:reset(First), <<"snapshot">>, Snapshot, Opts),
+    {ok, Restored} = hb_ao:resolve(Cold, <<"normalize">>, Opts),
+    {ok, Second} = hb_ao:resolve(Restored, request(2), Opts),
+    ?assertEqual(Expected, hb_ao:get(<<"kinds">>, Second, Opts)).
 
 %% @doc Deletes work, while runtime-owned paths are refused.
 %% @doc Lua identifies a signer by its address, not by v0.11's committer URI,
