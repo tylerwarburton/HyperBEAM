@@ -46,7 +46,26 @@ start(ProcID, Proc, Opts) ->
                             {existing_pid, ExistingPid}
                         }
                     ),
-                    Caller ! {ok, Ref, ExistingPid}
+                    % ...and stop here. Going on would write the spawn again
+                    % and run a second, unregistered server for the process,
+                    % which could hand out a slot the registered one also
+                    % hands out.
+                    case is_pid(ExistingPid) of
+                        true ->
+                            Caller ! {ok, Ref, ExistingPid},
+                            exit(normal);
+                        false ->
+                            % The registered server exited between our
+                            % registration and the lookup: take the name.
+                            case hb_name:register(dev_scheduler_registry:name(ProcID, Opts)) of
+                                ok -> ok;
+                                error ->
+                                    Caller !
+                                        {error, Ref, error,
+                                            {scheduler_registration_race, ProcID}, []},
+                                    exit(normal)
+                            end
+                    end
             end,
             % Write the process to the cache. We are the provider-of-last-resort
             % for this data.
@@ -519,3 +538,61 @@ mode_test() ->
         {unknown_scheduling_mode, <<"fast">>},
         mode(#{ <<"scheduling-mode">> => <<"fast">> }, x)
     ).
+
+%% @doc Concurrent starts for one process leave exactly one scheduler: every
+%% caller gets the same server, the definition is written once, and
+%% concurrent schedules get unique, consecutive slots.
+concurrent_start_one_server_test_() ->
+    {timeout, 90, fun() ->
+        Wallet = hb:wallet(),
+        Store = hb_test_utils:test_store(hb_store_lmdb, <<"sched-race">>),
+        Opts = #{ <<"priv-wallet">> => Wallet, <<"store">> => [Store],
+                  <<"scheduling-mode">> => local_confirmation },
+        ok = hb_store:start([Store], #{}, Opts),
+        Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+        Proc = hb_message:commit(#{
+            <<"device">> => <<"process@1.0">>, <<"type">> => <<"Process">>,
+            <<"scheduler-device">> => <<"scheduler@1.0">>,
+            <<"scheduler-location">> => Address,
+            <<"test-random-seed">> => rand:uniform(1 bsl 40) }, Opts),
+        ProcID = hb_util:human_id(hb_message:id(Proc, all, Opts)),
+        {module, CacheMod} = erlang:fun_info(fun dev_scheduler_cache:write_spawn/2, module),
+        Parent = self(),
+        Counter = spawn(fun() -> count_calls(0, Parent) end),
+        erlang:trace_pattern({CacheMod, write_spawn, 2}, true, [global]),
+        erlang:trace(all, true, [call, {tracer, Counter}]),
+        Servers0 = count_servers(),
+        N = 20,
+        [ spawn(fun() -> Parent ! {started, catch start(ProcID, Proc, Opts)} end)
+        || _ <- lists:seq(1, N) ],
+        Pids = [ receive {started, P} -> P after 30000 -> timeout end
+               || _ <- lists:seq(1, N) ],
+        timer:sleep(1000),
+        erlang:trace(all, false, [call]),
+        erlang:trace_pattern({CacheMod, write_spawn, 2}, false, [global]),
+        Counter ! {count, self()},
+        Writes = receive {calls, C} -> C after 5000 -> timeout end,
+        Servers = count_servers() - Servers0,
+        ?assertMatch([Pid] when is_pid(Pid), lists:usort(Pids)),
+        ?assertEqual(1, Servers),
+        ?assertEqual(1, Writes),
+        M = 30,
+        [ spawn(fun() ->
+              Msg = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => I }, Opts),
+              A = schedule(hd(Pids), Msg),
+              Parent ! {slot, hb_util:int(hb_ao:get(<<"slot">>, A, Opts))}
+          end)
+        || I <- lists:seq(1, M) ],
+        Slots = [ receive {slot, S} -> S after 30000 -> timeout end || _ <- lists:seq(1, M) ],
+        ?assertEqual(lists:seq(0, M - 1), lists:sort(Slots))
+    end}.
+
+count_servers() ->
+    length([ P || P <- processes(),
+                  process_info(P, current_function) == {current_function, {?MODULE, server, 1}} ]).
+
+count_calls(N, Parent) ->
+    receive
+        {trace, _, call, _} -> count_calls(N + 1, Parent);
+        {count, From} -> From ! {calls, N}
+    end.
