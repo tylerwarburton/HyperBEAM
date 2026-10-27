@@ -568,11 +568,12 @@ blob_store(Opts) ->
     case hb_util:atom(hb_opts:get(<<"process-state-blobs">>, false, Opts)) of
         true ->
             Stores =
-                case hb_opts:get(<<"store">>, [], Opts) of
-                    M when is_map(M) -> [M];
-                    L when is_list(L) -> L;
-                    _ -> []
-                end,
+                hb_store:normalize_stores(
+                    case hb_opts:get(<<"store">>, [], Opts) of
+                        M when is_map(M) -> [M];
+                        L when is_list(L) -> L;
+                        _ -> []
+                    end),
             case [ S || S = #{ <<"store-module">> := hb_store_lmdb } <- Stores,
                         not is_map_key(<<"access">>, S),
                         maps:get(<<"read-only">>, S, false) =/= true ] of

@@ -105,7 +105,7 @@ wrap(Inner = #{ <<"store-module">> := Mod }, Export) ->
         <<"max-retries">> => 0
     }.
 
-inner(#{ <<"inner">> := Inner }) -> Inner.
+inner(#{ <<"inner">> := Inner }) -> hb_store:normalize_store(Inner).
 inner_mod(Store) -> maps:get(<<"store-module">>, inner(Store)).
 
 %%% Store callbacks.

@@ -353,7 +353,10 @@ new_server(RawNodeMsg) ->
                 % scheduler's store and add it (read-only) to the node's
                 % store list. Unchanged otherwise.
                 % Then start store retention, if it is on.
-                NodeMsgIrr = hb_store_irreplaceable:node_message(NodeMsgAfterHook),
+                % Store modules as atoms, whatever the config format gave.
+                NodeMsgIrr =
+                    hb_store_irreplaceable:node_message(
+                        hb_store:normalize_opts(NodeMsgAfterHook)),
                 _ = hb_store_retention:maybe_start(NodeMsgIrr),
                 NodeMsgIrr;
             Unexpected ->

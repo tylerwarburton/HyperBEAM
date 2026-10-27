@@ -32,7 +32,7 @@
 %% @doc The irreplaceable store list, wrapped in the offsite journal when one
 %% is configured, or `undefined'.
 store(Opts) ->
-    case hb_opts:get(<<"irreplaceable-store">>, undefined, Opts) of
+    case hb_store:normalize_stores(hb_opts:get(<<"irreplaceable-store">>, undefined, Opts)) of
         Store when is_map(Store) -> with_export([Store], Opts);
         [_ | _] = Stores -> with_export(Stores, Opts);
         _ -> undefined
@@ -58,7 +58,7 @@ node_message(NodeMsg) ->
         undefined -> NodeMsg;
         Irr ->
             ok = hb_store:start(Irr, #{}, NodeMsg),
-            Main = as_list(hb_opts:get(<<"store">>, [], NodeMsg)),
+            Main = hb_store:normalize_stores(as_list(hb_opts:get(<<"store">>, [], NodeMsg))),
             ReadOnly = [ S#{ <<"access">> => [<<"read">>] } || S <- Irr ],
             Store =
                 case Main of
@@ -68,7 +68,7 @@ node_message(NodeMsg) ->
             Sched =
                 case hb_opts:get(<<"scheduler-store">>, undefined, NodeMsg) of
                     undefined -> Irr;
-                    Explicit -> Explicit
+                    Explicit -> hb_store:normalize_stores(Explicit)
                 end,
             NodeMsg#{ <<"store">> => Store, <<"scheduler-store">> => Sched }
     end.

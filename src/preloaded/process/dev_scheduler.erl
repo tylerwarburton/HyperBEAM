@@ -2354,3 +2354,41 @@ spawn_is_flushed_before_answer_test() ->
         <<"path">> => <<"schedule">>, <<"body">> => Base }, Opts),
     #{ <<"db">> := DB } = hb_store:find(Sched),
     ?assertEqual(0, elmdb:overlay_count(DB)).
+
+%% @doc A node whose store list came from a JSON config (store modules as
+%% binaries, no `ao-types') spawns a process and schedules to it, answering
+%% each request instead of crashing the scheduler and leaving the client
+%% waiting.
+spawn_with_json_store_config_test_() ->
+    {timeout, 60, fun() ->
+        start(),
+        Wallet = hb:wallet(),
+        Dir = fun(T) -> maps:get(<<"name">>, hb_test_utils:test_store(hb_store_lmdb, T)) end,
+        Json = iolist_to_binary([
+            <<"{\"store\":[{\"store-module\":\"hb_store_lmdb\",\"name\":\"">>,
+            Dir(<<"json-main">>),
+            <<"\"}],\"scheduler-store\":[{\"store-module\":\"hb_store_lmdb\",\"name\":\"">>,
+            Dir(<<"json-sched">>), <<"\"}]}">>]),
+        Config = hb_json:decode(Json),
+        ?assertMatch([#{ <<"store-module">> := <<"hb_store_lmdb">> }],
+                     maps:get(<<"store">>, Config)),
+        Opts = Config#{ <<"priv-wallet">> => Wallet },
+        Base = hb_message:commit(test_process(Opts), Opts),
+        Self = self(),
+        Run =
+            fun(Tag, F) ->
+                spawn(fun() -> Self ! {Tag, catch F()} end),
+                receive {Tag, R} -> R after 20000 -> {Tag, timeout} end
+            end,
+        ?assertMatch({ok, _},
+            Run(spawn_post, fun() ->
+                hb_ao:resolve(Base, #{ <<"method">> => <<"POST">>,
+                    <<"path">> => <<"schedule">>, <<"body">> => Base }, Opts)
+            end)),
+        Msg = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"test-key">> => <<"v">> }, Opts),
+        ?assertMatch({ok, _},
+            Run(schedule, fun() ->
+                hb_ao:resolve(Base, #{ <<"method">> => <<"POST">>,
+                    <<"path">> => <<"schedule">>, <<"body">> => Msg }, Opts)
+            end))
+    end}.

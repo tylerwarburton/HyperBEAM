@@ -29,7 +29,7 @@ start(ProcID, Proc, Opts) ->
     end,
     Ref = make_ref(),
     Caller = self(),
-    spawn(
+    {Server, MonRef} = spawn_monitor(
         fun() ->
             % Before we start, register the scheduler name.
             case hb_name:register(dev_scheduler_registry:name(ProcID, Opts)) of
@@ -50,8 +50,15 @@ start(ProcID, Proc, Opts) ->
             end,
             % Write the process to the cache. We are the provider-of-last-resort
             % for this data.
-            {ok, _} = dev_scheduler_cache:write_spawn(Proc, Opts),
-            ok = dev_scheduler_cache:flush(Opts),
+            % A failure answers the caller instead of leaving it waiting.
+            try
+                {ok, _} = dev_scheduler_cache:write_spawn(Proc, Opts),
+                ok = dev_scheduler_cache:flush(Opts)
+            catch SpawnClass:SpawnReason:SpawnStack ->
+                hb_name:unregister(dev_scheduler_registry:name(ProcID, Opts)),
+                Caller ! {error, Ref, SpawnClass, SpawnReason, SpawnStack},
+                exit(normal)
+            end,
             HashpathAlg = hb_path:hashpath_alg(Proc, Opts),
             {CurrentSlot, BaseStateHashpath} =
                 try dev_scheduler_cache:latest(ProcID, Opts) of
@@ -101,10 +108,16 @@ start(ProcID, Proc, Opts) ->
             )
         end
     ),
+    % The server answers before it runs; if it dies first, so does the wait.
     receive
-        {ok, Ref, ServerPID} -> ServerPID;
+        {ok, Ref, ServerPID} ->
+            erlang:demonitor(MonRef, [flush]),
+            ServerPID;
         {error, Ref, Class, Reason, Stacktrace} ->
-            erlang:raise(Class, Reason, Stacktrace)
+            erlang:demonitor(MonRef, [flush]),
+            erlang:raise(Class, Reason, Stacktrace);
+        {'DOWN', MonRef, process, Server, Why} ->
+            erlang:error({scheduler_server_failed_to_start, ProcID, Why})
     end.
 
 %% @doc Determine the appropriate list of keys to use to commit assignments for
