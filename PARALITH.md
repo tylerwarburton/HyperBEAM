@@ -56,7 +56,30 @@ the numbers below with the reason they moved.
    per-key cost in the monorepo's CLAUDE.md). Inherit RC7's `dev_lua` fixes:
    node wallet kept out of snapshots (`put_private`), clean errors for
    unexpected return shapes.
-4. **`lua-atomic@1.0`**.
+4. **`lua-atomic@1.0`**: ported (2026-10-27) from `dev_lua_53c` as
+   `dev_lua_atomic`, on `lua-patch@1.0`. What v0.11 changed:
+   - A snapshot restore drops every Erlang function in the VM, so
+     `normalize` checks the version witness, then installs `ao.atomic` and
+     the host-call guards again. A `lua-patch@1.0` VM or snapshot is refused.
+   - `collectgarbage` does nothing inside a batch. Stock Luerl (the GC
+     patch is reverted) cannot see the suspended caller's frames from a
+     nested call, and a collection there freed the caller's locals.
+   - `dev_lua` takes `lua-device-sandbox` again, on top of the node's
+     minimum sandbox.
+   - Found on the way: `lua-patch@1.0` never gave RC7's `ao` library its
+     node message, so every `ao.get`/`resolve`/`set`/`event` from a
+     lua-patch contract failed. Fixed, with a test.
+   - The monorepo's deploy probe (`contract-device.mjs`, `ATOMIC_PROBE`)
+     must POST to `/~lua-atomic@1.0/compute/body`. On `/compute`, RC7
+     sends the reply as multipart (its `results` is a link), so the body
+     is never exactly `lua-atomic-v1-ready`. The test covers both.
+
+   Tests (`hb-v11-dev`, `--module=dev_lua_atomic,dev_lua_patch,
+   hb_state_patch,lib_process_cache`): 52 passed, 1 failed, twice. The
+   failure is `incremental_gc_step_test` (needs the reverted Luerl patch).
+   All 7 `lua-atomic@1.0` tests pass. `dev_lua,dev_lua_test`: 30 passed,
+   1 failed: `pure_lua_process_benchmark_test_` (38 slots/s, limit 500 ms
+   for 30 slots), a timing limit that fails the same without this port.
 5. **Worker, process cache, `hb_persistent`**: each measured on its own.
 6. **Push**.
 7. **Stores**: crash-safe LMDB sync, `hb_store_irreplaceable`,
