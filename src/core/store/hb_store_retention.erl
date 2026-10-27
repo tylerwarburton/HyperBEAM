@@ -274,10 +274,11 @@ list(Store, Path) ->
 %% the node's store list, never an irreplaceable store.
 store(Opts) ->
     Stores =
-        case hb_opts:get(<<"store">>, [], Opts) of
-            L when is_list(L) -> L;
-            M when is_map(M) -> [M]
-        end,
+        hb_store:normalize_stores(
+            case hb_opts:get(<<"store">>, [], Opts) of
+                L when is_list(L) -> L;
+                M when is_map(M) -> [M]
+            end),
     Irr = case hb_store_irreplaceable:store(Opts) of undefined -> []; I -> I end,
     IrrNames = lists:flatmap(
         fun(S) -> [maps:get(<<"name">>, S, undefined),
