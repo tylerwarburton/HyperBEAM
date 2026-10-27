@@ -25,6 +25,7 @@
 -define(PATCH_LUA, <<"lua-patch@1.0">>).
 -define(VERSION, {lua_atomic, version}).
 -define(DEPTH, {lua_atomic, depth}).
+-define(GC_PENDING, {lua_atomic, gc_pending}).
 -define(HOST_FUNCTIONS, [<<"get">>, <<"resolve">>, <<"set">>, <<"event">>]).
 -define(ATOMIC_MFA, #erl_mfa{ m = ?MODULE, f = lua_atomic, a = nil }).
 -define(COLLECT_MFA, #erl_mfa{ m = ?MODULE, f = lua_collect, a = nil }).
@@ -75,18 +76,38 @@ in_batch(State) ->
         _ -> false
     end.
 
-%% @doc `collectgarbage' that does nothing inside a batch. A batch runs through
-%% `luerl:call_function/3', which starts a new call stack, so the frames of the
-%% suspended Lua beneath it are not roots: a collection there frees the
-%% caller's locals. The old fork's Luerl patch deferred such a collection;
-%% v0.11 runs stock Luerl, so the batch skips it and the next collection
-%% outside a batch does the work. Outside a batch this is Luerl's own
-%% `collectgarbage', called on the current state so its stack stays a root.
+%% @doc `collectgarbage' that only asks for a collection; `compute/4' runs one
+%% when the call returns, with no Lua on the stack. Two reasons:
+%% - Inside a batch (`luerl:call_function/3', a new call stack) the frames of
+%%   the suspended Lua beneath it are not roots, so collecting there freed the
+%%   caller's locals.
+%% - A full collection costs time in the size of the whole heap, and the
+%%   orderbook's network test asks for one after every simulated message,
+%%   thousands in one compute (on Luerl's own quadratic collector, ~300 ms
+%%   each; see `hb_luerl_gc'). One per compute is what a contract that
+%%   collects at the end of its handler costs anyway.
+%% Every other option is ignored, as Luerl's own `collectgarbage' ignores it.
 lua_collect(_, Args, State) ->
-    case in_batch(State) of
-        true -> {[], State};
-        false -> luerl_lib_basic:collectgarbage(nil, Args, State)
+    case Args of
+        [] -> {[], luerl:put_private(?GC_PENDING, true, State)};
+        [<<"collect">> | _] -> {[], luerl:put_private(?GC_PENDING, true, State)};
+        _ -> {[], State}
     end.
+
+%% @doc Run the collection Lua asked for during a compute, if it asked.
+collect_pending({Status, Msg}, Opts) when is_map(Msg) ->
+    case hb_private:get(<<"state">>, Msg, Opts) of
+        not_found -> {Status, Msg};
+        State ->
+            case private(?GC_PENDING, State) of
+                true ->
+                    Collected = hb_luerl_gc:gc(luerl:delete_private(?GC_PENDING, State)),
+                    {Status, hb_private:set(Msg, <<"state">>, Collected, Opts)};
+                _ -> {Status, Msg}
+            end
+    end;
+collect_pending(Other, _Opts) ->
+    Other.
 
 %% @doc Wrap host entries before the VM is exposed to a caller. The library is
 %% installed after module loading with raw writes (`dev_lua_lib'), and no Lua
@@ -231,7 +252,8 @@ sandbox() ->
 %% @doc Execute with the patch protocol after checking the VM witness.
 compute(Key, Base, Req, Opts) ->
     case init(Base, Req, Opts) of
-        {ok, Ready} -> hb_ao:raw(?PATCH_LUA, Key, Ready, Req, Opts);
+        {ok, Ready} ->
+            collect_pending(hb_ao:raw(?PATCH_LUA, Key, Ready, Req, Opts), Opts);
         Error -> Error
     end.
 
@@ -448,6 +470,33 @@ non_table_ao_restores_test() ->
     {ok, Restored} = hb_ao:resolve(Cold, <<"normalize">>, Opts),
     {ok, Second} = hb_ao:resolve(Restored, <<"compute">>, Opts),
     ?assertEqual(<<"table">>, hb_ao:get(<<"kind">>, Second, Opts)).
+
+%% @doc `collectgarbage('collect')' costs one collection per compute, however
+%% often Lua asks: the orderbook's test suite drives thousands of contract
+%% calls, each ending in a collection, inside one compute, and on stock Luerl
+%% each full collection of a large heap took up to ~300 ms (the suite ran past
+%% nginx's 300 s). The garbage is still freed when the compute returns.
+collect_once_per_compute_test_() ->
+    {timeout, 120, fun() ->
+        hb:init(),
+        Opts = #{ <<"hashpath">> => ignore },
+        Script = <<"""
+            Live = Live or {}
+            function compute(req)
+                if #Live == 0 then for i = 1, 20000 do Live[i] = { i } end end
+                for i = 1, 20000 do local t = { i } end
+                for i = 1, 50 do collectgarbage('collect') end
+                return { patches = {{ path = '/n', value = tostring(#Live) }} }
+            end
+            """>>,
+        {Micros, {ok, Result}} =
+            timer:tc(fun() -> hb_ao:resolve(base(Script), <<"compute">>, Opts) end),
+        ?assertEqual(<<"20000">>, hb_ao:get(<<"n">>, Result, Opts)),
+        ?assert(Micros < 5000000),
+        #luerl{ tabs = #tstruct{ data = Tables } } =
+            hb_private:get(<<"state">>, Result, Opts),
+        ?assert(map_size(Tables) < 30000)
+    end}.
 
 %% @doc `math.random' is unavailable even to a base that does not ask for
 %% determinism, from module load on.
