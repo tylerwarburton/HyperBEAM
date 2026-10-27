@@ -90,7 +90,9 @@ compute(Key, RawBase, RawReq, Opts) ->
         try luerl:call_function_dec(
             [Function],
             encode(Params, Opts),
-            State
+            % RC7's `ao' library reads the node message from here, as in
+            % `dev_lua'; `snapshot/3' keeps it out of the snapshot.
+            luerl:put_private(<<"node-message">>, Opts, State)
         )
         catch
             _:Reason:Stacktrace -> {error, Reason, Stacktrace}
@@ -543,6 +545,19 @@ snapshot_restores_live_heap_test() ->
     % Taking a snapshot must not replace or mutate the live VM's heap.
     {ok, LiveNext} = hb_ao:resolve(Live, request(2), Opts),
     ?assertEqual(<<"2">>, hb_ao:get(<<"count">>, LiveNext, Opts)).
+
+%% @doc The `ao' host library works from a `lua-patch@1.0' contract.
+ao_library_test() ->
+    hb:init(),
+    Opts = #{ <<"hashpath">> => ignore },
+    Script =
+        <<
+            "function compute(req) "
+            "return { patches = {{ path = '/got', "
+            "value = ao.get('hello', { hello = 'world' }) }}, results = {} } end"
+        >>,
+    {ok, Out} = hb_ao:resolve(base(<<"lua-patch@1.0">>, Script), request(1), Opts),
+    ?assertEqual(<<"world">>, hb_ao:get(<<"got">>, Out, Opts)).
 
 %% @doc Deletes work, while runtime-owned paths are refused.
 %% @doc Lua identifies a signer by its address, not by v0.11's committer URI,
