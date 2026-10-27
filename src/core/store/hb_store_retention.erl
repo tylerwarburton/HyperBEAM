@@ -10,7 +10,11 @@
 %%% `delete_batch/2' (`patches/elmdb-delete.patch' not applied) never deletes:
 %%% retention refuses to start and says so.
 %%%
-%%% Per process, it keeps the newest `store-retention-checkpoints' (default
+%%% A full-state process (no delta rows: `lua@5.3a', WASM, native devices)
+%%% keeps its newest `store-retention-checkpoints' snapshot checkpoints and
+%%% its newest `store-retention-recent-slots' (default 32) states; every
+%%% other row goes. A delta process (`lua-patch', `lua-atomic') keeps the
+%%% newest `store-retention-checkpoints' (default
 %%% 2) checkpoints that carry a VM snapshot (the `s' markers: the only states
 %%% a worker can resume from) and every slot from the oldest of them to the
 %%% head. Everything below that floor is deleted, top-down: the highest slot
@@ -35,11 +39,13 @@
 %%% `store' list that is not an irreplaceable store.
 -module(hb_store_retention).
 -export([maybe_start/1, start/1, stop/0, run_now/1, status/0, running/0]).
--export([retain/1, plan/3, store/1]).
+-export([retain/1, plan/3, plan/4, store/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -define(NS, <<"pstate">>).
+%% States a full-state process keeps besides its snapshot checkpoints.
+-define(RECENT, 32).
 -define(SERVER, hb_store_retention_server).
 -define(STATUS, {?MODULE, status}).
 -define(RUNNING, {?MODULE, running}).
@@ -137,6 +143,7 @@ retain(Opts) ->
             ok = hb_store:start([Store], #{}, Opts),
             #{ <<"db">> := DB } = hb_store:find(Store),
             Keep = max(1, int(<<"store-retention-checkpoints">>, 2, Opts)),
+            Recent = max(1, int(<<"store-retention-recent-slots">>, ?RECENT, Opts)),
             Max = int(<<"store-retention-max-candidates">>, 1000000, Opts),
             Batch = max(1, int(<<"store-retention-batch-keys">>, 1000, Opts)),
             Pct = min(100, max(1, int(<<"store-retention-max-cpu-pct">>, 25, Opts))),
@@ -145,7 +152,7 @@ retain(Opts) ->
                 lists:foldl(
                     fun(_P, Acc = {D, _, _}) when D >= Max -> Acc;
                        (P, {D, Sl, Pl}) ->
-                            Keys = lists:sublist(plan(Store, P, Keep), Max - D),
+                            Keys = lists:sublist(plan(Store, P, Keep, Recent), Max - D),
                             {D1, Sl1} = delete(DB, Keys, Batch, Pct),
                             {D + D1, Sl + Sl1, Pl + length(Keys)}
                     end,
@@ -164,10 +171,36 @@ retain(Opts) ->
     end.
 
 %% @doc The keys of one process to delete, in the order to delete them.
-plan(Store, P, Keep) ->
+plan(Store, P, Keep) -> plan(Store, P, Keep, ?RECENT).
+plan(Store, P, Keep, Recent) ->
     Slots = fun(Kind) -> slots(Store, P, Kind) end,
     Snaps = lists:reverse(Slots(<<"s">>)),
     Full = Slots(<<"f">>),
+    case Slots(<<"d">>) of
+        [] -> plan_full(P, Snaps, Full, Keep, Recent);
+        _ -> plan_delta(P, Snaps, Full, Slots, Keep)
+    end.
+
+%% A full-state process (no delta rows): every row stands alone. Keep the
+%% newest `Keep' snapshot checkpoints and the newest `Recent' states; every
+%% other row goes, newest first.
+plan_full(P, Snaps, Full, Keep, Recent) ->
+    KeepS = lists:sublist(Snaps, Keep),
+    KeepF = KeepS ++ lists:sublist(lists:reverse(Full), Recent),
+    Doomed =
+        [ {S, 0, <<"s">>} || S <- Snaps, not lists:member(S, KeepS) ] ++
+        [ {S, 2, <<"f">>} || S <- Full, not lists:member(S, KeepF) ],
+    order(P, Doomed).
+
+order(P, Doomed) ->
+    [ key(P, Kind, S)
+    || {S, _, Kind} <- lists:sort(
+           fun({A, KA, _}, {B, KB, _}) -> {A, -KA} >= {B, -KB} end,
+           Doomed) ].
+
+%% A delta process: keep everything from the oldest kept snapshot checkpoint
+%% up, so every kept delta still reaches a full state.
+plan_delta(P, Snaps, Full, Slots, Keep) ->
     case length(Snaps) > Keep of
         false -> [];
         true ->
@@ -178,14 +211,10 @@ plan(Store, P, Keep) ->
                                      {floor_without_state, Floor}}),
                     [];
                 true ->
-                    Doomed =
+                    order(P,
                         [ {S, 0, <<"s">>} || S <- Snaps, S < Floor ] ++
                         [ {S, 1, <<"d">>} || S <- Slots(<<"d">>), S < Floor ] ++
-                        [ {S, 2, <<"f">>} || S <- Full, S < Floor ],
-                    [ key(P, Kind, S)
-                    || {S, _, Kind} <- lists:sort(
-                           fun({A, KA, _}, {B, KB, _}) -> {A, -KA} >= {B, -KB} end,
-                           Doomed) ]
+                        [ {S, 2, <<"f">>} || S <- Full, S < Floor ])
             end
     end.
 
@@ -198,7 +227,16 @@ delete(DB, Keys, Batch, Pct) ->
     T0 = erlang:monotonic_time(microsecond),
     N = case elmdb:delete_batch(DB, Now) of
             {ok, Count} -> Count;
-            Error -> erlang:error({store_retention_delete_failed, Error})
+            Error ->
+                % elmdb fails the store like a failed flush: it refuses
+                % writes until the node restarts.
+                ?event(error,
+                    {store_retention_delete_failed,
+                        {main_store_refuses_writes_until_restart, true},
+                        {error, Error}}),
+                persistent_term:put(?STATUS,
+                    (persistent_term:get(?STATUS, #{}))#{ store_failed => Error }),
+                erlang:error({store_retention_delete_failed, Error})
         end,
     Work = (erlang:monotonic_time(microsecond) - T0) div 1000,
     Sleep = Work * (100 - Pct) div Pct,
@@ -326,3 +364,23 @@ never_a_foreign_key_test() ->
     ?assertNot(is_retention_key(<<"~scheduler@1.0/assignments/", P/binary, "/5">>)),
     ?assertNot(is_retention_key(<<"pstate/", P/binary, "/x/000000000005">>)),
     ?assertNot(is_retention_key(P)).
+
+%% @doc A full-state process keeps its newest snapshot checkpoints and its
+%% newest states; everything else goes, newest first.
+plan_full_state_test() ->
+    Main = hb_test_utils:test_store(hb_store_lmdb, <<"ret-full">>),
+    ok = hb_store:start([Main], #{}, #{}),
+    P = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ok = hb_store:write([Main], maps:from_list(
+        [ {key(P, <<"f">>, S), <<"x">>} || S <- lists:seq(0, 12) ] ++
+        [ {key(P, <<"s">>, S), <<>>} || S <- [0, 5, 10] ]), #{}),
+    ?assertEqual(
+        [ key(P, <<"f">>, 9), key(P, <<"f">>, 8), key(P, <<"f">>, 7), key(P, <<"f">>, 6),
+          key(P, <<"f">>, 4), key(P, <<"f">>, 3), key(P, <<"f">>, 2), key(P, <<"f">>, 1),
+          key(P, <<"s">>, 0), key(P, <<"f">>, 0) ],
+        plan(Main, P, 2, 3)),
+    % Without any snapshot checkpoint, only the newest states stay.
+    Q = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ok = hb_store:write([Main], maps:from_list(
+        [ {key(Q, <<"f">>, S), <<"x">>} || S <- lists:seq(0, 4) ]), #{}),
+    ?assertEqual([ key(Q, <<"f">>, 1), key(Q, <<"f">>, 0) ], plan(Main, Q, 2, 3)).
