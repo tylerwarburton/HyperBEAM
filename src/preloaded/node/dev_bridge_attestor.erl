@@ -42,9 +42,19 @@
 %%% The cursors and the deposits and releases still waiting are kept in the
 %%% `state-file', so a restart picks up where the node left off.
 %%%
+%%% What PUSD holds (its set, proposals, minted deposits and withdrawals) comes
+%%% from this node's own computation of PUSD, never from another node's
+%%% published state. When PUSD runs elsewhere (`pusd-node'), the node keeps a
+%%% verified replica of it (`dev_bridge_attestor_replica'): the scheduler's
+%%% signed, hash-chained assignments, each message's own signature checked,
+%%% computed here. A replica that is behind, cannot verify a slot or breaks
+%%% the chain stops the pass: nothing is minted, signed or voted on.
+%%%
 %%% Configuration, under the node option `bridge':
-%%%   pusd, pusd-node (the URL of the node that runs PUSD; omit when it is this
-%%%   node), interval, fast-interval, fast-window (ms), keys-file, state-file, follow-file,
+%%%   pusd, pusd-node (the URL of the node that runs PUSD's scheduler; omit when
+%%%   it is this node), replica-dir (where the replica is kept, default
+%%%   `bridge-replica'), interval, fast-interval, fast-window (ms), keys-file,
+%%%   state-file, follow-file,
 %%%   base => #{ rpc, contract, chain-id, confirmations, from-block, log-range },
 %%%   solana => #{ rpc, program, commitment }, sui => #{ rpc, package, bridge }
 -module(dev_bridge_attestor).
@@ -157,7 +167,7 @@ loop(St) ->
         pass ->
             Start = os:system_time(millisecond),
             St1 = St#{ timer => undefined, pass_at => Start },
-            St2 = try pass(St1)
+            St2 = try maps:remove(views, pass(St1))
                   catch C:R:T ->
                       {LastError, Log} = failure(C, R, T),
                       ?event(bridge, Log),
@@ -240,7 +250,15 @@ nudge_arm(Now, Cfg, St = #{ nudge_at := NudgeAt, fast_since := Since0, fast_unti
         false -> {ok, St#{ nudge_at := Now, fast_since := Since, fast_until := Until }}
     end.
 
-pass(St) ->
+pass(St0) ->
+    case replica_view(St0) of
+        {ok, St} -> pass_verified(St);
+        {error, Why} ->
+            St0#{ last_error => <<"replica: ", Why/binary>>,
+                last_pass => os:system_time(millisecond) }
+    end.
+
+pass_verified(St) ->
     Info = published(<<"bridgeinfo">>, St),
     case maps:get(<<"successor">>, Info, <<>>) of
         Succ when is_binary(Succ), byte_size(Succ) =:= 43 -> follow(Succ, Info, St);
@@ -567,19 +585,50 @@ send(Tags, #{ cfg := Cfg, opts := Opts }) ->
     ?event(bridge, {sent, maps:get(<<"action">>, Tags), Res}),
     Res.
 
-%% A published key as decoded JSON, or #{} when absent (the node answers a
-%% missing key with its HTML page, never with an error).
-published(Key, #{ cfg := Cfg, opts := Opts }) ->
+%% A key of PUSD's state as decoded JSON, or #{} when absent. Where PUSD runs
+%% here, from its own computation; otherwise from this node's replica, as of
+%% the slot this pass verified up to.
+published(Key, St = #{ cfg := Cfg, opts := Opts }) ->
     Pusd = maps:get(<<"pusd">>, Cfg),
     case maps:get(<<"pusd-node">>, Cfg, undefined) of
         undefined ->
             {ok, Proc} = hb_cache:read(Pusd, Opts),
             json_value(hb_ao:get(<<"now/", Key/binary>>, Proc, not_found, Opts));
+        _ ->
+            case maps:find(Pusd, maps:get(views, St, #{})) of
+                {ok, {State, ROpts}} -> json_value(hb_ao:get(Key, State, not_found, ROpts));
+                error ->
+                    % A PUSD this pass has not verified (a successor): verify it now.
+                    case replica_view(St) of
+                        {ok, St1} -> published(Key, St1);
+                        {error, _} -> #{}
+                    end
+            end
+    end.
+
+%% Bring the replica of the configured PUSD up to its scheduler's head and
+%% compute it there. Only when PUSD runs on another node.
+replica_view(St = #{ cfg := Cfg, opts := Opts }) ->
+    case maps:get(<<"pusd-node">>, Cfg, undefined) of
+        undefined -> {ok, St};
         Node ->
-            Url = <<Node/binary, "/", Pusd/binary, "~process@1.0/now/", Key/binary>>,
-            case dev_bridge_attestor_chains:get_body(Url, Opts) of
-                {ok, Body} -> json_value(Body);
-                _ -> #{}
+            Pusd = maps:get(<<"pusd">>, Cfg),
+            Dir = hb_util:bin(maps:get(<<"replica-dir">>, Cfg, <<"bridge-replica">>)),
+            Start = os:system_time(millisecond),
+            R0 = dev_bridge_attestor_replica:new(Pusd, Node, #{ opts => Opts, dir => Dir }),
+            case dev_bridge_attestor_replica:sync(R0) of
+                {ok, R} ->
+                    case dev_bridge_attestor_replica:state(R) of
+                        {ok, State} ->
+                            ?event(bridge, {replica, {slot, dev_bridge_attestor_replica:slot(R)},
+                                {ms, os:system_time(millisecond) - Start}}),
+                            Views = maps:get(views, St, #{}),
+                            {ok, St#{ views => Views#{ Pusd =>
+                                {State, maps:get(opts, R)} },
+                                replica_slot => dev_bridge_attestor_replica:slot(R) }};
+                        {error, Why} -> {error, Why}
+                    end;
+                {error, Why, _} -> {error, Why}
             end
     end.
 
@@ -704,6 +753,7 @@ status_view(St) ->
         <<"waiting-acks">> => maps:size(maps:get(releases, St)),
         <<"last-pass">> => maps:get(last_pass, St),
         <<"last-error">> => maps:get(last_error, St),
+        <<"replica-slot">> => maps:get(replica_slot, St, null),
         <<"skipped">> => [#{ <<"item">> => K, <<"reason">> => V }
             || {K, V} <- lists:sort(maps:to_list(maps:get(skipped, St, #{})))],
         <<"rpcs">> => rpc_hosts(maps:get(cfg, St))
@@ -850,6 +900,9 @@ withdrawal_signature_base_test() ->
 %% A stand-in PUSD on `lua-patch@1.0': it publishes `bridgeinfo' naming the
 %% node as its only attestor, with one open migration the node's operator
 %% approved, and records each `Attestor-Vote' as `<proposal>:<committer>;'.
+-define(TEST_TOKEN, "0x2222222222222222222222222222222222222222").
+-define(TEST_TO, <<"0x3333333333333333333333333333333333333333">>).
+
 fake_pusd(Me, Opts) ->
     Info = hb_json:encode(#{
         <<"epoch">> => 2, <<"namespace">> => 0,
@@ -860,15 +913,39 @@ fake_pusd(Me, Opts) ->
     }),
     Script = <<
         "Votes = Votes or ''\n"
+        "Signs = Signs or ''\n"
+        "W = W or {}\n"
+        "local function wjson()\n"
+        "  local out = {}\n"
+        "  for _, w in ipairs(W) do\n"
+        "    local sigs = {}\n"
+        "    for k, v in pairs(w.sigs) do sigs[#sigs + 1] = '\"' .. k .. '\":\"' .. v .. '\"' end\n"
+        "    out[#out + 1] = '{\"id\":\"' .. w.id .. '\",\"chain\":\"base\",\"status\":\"pending\",'\n"
+        "      .. '\"token\":\"", ?TEST_TOKEN, "\",\"to\":\"' .. w.to\n"
+        "      .. '\",\"amount\":\"' .. w.amount .. '\",\"sigs\":{' .. table.concat(sigs, ',') .. '}}'\n"
+        "  end\n"
+        "  return '[' .. table.concat(out, ',') .. ']'\n"
+        "end\n"
         "function compute(req)\n"
         "  local body = req.body or req\n"
-        "  if tostring(body.action or '') == 'Attestor-Vote' then\n"
-        "    local who = ''\n"
-        "    for _, c in pairs(body.commitments or {}) do who = tostring(c.committer) end\n"
+        "  local action = tostring(body.action or '')\n"
+        "  local who = ''\n"
+        "  for _, c in pairs(body.commitments or {}) do who = tostring(c.committer) end\n"
+        "  if action == 'Attestor-Vote' then\n"
         "    Votes = Votes .. tostring(body.proposalid) .. ':' .. who .. ';'\n"
+        "  elseif action == 'Redeem' then\n"
+        "    W[#W + 1] = { id = tostring(#W + 1), to = tostring(body.to),\n"
+        "      amount = tostring(body.amount), sigs = {} }\n"
+        "  elseif action == 'Bridge-Sign' then\n"
+        "    Signs = Signs .. tostring(body.withdrawalid) .. '=' .. tostring(body.releasesig) .. ';'\n"
+        "    for _, w in ipairs(W) do\n"
+        "      if w.id == tostring(body.withdrawalid) then w.sigs[who] = tostring(body.releasesig) end\n"
+        "    end\n"
         "  end\n"
         "  return { patches = {\n"
         "    { path = '/bridgeinfo', value = [==[", Info/binary, "]==] },\n"
+        "    { path = '/withdrawals', value = wjson() },\n"
+        "    { path = '/signs', value = Signs },\n"
         "    { path = '/votes', value = Votes } }, results = {} }\n"
         "end\n"
     >>,
@@ -913,6 +990,14 @@ vote_reaches_pusd(Cfg0, Opts) ->
     % Within RESEND_MS the vote is not sent again.
     _ = pass(St1),
     ?assertEqual({ok, <<"1:", Me/binary, ";">>}, votes(St1)).
+
+%% A plain-string key of the real PUSD, read where it runs.
+raw(Key, #{ cfg := Cfg, opts := Opts }) ->
+    {ok, Proc} = hb_cache:read(maps:get(<<"pusd">>, Cfg), Opts),
+    case hb_ao:resolve(Proc, <<"now/", Key/binary>>, Opts) of
+        {ok, V} -> V;
+        _ -> <<>>
+    end.
 
 %% `votes' is a plain string, so it is read raw rather than as JSON.
 votes(#{ cfg := Cfg, opts := Opts }) ->
@@ -1035,3 +1120,130 @@ malformed_withdrawal_is_skipped_test() ->
     ?assertMatch(#{ <<"skipped">> := [_, _, _] },
         status_view(St1#{ cursors => #{}, deposits => #{}, releases => #{}, member => true,
             last_pass => 0, last_error => null })).
+
+%%% The replica: what is signed comes from this node's own PUSD ------------------
+
+%% A wallet's message, scheduled on PUSD where it runs.
+schedule_as(Wallet, Tags, Pusd, Opts) ->
+    Signed = hb_message:commit(Tags#{ <<"target">> => Pusd },
+        Opts#{ <<"priv-wallet">> => Wallet }, <<"httpsig@1.0">>),
+    {ok, _} = hb_cache:write(Signed, Opts),
+    {ok, Proc} = hb_cache:read(Pusd, Opts),
+    {ok, _} = hb_ao:resolve({as, <<"process@1.0">>, Proc},
+        #{ <<"path">> => <<"schedule">>, <<"method">> => <<"POST">>, <<"body">> => Signed }, Opts).
+
+%% A scheduler node running PUSD, whose HTTP replies pass through `Hostile'
+%% first (identity for an honest node), and an attestor that reads it as its
+%% `pusd-node'. PUSD holds one pending Base withdrawal: 5 to TEST_TO.
+replica_setup(Name, MakeHostile) ->
+    hb:init(),
+    Opts = ao_test_opts(),
+    Hostile = MakeHostile(hb_opts:get(<<"priv-wallet">>, none, Opts)),
+    Me = hb_util:human_id(ar_wallet:to_address(hb_opts:get(<<"priv-wallet">>, none, Opts))),
+    Pusd = fake_pusd(Me, Opts),
+    Hook = fun(_, HookReq = #{ <<"request">> := Req, <<"body">> := Body }, _) ->
+        Path = hb_util:bin(hb_maps:get(<<"path">>, Req, <<>>, #{})),
+        {ok, HookReq#{ <<"body">> => Hostile(Path, Body) }}
+    end,
+    Node = hb_http_server:start_node(Opts#{
+        <<"on">> => #{ <<"response">> => #{ <<"device">> => #{ <<"response">> => Hook } } } }),
+    Dir = <<"/tmp/bridge-replica-", Name/binary>>,
+    _ = os:cmd("rm -rf " ++ binary_to_list(Dir)),
+    Cfg = (ao_test_cfg(Pusd, Dir))#{
+        <<"pusd-node">> => hb_util:bin(string:trim(hb_util:list(Node), trailing, "/")),
+        <<"replica-dir">> => <<Dir/binary, "/replica">>,
+        <<"base">> => #{ <<"rpc">> => <<"http://127.0.0.1:1">>, <<"chain-id">> => 8453,
+            <<"contract">> => <<"0x1111111111111111111111111111111111111111">> } },
+    St = initial_state(Cfg, Opts),
+    {ok, _} = send(#{ <<"action">> => <<"Ping">> }, St),
+    schedule_as(ar_wallet:new(), #{ <<"action">> => <<"Redeem">>, <<"to">> => ?TEST_TO,
+        <<"amount">> => <<"5">> }, Pusd, Opts),
+    St.
+
+honest(_Wallet) -> fun(_Path, Body) -> Body end.
+
+%% The signature this node owes PUSD's real withdrawal 1.
+true_signature(St = #{ cfg := Cfg, keys := Keys }) ->
+    withdrawal_signature(#{ <<"id">> => <<"1">>, <<"chain">> => <<"base">>,
+        <<"token">> => <<?TEST_TOKEN>>, <<"to">> => ?TEST_TO, <<"amount">> => <<"5">> },
+        Cfg, Keys, maps:get(namespace, St)).
+
+replica_signs_its_own_withdrawal_test_() ->
+    {timeout, 120, fun() ->
+        St = replica_setup(<<"honest">>, fun honest/1),
+        St1 = pass(St),
+        ?assertMatch(#{ member := true, last_error := null }, St1),
+        ?assertEqual(<<"1=", (true_signature(St1))/binary, ";">>, raw(<<"signs">>, St1))
+    end}.
+
+%% The node running PUSD publishes a withdrawal list of its own making:
+%% withdrawal 1 redirected and enlarged, and a 7 that PUSD never made. The
+%% attestor signs only what its own replica holds: the real 1.
+hostile_withdrawal_list_is_not_signed_test_() ->
+    {timeout, 120, fun() ->
+        Fake = hb_json:encode([
+            #{ <<"id">> => <<"1">>, <<"chain">> => <<"base">>, <<"status">> => <<"pending">>,
+                <<"token">> => <<?TEST_TOKEN>>, <<"amount">> => <<"999">>, <<"sigs">> => #{},
+                <<"to">> => <<"0x4444444444444444444444444444444444444444">> },
+            #{ <<"id">> => <<"7">>, <<"chain">> => <<"base">>, <<"status">> => <<"pending">>,
+                <<"token">> => <<?TEST_TOKEN>>, <<"amount">> => <<"999">>, <<"sigs">> => #{},
+                <<"to">> => <<"0x4444444444444444444444444444444444444444">> }]),
+        Lie = fun(Path, Body) ->
+            case binary:match(Path, <<"withdrawals">>) of
+                nomatch -> Body;
+                _ -> Fake
+            end
+        end,
+        St = replica_setup(<<"list">>, fun(_) -> Lie end),
+        St1 = pass(St),
+        ?assertEqual(<<"1=", (true_signature(St1))/binary, ";">>, raw(<<"signs">>, St1))
+    end}.
+
+%% Rewrite the Redeem's assignment in every schedule the node serves.
+tamper_redeem(Fun) ->
+    fun(Path, Body) ->
+        case binary:match(Path, <<"schedule">>) of
+            nomatch -> Body;
+            _ ->
+                Opts = #{ <<"hashpath">> => ignore },
+                Loaded = hb_cache:ensure_all_loaded(Body, Opts),
+                As = hb_maps:get(<<"assignments">>, Loaded, #{}, Opts),
+                Loaded#{ <<"assignments">> => maps:map(
+                    fun(_, A) when is_map(A) ->
+                            case hb_maps:get(<<"action">>, hb_maps:get(<<"body">>, A, #{}, Opts), none, Opts) of
+                                <<"Redeem">> -> Fun(A);
+                                _ -> A
+                            end;
+                       (_, A) -> A
+                    end, As) }
+        end
+    end.
+
+%% A schedule whose assignment no longer carries the scheduler's signature:
+%% the replica halts there and nothing is signed, not even the real 1.
+bad_scheduler_signature_halts_replica_test_() ->
+    {timeout, 120, fun() ->
+        St = replica_setup(<<"badsig">>,
+            fun(_) -> tamper_redeem(fun(A) -> A#{ <<"timestamp">> => 1 } end) end),
+        St1 = pass(St),
+        ?assertEqual(<<>>, raw(<<"signs">>, St1)),
+        ?assertMatch(<<"replica: assignment not signed by the scheduler", _/binary>>,
+            maps:get(last_error, St1))
+    end}.
+
+%% A compromised scheduler re-signs an assignment whose message it altered:
+%% the message's own signature fails, and nothing is signed.
+forged_message_halts_replica_test_() ->
+    {timeout, 120, fun() ->
+        Forge = fun(Wallet) -> fun(A) ->
+            Body = hb_maps:get(<<"body">>, A, #{}, #{}),
+            Unsigned = maps:without([<<"commitments">>], A),
+            hb_message:commit(Unsigned#{ <<"body">> => Body#{ <<"amount">> => <<"999">> } },
+                #{ <<"priv-wallet">> => Wallet })
+        end end,
+        St = replica_setup(<<"forged">>, fun(W) -> tamper_redeem(Forge(W)) end),
+        St1 = pass(St),
+        ?assertEqual(<<>>, raw(<<"signs">>, St1)),
+        ?assertMatch(<<"replica: message signature does not verify", _/binary>>,
+            maps:get(last_error, St1))
+    end}.
