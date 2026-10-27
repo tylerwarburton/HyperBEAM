@@ -279,9 +279,17 @@ create_state(Base, Opts) ->
                     Opts
                 )
         end,
+    % Luerl's own collector is quadratic in the number of live tables
+    % (`hb_luerl_gc'); Lua's `collectgarbage' uses the linear one.
+    {ok, Collecting} =
+        luerl:set_table_keys(
+            [<<"collectgarbage">>],
+            #erl_mfa{ m = hb_luerl_gc, f = collectgarbage, a = nil },
+            State
+        ),
     case hb_opts:get(<<"lua-device-preload">>, undefined, Opts) of
-        Preload when is_function(Preload, 1) -> Preload(State);
-        _ -> State
+        Preload when is_function(Preload, 1) -> Preload(Collecting);
+        _ -> Collecting
     end.
 
 sandbox_list(false) -> [];
@@ -428,7 +436,7 @@ process_response({ok, [Status, MsgResult], NewState}, Priv, Opts) ->
             % only when it collects garbage, so collect after each call.
             {hb_util:atom(Status), Msg#{
                 <<"priv">> => Priv#{
-                    <<"state">> => luerl:gc(NewState)
+                    <<"state">> => hb_luerl_gc:gc(NewState)
                 }
             }};
         NonMsgRes -> {hb_util:atom(Status), NonMsgRes}
