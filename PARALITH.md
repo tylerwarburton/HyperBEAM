@@ -46,6 +46,39 @@ Settings our v0.11 nodes run with, each one decided or measured:
 | `store-retention` (+ `-checkpoints` 2, `-interval-ms` 600000, `-first-ms` 60000, `-batch-keys` 1000, `-max-cpu-pct` 25, `-max-candidates` 1000000) | `true`, defaults | delete computed states below the newest two snapshot checkpoints. Every node. Needs `patches/elmdb-delete.patch` in the build |
 | LMDB `sync` | leave unset (now `true` by default; `false` opts out) | RC7 opened every LMDB `no_sync`: a host crash could corrupt the tree, as on the old fork's main node 2026-10-20. +3 ms a game slot |
 
+## Ship gate: ms per game slot (required before a node build ships)
+
+Every functional suite passed on the build that made the test-net game 14x
+slower (2026-10-27: ~1.5 msg/s, round trip p50 174 s under a 300-wallet
+swarm). The cost grew with the size of the game's state, and every bench we
+had used 28 players. So before any build of this branch replaces a node:
+
+```bash
+# on the box that built the image (or GAME_BENCH_SSH="root@<host> -i <key>")
+bench/game-slot-bench.sh runerealm-hb:<tag>        # 300 players, 200 slots, max 20
+```
+
+It runs `bench/game_slot_bench.erl` in a throwaway container of the built
+image (3 CPUs, ~2 minutes): a `lua-patch@1.0` process seeded with 300 players
+of ~3 KB, each its own published key (the test-net game: ~1 MB, ~430 keys),
+then 200 single-player mutations, each scheduled and computed through the
+process worker with the test node's store options. It FAILS when the
+worker's mean busy time per slot (`worker_execute`) is above 20 ms. That is
+the number every message to one process queues behind: 1000 / it is the
+process's ceiling in slots a second.
+
+Baseline, paralith box, 2026-10-27, two runs each:
+
+| Build | Worker ms/slot | Compute round trip | Slot execution | Schedule (bench client) |
+|---|---:|---:|---:|---:|
+| 5d5dbbf90 (before; timer added) | 167 | 183-184 ms | 57-61 ms | 52 ms |
+| 3a83a1509 (worker without state hashing) | 11.6-12.1 | 40-41 ms | 4.1-4.3 ms | 50-51 ms |
+
+The monorepo's deploy runs the matching live check against the target node
+(`backend/native/load-gate.mjs`, `npm run load:gate`): a throwaway game with
+300 players, `Sprite.Update` at 20 msg/s for 60 s from 20 burners, failing on
+round trip p95 or confirmed throughput.
+
 ## Port order
 
 Safe and small first. Every step: port, run its tests, re-run the bench, record
