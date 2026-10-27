@@ -42,6 +42,8 @@ Settings our v0.11 nodes run with, each one decided or measured:
 | `rate-limit-requests` / `-period` / `-max` / `-min` / `-exempt` | as prod (`node-config.base.json`: 60000 per 60 s; exempt our servers' IPs) | RC7's default limiter allows a burst of 1,000 then ~17/s per client, and refuses beyond: game backends, indexers and bots get 429s under load. Same keys as the old fork |
 | `irreplaceable-store` | a local `hb_store_lmdb` (was `essentials-store`), e.g. `/app/cache-mainnet/irreplaceable` | assignments, their messages and process definitions in their own store, so a damaged or wiped main store loses nothing that cannot be recomputed. Never on a network filesystem |
 | `irreplaceable-export` | `{path, journal, max-fill-pct}` (was `essentials-export`, same three keys) | journals every irreplaceable write and ships it to the backup mount. Main only |
+| `process-state-blobs` | `true` | computed slots as one row each under `pstate/`, the only rows retention may delete. Every node |
+| `store-retention` (+ `-checkpoints` 2, `-interval-ms` 600000, `-first-ms` 60000, `-batch-keys` 1000, `-max-cpu-pct` 25, `-max-candidates` 1000000) | `true`, defaults | delete computed states below the newest two snapshot checkpoints. Every node. Needs `patches/elmdb-delete.patch` in the build |
 | LMDB `sync` | leave unset (now `true` by default; `false` opts out) | RC7 opened every LMDB `no_sync`: a host crash could corrupt the tree, as on the old fork's main node 2026-10-20. +3 ms a game slot |
 
 ## Port order
@@ -162,7 +164,7 @@ the numbers below with the reason they moved.
      too. Not ported: `migrate`/`verify` (v0.11 lands on a fresh deploy
      only) and routing for the bundler and Arweave block caches (unused on
      our nodes; regenerable).
-   - **`hb_store_offsite_journal`** (from `hb_store_export`, ~860 lines plus tests,
+   - **`hb_store_offsite_journal`** (from `hb_store_export`, ~1,150 lines plus tests,
      instead of ~2,400). Write-ahead: the writer appends a write to the
      local journal, then writes the inner store; `flush` (the scheduler's,
      before it confirms a slot) syncs the journal, then flushes the inner
@@ -176,17 +178,48 @@ the numbers below with the reason they moved.
      unshipped local segments. Not ported: base images and gap marks (the
      write-ahead order and the reconcile replace them), local pruning after
      export, the target-op gate.
-   - **`hb_store_retention` not ported.** It is not redundant: nothing in
-     RC7 ever deletes a row, and with delta storage the main store still
-     grows ~16 MiB per 1,000 game slots, the irreplaceable store ~14 MiB.
-     But it cannot be built on RC7 as it is: the pinned `elmdb` (94f6d30)
-     has no delete, and the fork's collector stood on an 851-line `elmdb`
-     patch (delete, guarded delete, write tracking, reference scans), on
-     the fork's link/group layout and on `process-state-blobs`, none of
-     which exist here. **Decision for Tyler**: port a delete into `elmdb`
-     and write a v0.11 retention, or launch main without one and watch
-     disk (the old fork's main ran `store-retention: false` anyway, and
-     pruned essentials to 6 h only because they were exported).
+   - **`hb_store_retention`** (from `hb_store_gc`, ~260 lines instead of
+     ~3,800; required before prod, decided 2026-10-27). Three parts:
+     - `patches/elmdb-delete.patch` (237 lines, the fork's was 851):
+       `elmdb:delete_batch/2`, one write-worker command that commits the
+       overlay and deletes the keys in one transaction. No guarded delete,
+       write tracking or reference scans: nothing here needs them. Applied
+       after `rebar3 get-deps` (`patch -p1 -d _build/default/lib/elmdb`);
+       verified from a clean `get-deps`, patch, `compile --deps_only`.
+       Without it retention refuses to start, and its test fails.
+     - `process-state-blobs` in `lib_process_cache`: a delta process's slot
+       is one row under `pstate/<proc>/{d,f,s}/<slot>` (delta envelope,
+       full state, snapshot marker written after the state), owned by that
+       process and slot and referenced by nothing. RC7's content-addressed
+       layout shares rows between states and the definition, so no row of
+       it is ever safe to delete.
+     - The collector: keeps the newest `store-retention-checkpoints` (2)
+       snapshot checkpoints and every slot from the oldest of them up;
+       deletes `pstate/` rows below, highest slot first (what a crash leaves
+       is still a readable chain), in one-transaction batches, throttled to
+       `store-retention-max-cpu-pct`. Only keys of the exact
+       `pstate/<id>/{s,d,f}/<12 digits>` form can reach the delete; the
+       irreplaceable store is never chosen. Assignments, messages,
+       definitions and kept checkpoints are therefore never candidates.
+   - Audit fixes (2026-10-27, each with a test that failed first): a failed
+     journal sync poisons the run (never retried); only confirmed writes
+     restore (`flushed`/`start`/`revoke` markers) and confirmed-only marks
+     make reconcile journal a reassigned slot as the inner store has it;
+     frames carry a magic, so mid-file damage stops the writer, the
+     shipper and a restore while a torn tail of the open segment is cut;
+     the manifest carries a hash chain and tolerates a torn last line;
+     restore refuses gaps in a process's assignments; directories are
+     synced after renames; spawns are flushed before they are answered; a
+     definition's `image`/`module` given by ID is copied into the
+     scheduler's store; the closure follows `ao://with-commitments=`.
+     Signing an assignment no longer leaves a copy of its body in the main
+     store (it went to the node's first store: ~1.8 KB a slot that no
+     retention may touch).
+   - Deliberately not in the irreplaceable store: `~bundler@1.0` (our nodes
+     send no bundles), `~arweave@2.9` blocks (refetched from a gateway),
+     `~meta@1.0` (the node config file is the source). `~location@1.0`
+     goes there already, through `scheduler-store`. Our Lua processes carry
+     their module inline in the definition.
 
    Tests (`hb-v11-dev`, `--with-core --module=hb_store_offsite_journal,
    hb_store_irreplaceable,dev_scheduler_cache`): 17/17 (5 journal, 2
@@ -239,11 +272,60 @@ the numbers below with the reason they moved.
      irreplaceable store measured the same) and not order (reading it
      first measured the same).
    - Irreplaceable store: +20% disk (30 vs 25 MiB per 1,000 slots), as
-     signing the assignment leaves a copy of the body in the main store.
+     signing the assignment left a copy of the body in the main store.
+     Since fixed (8d997fbd9); about half of that figure was also the
+     bench client's own signing, now kept out of the node's stores.
    - Offsite journal: +2-4 ms a slot (an `fdatasync` per confirmed slot,
      and the write-ahead hop through the writer). The offsite copy is ~9%
      of the irreplaceable store's size (gzip).
    - Everything at once: ~97 -> ~108 ms a game slot in the VM (+11%).
+
+   Retention tests (`--with-core --module=hb_store_retention,
+   lib_process_cache,hb_store_offsite_journal,hb_store_irreplaceable,
+   dev_scheduler,dev_scheduler_cache,dev_scheduler_server,dev_process`):
+   74/76, the same two redirect failures as without this unit.
+   - `kill -9` in the middle of a run, 20 rounds: 20 processes, 90,180
+     doomed rows among 102,000 assignments and kept rows, batches of 50,
+     throttled to 50%, killed after 1-4.5 s (3,650-47,090 rows deleted).
+     Every time: LMDB opens, every assignment and definition and every kept
+     row is intact, what was deleted is exactly a prefix of each process's
+     top-down plan, and the next run deletes the rest.
+   - Recompute (`bench/retention_bench.erl recompute`, game-shaped process,
+     3,000 slots, a snapshot checkpoint every 500): retention deleted 2,505
+     rows (7 checkpoints -> 2, 2,994 deltas -> 499) in 58 ms. Then, with
+     the worker and hot cache dropped, all equal on every published key:
+     the head recomputed from an empty main store (the irreplaceable store
+     alone, 121 s for 3,001 slots); the next slot resumed from the kept
+     checkpoint (1.1 s) against the same from scratch; slot 100, below the
+     floor, recomputed against the same from scratch.
+   - Disk, 20,000 game-shaped slots, retention every 60 s (main store):
+
+     | Slot | RC7 layout | blobs, no retention | blobs + retention |
+     |---:|---:|---:|---:|
+     | 4,000 | 213 MiB | 33 MiB | 23 MiB |
+     | 10,000 | 1,756 MiB | 229 MiB | 102 MiB |
+     | 16,000 | 4,299 MiB | 599 MiB | 136 MiB |
+     | 20,000 | 6,327 MiB | 878 MiB | 193 MiB |
+
+     (RC7 layout from the first run, before the bench client's signing was
+     moved out of the node's store: ~3.7 KB a slot of it is that.) With
+     retention the main store holds, logically, 92 MiB at the end: 3
+     checkpoints (the 2 kept and 1 written since the last run) and 998
+     deltas, nothing else. The file is about twice that because LMDB
+     never shrinks: it holds the peak (new checkpoints written before the
+     next run frees old ones) and reuses the space after. Its size tracks
+     the checkpoint size, which in this bench grew from ~15 to ~31 MiB
+     (the Lua VM image grows); bound ~= 2 x (kept + new) x checkpoint.
+   - Slot cost while a run is in progress: 8 of 20,001 slots overlapped
+     one, median 186 vs 119 ms (p95 263 vs 230). Slot median with
+     retention on is the same as without (119 ms, same box, same time).
+
+   Trade-offs, retention: a slot that overlaps a run waits for a delete
+   batch's synced commit (+~70 ms, rare); `process-state-blobs` writes a
+   checkpoint as one compressed row instead of deduplicated
+   content-addressed rows (on this bench far smaller: 878 vs 6,327 MiB);
+   a read below the floor recomputes from the start; LMDB keeps its
+   high-water mark.
 8. **`bridge-attestor@1.0`**, `evm-rpc@1.0`, chain signing: ported
    (2026-10-27) from `dev_bridge`, `hb_bridge_sign`, `hb_bridge_chains` and
    `dev_eth_client`, with the 2026-10-26 polling fix (fixed 15 s nudge
