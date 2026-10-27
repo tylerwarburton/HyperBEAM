@@ -18,6 +18,7 @@
 -export([device_info/1, init/3, compute/4, snapshot/3, normalize/3, functions/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("luerl/include/luerl.hrl").
 
 -define(PATCH_LUA, <<"lua-patch@1.0">>).
 -define(VERSION, {lua_atomic, version}).
@@ -25,6 +26,8 @@
 -define(HOST_FUNCTIONS, [<<"get">>, <<"resolve">>, <<"set">>, <<"event">>]).
 
 %% @doc Install raw closure callbacks without decoding the closure environment.
+%% Every read and write is raw, so no metamethod a module set on `_G' or `ao'
+%% runs while the host functions are in hand.
 install_atomic(State) ->
     S0 = luerl:put_private(?VERSION, 1, State),
     S1 = lists:foldl(
@@ -32,10 +35,29 @@ install_atomic(State) ->
         luerl:put_private(?DEPTH, 0, S0),
         ?HOST_FUNCTIONS
     ),
-    {ok, S2} = luerl:set_table_keys_dec([ao, atomic], fun atomic/2, S1),
-    {ok, S3} = luerl:set_table_keys_dec([ao, atomic_version], 1, S2),
-    {ok, S4} = luerl:set_table_keys_dec([collectgarbage], fun collect/2, S3),
-    S4.
+    S2 = raw_set(raw_ao(S1), <<"atomic">>, fun atomic/2, S1),
+    S3 = raw_set(raw_ao(S2), <<"atomic_version">>, 1, S2),
+    preload(S3).
+
+%% @doc Replace `collectgarbage' (`lua-device-preload'). It runs before any
+%% module code, so no module can keep Luerl's own, and again on a restored VM,
+%% whose copy the restore dropped.
+preload(State) ->
+    raw_set(State#luerl.g, <<"collectgarbage">>, fun collect/2, State).
+
+raw_ao(State) ->
+    luerl_heap:raw_get_table_key(State#luerl.g, <<"ao">>, State).
+
+raw_set(Table, Key, Value, State) ->
+    {Encoded, S1} = luerl:encode(Value, State),
+    luerl_heap:raw_set_table_key(Table, Key, Encoded, S1).
+
+%% @doc Whether a batch is running.
+in_batch(State) ->
+    case private(?DEPTH, State) of
+        Depth when is_integer(Depth) -> Depth > 0;
+        _ -> false
+    end.
 
 %% @doc `collectgarbage' that does nothing inside a batch. A batch runs through
 %% `luerl:call_function/3', which starts a new call stack, so the frames of the
@@ -45,19 +67,21 @@ install_atomic(State) ->
 %% outside a batch does the work. Outside a batch this is Luerl's own
 %% `collectgarbage', called on the current state so its stack stays a root.
 collect(Args, State) ->
-    case private(?DEPTH, State) > 0 of
+    case in_batch(State) of
         true -> {[], State};
         false -> luerl_lib_basic:collectgarbage(nil, Args, State)
     end.
 
 %% @doc Wrap host entries before the VM is exposed to a caller. The library is
-%% installed after module loading, so Lua cannot retain an original host alias
-%% before these wrappers are installed. The mandatory sandbox removes other
-%% host-effect sources, and VMs from other devices are rejected by `init/3'.
+%% installed after module loading with raw writes (`dev_lua_lib'), and no Lua
+%% runs between that and this, so Lua never holds an unwrapped host function.
+%% The mandatory sandbox removes other host-effect sources, and VMs from other
+%% devices are rejected by `init/3'.
 guard_host(Name, State) ->
-    {ok, Original, S0} = luerl:get_table_keys([<<"ao">>, Name], State),
+    AO = raw_ao(State),
+    Original = luerl_heap:raw_get_table_key(AO, Name, State),
     Wrapper = fun(Args, Current) ->
-        case private(?DEPTH, Current) > 0 of
+        case in_batch(Current) of
             true -> luerl_lib:lua_error(
                 {assert_error, <<"Host calls are forbidden inside ao.atomic">>},
                 Current
@@ -69,8 +93,7 @@ guard_host(Name, State) ->
                 end
         end
     end,
-    {ok, S1} = luerl:set_table_keys_dec([ao, Name], Wrapper, S0),
-    S1.
+    raw_set(AO, Name, Wrapper, State).
 
 %% @doc A version witness prevents importing an unrestricted VM into this device.
 atomic_enabled(State) ->
@@ -156,11 +179,18 @@ refuse() ->
 %% @doc The node options with this device's sandbox added. `dev_lua' applies it
 %% on top of the node's minimum sandbox, before any module loads.
 strict(Opts) ->
-    Opts#{ <<"lua-device-sandbox">> => sandbox() }.
+    Opts#{
+        <<"lua-device-sandbox">> => sandbox(),
+        <<"lua-device-preload">> => fun preload/1
+    }.
 
 %% @doc Restrict both global names and package aliases before module loading.
+%% `math.random' is seeded per node, so it is refused whatever the process sets
+%% `requires-determinism' to (`os' is gone entirely).
 sandbox() ->
     [
+        {[math, random], <<"sandboxed">>},
+        {[math, randomseed], <<"sandboxed">>},
         {[loadfile], <<"sandboxed">>},
         {[dofile], <<"sandboxed">>},
         {[print], <<"sandboxed">>},
@@ -354,6 +384,128 @@ module_sandbox_test() ->
     Opts = #{ <<"hashpath">> => ignore, <<"lua-minimum-sandbox">> => false },
     {ok, Result} = hb_ao:resolve(Base, <<"compute">>, Opts),
     ?assertEqual(<<"yes">>, hb_ao:get(<<"safe">>, Result, Opts)).
+
+%% @doc `math.random' is unavailable even to a base that does not ask for
+%% determinism, from module load on.
+no_random_test() ->
+    hb:init(),
+    Opts = #{ <<"hashpath">> => ignore },
+    Script = <<"""
+        local early = type(math.random)
+        function compute(req)
+            return { patches = {{ path = '/random',
+                value = early .. ' ' .. type(math.random) .. ' ' .. type(math.randomseed) }} }
+        end
+        """>>,
+    Base = (base(Script))#{ <<"requires-determinism">> => false },
+    {ok, Result} = hb_ao:resolve(Base, <<"compute">>, Opts),
+    ?assertEqual(<<"string string string">>, hb_ao:get(<<"random">>, Result, Opts)).
+
+%% @doc A module that keeps its own `collectgarbage' while it loads gets the
+%% batch-safe one: collecting through the alias inside a batch, committed or
+%% rolled back, leaves the caller's locals alive.
+module_gc_alias_test() ->
+    hb:init(),
+    Opts = #{ <<"hashpath">> => ignore },
+    Script = <<"""
+        local gc = collectgarbage
+        function compute(req)
+            local mine = { owner = 'alice', balance = 100 }
+            ao.atomic(function() gc('collect'); return true end)
+            ao.atomic(function() gc('collect'); return false, 'refused' end)
+            local seen = tostring(mine.owner) .. ' ' .. tostring(mine.balance)
+            return { patches = {{ path = '/seen', value = seen }} }
+        end
+        """>>,
+    {ok, Result} = hb_ao:resolve(base(Script), <<"compute">>, Opts),
+    ?assertEqual(<<"alice 100">>, hb_ao:get(<<"seen">>, Result, Opts)).
+
+%% @doc A restored VM never holds Luerl's own `collectgarbage', wherever the
+%% snapshot put it: the restore drops it like any other host function.
+restore_drops_original_gc_test() ->
+    hb:init(),
+    Opts = #{ <<"hashpath">> => ignore },
+    Script = <<"""
+        function compute(req)
+            return { patches = {{ path = '/orig', value = type(Orig) }} }
+        end
+        """>>,
+    {ok, First} = hb_ao:resolve(base(Script), <<"compute">>, Opts),
+    State = hb_private:get(<<"state">>, First, Opts),
+    Fresh = luerl:init(),
+    #erl_mfa{} = Orig =
+        luerl_heap:raw_get_table_key(Fresh#luerl.g, <<"collectgarbage">>, Fresh),
+    {ok, Planted} = luerl:set_table_keys([<<"Orig">>], Orig, State),
+    Live = hb_private:set(First, <<"state">>, Planted, Opts),
+    {ok, Snapshot} = hb_ao:resolve(Live, <<"snapshot">>, Opts),
+    Cold = hb_ao:set(hb_private:reset(First), <<"snapshot">>, Snapshot, Opts),
+    {ok, Restored} = hb_ao:resolve(Cold, <<"normalize">>, Opts),
+    {ok, Second} = hb_ao:resolve(Restored, <<"compute">>, Opts),
+    ?assertEqual(<<"nil">>, hb_ao:get(<<"orig">>, Second, Opts)).
+
+%% @doc A module cannot catch the raw host functions with `__newindex' on `_G'
+%% and on the `ao' table that is installed after it loads.
+newindex_capture_at_install_test() ->
+    hb:init(),
+    Opts = #{ <<"hashpath">> => ignore },
+    Script = <<"""
+        Captured = {}
+        setmetatable(_G, { __newindex = function(t, k, v)
+            if k == 'ao' and type(v) == 'table' then
+                setmetatable(v, { __newindex = function(t2, k2, v2)
+                    Captured[k2] = v2
+                    rawset(t2, k2, v2)
+                end })
+            end
+            rawset(t, k, v)
+        end })
+        function compute(req)
+            local ran = ao.atomic(function()
+                if Captured.get then Captured.get('x', { x = 'y' }) end
+                return true
+            end)
+            local caught = tostring(Captured.get ~= nil)
+            return { patches = {
+                { path = '/caught', value = caught },
+                { path = '/ran', value = tostring(ran) }
+            } }
+        end
+        """>>,
+    {ok, Result} = hb_ao:resolve(base(Script), <<"compute">>, Opts),
+    ?assertEqual(<<"false">>, hb_ao:get(<<"caught">>, Result, Opts)).
+
+%% @doc Nor with `__newindex' on `ao' set at compute time, with `ao.get'
+%% removed, which a restore would fire when it sets the host functions again.
+newindex_capture_at_restore_test() ->
+    hb:init(),
+    Opts = #{ <<"hashpath">> => ignore },
+    Script = <<"""
+        Captured = Captured or {}
+        function compute(req)
+            if getmetatable(ao) == nil then
+                setmetatable(ao, { __newindex = function(t, k, v)
+                    Captured[k] = v
+                    rawset(t, k, v)
+                end })
+                rawset(ao, 'get', nil)
+            end
+            local ran = ao.atomic(function()
+                if Captured.get then Captured.get('x', { x = 'y' }) end
+                return true
+            end)
+            return { patches = {
+                { path = '/caught', value = tostring(Captured.get ~= nil) },
+                { path = '/ran', value = tostring(ran) }
+            } }
+        end
+        """>>,
+    {ok, First} = hb_ao:resolve(base(Script), <<"compute">>, Opts),
+    ?assertEqual(<<"false">>, hb_ao:get(<<"caught">>, First, Opts)),
+    {ok, Snapshot} = hb_ao:resolve(First, <<"snapshot">>, Opts),
+    Cold = hb_ao:set(hb_private:reset(First), <<"snapshot">>, Snapshot, Opts),
+    {ok, Restored} = hb_ao:resolve(Cold, <<"normalize">>, Opts),
+    {ok, Second} = hb_ao:resolve(Restored, <<"compute">>, Opts),
+    ?assertEqual(<<"false">>, hb_ao:get(<<"caught">>, Second, Opts)).
 
 %% @doc The monorepo's deploy tooling (`contract-device.mjs', `ATOMIC_PROBE')
 %% refuses a custody deployment unless a plain HTTP POST of this script answers
