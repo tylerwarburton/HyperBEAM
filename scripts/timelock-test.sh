@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Build this tree in a container (erlang:27, with the blst NIF) and run the
-# `vrf@1.0' tests and the `lua@5.3a' tests next to them. Uncommitted changes
+# `timelock@1.0' tests and the `lua@5.3a' tests next to them. Uncommitted changes
 # are included. An argument replaces the default `--devices' list, e.g.
-#   scripts/vrf-test.sh dev_vrf
+#   scripts/timelock-test.sh dev_timelock
 set -euo pipefail
 cd "$(dirname "$0")/.."
-DEVICES="${1:-dev_vrf,dev_lua}"
+DEVICES="${1:-dev_timelock,dev_lua}"
 SUBMODULES="native/lib/secp256k1 native/lib/blst"
 git submodule update --init $SUBMODULES
 tmp="$(mktemp -d)"
@@ -21,6 +21,6 @@ for sm in $SUBMODULES; do
         --prefix="$sm/" -o "$tmp/sm.tar" HEAD
     tar -Af "$tmp/src.tar" "$tmp/sm.tar"
 done
-cp scripts/vrf-test.Dockerfile "$tmp/Dockerfile"
-docker build -t hb-vrf-test "$tmp"
-docker run --rm hb-vrf-test rebar3 device test --devices "$DEVICES"
+cp scripts/timelock-test.Dockerfile "$tmp/Dockerfile"
+docker build -t hb-timelock-test "$tmp"
+docker run --rm hb-timelock-test rebar3 device test --devices "$DEVICES"
