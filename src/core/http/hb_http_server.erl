@@ -1011,7 +1011,9 @@ set_default_opts(Opts) ->
         <<"priv-wallet">> => Wallet,
         <<"address">> => hb_util:human_id(ar_wallet:to_address(Wallet)),
         <<"committer">> => hb_opts:committer(#{ <<"priv-wallet">> => Wallet }),
-        <<"force-signed">> => true
+        % Sign the hashpath of every reply unless the node is configured not
+        % to: each one is an RSA signature.
+        <<"force-signed">> => hb_opts:get(force_signed, true, TempOpts)
     }.
 
 %% @doc Test that we can start the server, send a message, and get a response.
@@ -2610,3 +2612,13 @@ signed_request_query_riders_test() ->
             Opts
         )
     ).
+
+force_signed_follows_config_test() ->
+    Store = [hb_test_utils:test_store()],
+    Wallet = ar_wallet:new(),
+    Base = #{ <<"store">> => Store, <<"priv-wallet">> => Wallet },
+    ?assertEqual(true,
+        hb_maps:get(<<"force-signed">>, set_default_opts(Base), unset, #{})),
+    ?assertEqual(false,
+        hb_maps:get(<<"force-signed">>,
+            set_default_opts(Base#{ <<"force-signed">> => false }), unset, #{})).
