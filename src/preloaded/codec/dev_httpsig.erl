@@ -449,14 +449,12 @@ normalize_for_encoding(Msg, Commitment, Ordered, Opts) ->
                 }
             )
     end,
-    % Encode the message without its commitments.
-    {ok, EncodedWithSigInfo} =
-        to(
-            maps:without([<<"commitments">>], Msg),
-            #{
-                <<"bundle">> =>
-                    hb_util:atom(maps:get(<<"bundle">>, Commitment, false))
-            },
+    % Encode the message without its commitments. `to/3' drops its private
+    % element too, so the encoding does not depend on it.
+    EncodedWithSigInfo =
+        encode_uncommitted(
+            maps:without([<<"commitments">>, <<"priv">>], Msg),
+            hb_util:atom(maps:get(<<"bundle">>, Commitment, false)),
             Opts
         ),
     % `to/3' adds the `content-digest' key of a binary body, so remove the
@@ -529,6 +527,46 @@ normalize_for_encoding(Msg, Commitment, Ordered, Opts) ->
         Commitment#{ <<"committed">> => Components },
         KeysForCommitment
     }.
+
+%% @doc The `httpsig@1.0' encoding of a message without its commitments, from
+%% which every signature base of the message is built. It is a function of the
+%% message and its bundle flag alone, and one request derives it for the same
+%% message several times: its unsigned ID, the ID in its hashpath, and the
+%% commitments that normalization makes and verifies all encode it. So a
+%% process keeps its last few large encodings, and reuses one for an exactly
+%% equal (`=:=') message. Comparing a term with itself costs nothing; a message
+%% that differs is encoded again.
+-define(ENCODING_MEMO, {?MODULE, encoding_memo}).
+-define(ENCODING_MEMO_ENTRIES, 4).
+%% An encoding with a smaller body is cheaper to make again than to keep.
+-define(ENCODING_MEMO_MIN_BODY, 8192).
+encode_uncommitted(Msg, Bundle, Opts) ->
+    Memo = case get(?ENCODING_MEMO) of undefined -> []; Entries -> Entries end,
+    case memo_find(Msg, Bundle, Memo) of
+        {ok, Encoded} -> Encoded;
+        not_found ->
+            {ok, Encoded} = to(Msg, #{ <<"bundle">> => Bundle }, Opts),
+            case maps:get(<<"body">>, Encoded, <<>>) of
+                Body when is_binary(Body),
+                        byte_size(Body) >= ?ENCODING_MEMO_MIN_BODY ->
+                    put(
+                        ?ENCODING_MEMO,
+                        lists:sublist(
+                            [{Msg, Bundle, Encoded} | Memo],
+                            ?ENCODING_MEMO_ENTRIES
+                        )
+                    );
+                _ -> ok
+            end,
+            Encoded
+    end.
+
+%% @doc Find an encoding by exact equality: `lists:keyfind/3' compares with
+%% `==', under which `1' and `1.0' are the same key.
+memo_find(_Msg, _Bundle, []) -> not_found;
+memo_find(Msg, Bundle, [{Key, Bundle, Encoded} | _]) when Key =:= Msg ->
+    {ok, Encoded};
+memo_find(Msg, Bundle, [_ | Rest]) -> memo_find(Msg, Bundle, Rest).
 
 %% @doc Order the components of a signature as a commitment lists its keys. The
 %% keys of the body are covered together by `content-digest', at the place of
@@ -1041,3 +1079,52 @@ sign_and_verify_link_test() ->
     Signed = hb_message:commit(NormMsg, Opts),
     ?event_debug({signed_msg, Signed}),
     ?assert(hb_message:verify(Signed, Opts)).
+
+%% @doc A reused encoding gives the IDs that encoding the message again gives.
+%% The expected IDs are those of the build before encodings were reused.
+encoding_memo_keeps_ids_test() ->
+    Big = binary:copy(<<"0123456789abcdef">>, 4096),
+    Flat = #{ <<"body">> => Big, <<"key">> => <<"value">> },
+    Nested =
+        #{
+            <<"data">> => Big,
+            <<"n">> => 1,
+            <<"nested">> => #{ <<"body">> => Big, <<"f">> => 1.5 }
+        },
+    Expected =
+        [
+            {Flat, <<"WpQj_Ql-4kwXayhepg9EMO_7hkN8l5enjcjqiHYr89Y">>},
+            % The private element is not part of the message's identity, so
+            % the encoding of the message without it is reused.
+            {Flat#{ <<"priv">> => #{ <<"hashpath">> => <<"x">> } },
+                <<"WpQj_Ql-4kwXayhepg9EMO_7hkN8l5enjcjqiHYr89Y">>},
+            {Nested, <<"c17XDBh3deqcyjLGBHzWLkEOafoFZ5OuZzTbkKUn6Ds">>}
+        ],
+    erase(?ENCODING_MEMO),
+    lists:foreach(
+        fun({Msg, ID}) ->
+            ?assertEqual(ID, hb_message:id(Msg, all, #{})),
+            ?assertEqual(ID, hb_message:id(Msg, all, #{})),
+            Unsigned =
+                hb_message:commit(Msg, #{}, #{ <<"type">> => <<"unsigned">> }),
+            ?assertEqual(
+                [ID],
+                maps:keys(maps:get(<<"commitments">>, Unsigned))
+            ),
+            ?assert(hb_message:verify(Unsigned, all, #{}))
+        end,
+        Expected
+    ),
+    ?assertNotEqual(undefined, get(?ENCODING_MEMO)),
+    % A changed message is encoded again, not served the encoding it had.
+    ?assertNotEqual(
+        <<"WpQj_Ql-4kwXayhepg9EMO_7hkN8l5enjcjqiHYr89Y">>,
+        hb_message:id(Flat#{ <<"key">> => <<"other">> }, all, #{})
+    ).
+
+%% @doc An encoding is found only for an exactly equal message.
+encoding_memo_exact_match_test() ->
+    Memo = [{#{ <<"n">> => 1 }, false, encoded}],
+    ?assertEqual({ok, encoded}, memo_find(#{ <<"n">> => 1 }, false, Memo)),
+    ?assertEqual(not_found, memo_find(#{ <<"n">> => 1.0 }, false, Memo)),
+    ?assertEqual(not_found, memo_find(#{ <<"n">> => 1 }, true, Memo)).
