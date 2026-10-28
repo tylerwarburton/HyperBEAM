@@ -430,8 +430,12 @@ path(ProcID, Ref, PathSuffix, _Opts) ->
 latest(ProcID, Opts) -> latest(ProcID, [], Opts).
 latest(ProcID, RequiredPath, Opts) ->
     latest(ProcID, RequiredPath, undefined, Opts).
-latest(ProcID, RawRequiredPath, Limit, RawOpts) ->
+latest(ProcID, RawRequiredPath, RawLimit, RawOpts) ->
     Opts = lib_process:scoped_opts(RawOpts),
+    % A slot limit arrives as a binary from an HTTP request. Compared with
+    % integer slots it would admit every slot (any integer sorts below any
+    % binary), and the hot cache's `Limit + 1' would raise.
+    Limit = slot_limit(RawLimit),
     % Convert the required path to a list of _binary_ keys.
     RequiredPath =
         case RawRequiredPath of
@@ -452,6 +456,11 @@ latest(ProcID, RawRequiredPath, Limit, RawOpts) ->
             end;
         not_found -> latest_stored(ProcID, RequiredPath, Limit, Opts)
     end.
+
+slot_limit(undefined) -> undefined;
+slot_limit(not_found) -> undefined;
+slot_limit(Limit) when is_integer(Limit) -> Limit;
+slot_limit(Limit) -> hb_util:int(Limit).
 
 %% @doc The latest stored slot, listing every slot of the process.
 latest_stored(ProcID, RequiredPath, Limit, Opts) ->
@@ -1112,3 +1121,25 @@ state_blobs_full_state_test() ->
     {ok, R} = read(ProcID, 1, Opts),
     ?assertEqual(<<"1">>, hb_maps:get(<<"count">>, R)),
     ?assertMatch({ok, 2, _}, latest(ProcID, [<<"snapshot">>], undefined, Opts)).
+
+%% @doc A slot limit given as a binary (as an HTTP request gives it) limits
+%% the search like the integer: from the hot cache and from the store.
+binary_slot_limit_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb),
+    Opts = #{ <<"store">> => Store, <<"process-delta-cache">> => true,
+              <<"process-state-blobs">> => true },
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    lists:foreach(
+        fun(N) ->
+            Msg = #{ <<"count">> => integer_to_binary(N), <<"at-slot">> => N },
+            Msg1 = case N rem 3 of 0 -> Msg#{ <<"snapshot">> => <<"vm">> }; _ -> Msg end,
+            {ok, _} = write(ProcID, N, Msg1, Opts)
+        end,
+        lists:seq(0, 5)),
+    ?assertMatch({ok, 4, _}, latest(ProcID, [], <<"4">>, Opts)),
+    ?assertMatch({ok, 3, _}, latest(ProcID, [<<"snapshot">>], <<"4">>, Opts)),
+    % From the store alone, as after a restart.
+    catch ets:delete_all_objects(lib_process_cache_hot),
+    ?assertMatch({ok, 4, _}, latest(ProcID, [], <<"4">>, Opts)),
+    ?assertMatch({ok, 3, _}, latest(ProcID, [<<"snapshot">>], <<"4">>, Opts)),
+    ?assertMatch({ok, 3, _}, latest(ProcID, [<<"snapshot">>], 4, Opts)).
