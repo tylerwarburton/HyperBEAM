@@ -198,7 +198,15 @@ the numbers below with the reason they moved.
    - **Collection inside running Lua is safe.** Luerl's collector missed the
      values a suspended frame's instructions hold, so collecting from inside
      an open `for ... in ipairs(...)` freed the iterated table (`badkey`).
-     `hb_luerl_gc` marks them.
+     `hb_luerl_gc` marks them. And every call Luerl makes from Erlang
+     (`pcall`, an error value's `__tostring`, `table.sort`'s comparator,
+     `string.gsub`'s replacement, `__eq`, `__index` from library code)
+     started on a new call stack, so the suspended Lua beneath it was not a
+     root: a contract that `pcall`s a function that collects lost its
+     caller's locals and the slot failed on every node.
+     `patches/luerl-nested-call-roots.patch` (applied after get-deps, as for
+     elmdb; `bench/Dockerfile.branch` does) puts the new frame on top of the
+     caller's stack instead. Every build of this branch needs it.
    - **Direct computes have a deadline.** `lua-compute-deadline` (ms,
      default 120000, `infinity`/`false` off) stops a direct call to
      lua-patch or lua-atomic with a 504; the Lua runs in its own process and
