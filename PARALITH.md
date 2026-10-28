@@ -672,6 +672,31 @@ compute, no HTTP; this is where "200-400 msg/s" comes from), pure Lua process
 
 Across processes the old fork scales: 1 process 99/s, 4 processes 251/s total.
 
+Node CPU per scheduled message (2026-10-28, paralith box, scratch container,
+3 CPUs, `split-sync` bench config, burst of 1,000 signed messages to one
+`lua@5.3a` process at c=16 then one compute; cgroup CPU / messages, three
+interleaved runs each):
+
+| Build | Node CPU / msg | RSA verifies / msg | RSA signs / msg | Schedule /s (one process) |
+|---|---:|---:|---:|---:|
+| 07c23006f | 36.1-36.8 ms | 12 | 2 | 82-83 |
+| + verify cache (3b0a6a9c8) | 34.3-35.5 ms | 2 | 2 | 82-85 |
+| + `force-signed` from config (d4f4731e8), unset | 34.6-36.7 ms | 2 | 2 | 83-84 |
+| same, `"force-signed": false` | 30.8-31.1 ms (one run 34.6) | 2 | 1 | 72-76 |
+
+One process's schedule rate is capped by its scheduler server, which is
+serial: per slot ~1.2 ms building the assignment, 5.4-6.2 ms its RSA-4096
+signature, 1.6 ms the cache write and 3.4-3.7 ms the irreplaceable-store
+flush (call_time, 500 messages). The base-hashpath chain is taken over the
+assignment's signed id (`hb_message:id(Assignment, all)`), so the signature
+cannot leave that path without changing every assignment id after it.
+`hb_ao:normalize_key/2` and `has_only_binary_keys/1` are called ~2,600 times
+a message but take 0.13% of perf samples; their large call_time in traced
+profiles is the tracing itself.
+
+Ship gate unchanged by these (worker 7.9-8.2 ms/slot base, 8.1 after): it
+schedules and computes inside the node and never crosses HTTP.
+
 ## Where the real game spends a slot
 
 Old fork on the bench node, game on `lua@5.3b`, 28 fixture players, node's own
