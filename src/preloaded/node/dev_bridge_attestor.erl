@@ -1325,6 +1325,22 @@ message_for_another_process_is_not_used_test_() ->
             maps:get(replica, St1))
     end}.
 
+%% A signed message without a `target', scheduled on PUSD: the honest
+%% scheduler takes the process from the path, so any wallet can send one. The
+%% assignment says the slot is PUSD's; the replica goes on past it, and the
+%% Redeem it carries is signed.
+message_without_target_is_pusds_test_() ->
+    {timeout, 120, fun() ->
+        Make = fun(_Orig) ->
+            hb_message:commit(#{ <<"action">> => <<"Redeem">>, <<"to">> => ?TEST_TO,
+                <<"amount">> => <<"5">> },
+                #{ <<"priv-wallet">> => ar_wallet:new() }, <<"httpsig@1.0">>)
+        end,
+        St = replica_setup(<<"no-target">>, fun(W) -> replace_redeem(W, Make) end),
+        St1 = pass(St),
+        ?assertEqual(<<"1=", (true_signature(St1))/binary, ";">>, raw(<<"signs">>, St1))
+    end}.
+
 %% An hmac names whoever it claims to: a message whose only commitment is an
 %% hmac carrying a committer is unsigned, and nothing is signed.
 hmac_is_not_a_signature_test_() ->
