@@ -268,10 +268,11 @@ read_target(Target, Opts) ->
                 _ -> {error, recently_not_found}
             end;
         false ->
-            case hb_cache:read(Target, Opts) of
+            case hb_cache:read(Target, Opts#{ <<"gateway-report-unavailable">> => true }) of
                 {error, not_found} ->
                     remember_missing(Target, TTL),
                     {error, not_found};
+                {error, gateway_unavailable} -> {error, not_found};
                 Other -> Other
             end
     end.
@@ -1241,6 +1242,41 @@ max_depth_test_cases() ->
 
 cron_depth_zero_push_test_() ->
     {timeout, 120, fun test_cron_depth_zero_push/0}.
+
+push_gateway_outage_test_() ->
+    {timeout, 120, fun test_push_gateway_outage/0}.
+
+%% @doc With the gateway down, a compute and a push to a target nobody has
+%% still complete: the target is refused as not found, and not remembered.
+test_push_gateway_outage() ->
+    hb_process_test_vectors:init(),
+    Opts = #{
+        <<"priv-wallet">> => hb:wallet(),
+        <<"cache-control">> => <<"always">>,
+        <<"store">> => [
+            hb_test_utils:test_store(hb_store_lmdb),
+            #{ <<"store-module">> => hb_store_gateway,
+                <<"node">> => <<"http://127.0.0.1:1">>,
+                <<"node-type">> => <<"ao">> }
+        ]
+    },
+    Base = hb_process_test_vectors:aos_process(Opts),
+    hb_cache:write(Base, Opts),
+    {ok, _} =
+        hb_ao:resolve(
+            Base,
+            #{ <<"method">> => <<"POST">>, <<"path">> => <<"schedule">>,
+                <<"body">> => Base },
+            Opts
+        ),
+    Target = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Code = <<"Send({ Target = '", Target/binary, "', Data = 'hi' })">>,
+    {ok, Req} = hb_process_test_vectors:schedule_aos_call(Base, Code, Opts),
+    {ok, Slot} = hb_ao:resolve(Req, #{ <<"path">> => <<"slot">> }, Opts),
+    {ok, Pushed} =
+        hb_ao:resolve(Base, #{ <<"path">> => <<"push">>, <<"slot">> => Slot }, Opts),
+    ?event({pushed, Pushed}),
+    ?assertNot(recently_missing(Target, 60)).
 
 test_paranoid_push_result() ->
     % The `push_result' topic verifies the result before it is signed for
