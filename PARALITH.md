@@ -729,6 +729,21 @@ profiles is the tracing itself.
 Ship gate unchanged by these (worker 7.9-8.2 ms/slot base, 8.1 after): it
 schedules and computes inside the node and never crosses HTTP.
 
+Grouped scheduler flush (2026-10-28, same box and bench, three interleaved
+runs each, base ff752f851): the per-process scheduler takes every schedule
+request already queued (at most 32, never waiting for more), builds, signs and
+writes each, flushes the irreplaceable store once, then confirms them in slot
+order.
+
+| Build | Schedule /s (one process, c=16) | Node CPU / msg | Post p50 | Idle round trip p50 |
+|---|---:|---:|---:|---:|
+| ff752f851 | 73.9-74.3 | 37.9-41.0 ms | 213-215 ms | 43.6-46.8 ms |
+| grouped flush | 91.0-102.7 | 29.5-33.5 ms | 155-175 ms | 44.6-51.9 ms |
+
+kill -9 mid-burst then restart on the same store (`docker kill -s KILL`, two
+timings): no confirmed slot missing on either build, and the scheduler resumes
+at or above the newest confirmed slot.
+
 ## Where the real game spends a slot
 
 Old fork on the bench node, game on `lua@5.3b`, 28 fixture players, node's own
