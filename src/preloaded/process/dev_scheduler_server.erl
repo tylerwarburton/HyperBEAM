@@ -85,6 +85,13 @@ start(ProcID, Proc, Opts) ->
                         ?event({starting_new_schedule, {proc_id, ProcID}}),
                         {-1, undefined};
                     {Slot, Latest} ->
+                        % Only the latest slot can have been written without
+                        % its message index (each slot is flushed before the
+                        % next is assigned): write it again.
+                        ok = dev_scheduler_cache:write_message_slot(
+                            ProcID, hb_maps:get(<<"body">>, Latest, #{}, Opts),
+                            Slot, Opts),
+                        ok = dev_scheduler_cache:flush(Opts),
                         % The next assignment applies to the state after the
                         % latest one, as `do_assign/3' sets it.
                         {
@@ -202,7 +209,9 @@ schedule(ErlangProcID, Message) ->
     ErlangProcID ! {schedule, Message, self(), AbortTime},
     receive
         {scheduled, Message, Assignment} ->
-            Assignment
+            Assignment;
+        {refused, Message, Error} ->
+            {error, Error}
     after ?DEFAULT_TIMEOUT ->
         throw({scheduler_timeout, {proc_id, ErlangProcID}, {message, Message}})
     end.
@@ -265,6 +274,25 @@ do_assign(State, Message, ReplyPID) ->
             Message,
             Opts = maps:get(opts, State)
         ),
+    % A signed message is assigned at most once per process: anyone can post
+    % a message again once it is public, and it would run again.
+    case dev_scheduler_cache:find_assigned(
+            maps:get(id, State), OnlyAttested, maps:get(current, State), Opts) of
+        not_found -> do_assign(State, Message, OnlyAttested, ReplyPID);
+        {ok, Slot, ID} ->
+            ?event(scheduling, {refused_already_assigned,
+                {proc_id, maps:get(id, State)}, {slot, Slot}, {message, ID}}),
+            ReplyPID ! {refused, Message, #{
+                <<"status">> => 409,
+                <<"body">> => <<"Message already scheduled.">>,
+                <<"process">> => hb_util:human_id(maps:get(id, State)),
+                <<"message">> => ID,
+                <<"slot">> => Slot
+            }},
+            State
+    end.
+do_assign(State, Message, OnlyAttested, ReplyPID) ->
+    Opts = maps:get(opts, State),
     % Generate parameters for the assignment message and commit to it.
     BaseStateHashpath = base_state(State),
     NextSlot = maps:get(current, State) + 1,
@@ -312,6 +340,9 @@ do_assign(State, Message, ReplyPID) ->
             ),
             ?event(starting_message_write),
             ok = dev_scheduler_cache:write(maps:get(id, State), Assignment, Opts),
+            % Committed by the flush below, with the assignment.
+            ok = dev_scheduler_cache:write_message_slot(
+                maps:get(id, State), OnlyAttested, NextSlot, Opts),
             % The store may keep the write in memory: commit it before the
             % slot is confirmed. A failed commit raises, and `assign/3' keeps
             % the previous slot without answering the client.
@@ -596,3 +627,146 @@ count_calls(N, Parent) ->
         {trace, _, call, _} -> count_calls(N + 1, Parent);
         {count, From} -> From ! {calls, N}
     end.
+
+%%% A message is assigned at most once per process.
+
+dedupe_setup(Tag) ->
+    Wallet = hb:wallet(),
+    Store = hb_test_utils:test_store(hb_store_lmdb, Tag),
+    Opts = #{ <<"priv-wallet">> => Wallet, <<"store">> => [Store],
+              <<"scheduling-mode">> => local_confirmation },
+    ok = hb_store:start([Store], #{}, Opts),
+    Proc = dedupe_proc(Opts),
+    ProcID = hb_util:human_id(hb_message:id(Proc, all, Opts)),
+    {Opts, ProcID, Proc, start(ProcID, Proc, Opts)}.
+
+dedupe_proc(Opts) ->
+    hb_message:commit(#{
+        <<"device">> => <<"process@1.0">>, <<"type">> => <<"Process">>,
+        <<"scheduler-device">> => <<"scheduler@1.0">>,
+        <<"scheduler-location">> =>
+            hb_util:human_id(ar_wallet:to_address(hb_opts:get(priv_wallet, x, Opts))),
+        <<"test-random-seed">> => rand:uniform(1 bsl 40) }, Opts).
+
+slot_of(Assignment) -> hb_util:int(hb_ao:get(<<"slot">>, Assignment, #{})).
+
+%% @doc Posting a signed message again is refused with the slot it already
+%% has, also as another encoding of the same signature, and with a second
+%% signature added. No slot is taken.
+reposted_message_refused_test_() ->
+    {timeout, 60, fun() ->
+        {Opts, _ProcID, _Proc, Server} = dedupe_setup(<<"dedupe-repost">>),
+        Msg = hb_message:commit(
+            #{ <<"type">> => <<"Message">>, <<"action">> => <<"Feed">> },
+            Opts, <<"ans104@1.0">>),
+        [ID] = dev_scheduler_cache:signature_ids(Msg, Opts),
+        Slot = slot_of(schedule(Server, Msg)),
+        ?assertMatch(
+            {error, #{ <<"status">> := 409, <<"slot">> := Slot, <<"message">> := ID }},
+            schedule(Server, Msg)),
+        % The same signature as an ANS-104 item, serialized and read back.
+        TX = ar_bundles:deserialize(ar_bundles:serialize(
+            hb_message:convert(Msg, <<"ans104@1.0">>, Opts))),
+        FromItem = hb_message:convert(TX, <<"structured@1.0">>, <<"ans104@1.0">>, Opts),
+        ?assertEqual([ID], dev_scheduler_cache:signature_ids(FromItem, Opts)),
+        ?assertMatch({error, #{ <<"slot">> := Slot }}, schedule(Server, FromItem)),
+        % ...and through HTTP signature form.
+        ViaHTTPSig = hb_message:convert(
+            hb_message:convert(Msg, <<"httpsig@1.0">>, Opts),
+            <<"structured@1.0">>, <<"httpsig@1.0">>, Opts),
+        ?assertMatch({error, #{ <<"slot">> := Slot }}, schedule(Server, ViaHTTPSig)),
+        % A second signature does not make it a new message.
+        Twice = hb_message:commit(Msg, Opts#{ <<"priv-wallet">> => ar_wallet:new() }),
+        ?assertMatch({error, #{ <<"slot">> := Slot, <<"message">> := ID }},
+            schedule(Server, Twice)),
+        ?assertMatch(#{ current := Slot }, info(Server))
+    end}.
+
+%% @doc The same content signed twice is two messages: both are assigned.
+same_content_new_signature_assigned_test_() ->
+    {timeout, 60, fun() ->
+        {Opts, _ProcID, _Proc, Server} = dedupe_setup(<<"dedupe-resign">>),
+        Content = #{ <<"type">> => <<"Message">>, <<"action">> => <<"Feed">> },
+        A = hb_message:commit(Content, Opts),
+        B = hb_message:commit(Content, Opts),
+        ?assertNotEqual(dev_scheduler_cache:signature_ids(A, Opts),
+            dev_scheduler_cache:signature_ids(B, Opts)),
+        S1 = slot_of(schedule(Server, A)),
+        S2 = slot_of(schedule(Server, B)),
+        ?assertEqual(S1 + 1, S2)
+    end}.
+
+%% @doc Concurrent posts of one message take exactly one slot.
+concurrent_identical_posts_one_slot_test_() ->
+    {timeout, 60, fun() ->
+        {Opts, ProcID, _Proc, Server} = dedupe_setup(<<"dedupe-concurrent">>),
+        Msg = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 1 }, Opts),
+        Before = length(dev_scheduler_cache:list(ProcID, Opts)),
+        Parent = self(),
+        N = 20,
+        [ spawn(fun() -> Parent ! {res, schedule(Server, Msg)} end) || _ <- lists:seq(1, N) ],
+        Res = [ receive {res, R} -> R after 30000 -> timeout end || _ <- lists:seq(1, N) ],
+        {Refused, Assigned} = lists:partition(fun(R) -> element(1, R) == error end,
+            [ case R of {error, _} -> R; _ -> {ok, R} end || R <- Res ]),
+        ?assertEqual(1, length(Assigned)),
+        [{ok, A}] = Assigned,
+        Slot = slot_of(A),
+        ?assert(lists:all(fun({error, #{ <<"slot">> := S }}) -> S == Slot end, Refused)),
+        ?assertEqual(Before + 1, length(dev_scheduler_cache:list(ProcID, Opts)))
+    end}.
+
+%% @doc An index row whose assignment was never committed does not refuse the
+%% message; an assignment committed without its index row (a crash between
+%% the two) gets one when the server starts again.
+torn_index_test_() ->
+    {timeout, 60, fun() ->
+        {Opts, ProcID, Proc, Server} = dedupe_setup(<<"dedupe-torn">>),
+        #{ current := Current } = info(Server),
+        % A row past the latest slot (its assignment never committed).
+        Stale = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 1 }, Opts),
+        ok = dev_scheduler_cache:write_message_slot(ProcID, Stale, Current + 1, Opts),
+        ?assertEqual(Current + 1, slot_of(schedule(Server, Stale))),
+        % A row naming a slot that carries another message (the slot reused).
+        Other = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 2 }, Opts),
+        ok = dev_scheduler_cache:write_message_slot(ProcID, Other, Current + 1, Opts),
+        ?assertEqual(Current + 2, slot_of(schedule(Server, Other))),
+        % An assignment written as a crash would leave it: no index row.
+        Unindexed = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 3 }, Opts),
+        #{ base_state_hashpath := Base } = info(Server),
+        ok = dev_scheduler_cache:write(ProcID, #{
+            <<"variant">> => <<"ao.N.1">>, <<"type">> => <<"Assignment">>,
+            <<"process">> => ProcID, <<"slot">> => Current + 3,
+            <<"base-hashpath">> => Base, <<"body">> => Unindexed }, Opts),
+        ok = dev_scheduler_cache:flush(Opts),
+        ?assertEqual(not_found,
+            dev_scheduler_cache:find_assigned(ProcID, Unindexed, Current + 3, Opts)),
+        exit(Server, kill),
+        timer:sleep(100),
+        Server2 = start(ProcID, Proc, Opts),
+        ?assertMatch({error, #{ <<"slot">> := S }} when S == Current + 3,
+            schedule(Server2, Unindexed)),
+        ?assertMatch({error, #{ <<"slot">> := S }} when S == Current + 1,
+            schedule(Server2, Stale))
+    end}.
+
+%% @doc After the server is killed and the store closed and opened again, a
+%% message that is not the latest slot is still refused, from its index row
+%% on disk. (A real `kill -9' of the VM loses only what is not flushed, and
+%% a slot is flushed before it is confirmed; that case is run outside eunit.)
+refused_after_restart_test_() ->
+    {timeout, 60, fun() ->
+        {Opts, ProcID, Proc, Server} = dedupe_setup(<<"dedupe-restart">>),
+        [Store] = hb_opts:get(store, [], Opts),
+        Msg = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 1 }, Opts),
+        Later = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 2 }, Opts),
+        Slot = slot_of(schedule(Server, Msg)),
+        _ = schedule(Server, Later),
+        exit(Server, kill),
+        timer:sleep(100),
+        hb_store:stop(Store),
+        ok = hb_store:start([Store], #{}, Opts),
+        Server2 = start(ProcID, Proc, Opts),
+        ?assertMatch({error, #{ <<"status">> := 409, <<"slot">> := Slot }},
+            schedule(Server2, Msg)),
+        ?assertMatch(#{ current := S } when S == Slot + 1, info(Server2))
+    end}.

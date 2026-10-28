@@ -2,6 +2,7 @@
 -module(dev_scheduler_cache).
 -export([write/3, write_spawn/2, read/3, flush/1]).
 -export([list/2, latest/2]).
+-export([signature_ids/2, write_message_slot/4, find_assigned/4]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -146,6 +147,75 @@ list(ProcID, RawOpts) ->
         ]),
         Opts#{ <<"store-failure">> => throw }
     ).
+
+%% @doc The IDs of a message's signature commitments: those with a committer.
+%% Each is derived from its signature and checked against it when the message
+%% verifies (`sha256' of the signature for both `ans104@1.0' and `httpsig@1.0'),
+%% so the same signature has the same ID in either encoding, and a signature
+%% cannot be relabelled. A message signed twice has two, and neither may be
+%% assigned again, so adding a signature to a message does not make it new.
+signature_ids(Msg, Opts) ->
+    Commitments = hb_cache:ensure_all_loaded(
+        hb_maps:get(<<"commitments">>, Msg, #{}, Opts), Opts),
+    lists:sort(
+        [ hb_util:human_id(ID)
+        || {ID, Comm} <- maps:to_list(Commitments),
+           is_map(Comm), is_map_key(<<"committer">>, Comm) ]).
+
+%% @doc Index the slot under each signature ID of the message it assigns, in
+%% the scheduler's store, beside the assignment and committed with it by the
+%% same flush.
+write_message_slot(ProcID, Msg, Slot, RawOpts) ->
+    Opts = opts(RawOpts),
+    case signature_ids(Msg, Opts) of
+        [] -> ok;
+        IDs ->
+            ok = hb_store:write(
+                hb_opts:get(store, no_viable_store, Opts),
+                maps:from_list(
+                    [ {message_slot_path(ProcID, ID), hb_util:bin(Slot)} || ID <- IDs ]),
+                Opts#{ <<"store-failure">> => throw })
+    end.
+
+%% @doc The slot at or below `Current' that already carries one of the message's
+%% signatures: `{ok, Slot, ID}', or `not_found'. An index row is trusted only
+%% if that slot's assignment carries the ID, so a row whose assignment was
+%% never committed (a crash between the two, or a failed flush whose slot was
+%% then reused) does not refuse the message.
+find_assigned(ProcID, Msg, Current, RawOpts) ->
+    Opts = opts(RawOpts),
+    Store = hb_opts:get(store, no_viable_store, Opts),
+    ThrowOpts = Opts#{ <<"store-failure">> => throw },
+    find_assigned(ProcID, signature_ids(Msg, Opts), Current, Store, ThrowOpts).
+find_assigned(_ProcID, [], _Current, _Store, _Opts) -> not_found;
+find_assigned(ProcID, [ID | IDs], Current, Store, Opts) ->
+    case hb_store:read(Store, message_slot_path(ProcID, ID), Opts) of
+        {ok, SlotBin} ->
+            Slot = hb_util:int(SlotBin),
+            Carries =
+                Slot =< Current andalso
+                    case read(ProcID, Slot, Opts) of
+                        {ok, Assignment} ->
+                            lists:member(ID,
+                                signature_ids(
+                                    hb_maps:get(<<"body">>, Assignment, #{}, Opts),
+                                    Opts));
+                        not_found -> false
+                    end,
+            case Carries of
+                true -> {ok, Slot, ID};
+                false -> find_assigned(ProcID, IDs, Current, Store, Opts)
+            end;
+        _ -> find_assigned(ProcID, IDs, Current, Store, Opts)
+    end.
+
+message_slot_path(ProcID, ID) ->
+    hb_path:to_binary([
+        ?SCHEDULER_CACHE_PREFIX,
+        <<"message-slots">>,
+        hb_util:human_id(ProcID),
+        ID
+    ]).
 
 %% @doc Get the latest assignment from the cache.
 latest(ProcID, RawOpts) ->

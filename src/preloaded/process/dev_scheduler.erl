@@ -537,7 +537,7 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
                     {is_alive, is_process_alive(PID)}
                 }
             ),
-            {ok, dev_scheduler_server:schedule(PID, Req)};
+            scheduled(dev_scheduler_server:schedule(PID, Req));
         {true, _} ->
             ?event(
                 {scheduling_message,
@@ -547,8 +547,13 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
                 }
             ),
             % If Request is not a process, use the ID of Base as the PID
-            {ok, dev_scheduler_server:schedule(PID, Req)}
+            scheduled(dev_scheduler_server:schedule(PID, Req))
     end.
+
+%% @doc A refusal from the scheduling server (a message it has already
+%% assigned) is the request's error; anything else is the assignment.
+scheduled({error, Error}) -> {error, Error};
+scheduled(Assignment) -> {ok, Assignment}.
 
 %% @doc Locate the correct scheduling server for a given process.
 find_server(ProcID, Base, Opts) ->
@@ -1654,17 +1659,26 @@ schedule_does_not_borrow_another_process_test_parallel() ->
 schedule_message_and_get_slot_test_parallel() ->
     start(),
     Base = hb_message:commit(test_process(), #{ <<"priv-wallet">> => hb:wallet() }),
-    Req = #{
-        <<"path">> => <<"schedule">>,
-        <<"method">> => <<"POST">>,
-        <<"body">> =>
-            hb_message:commit(#{
-                <<"type">> => <<"Message">>,
-                <<"test-key">> => <<"true">>
-            }, #{ <<"priv-wallet">> => hb:wallet() })
-    },
-    ?assertMatch({ok, _}, hb_ao:resolve(Base, Req, #{})),
-    ?assertMatch({ok, _}, hb_ao:resolve(Base, Req, #{})),
+    MkReq =
+        fun() ->
+            #{
+                <<"path">> => <<"schedule">>,
+                <<"method">> => <<"POST">>,
+                <<"body">> =>
+                    hb_message:commit(#{
+                        <<"type">> => <<"Message">>,
+                        <<"test-key">> => <<"true">>
+                    }, #{ <<"priv-wallet">> => hb:wallet() })
+            }
+        end,
+    Req = MkReq(),
+    {ok, First} = hb_ao:resolve(Base, Req, #{}),
+    ?assertMatch({ok, _}, hb_ao:resolve(Base, MkReq(), #{})),
+    % The same signed message again is refused, naming its slot.
+    FirstSlot = hb_ao:get(<<"slot">>, First, #{}),
+    ?assertMatch(
+        {error, #{ <<"status">> := 409, <<"slot">> := FirstSlot }},
+        hb_ao:resolve(Base, Req, #{})),
     Res = #{
         <<"path">> => <<"slot">>,
         <<"method">> => <<"GET">>,
@@ -1701,18 +1715,21 @@ schedule_with_binary_mode_test_parallel() ->
                 <<"scheduler-publish-remote">> => false
             },
             Base = hb_message:commit(test_process(), Opts),
-            Req = #{
-                <<"path">> => <<"schedule">>,
-                <<"method">> => <<"POST">>,
-                <<"body">> =>
-                    hb_message:commit(
-                        #{ <<"type">> => <<"Message">>, <<"test-key">> => Mode },
-                        Opts
-                    )
-            },
+            MkReq =
+                fun() ->
+                    #{
+                        <<"path">> => <<"schedule">>,
+                        <<"method">> => <<"POST">>,
+                        <<"body">> =>
+                            hb_message:commit(
+                                #{ <<"type">> => <<"Message">>, <<"test-key">> => Mode },
+                                Opts
+                            )
+                    }
+                end,
             Start = erlang:monotonic_time(millisecond),
-            ?assertMatch({ok, _}, hb_ao:resolve(Base, Req, Opts)),
-            ?assertMatch({ok, _}, hb_ao:resolve(Base, Req, Opts)),
+            ?assertMatch({ok, _}, hb_ao:resolve(Base, MkReq(), Opts)),
+            ?assertMatch({ok, _}, hb_ao:resolve(Base, MkReq(), Opts)),
             ?assert(erlang:monotonic_time(millisecond) - Start < 5000)
         end,
         [<<"aggressive">>, <<"local_confirmation">>, <<"remote_confirmation">>]
@@ -1942,7 +1959,7 @@ http_get_schedule_test_parallel_() ->
 			<<"method">> => <<"POST">>,
 			<<"body">> => PMsg
 		}, Opts),
-		Req = hb_message:commit(#{
+		MkReq = fun() -> hb_message:commit(#{
 			<<"path">> => <<"/~scheduler@1.0/schedule">>,
 			<<"method">> => <<"POST">>,
 			<<"body">> =>
@@ -1957,11 +1974,11 @@ http_get_schedule_test_parallel_() ->
                     },
                     Opts
                 )
-		}, Opts),
+		}, Opts) end,
 		{ok, _} = hb_http:post(Node, Base, Opts),
 			lists:foreach(
 				fun(_) ->
-	                {ok, Res} = hb_http:post(Node, Req, Opts),
+	                {ok, Res} = hb_http:post(Node, MkReq(), Opts),
 	                ?event(debug_scheduler_test, {res, Res})
 	            end,
 					lists:seq(1, 3)
@@ -2066,7 +2083,7 @@ http_get_json_schedule_test_parallel_() ->
 			<<"body">> => PMsg
 		}, Opts),
 		{ok, _} = hb_http:post(Node, Base, Opts),
-		Req = hb_message:commit(#{
+		MkReq = fun() -> hb_message:commit(#{
 			<<"path">> => <<"/~scheduler@1.0/schedule">>,
 			<<"method">> => <<"POST">>,
 			<<"body">> =>
@@ -2079,9 +2096,9 @@ http_get_json_schedule_test_parallel_() ->
 				)
 			},
 			Opts
-		),
+		) end,
 			lists:foreach(
-				fun(_) -> {ok, _} = hb_http:post(Node, Req, Opts) end,
+				fun(_) -> {ok, _} = hb_http:post(Node, MkReq(), Opts) end,
 					lists:seq(1, 3)
 				),
 				?assertMatch({ok, #{ <<"current">> := 3 }}, http_get_slot(Node, PMsg)),
@@ -2196,13 +2213,13 @@ single_resolution(Opts) ->
         end,
     Base = hb_message:commit(test_process(SignedOpts), SignedOpts),
     ?event({benchmark_start, ?MODULE}),
-    MsgToSchedule = hb_message:commit(#{
-        <<"type">> => <<"Message">>,
-        <<"test-key">> => <<"test-val">>
-    }, SignedOpts),
-    {ok, _} = hb_cache:write(MsgToSchedule, SignedOpts),
     Iterations = hb_test_utils:benchmark(
         fun(_) ->
+            % Each a new signed message: one is assigned at most once.
+            MsgToSchedule = hb_message:commit(#{
+                <<"type">> => <<"Message">>,
+                <<"test-key">> => <<"test-val">>
+            }, SignedOpts),
             MsgX = #{
                 <<"path">> => <<"schedule">>,
                 <<"method">> => <<"POST">>,
@@ -2239,16 +2256,17 @@ many_clients(Opts) ->
     Processes = hb_opts:get(workers, 25, Opts),
     {Node, HTTPOpts} = http_init(Opts),
     PMsg = hb_message:commit(test_process(HTTPOpts), HTTPOpts),
-    Base = hb_message:commit(#{
+    % Each a new signed message: one is assigned at most once.
+    MkBase = fun() -> hb_message:commit(#{
         <<"path">> => <<"/~scheduler@1.0/schedule">>,
         <<"method">> => <<"POST">>,
         <<"process">> => PMsg,
         <<"body">> => hb_message:commit(#{ <<"inner">> => <<"test">> }, HTTPOpts)
-    }, HTTPOpts),
-    {ok, _} = hb_http:post(Node, Base, HTTPOpts),
+    }, HTTPOpts) end,
+    {ok, _} = hb_http:post(Node, MkBase(), HTTPOpts),
     Iterations = hb_test_utils:benchmark(
         fun(X) ->
-            {ok, _} = hb_http:post(Node, Base, HTTPOpts),
+            {ok, _} = hb_http:post(Node, MkBase(), HTTPOpts),
             ?event(bench, {iteration, X, self()})
         end,
         BenchTime,
