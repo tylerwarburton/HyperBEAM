@@ -11,8 +11,8 @@
 %%%     the message whose ID is PUSD's.
 %%%   - An assignment: what PUSD's scheduler's signature vouches for, if it is
 %%%     the next slot of PUSD and its `base-hashpath' continues the chain.
-%%%   - Its message: what a real signature on it vouches for, if it is
-%%%     addressed to PUSD.
+%%%   - Its message: what a real signature on it vouches for, if it names no
+%%%     other process as its `target'.
 %%%
 %%% A real signature is a commitment whose algorithm (`type' or `alg') is a
 %%% signature algorithm and that verifies; an hmac names whoever it claims to
@@ -192,7 +192,12 @@ step(A, #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers,
         need(Get(<<"base-hashpath">>) =:= Chain, <<"assignment breaks the hash chain">>),
         Body = need(vouched(hb_cache:ensure_all_loaded(Get(<<"body">>), Opts), any, Opts),
             <<"message signature does not verify">>),
-        need(hb_maps:get(<<"target">>, Body, none, Opts) =:= Pusd, <<"message is for another process">>),
+        % The vouched assignment says whose slot this is; a message that names
+        % a process at all must name PUSD.
+        need(case hb_maps:get(<<"target">>, Body, none, Opts) of
+                none -> true;
+                Target -> (catch hb_util:human_id(Target)) =:= Pusd
+            end, <<"message is for another process">>),
         {ok, Kept#{ <<"body">> => Body }, hb_message:id(Kept, all, Opts)}
     catch
         throw:{refused, Why} -> {refused, Why};
