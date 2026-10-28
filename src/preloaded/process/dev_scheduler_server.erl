@@ -14,6 +14,9 @@
 %%% confirmation of the assignment, but the scheduler still processes it.
 -define(DEFAULT_TIMEOUT, 10000).
 
+%%% At most this many queued schedule requests share one store flush.
+-define(MAX_BATCH, 32).
+
 %% @doc Start a scheduling server for a given computation. Once the server has
 %% started it attempts to register on the message ID for the process definition.
 %% If there is already a scheduler registered on the message ID, it will return
@@ -226,36 +229,161 @@ stop(ProcID) ->
     ?event({stopping_scheduling_server, {proc_id, ProcID}}),
     ProcID ! stop.
 
-%% @doc The main loop of the server. Simply waits for messages to assign and
-%% returns the current slot.
+%% @doc The main loop of the server. Waits for messages to assign. Requests
+%% already queued when one arrives are assigned with it, as one batch (see
+%% `assign_batch/2'); the server never waits for a batch to fill.
 server(State) ->
     receive
         {schedule, Message, Reply, AbortTime} ->
-            case SchedTime = scheduler_time() > AbortTime of
-                true ->
-                    % Ignore scheduling requests if they are too old. The
-                    % `abort-time' signals to us that the client has already
-                    % given up on the request, so in order to maintain
-                    % predictability we ignore it.
-                    ?event(error,
-                        {received_old_schedule_request,
-                            {abort_time, AbortTime},
-                            {sched_time, SchedTime}
-                        }
-                    ),
-                    server(State);
-                false ->
-                    server(assign(State, Message, Reply))
-            end;
+            Requests =
+                [{Message, Reply, AbortTime} | queued(?MAX_BATCH - 1)],
+            server(assign_batch(State, Requests));
         {info, Reply} ->
             Reply ! {info, State},
             server(State);
         stop ->
-            ?event({stopping_scheduler_server, {proc_id, maps:get(id, State)}}),
+            ?event({stopping_scheduling_server, {proc_id, maps:get(id, State)}}),
             ok
     end.
 
-%% @doc Assign a message to the next slot.
+%% @doc The schedule requests already in the mailbox, oldest first, at most
+%% `N'. Never waits.
+queued(0) -> [];
+queued(N) ->
+    receive
+        {schedule, Message, Reply, AbortTime} ->
+            [{Message, Reply, AbortTime} | queued(N - 1)]
+    after 0 -> []
+    end.
+
+%% @doc Assign a batch of requests in arrival order. Each one is built, signed
+%% and written as before; then the store is flushed ONCE for the batch, and
+%% only then is each client told its slot, in slot order. A confirmation never
+%% precedes the flush of its assignment. A request that fails is skipped and
+%% keeps no slot. If the flush fails, nobody is answered and the slot counter
+%% stays where it was before the batch, as a failed flush did per message.
+%% In `aggressive' mode a client is told before the write, so there is nothing
+%% to batch: each request goes the old way.
+assign_batch(State = #{ mode := aggressive }, Requests) ->
+    lists:foldl(
+        fun({Message, Reply, AbortTime}, S) ->
+            case too_old(AbortTime) of
+                true -> S;
+                false -> assign(S, Message, Reply)
+            end
+        end,
+        State,
+        Requests
+    );
+assign_batch(State, Requests) ->
+    {Assigned, Written} =
+        lists:foldl(
+            fun({Message, Reply, AbortTime}, {S, Acc}) ->
+                case too_old(AbortTime) of
+                    true -> {S, Acc};
+                    false ->
+                        try write_assignment(S, Message) of
+                            {refused, Error} ->
+                                {S, [{refused, Reply, Message, Error} | Acc]};
+                            {S2, Assignment} ->
+                                {S2, [{Reply, Message, Assignment} | Acc]}
+                        catch
+                            _Class:Reason:Stack ->
+                                ?event({error_scheduling,
+                                    {reason, Reason}, {trace, Stack}}),
+                                {S, Acc}
+                        end
+                end
+            end,
+            {State, []},
+            Requests
+        ),
+    case Written of
+        [] -> Assigned;
+        _ ->
+            try ok = dev_scheduler_cache:flush(maps:get(opts, State)) of
+                ok ->
+                    % A refusal can name a slot of this batch, so it waits
+                    % for the flush too.
+                    lists:foreach(
+                        fun({refused, Reply, Message, Error}) ->
+                               Reply ! {refused, Message, Error};
+                           ({Reply, Message, Assignment}) ->
+                            confirm(Reply, Message, Assignment, Assigned)
+                        end,
+                        lists:reverse(Written)
+                    ),
+                    Assigned
+            catch
+                _FClass:FReason:FStack ->
+                    ?event(error, {scheduler_flush_failed,
+                        {reason, FReason}, {trace, FStack}}),
+                    State
+            end
+    end.
+
+%% @doc Whether the client has already given up on a request. Such requests
+%% are ignored, so that no slot is taken for a message nobody was told about.
+too_old(AbortTime) ->
+    case (SchedTime = scheduler_time()) > AbortTime of
+        true ->
+            ?event(error,
+                {received_old_schedule_request,
+                    {abort_time, AbortTime},
+                    {sched_time, SchedTime}
+                }
+            ),
+            true;
+        false -> false
+    end.
+
+%% @doc Build, sign and write the next assignment, and its message index row
+%% right after it; return the next state. A signed message is assigned at
+%% most once per process (anyone can post a public message again, and it
+%% would run again): one already assigned is `{refused, Error}'.
+write_assignment(State, Message) ->
+    Opts = maps:get(opts, State),
+    ProcID = maps:get(id, State),
+    {ok, OnlyAttested} = hb_message:with_only_committed(Message, Opts),
+    case dev_scheduler_cache:find_assigned(
+            ProcID, OnlyAttested, maps:get(current, State), Opts) of
+        {ok, Slot, ID} -> {refused, refusal(State, Slot, ID)};
+        not_found ->
+            {Assignment, Next} = build_assignment(State, Message),
+            ok = dev_scheduler_cache:write(ProcID, Assignment, Opts),
+            ok = dev_scheduler_cache:write_message_slot(
+                ProcID, OnlyAttested, maps:get(current, Next), Opts),
+            {Next, Assignment}
+    end.
+
+refusal(State, Slot, ID) ->
+    ?event(scheduling, {refused_already_assigned,
+        {proc_id, maps:get(id, State)}, {slot, Slot}, {message, ID}}),
+    #{
+        <<"status">> => 409,
+        <<"body">> => <<"Message already scheduled.">>,
+        <<"process">> => hb_util:human_id(maps:get(id, State)),
+        <<"message">> => ID,
+        <<"slot">> => Slot
+    }.
+
+%% @doc Answer a client whose assignment is flushed, publishing it first if
+%% the node publishes remotely.
+confirm(ReplyPID, Message, Assignment, State) ->
+    Opts = maps:get(opts, State),
+    maybe_inform_recipient(local_confirmation, ReplyPID, Message, Assignment, State),
+    % Publishing is a network round trip made inside the scheduling loop:
+    % measured at ~120 ms a message on a node with no reachable bundler.
+    % `scheduler-publish-remote => false' keeps a node's schedule local.
+    case hb_opts:get(scheduler_publish_remote, true, Opts) of
+        false -> ok;
+        _ ->
+            upload(Message, Opts),
+            upload(Assignment, Opts)
+    end,
+    maybe_inform_recipient(remote_confirmation, ReplyPID, Message, Assignment, State).
+
+%% @doc Assign a message to the next slot (`aggressive' mode).
 assign(State, Message, ReplyPID) ->
     try
         do_assign(State, Message, ReplyPID)
@@ -265,8 +393,32 @@ assign(State, Message, ReplyPID) ->
             State
     end.
 
-%% @doc Generate and store the actual assignment message.
+%% @doc Tell the client first, then write the assignment in the background.
 do_assign(State, Message, ReplyPID) ->
+    Opts = maps:get(opts, State),
+    {ok, OnlyAttested} = hb_message:with_only_committed(Message, Opts),
+    case dev_scheduler_cache:find_assigned(
+            maps:get(id, State), OnlyAttested, maps:get(current, State), Opts) of
+        {ok, Slot, ID} ->
+            ReplyPID ! {refused, Message, refusal(State, Slot, ID)},
+            State;
+        not_found -> do_assign(State, Message, ReplyPID, Opts)
+    end.
+do_assign(State, Message, ReplyPID, Opts) ->
+    {Assignment, Next} = build_assignment(State, Message),
+    spawn(
+        fun() ->
+            maybe_inform_recipient(aggressive, ReplyPID, Message, Assignment, State),
+            ok = dev_scheduler_cache:write(maps:get(id, State), Assignment, Opts),
+            ok = dev_scheduler_cache:flush(Opts),
+            confirm(ReplyPID, Message, Assignment, State)
+        end
+    ),
+    Next.
+
+%% @doc Generate and sign the assignment for the next slot, and the state that
+%% follows it.
+build_assignment(State, Message) ->
     % Ensure that only committed keys from the message are included in the
     % assignment.
     {ok, OnlyAttested} =
@@ -274,25 +426,6 @@ do_assign(State, Message, ReplyPID) ->
             Message,
             Opts = maps:get(opts, State)
         ),
-    % A signed message is assigned at most once per process: anyone can post
-    % a message again once it is public, and it would run again.
-    case dev_scheduler_cache:find_assigned(
-            maps:get(id, State), OnlyAttested, maps:get(current, State), Opts) of
-        not_found -> do_assign(State, Message, OnlyAttested, ReplyPID);
-        {ok, Slot, ID} ->
-            ?event(scheduling, {refused_already_assigned,
-                {proc_id, maps:get(id, State)}, {slot, Slot}, {message, ID}}),
-            ReplyPID ! {refused, Message, #{
-                <<"status">> => 409,
-                <<"body">> => <<"Message already scheduled.">>,
-                <<"process">> => hb_util:human_id(maps:get(id, State)),
-                <<"message">> => ID,
-                <<"slot">> => Slot
-            }},
-            State
-    end.
-do_assign(State, Message, OnlyAttested, ReplyPID) ->
-    Opts = maps:get(opts, State),
     % Generate parameters for the assignment message and commit to it.
     BaseStateHashpath = base_state(State),
     NextSlot = maps:get(current, State) + 1,
@@ -321,73 +454,20 @@ do_assign(State, Message, OnlyAttested, ReplyPID) ->
             },
             State
         ),
-    DispatchFun =
-        fun() ->
-            AssignmentID = hb_message:id(Assignment, all),
-            ?event(scheduling,
-                {assigned,
-                    {proc_id, maps:get(id, State)},
-                    {slot, NextSlot},
-                    {assignment, AssignmentID}
-                }
-            ),
-            maybe_inform_recipient(
-                aggressive,
-                ReplyPID,
-                Message,
-                Assignment,
-                State
-            ),
-            ?event(starting_message_write),
-            ok = dev_scheduler_cache:write(maps:get(id, State), Assignment, Opts),
-            % Committed by the flush below, with the assignment.
-            ok = dev_scheduler_cache:write_message_slot(
-                maps:get(id, State), OnlyAttested, NextSlot, Opts),
-            % The store may keep the write in memory: commit it before the
-            % slot is confirmed. A failed commit raises, and `assign/3' keeps
-            % the previous slot without answering the client.
-            ok = dev_scheduler_cache:flush(Opts),
-            maybe_inform_recipient(
-                local_confirmation,
-                ReplyPID,
-                Message,
-                Assignment,
-                State
-            ),
-            ?event(writes_complete),
-            % Publishing is a network round trip made inside the scheduling
-            % loop, so it holds every later slot behind this one's upload:
-            % measured at ~120 ms a message, 8 msg/s, on a node with no
-            % reachable bundler. `scheduler-publish-remote => false' keeps a
-            % node's schedule local.
-            case hb_opts:get(scheduler_publish_remote, true, Opts) of
-                false ->
-                    ?event(remote_publication_disabled);
-                _ ->
-                    ?event(uploading_message),
-                    upload(Message, Opts),
-                    upload(Assignment, Opts),
-                    ?event(uploads_complete)
-            end,
-            maybe_inform_recipient(
-                remote_confirmation,
-                ReplyPID,
-                Message,
-                Assignment,
-                State
-            )
-        end,
-    case maps:get(mode, State) of
-        aggressive ->
-            spawn(DispatchFun);
-        Other ->
-            ?event({scheduling_mode, Other}),
-            DispatchFun()
-    end,
-    % Update the state with the next hashpath.
-    State#{
-        current := NextSlot,
-        base_state_hashpath := next_hashpath(BaseStateHashpath, Assignment, State)
+    ?event(scheduling,
+        {assigned,
+            {proc_id, maps:get(id, State)},
+            {slot, NextSlot},
+            {assignment, hb_message:id(Assignment, all)}
+        }
+    ),
+    {
+        Assignment,
+        State#{
+            current := NextSlot,
+            base_state_hashpath :=
+                next_hashpath(BaseStateHashpath, Assignment, State)
+        }
     }.
 
 %% @doc Commit to the assignment using all of our appropriate wallets.
@@ -769,4 +849,132 @@ refused_after_restart_test_() ->
         ?assertMatch({error, #{ <<"status">> := 409, <<"slot">> := Slot }},
             schedule(Server2, Msg)),
         ?assertMatch(#{ current := S } when S == Slot + 1, info(Server2))
+    end}.
+
+%% @doc A fresh process with its own LMDB store and a started scheduler.
+batch_test_server(Name) ->
+    Wallet = hb:wallet(),
+    Store = hb_test_utils:test_store(hb_store_lmdb, Name),
+    Opts = #{ <<"priv-wallet">> => Wallet, <<"store">> => [Store],
+              <<"scheduling-mode">> => local_confirmation },
+    ok = hb_store:start([Store], #{}, Opts),
+    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Proc = hb_message:commit(#{
+        <<"device">> => <<"process@1.0">>, <<"type">> => <<"Process">>,
+        <<"scheduler-device">> => <<"scheduler@1.0">>,
+        <<"scheduler-location">> => Address,
+        <<"test-random-seed">> => rand:uniform(1 bsl 40) }, Opts),
+    ProcID = hb_util:human_id(hb_message:id(Proc, all, Opts)),
+    {start(ProcID, Proc, Opts), Opts}.
+
+%% @doc Send `N' schedule requests while the server is suspended, so that all
+%% of them are queued when it next runs. Returns the messages in send order.
+queue_requests(Server, N, Opts) ->
+    Msgs = [ hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => I }, Opts)
+           || I <- lists:seq(1, N) ],
+    erlang:suspend_process(Server),
+    Abort = scheduler_time() + ?DEFAULT_TIMEOUT,
+    [ Server ! {schedule, M, self(), Abort} || M <- Msgs ],
+    Msgs.
+
+%% @doc Every confirmation in arrival order, as `{Message, Slot}'.
+confirmations(Msgs, Opts) ->
+    [ receive
+          {scheduled, M, A} -> {M, hb_util:int(hb_ao:get(<<"slot">>, A, Opts))}
+      after 30000 -> timeout
+      end
+    || M <- Msgs ].
+
+%% @doc Queued requests share one flush, and are confirmed in slot order,
+%% which is the order they arrived in.
+queued_requests_share_one_flush_test_() ->
+    {timeout, 90, fun() ->
+        {Server, Opts} = batch_test_server(<<"sched-batch">>),
+        {module, CacheMod} = erlang:fun_info(fun dev_scheduler_cache:flush/1, module),
+        N = 10,
+        Msgs = queue_requests(Server, N, Opts),
+        erlang:trace_pattern({CacheMod, flush, 1}, true, [local, call_count]),
+        erlang:trace(Server, true, [call]),
+        erlang:resume_process(Server),
+        Confirmed = confirmations(Msgs, Opts),
+        erlang:trace(Server, false, [call]),
+        {call_count, Flushes} = erlang:trace_info({CacheMod, flush, 1}, call_count),
+        erlang:trace_pattern({CacheMod, flush, 1}, false, [local, call_count]),
+        ?assertEqual(lists:zip(Msgs, lists:seq(0, N - 1)), Confirmed),
+        ?assertEqual(1, Flushes)
+    end}.
+
+%% @doc No client hears of its slot before the flush that follows the write of
+%% its assignment has returned: the server's own calls and sends, in order.
+no_confirmation_before_its_flush_test_() ->
+    {timeout, 90, fun() ->
+        {Server, Opts} = batch_test_server(<<"sched-batch-order">>),
+        {module, CacheMod} = erlang:fun_info(fun dev_scheduler_cache:flush/1, module),
+        Parent = self(),
+        Tracer = spawn(fun() -> collect_trace([], Parent) end),
+        Msgs = queue_requests(Server, 6, Opts),
+        erlang:trace_pattern({CacheMod, write, 3}, true, [global]),
+        erlang:trace_pattern({CacheMod, flush, 1}, [{'_', [], [{return_trace}]}], [global]),
+        erlang:trace(Server, true, [call, send, {tracer, Tracer}]),
+        erlang:resume_process(Server),
+        Confirmed = confirmations(Msgs, Opts),
+        erlang:trace(Server, false, [call, send]),
+        erlang:trace_pattern({CacheMod, '_', '_'}, false, [global]),
+        Tracer ! {done, self()},
+        Events = receive {events, E} -> E after 5000 -> [] end,
+        % Walk the server's events: a write makes its slot pending, a flush
+        % that returns makes every pending slot durable, and a confirmation
+        % is only allowed for a durable slot.
+        Check =
+            fun Walk([], _Pending, _Durable) -> ok;
+                Walk([{write, Slot} | Rest], Pending, Durable) ->
+                    Walk(Rest, [Slot | Pending], Durable);
+                Walk([flushed | Rest], Pending, Durable) ->
+                    Walk(Rest, [], Pending ++ Durable);
+                Walk([{confirmed, Slot} | Rest], Pending, Durable) ->
+                    ?assert(lists:member(Slot, Durable)),
+                    Walk(Rest, Pending, Durable)
+            end,
+        Classified =
+            [ Ev || Raw <- Events, Ev <- [classify(Raw, CacheMod, Opts)], Ev =/= skip ],
+        ?assertEqual(6, length([ x || {confirmed, _} <- Classified ])),
+        ?assertEqual(ok, Check(Classified, [], [])),
+        ?assertEqual(lists:seq(0, 5), [ S || {_, S} <- Confirmed ])
+    end}.
+
+classify({trace, _, call, {Mod, write, [_, Assignment, _]}}, Mod, Opts) ->
+    {write, hb_util:int(hb_ao:get(<<"slot">>, Assignment, Opts))};
+classify({trace, _, return_from, {Mod, flush, 1}, ok}, Mod, _Opts) ->
+    flushed;
+classify({trace, _, send, {scheduled, _, Assignment}, _}, _Mod, Opts) ->
+    {confirmed, hb_util:int(hb_ao:get(<<"slot">>, Assignment, Opts))};
+classify(_, _, _) -> skip.
+
+collect_trace(Acc, Parent) ->
+    receive
+        {done, From} -> From ! {events, lists:reverse(Acc)};
+        Ev -> collect_trace([Ev | Acc], Parent)
+    end.
+
+%% @doc A request to an idle server is flushed and confirmed at once: it does
+%% not wait for others to share its flush.
+idle_request_confirmed_alone_test_() ->
+    {timeout, 60, fun() ->
+        {Server, Opts} = batch_test_server(<<"sched-batch-idle">>),
+        {module, CacheMod} = erlang:fun_info(fun dev_scheduler_cache:flush/1, module),
+        erlang:trace_pattern({CacheMod, flush, 1}, true, [local, call_count]),
+        erlang:trace(Server, true, [call]),
+        Times =
+            [ begin
+                  Msg = hb_message:commit(
+                      #{ <<"type">> => <<"Message">>, <<"n">> => I }, Opts),
+                  {T, _} = timer:tc(fun() -> schedule(Server, Msg) end),
+                  T div 1000
+              end
+            || I <- lists:seq(1, 3) ],
+        erlang:trace(Server, false, [call]),
+        {call_count, Flushes} = erlang:trace_info({CacheMod, flush, 1}, call_count),
+        erlang:trace_pattern({CacheMod, flush, 1}, false, [local, call_count]),
+        ?assertEqual(3, Flushes),
+        ?assert(lists:max(Times) < 2000)
     end}.
