@@ -282,7 +282,7 @@ spawn_lookahead_worker(ProcID, Slot, Opts) ->
                     {caller, Caller}
                 }
             ),
-            case dev_scheduler_cache:read(ProcID, Slot, Opts) of
+            case dev_scheduler_cache:read_durable(ProcID, Slot, Opts) of
                 {ok, Assignment} ->
                     LoadedAssignment = hb_cache:ensure_all_loaded(Assignment, Opts),
                     Caller ! {assignment, ProcID, Slot, LoadedAssignment};
@@ -335,7 +335,7 @@ check_lookahead_and_local_cache(undefined, ProcID, TargetSlot, Opts) ->
     % The lookahead worker has not found an assignment for the target
     % slot yet, so we check our local cache.
     ?event(next_lookahead, {reading_local_cache, {slot, TargetSlot}}),
-    case dev_scheduler_cache:read(ProcID, TargetSlot, Opts) of
+    case dev_scheduler_cache:read_durable(ProcID, TargetSlot, Opts) of
         not_found -> not_found;
         {ok, Assignment} ->
             % We have an assignment in our local cache, so we return it.
@@ -778,8 +778,10 @@ slot(M1, M2, Opts) ->
         {local, PID} ->
             ?event({getting_current_slot, {proc_id, ProcID}}),
             {Timestamp, Height, Hash} = ar_timestamp:get(),
-            #{ current := CurrentSlot, wallets := Wallets } =
+            #{ current := Assigned, wallets := Wallets } =
                 dev_scheduler_server:info(PID),
+            % The newest slot that is durable, not the newest assigned.
+            CurrentSlot = min(Assigned, dev_scheduler_cache:durable(ProcID)),
             {ok, #{
                 <<"process">> => ProcID,
                 <<"current">> => CurrentSlot,
@@ -1525,7 +1527,8 @@ get_local_assignments(ProcID, From, undefined, Opts) ->
             % No assignments in cache.
             {[], false};
         {Slot, _} ->
-            get_local_assignments(ProcID, From, Slot, Opts)
+            get_local_assignments(
+                ProcID, From, min(Slot, dev_scheduler_cache:durable(ProcID)), Opts)
     end;
 get_local_assignments(ProcID, From, RequestedTo, Opts) ->
     ?event({handling_req_to_get_assignments, ProcID, {from, From}, {to, RequestedTo}}),
@@ -1543,7 +1546,7 @@ get_local_assignments(ProcID, From, RequestedTo, Opts) ->
 read_local_assignments(_ProcID, From, To, _Opts) when From > To ->
     [];
 read_local_assignments(ProcID, CurrentSlot, To, Opts) ->
-    case dev_scheduler_cache:read(ProcID, CurrentSlot, Opts) of
+    case dev_scheduler_cache:read_durable(ProcID, CurrentSlot, Opts) of
         not_found ->
             % No assignment found in cache.
             [];
@@ -2153,6 +2156,8 @@ http_cache_remote_schedule() ->
             #{ <<"priv-wallet">> => ar_wallet:new() }
         ),
     ok = dev_scheduler_cache:write(ProcID, Forged, SchedOpts),
+    % Served as if it were durable, as a dishonest scheduler would serve it.
+    ok = dev_scheduler_cache:set_durable(ProcID, 1),
     Location =
         hb_message:commit(
             #{
@@ -2409,4 +2414,47 @@ spawn_with_json_store_config_test_() ->
                 hb_ao:resolve(Base, #{ <<"method">> => <<"POST">>,
                     <<"path">> => <<"schedule">>, <<"body">> => Msg }, Opts)
             end))
+    end}.
+
+%% @doc Nothing is computed from, or served for, a slot whose assignment is
+%% written but not durable. Here the batch's flush fails, as a crash between
+%% the write and the flush would leave it: slot 1 is in the store, readable,
+%% but only slot 0 is given to compute or served as the schedule.
+undurable_slot_not_computed_or_served_test_() ->
+    {timeout, 90, fun() ->
+        start(),
+        Wallet = hb:wallet(),
+        Inner = (hb_test_utils:test_store(hb_store_lmdb, <<"durable-slots">>))#{
+            <<"capacity">> => 1 bsl 30 },
+        Store = hb_store_offsite_journal:wrap(Inner,
+            #{ <<"path">> => <<(maps:get(<<"name">>, Inner))/binary, "-export">> }),
+        Opts = #{ <<"priv-wallet">> => Wallet, <<"store">> => [Store],
+                  <<"scheduling-mode">> => local_confirmation,
+                  <<"scheduler-lookahead">> => false },
+        ok = hb_store:start([Store], #{}, Opts),
+        Proc = hb_message:commit(test_process(Opts), Opts),
+        ProcID = hb_util:human_id(hb_message:id(Proc, all, Opts)),
+        Server = dev_scheduler_server:start(ProcID, Proc, Opts),
+        M1 = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 1 }, Opts),
+        M2 = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 2 }, Opts),
+        _ = dev_scheduler_server:schedule(Server, M1),
+        Ref = monitor(process, Server),
+        erlang:suspend_process(Server),
+        Server ! {schedule, M2, self(), erlang:system_time(millisecond) + 10000},
+        persistent_term:put({hb_store_offsite_journal, fail_sync}, true),
+        try
+            erlang:resume_process(Server),
+            receive {'DOWN', Ref, _, _, _} -> ok after 10000 -> error(server_alive) end
+        after
+            persistent_term:erase({hb_store_offsite_journal, fail_sync})
+        end,
+        % The assignment of slot 1 was written: the window is real.
+        ?assertMatch({ok, _}, dev_scheduler_cache:read(ProcID, 1, Opts)),
+        ?assertMatch({ok, _, _},
+            check_lookahead_and_local_cache(undefined, ProcID, 0, Opts)),
+        ?assertEqual(not_found,
+            check_lookahead_and_local_cache(undefined, ProcID, 1, Opts)),
+        {Served, _} = get_local_assignments(ProcID, 0, undefined, Opts),
+        ?assertEqual([0],
+            [ hb_util:int(hb_ao:get(<<"slot">>, A, Opts)) || A <- Served ])
     end}.

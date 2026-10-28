@@ -3,6 +3,7 @@
 -export([write/3, write_spawn/2, read/3, flush/1]).
 -export([list/2, latest/2]).
 -export([signature_ids/2, write_message_slot/4, find_assigned/4]).
+-export([set_durable/2, clear_durable/1, durable/1, read_durable/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -216,6 +217,56 @@ message_slot_path(ProcID, ID) ->
         hb_util:human_id(ProcID),
         ID
     ]).
+
+%% @doc The newest slot of a process scheduled here that is known durable
+%% (flushed to the scheduler's store), as the process's scheduling server
+%% last set it; `infinity' if none has (the process is not scheduled here).
+%% An assignment above it may be written but not yet flushed: a crash can
+%% lose it and the slot number be given to another message, so nothing may
+%% be computed from it, pushed or served before it is durable.
+durable(ProcID) ->
+    case ets:lookup(durable_table(), hb_util:human_id(ProcID)) of
+        [{_, Slot}] -> Slot;
+        [] -> infinity
+    end.
+
+set_durable(ProcID, Slot) ->
+    true = ets:insert(durable_table(), {hb_util:human_id(ProcID), Slot}),
+    ok.
+
+clear_durable(ProcID) ->
+    true = ets:delete(durable_table(), hb_util:human_id(ProcID)),
+    ok.
+
+%% @doc Read an assignment only if its slot is durable: what compute and the
+%% schedule served to others read.
+read_durable(ProcID, Slot, Opts) ->
+    case hb_util:int(Slot) =< durable(ProcID) of
+        true -> read(ProcID, Slot, Opts);
+        false -> not_found
+    end.
+
+%% @doc The node-wide table of durable slots. Its owner is a process of its
+%% own that never exits, so the table outlives any scheduler or caller.
+durable_table() ->
+    case ets:whereis(dev_scheduler_durable) of
+        undefined ->
+            Self = self(),
+            spawn(
+                fun() ->
+                    try ets:new(dev_scheduler_durable,
+                            [named_table, public, {read_concurrency, true}]) of
+                        _ ->
+                            Self ! durable_table,
+                            receive never -> ok end
+                    catch error:badarg -> Self ! durable_table
+                    end
+                end
+            ),
+            receive durable_table -> ok end,
+            ets:whereis(dev_scheduler_durable);
+        Tab -> Tab
+    end.
 
 %% @doc Get the latest assignment from the cache.
 latest(ProcID, RawOpts) ->

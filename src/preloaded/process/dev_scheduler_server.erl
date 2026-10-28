@@ -121,6 +121,13 @@ start(ProcID, Proc, Opts) ->
                     {base_state_hashpath, BaseStateHashpath}
                 }
             ),
+            % What is on disk now is durable; in `aggressive' mode a client
+            % is answered before its write, so nothing is held back.
+            ok =
+                case mode(Opts, remote_confirmation) of
+                    aggressive -> dev_scheduler_cache:clear_durable(ProcID);
+                    _ -> dev_scheduler_cache:set_durable(ProcID, CurrentSlot)
+                end,
             Caller ! {ok, Ref, self()},
             server(
                 #{
@@ -326,6 +333,10 @@ assign_batch(State, Requests) ->
         _ ->
             try ok = dev_scheduler_cache:flush(maps:get(opts, State)) of
                 ok ->
+                    % The batch is durable: only now may its slots be
+                    % computed, pushed or served.
+                    ok = dev_scheduler_cache:set_durable(
+                        maps:get(id, State), maps:get(current, Assigned)),
                     % A refusal can name a slot of this batch, so it waits
                     % for the flush too.
                     lists:foreach(
