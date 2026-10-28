@@ -162,34 +162,34 @@ signature_ids(Msg, Opts) ->
         || {ID, Comm} <- maps:to_list(Commitments),
            is_map(Comm), is_map_key(<<"committer">>, Comm) ]).
 
-%% @doc Index the slot under each signature ID of the message it assigns, in
-%% the scheduler's store, beside the assignment and committed with it by the
-%% same flush.
-write_message_slot(ProcID, Msg, Slot, RawOpts) ->
+%% @doc Index the slot under each of the message's signature IDs, in the
+%% scheduler's store. The scheduler writes the rows right after the
+%% assignment, and the store's commits keep write order, so what is on disk
+%% after a crash is a prefix: an assignment without its rows can only be one
+%% of the last written.
+write_message_slot(_ProcID, [], _Slot, _RawOpts) -> ok;
+write_message_slot(ProcID, IDs, Slot, RawOpts) ->
     Opts = opts(RawOpts),
-    case signature_ids(Msg, Opts) of
-        [] -> ok;
-        IDs ->
-            ok = hb_store:write(
-                hb_opts:get(store, no_viable_store, Opts),
-                maps:from_list(
-                    [ {message_slot_path(ProcID, ID), hb_util:bin(Slot)} || ID <- IDs ]),
-                Opts#{ <<"store-failure">> => throw })
-    end.
+    ok = hb_store:write(
+        hb_opts:get(store, no_viable_store, Opts),
+        maps:from_list(
+            [ {message_slot_path(ProcID, ID), hb_util:bin(Slot)} || ID <- IDs ]),
+        Opts#{ <<"store-failure">> => throw }).
 
-%% @doc The slot at or below `Current' that already carries one of the message's
-%% signatures: `{ok, Slot, ID}', or `not_found'. An index row is trusted only
-%% if that slot's assignment carries the ID, so a row whose assignment was
-%% never committed (a crash between the two, or a failed flush whose slot was
-%% then reused) does not refuse the message.
-find_assigned(ProcID, Msg, Current, RawOpts) ->
+%% @doc The slot at or below `Current' that already carries one of the
+%% signature IDs: `{ok, Slot, ID}', or `not_found'. A row is read by its exact
+%% key (one `get', which sees the writes not yet flushed too; never a prefix
+%% scan, which commits pending writes first). A row is trusted only if that
+%% slot's assignment carries the ID, so a row whose assignment never landed
+%% (or a slot reused after a failed flush) refuses nothing.
+find_assigned(ProcID, IDs, Current, RawOpts) ->
     Opts = opts(RawOpts),
     Store = hb_opts:get(store, no_viable_store, Opts),
-    ThrowOpts = Opts#{ <<"store-failure">> => throw },
-    find_assigned(ProcID, signature_ids(Msg, Opts), Current, Store, ThrowOpts).
+    find_assigned(ProcID, IDs, Current, Store, Opts#{ <<"store-failure">> => throw }).
 find_assigned(_ProcID, [], _Current, _Store, _Opts) -> not_found;
 find_assigned(ProcID, [ID | IDs], Current, Store, Opts) ->
-    case hb_store:read(Store, message_slot_path(ProcID, ID), Opts) of
+    Req = #{ <<"read">> => message_slot_path(ProcID, ID), <<"exact">> => true },
+    case hb_store:read(Store, Req, Opts) of
         {ok, SlotBin} ->
             Slot = hb_util:int(SlotBin),
             Carries =

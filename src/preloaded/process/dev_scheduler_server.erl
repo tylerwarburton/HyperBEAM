@@ -88,13 +88,12 @@ start(ProcID, Proc, Opts) ->
                         ?event({starting_new_schedule, {proc_id, ProcID}}),
                         {-1, undefined};
                     {Slot, Latest} ->
-                        % Only the latest slot can have been written without
-                        % its message index (each slot is flushed before the
-                        % next is assigned): write it again.
-                        ok = dev_scheduler_cache:write_message_slot(
-                            ProcID, hb_maps:get(<<"body">>, Latest, #{}, Opts),
-                            Slot, Opts),
-                        ok = dev_scheduler_cache:flush(Opts),
+                        % A crash can leave the last assignments written
+                        % without their index rows: the rows follow each
+                        % assignment, and what is on disk is a prefix of
+                        % the writes, so at most the last batch's. Write
+                        % those rows again.
+                        ok = repair_index(ProcID, Slot, Latest, Opts),
                         % The next assignment applies to the state after the
                         % latest one, as `do_assign/3' sets it.
                         {
@@ -148,6 +147,30 @@ start(ProcID, Proc, Opts) ->
         {'DOWN', MonRef, process, Server, Why} ->
             erlang:error({scheduler_server_failed_to_start, ProcID, Why})
     end.
+
+%% @doc Write the message index rows of the last `?MAX_BATCH' assignments,
+%% up to and including the latest, again.
+repair_index(ProcID, Latest, LatestAssignment, Opts) ->
+    lists:foreach(
+        fun(Slot) ->
+            Read =
+                case Slot of
+                    Latest -> {ok, LatestAssignment};
+                    _ -> dev_scheduler_cache:read(ProcID, Slot, Opts)
+                end,
+            case Read of
+                {ok, Assignment} ->
+                    ok = dev_scheduler_cache:write_message_slot(
+                        ProcID,
+                        dev_scheduler_cache:signature_ids(
+                            hb_maps:get(<<"body">>, Assignment, #{}, Opts), Opts),
+                        Slot, Opts);
+                not_found -> ok
+            end
+        end,
+        lists:seq(max(0, Latest - ?MAX_BATCH + 1), Latest)
+    ),
+    dev_scheduler_cache:flush(Opts).
 
 %% @doc Determine the appropriate list of keys to use to commit assignments for
 %% a process.
@@ -316,9 +339,13 @@ assign_batch(State, Requests) ->
                     Assigned
             catch
                 _FClass:FReason:FStack ->
+                    % Nobody is answered. The batch may be on disk all the
+                    % same (a commit whose sync then failed), so the slot
+                    % counter cannot be moved back: stop, and the next
+                    % request starts a server from what the store holds.
                     ?event(error, {scheduler_flush_failed,
                         {reason, FReason}, {trace, FStack}}),
-                    State
+                    exit({scheduler_flush_failed, FReason})
             end
     end.
 
@@ -345,14 +372,15 @@ write_assignment(State, Message) ->
     Opts = maps:get(opts, State),
     ProcID = maps:get(id, State),
     {ok, OnlyAttested} = hb_message:with_only_committed(Message, Opts),
+    IDs = dev_scheduler_cache:signature_ids(OnlyAttested, Opts),
     case dev_scheduler_cache:find_assigned(
-            ProcID, OnlyAttested, maps:get(current, State), Opts) of
+            ProcID, IDs, maps:get(current, State), Opts) of
         {ok, Slot, ID} -> {refused, refusal(State, Slot, ID)};
         not_found ->
-            {Assignment, Next} = build_assignment(State, Message),
+            {Assignment, Next} = build_assignment(State, Message, OnlyAttested),
             ok = dev_scheduler_cache:write(ProcID, Assignment, Opts),
             ok = dev_scheduler_cache:write_message_slot(
-                ProcID, OnlyAttested, maps:get(current, Next), Opts),
+                ProcID, IDs, maps:get(current, Next), Opts),
             {Next, Assignment}
     end.
 
@@ -396,20 +424,25 @@ assign(State, Message, ReplyPID) ->
 %% @doc Tell the client first, then write the assignment in the background.
 do_assign(State, Message, ReplyPID) ->
     Opts = maps:get(opts, State),
+    ProcID = maps:get(id, State),
     {ok, OnlyAttested} = hb_message:with_only_committed(Message, Opts),
+    IDs = dev_scheduler_cache:signature_ids(OnlyAttested, Opts),
     case dev_scheduler_cache:find_assigned(
-            maps:get(id, State), OnlyAttested, maps:get(current, State), Opts) of
+            ProcID, IDs, maps:get(current, State), Opts) of
         {ok, Slot, ID} ->
             ReplyPID ! {refused, Message, refusal(State, Slot, ID)},
             State;
-        not_found -> do_assign(State, Message, ReplyPID, Opts)
+        not_found -> do_assign(State, Message, OnlyAttested, IDs, ReplyPID)
     end.
-do_assign(State, Message, ReplyPID, Opts) ->
-    {Assignment, Next} = build_assignment(State, Message),
+do_assign(State, Message, OnlyAttested, IDs, ReplyPID) ->
+    Opts = maps:get(opts, State),
+    {Assignment, Next} = build_assignment(State, Message, OnlyAttested),
     spawn(
         fun() ->
             maybe_inform_recipient(aggressive, ReplyPID, Message, Assignment, State),
             ok = dev_scheduler_cache:write(maps:get(id, State), Assignment, Opts),
+            ok = dev_scheduler_cache:write_message_slot(
+                maps:get(id, State), IDs, maps:get(current, Next), Opts),
             ok = dev_scheduler_cache:flush(Opts),
             confirm(ReplyPID, Message, Assignment, State)
         end
@@ -418,14 +451,9 @@ do_assign(State, Message, ReplyPID, Opts) ->
 
 %% @doc Generate and sign the assignment for the next slot, and the state that
 %% follows it.
-build_assignment(State, Message) ->
-    % Ensure that only committed keys from the message are included in the
-    % assignment.
-    {ok, OnlyAttested} =
-        hb_message:with_only_committed(
-            Message,
-            Opts = maps:get(opts, State)
-        ),
+build_assignment(State, Message, OnlyAttested) ->
+    % Only the committed keys of the message are in the assignment.
+    Opts = maps:get(opts, State),
     % Generate parameters for the assignment message and commit to it.
     BaseStateHashpath = base_state(State),
     NextSlot = maps:get(current, State) + 1,
@@ -712,7 +740,7 @@ count_calls(N, Parent) ->
 
 dedupe_setup(Tag) ->
     Wallet = hb:wallet(),
-    Store = hb_test_utils:test_store(hb_store_lmdb, Tag),
+    Store = small_store(hb_test_utils:test_store(hb_store_lmdb, Tag)),
     Opts = #{ <<"priv-wallet">> => Wallet, <<"store">> => [Store],
               <<"scheduling-mode">> => local_confirmation },
     ok = hb_store:start([Store], #{}, Opts),
@@ -729,6 +757,12 @@ dedupe_proc(Opts) ->
         <<"test-random-seed">> => rand:uniform(1 bsl 40) }, Opts).
 
 slot_of(Assignment) -> hb_util:int(hb_ao:get(<<"slot">>, Assignment, #{})).
+
+ids(Msg, Opts) -> dev_scheduler_cache:signature_ids(Msg, Opts).
+
+%% @doc A test LMDB store maps 1 GiB, not the default 2 TiB: a VM's address
+%% space holds about 60 of the default, and a full test run opens more.
+small_store(Store) -> Store#{ <<"capacity">> => 1 bsl 30 }.
 
 %% @doc Posting a signed message again is refused with the slot it already
 %% has, also as another encoding of the same signature, and with a second
@@ -804,11 +838,11 @@ torn_index_test_() ->
         #{ current := Current } = info(Server),
         % A row past the latest slot (its assignment never committed).
         Stale = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 1 }, Opts),
-        ok = dev_scheduler_cache:write_message_slot(ProcID, Stale, Current + 1, Opts),
+        ok = dev_scheduler_cache:write_message_slot(ProcID, ids(Stale, Opts), Current + 1, Opts),
         ?assertEqual(Current + 1, slot_of(schedule(Server, Stale))),
         % A row naming a slot that carries another message (the slot reused).
         Other = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 2 }, Opts),
-        ok = dev_scheduler_cache:write_message_slot(ProcID, Other, Current + 1, Opts),
+        ok = dev_scheduler_cache:write_message_slot(ProcID, ids(Other, Opts), Current + 1, Opts),
         ?assertEqual(Current + 2, slot_of(schedule(Server, Other))),
         % An assignment written as a crash would leave it: no index row.
         Unindexed = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 3 }, Opts),
@@ -819,7 +853,7 @@ torn_index_test_() ->
             <<"base-hashpath">> => Base, <<"body">> => Unindexed }, Opts),
         ok = dev_scheduler_cache:flush(Opts),
         ?assertEqual(not_found,
-            dev_scheduler_cache:find_assigned(ProcID, Unindexed, Current + 3, Opts)),
+            dev_scheduler_cache:find_assigned(ProcID, ids(Unindexed, Opts), Current + 3, Opts)),
         exit(Server, kill),
         timer:sleep(100),
         Server2 = start(ProcID, Proc, Opts),
@@ -854,7 +888,7 @@ refused_after_restart_test_() ->
 %% @doc A fresh process with its own LMDB store and a started scheduler.
 batch_test_server(Name) ->
     Wallet = hb:wallet(),
-    Store = hb_test_utils:test_store(hb_store_lmdb, Name),
+    Store = small_store(hb_test_utils:test_store(hb_store_lmdb, Name)),
     Opts = #{ <<"priv-wallet">> => Wallet, <<"store">> => [Store],
               <<"scheduling-mode">> => local_confirmation },
     ok = hb_store:start([Store], #{}, Opts),
@@ -977,4 +1011,116 @@ idle_request_confirmed_alone_test_() ->
         erlang:trace_pattern({CacheMod, flush, 1}, false, [local, call_count]),
         ?assertEqual(3, Flushes),
         ?assert(lists:max(Times) < 2000)
+    end}.
+
+%% @doc A lookup that misses reads its row by exact key: no prefix scan, which
+%% would commit the batch's pending writes before reading.
+index_miss_reads_no_prefix_test_() ->
+    {timeout, 60, fun() ->
+        {Opts, ProcID, _Proc, Server} = dedupe_setup(<<"dedupe-exact">>),
+        _ = schedule(Server, hb_message:commit(#{ <<"type">> => <<"Message">> }, Opts)),
+        % A pending write, as in the middle of a batch.
+        ok = dev_scheduler_cache:write_message_slot(
+            ProcID, [hb_util:human_id(crypto:strong_rand_bytes(32))], 0, Opts),
+        New = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 2 }, Opts),
+        erlang:trace_pattern({hb_store_lmdb, read_prefix_rows, 2}, true, [local, call_count]),
+        erlang:trace(self(), true, [call]),
+        ?assertEqual(not_found,
+            dev_scheduler_cache:find_assigned(ProcID, ids(New, Opts), 0, Opts)),
+        erlang:trace(self(), false, [call]),
+        {call_count, Prefix} =
+            erlang:trace_info({hb_store_lmdb, read_prefix_rows, 2}, call_count),
+        erlang:trace_pattern({hb_store_lmdb, read_prefix_rows, 2}, false, [local, call_count]),
+        ?assertEqual(0, Prefix)
+    end}.
+
+%% @doc A message posted twice inside one batch takes one slot; the second post
+%% is refused, naming it, and only after the flush that made it durable.
+duplicate_in_batch_refused_after_flush_test_() ->
+    {timeout, 90, fun() ->
+        {Opts, _ProcID, _Proc, Server} = dedupe_setup(<<"dedupe-batch">>),
+        {module, CacheMod} = erlang:fun_info(fun dev_scheduler_cache:flush/1, module),
+        M = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 1 }, Opts),
+        M2 = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 2 }, Opts),
+        Parent = self(),
+        Tracer = spawn(fun() -> collect_trace([], Parent) end),
+        erlang:suspend_process(Server),
+        Abort = scheduler_time() + ?DEFAULT_TIMEOUT,
+        [ Server ! {schedule, X, self(), Abort} || X <- [M, M, M2] ],
+        erlang:trace_pattern({CacheMod, flush, 1}, [{'_', [], [{return_trace}]}], [global]),
+        erlang:trace(Server, true, [call, send, {tracer, Tracer}]),
+        erlang:resume_process(Server),
+        Replies = [ receive {R, _, V} when R == scheduled; R == refused -> {R, V}
+                    after 30000 -> timeout end || _ <- lists:seq(1, 3) ],
+        erlang:trace(Server, false, [call, send]),
+        erlang:trace_pattern({CacheMod, '_', '_'}, false, [global]),
+        Tracer ! {done, self()},
+        Events = receive {events, E} -> E after 5000 -> [] end,
+        [{scheduled, A1}, {refused, #{ <<"status">> := 409, <<"slot">> := S1 }},
+            {scheduled, A2}] = Replies,
+        ?assertEqual(S1, slot_of(A1)),
+        ?assertEqual(S1 + 1, slot_of(A2)),
+        Order =
+            [ case Ev of
+                  {trace, _, return_from, {CacheMod, flush, 1}, ok} -> flushed;
+                  {trace, _, send, {refused, _, _}, _} -> refused;
+                  _ -> skip
+              end || Ev <- Events ],
+        ?assertEqual([flushed, refused], [ X || X <- Order, X =/= skip ])
+    end}.
+
+%% @doc If a batch's flush fails, nobody is answered, not even a refusal, and
+%% the server stops: a new one resumes from what the store holds.
+failed_flush_answers_nobody_and_stops_test_() ->
+    {timeout, 90, fun() ->
+        Wallet = hb:wallet(),
+        Inner = small_store(hb_test_utils:test_store(hb_store_lmdb, <<"dedupe-flushfail">>)),
+        Store = hb_store_offsite_journal:wrap(Inner,
+            #{ <<"path">> => <<(maps:get(<<"name">>, Inner))/binary, "-export">> }),
+        Opts = #{ <<"priv-wallet">> => Wallet, <<"store">> => [Store],
+                  <<"scheduling-mode">> => local_confirmation },
+        ok = hb_store:start([Store], #{}, Opts),
+        Proc = dedupe_proc(Opts),
+        ProcID = hb_util:human_id(hb_message:id(Proc, all, Opts)),
+        Server = start(ProcID, Proc, Opts),
+        M = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 1 }, Opts),
+        Ref = monitor(process, Server),
+        erlang:suspend_process(Server),
+        Abort = scheduler_time() + ?DEFAULT_TIMEOUT,
+        [ Server ! {schedule, M, self(), Abort} || _ <- [1, 2] ],
+        persistent_term:put({hb_store_offsite_journal, fail_sync}, true),
+        try
+            erlang:resume_process(Server),
+            ?assertMatch({'DOWN', Ref, process, Server, {scheduler_flush_failed, _}},
+                receive {'DOWN', Ref, _, _, _} = D -> D after 10000 -> timeout end),
+            ?assertEqual(none,
+                receive {R, M, _} when R == scheduled; R == refused -> R after 500 -> none end)
+        after
+            persistent_term:erase({hb_store_offsite_journal, fail_sync})
+        end
+    end}.
+
+%% @doc Assignments written without their index rows, as many as one batch,
+%% get them when the server starts again.
+start_repairs_last_batch_test_() ->
+    {timeout, 90, fun() ->
+        {Opts, ProcID, Proc, Server} = dedupe_setup(<<"dedupe-repair">>),
+        Msgs = [ hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => I }, Opts)
+               || I <- lists:seq(1, 5) ],
+        Slots = [ slot_of(schedule(Server, X)) || X <- Msgs ],
+        exit(Server, kill),
+        timer:sleep(100),
+        [Store] = hb_opts:get(store, [], Opts),
+        #{ <<"db">> := DB } = hb_store:find(Store),
+        {ok, _} = elmdb:delete_batch(DB,
+            [ <<"~scheduler@1.0/message-slots/", ProcID/binary, "/", ID/binary>>
+            || X <- Msgs, ID <- ids(X, Opts) ]),
+        ok = hb_store:flush(Store, #{}),
+        Server2 = start(ProcID, Proc, Opts),
+        ?assertEqual(
+            [ {error, S} || S <- Slots ],
+            [ case schedule(Server2, X) of
+                  {error, #{ <<"slot">> := S }} -> {error, S};
+                  Other -> Other
+              end || X <- Msgs ])
     end}.
