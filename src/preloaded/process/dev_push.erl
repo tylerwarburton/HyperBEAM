@@ -12,9 +12,14 @@
 
 %% Outbox targets that recently failed to resolve, e.g. wallet addresses. Each
 %% miss falls through the store chain to the Arweave gateway, so without this
-%% every push to a wallet waits on a gateway round trip. Entries expire after
-%% `push-missing-target-ttl' seconds (0 disables) so a process that is not yet
-%% visible here is not locked out once it appears.
+%% every push to a wallet waits on a gateway round trip. One rule: the cache
+%% only ever saves the remote lookup of an id the gateway said does not exist.
+%% Only IDs and only `{error, not_found}' are remembered; a remembered target is
+%% still read from the local stores; and each target is looked up remotely
+%% again once its entry is `push-missing-target-ttl' seconds old (0 disables).
+%% At most `?MISSING_TARGETS_MAX' entries: when full, expired ones are swept,
+%% and if none have expired a new miss is not remembered, so junk ids cannot
+%% evict the entries that are there.
 -define(MISSING_TARGETS, dev_push_missing_targets).
 -define(MISSING_TARGETS_MAX, 100000).
 -define(DEFAULT_MISSING_TARGET_TTL, 60).
@@ -249,10 +254,9 @@ do_push(PrimaryProcess, Assignment, Opts) ->
             {error, Result}
     end.
 
-%% @doc Read an outbox target. A target that was not found within the last
-%% `push-missing-target-ttl' seconds is read from the local stores only, so
-%% only the remote fallthrough is skipped: an id this node stores or spawns
-%% after the miss is found at once, and that clears the entry.
+%% @doc Read an outbox target (see `?MISSING_TARGETS'). A remembered miss is
+%% read from the local stores only and gives `{error, recently_not_found}'; a
+%% local hit clears the entry.
 read_target(Target, Opts) ->
     TTL = hb_opts:get(<<"push-missing-target-ttl">>, ?DEFAULT_MISSING_TARGET_TTL, Opts),
     case recently_missing(Target, TTL) of
@@ -261,7 +265,7 @@ read_target(Target, Opts) ->
                 {ok, _} = Found ->
                     forget_missing(Target),
                     Found;
-                _ -> {error, not_found}
+                _ -> {error, recently_not_found}
             end;
         false ->
             case hb_cache:read(Target, Opts) of
@@ -276,7 +280,7 @@ forget_missing(Target) ->
     try ets:delete(?MISSING_TARGETS, Target) catch error:badarg -> true end,
     ok.
 
-recently_missing(Target, TTL) when is_binary(Target), is_integer(TTL), TTL > 0 ->
+recently_missing(Target, TTL) when ?IS_ID(Target), is_integer(TTL), TTL > 0 ->
     try ets:lookup(?MISSING_TARGETS, Target) of
         [{Target, At}] -> erlang:monotonic_time(second) - At < TTL;
         [] -> false
@@ -284,43 +288,54 @@ recently_missing(Target, TTL) when is_binary(Target), is_integer(TTL), TTL > 0 -
     end;
 recently_missing(_, _) -> false.
 
-remember_missing(Target, TTL) when is_binary(Target), is_integer(TTL), TTL > 0 ->
+remember_missing(Target, TTL) when ?IS_ID(Target), is_integer(TTL), TTL > 0 ->
     ensure_missing_table(),
+    Now = erlang:monotonic_time(second),
     try
-        case ets:info(?MISSING_TARGETS, size) of
-            Size when Size >= ?MISSING_TARGETS_MAX -> ets:delete_all_objects(?MISSING_TARGETS);
-            _ -> ok
+        case ets:info(?MISSING_TARGETS, size) >= ?MISSING_TARGETS_MAX of
+            true ->
+                ets:select_delete(
+                    ?MISSING_TARGETS,
+                    [{{'_', '$1'}, [{'=<', '$1', Now - TTL}], [true]}]
+                );
+            false -> ok
         end,
-        ets:insert(?MISSING_TARGETS, {Target, erlang:monotonic_time(second)})
+        case ets:info(?MISSING_TARGETS, size) < ?MISSING_TARGETS_MAX of
+            true -> ets:insert(?MISSING_TARGETS, {Target, Now});
+            false -> ok
+        end
     catch error:badarg -> ok
     end,
     ok;
 remember_missing(_, _) -> ok.
 
 %% @doc The table is owned by a process that never exits: a table dies with its
-%% owner, and the first caller is usually a short-lived request.
+%% owner, and the first caller is usually a short-lived request. The reply goes
+%% to an alias that is dropped on timeout, so a late reply is never left in
+%% the caller's mailbox.
 ensure_missing_table() ->
     case ets:whereis(?MISSING_TARGETS) of
         undefined ->
-            Parent = self(),
-            Ref = make_ref(),
+            Alias = erlang:alias([reply]),
             {Owner, Mon} =
                 spawn_monitor(
                     fun() ->
                         try ets:new(?MISSING_TARGETS, [named_table, public, set, {read_concurrency, true}]) of
                             _ ->
-                                Parent ! {Ref, created},
+                                Alias ! {Alias, created},
                                 receive after infinity -> ok end
-                        catch error:badarg -> Parent ! {Ref, exists}
+                        catch error:badarg -> Alias ! {Alias, exists}
                         end
                     end
                 ),
             receive
-                {Ref, _} -> ok;
+                {Alias, _} -> ok;
                 {'DOWN', Mon, process, Owner, _} -> ok
             after 5000 -> ok
             end,
+            erlang:unalias(Alias),
             erlang:demonitor(Mon, [flush]),
+            receive {Alias, _} -> ok after 0 -> ok end,
             ok;
         _ -> ok
     end.
@@ -760,7 +775,13 @@ schedule(Base, Req, Opts) ->
                         },
                         Opts
                     );
-                {error, not_found} -> {error, target_process_not_found(Target)}
+                {error, recently_not_found} ->
+                    {error,
+                        (target_process_not_found(Target))#{
+                            <<"reason">> => <<"target-not-found-recently">>
+                        }
+                    };
+                _ -> {error, target_process_not_found(Target)}
             end,
         {ok,
             hb_ao:set(
@@ -1124,6 +1145,67 @@ read_target_finds_local_write_after_miss_test() ->
     {ok, _} = hb_cache:write(Msg, Opts),
     ?assertMatch({ok, _}, read_target(ID, Opts)),
     ?assertNot(recently_missing(ID, 60)).
+
+%% @doc A gateway that answered with no such item is a miss and is remembered;
+%% a gateway that could not be reached is not, so it is asked again next time.
+read_target_remembers_only_real_miss_test() ->
+    Local = hb_test_utils:test_store(),
+    hb_store:start(Local),
+    Up = hb_util:bin(string:trim(hb_util:list(hb_http_server:start_node(#{})), trailing, "/")),
+    Gateway =
+        fun(Node) ->
+            #{ <<"store">> => [Local,
+                #{ <<"store-module">> => hb_store_gateway, <<"node">> => Node,
+                    <<"node-type">> => <<"ao">> }] }
+        end,
+    Miss = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ?assertEqual({error, not_found}, read_target(Miss, Gateway(Up))),
+    ?assert(recently_missing(Miss, 60)),
+    Down = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ?assertNotMatch({ok, _}, read_target(Down, Gateway(<<"http://127.0.0.1:1">>))),
+    ?assertNot(recently_missing(Down, 60)),
+    % An error status (the node has no `/graphql' of its own) is not a miss.
+    Err = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ErrOpts =
+        #{ <<"store">> => [Local,
+            #{ <<"store-module">> => hb_store_gateway, <<"node">> => Up }] },
+    ?assertNotMatch({ok, _}, read_target(Err, ErrOpts)),
+    ?assertNot(recently_missing(Err, 60)).
+
+%% @doc Only IDs are remembered: a target can be any binary.
+non_id_target_not_remembered_test() ->
+    Path = <<"not/an/id">>,
+    remember_missing(Path, 60),
+    ?assertNot(recently_missing(Path, 60)).
+
+%% @doc A full table keeps its live entries: a new miss is not remembered
+%% until entries expire, and then the expired ones are swept to make room.
+full_table_keeps_live_entries_test() ->
+    remember_missing(hb_util:human_id(crypto:strong_rand_bytes(32)), 60),
+    ets:delete_all_objects(?MISSING_TARGETS),
+    Now = erlang:monotonic_time(second),
+    Live = [ hb_util:human_id(crypto:strong_rand_bytes(32))
+        || _ <- lists:seq(1, ?MISSING_TARGETS_MAX) ],
+    ets:insert(?MISSING_TARGETS, [ {ID, Now} || ID <- Live ]),
+    New = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    remember_missing(New, 60),
+    ?assertNot(recently_missing(New, 60)),
+    ?assert(recently_missing(hd(Live), 60)),
+    ets:insert(?MISSING_TARGETS, [ {ID, Now - 61} || ID <- Live ]),
+    remember_missing(New, 60),
+    ?assert(recently_missing(New, 60)),
+    ?assertEqual(1, ets:info(?MISSING_TARGETS, size)),
+    ets:delete_all_objects(?MISSING_TARGETS).
+
+%% @doc A push to a remembered miss is refused with its own reason, so it can
+%% be told apart (and re-pushed) from a target that was looked up.
+read_target_reports_remembered_miss_test() ->
+    Store = hb_test_utils:test_store(),
+    hb_store:start(Store),
+    Opts = #{ <<"store">> => [Store] },
+    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ?assertEqual({error, not_found}, read_target(ID, Opts)),
+    ?assertEqual({error, recently_not_found}, read_target(ID, Opts)).
 
 %% The test groups run sequentially with respect to each other but each
 %% group is internally parallel. Splitting keeps the WASM-heavy core
