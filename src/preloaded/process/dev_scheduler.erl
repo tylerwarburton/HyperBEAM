@@ -2457,4 +2457,43 @@ undurable_slot_not_computed_or_served_test_() ->
         {Served, _} = get_local_assignments(ProcID, 0, undefined, Opts),
         ?assertEqual([0],
             [ hb_util:int(hb_ao:get(<<"slot">>, A, Opts)) || A <- Served ])
+
+%% @doc With an unsynced main store and an irreplaceable store, everything a
+%% restore or recompute needs -- the definition, every assignment and the
+%% message it carries -- is in the irreplaceable store, whole: readable and
+%% verifiable from it alone.
+irreplaceable_store_alone_holds_the_chain_test_() ->
+    {timeout, 60, fun() ->
+        start(),
+        Wallet = hb:wallet(),
+        Main = (hb_test_utils:test_store(hb_store_lmdb, <<"chain-main">>))#{ <<"sync">> => false },
+        Irr = hb_test_utils:test_store(hb_store_lmdb, <<"chain-irr">>),
+        Opts = hb_store_irreplaceable:node_message(#{
+            <<"priv-wallet">> => Wallet, <<"store">> => [Main],
+            <<"irreplaceable-store">> => Irr }),
+        ok = hb_store:start([Main], #{}, Opts),
+        Base = hb_message:commit(test_process(Opts), Opts),
+        {ok, _} = hb_ao:resolve(Base, #{ <<"method">> => <<"POST">>,
+            <<"path">> => <<"schedule">>, <<"body">> => Base }, Opts),
+        Msgs =
+            [ hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => N,
+                                   <<"data">> => crypto:strong_rand_bytes(100) }, Opts)
+            || N <- lists:seq(1, 3) ],
+        [ {ok, _} = hb_ao:resolve(Base, #{ <<"method">> => <<"POST">>,
+              <<"path">> => <<"schedule">>, <<"body">> => M }, Opts) || M <- Msgs ],
+        ProcID = hb_util:human_id(hb_message:id(Base, signed, Opts)),
+        IrrOnly = #{ <<"store">> => [Irr], <<"scheduler-store">> => [Irr] },
+        {ok, Def} = hb_cache:read(ProcID, IrrOnly),
+        ?assert(hb_message:verify(hb_cache:ensure_all_loaded(Def, IrrOnly), all, IrrOnly)),
+        Slots = lists:sort(dev_scheduler_cache:list(ProcID, IrrOnly)),
+        ?assertEqual([0, 1, 2, 3], Slots),
+        lists:foreach(
+            fun(Slot) ->
+                {ok, A} = dev_scheduler_cache:read(ProcID, Slot, IrrOnly),
+                Loaded = hb_cache:ensure_all_loaded(A, IrrOnly),
+                ?assert(hb_message:verify(Loaded, all, IrrOnly)),
+                Body = hb_ao:get(<<"body">>, Loaded, IrrOnly),
+                ?assert(is_map(Body))
+            end,
+            Slots)
     end}.

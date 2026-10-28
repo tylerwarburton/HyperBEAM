@@ -55,7 +55,9 @@ failing(Store) -> maps:merge(#{ <<"store-failure">> => throw }, Store).
 %% it, read-only, after the first of the node's stores.
 node_message(NodeMsg) ->
     case store(NodeMsg) of
-        undefined -> NodeMsg;
+        undefined ->
+            ok = check_durable(NodeMsg),
+            NodeMsg;
         Irr ->
             ok = hb_store:start(Irr, #{}, NodeMsg),
             Main = hb_store:normalize_stores(as_list(hb_opts:get(<<"store">>, [], NodeMsg))),
@@ -71,6 +73,34 @@ node_message(NodeMsg) ->
                     Explicit -> hb_store:normalize_stores(Explicit)
                 end,
             NodeMsg#{ <<"store">> => Store, <<"scheduler-store">> => Sched }
+    end.
+
+%% @doc A node that schedules keeps its assignments, their messages and its
+%% process definitions in its scheduler store. If that is an LMDB opened
+%% unsynced (`sync: false', allowed for the main cache once an irreplaceable
+%% store holds all of these), a power cut can lose them: refuse to start.
+check_durable(NodeMsg) ->
+    Mode = hb_opts:get(<<"scheduling-mode">>, local_confirmation, NodeMsg),
+    case lists:member(Mode, [disabled, <<"disabled">>]) of
+        true -> ok;
+        false ->
+            Sched =
+                hb_store:normalize_stores(as_list(
+                    hb_opts:get(<<"scheduler-store">>,
+                        hb_opts:get(<<"store">>, [], NodeMsg), NodeMsg))),
+            Unsynced =
+                [ maps:get(<<"name">>, S, undefined)
+                || S = #{ <<"store-module">> := hb_store_lmdb } <- Sched,
+                   not is_map_key(<<"access">>, S),
+                   lists:member(maps:get(<<"sync">>, S, true), [false, <<"false">>]) ],
+            case Unsynced of
+                [] -> ok;
+                _ ->
+                    ?event(error, {unsafe_store_config,
+                        {scheduler_store_unsynced, Unsynced},
+                        {fix, <<"set irreplaceable-store (synced) or sync the store">>}}),
+                    throw({unsafe_store_config, {scheduler_store_unsynced, Unsynced}})
+            end
     end.
 
 as_list(S) when is_list(S) -> S;
@@ -91,3 +121,14 @@ routing_test() ->
     IrrT = Irr#{ <<"store-failure">> => throw },
     ?assertEqual([Main, IrrT#{ <<"access">> => [<<"read">>] }], maps:get(<<"store">>, Node)),
     ?assertEqual([IrrT], maps:get(<<"scheduler-store">>, Node)).
+
+%% @doc A scheduling node whose assignments would land in an unsynced LMDB
+%% refuses to start; with a (synced) irreplaceable store, or with scheduling
+%% disabled, an unsynced main store is allowed.
+unsynced_scheduler_store_refused_test() ->
+    Main = (hb_test_utils:test_store(hb_store_lmdb, <<"irr-unsynced">>))#{ <<"sync">> => false },
+    Irr = hb_test_utils:test_store(hb_store_lmdb, <<"irr-synced">>),
+    ?assertThrow({unsafe_store_config, _}, node_message(#{ <<"store">> => [Main] })),
+    ?assertMatch(#{}, node_message(#{ <<"store">> => [Main], <<"irreplaceable-store">> => Irr })),
+    ?assertMatch(#{}, node_message(#{ <<"store">> => [Main], <<"scheduling-mode">> => <<"disabled">> })),
+    ?assertMatch(#{}, node_message(#{ <<"store">> => [Main#{ <<"sync">> => true }] })).
