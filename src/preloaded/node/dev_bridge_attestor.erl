@@ -1188,3 +1188,169 @@ forged_message_halts_replica_test_() ->
             maps:get(replica, St1))
     end}.
 
+
+%%% Only what was verified is used --------------------------------------------
+
+%% Rewrite every served schedule: each assignment through `Fun(Slot, A)'
+%% (a list of assignments to serve in its place), then all of them re-signed
+%% by `Wallet' in slot order, the chain carried over the new signatures.
+reschedule(Wallet, Fun) ->
+    fun(Path, Body) ->
+        case binary:match(Path, <<"schedule">>) of
+            nomatch -> Body;
+            _ ->
+                Opts = #{ <<"hashpath">> => ignore },
+                Loaded = hb_cache:ensure_all_loaded(Body, Opts),
+                As = hb_maps:get(<<"assignments">>, Loaded, #{}, Opts),
+                Sorted = [A || {N, A} <- lists:keysort(1,
+                    [{catch hb_util:int(K), V} || {K, V} <- maps:to_list(As), is_map(V)]), is_integer(N)],
+                case Sorted of [] -> Body; _ ->
+                Served = lists:append([Fun(A) || A <- Sorted]),
+                First = hb_util:int(hb_maps:get(<<"slot">>, hd(Sorted), 0, Opts)),
+                Chain0 = hb_maps:get(<<"base-hashpath">>, hd(Sorted), <<>>, Opts),
+                {Signed, _} = lists:foldl(
+                    fun(A, {Acc, {N, Chain}}) ->
+                        S = hb_message:commit(
+                            (maps:without([<<"commitments">>], A))#{
+                                <<"slot">> => N, <<"base-hashpath">> => Chain },
+                            #{ <<"priv-wallet">> => Wallet }),
+                        Next = hb_path:hashpath(Chain, hb_message:id(S, all, #{}),
+                            hb_path:hashpath_alg(#{}, #{}), #{}),
+                        {Acc#{ integer_to_binary(N) => S }, {N + 1, Next}}
+                    end, {#{}, {First, Chain0}}, Served),
+                Loaded#{ <<"assignments">> => Signed }
+                end
+        end
+    end.
+
+redeem(A) ->
+    hb_maps:get(<<"action">>, hb_maps:get(<<"body">>, A, #{}, #{}), none, #{}) =:= <<"Redeem">>.
+
+%% A server without PUSD's scheduler key names itself PUSD's scheduler in the
+%% process it serves, and serves a schedule it signed, the Redeem in it twice.
+%% The process's own signature does not cover that: nothing is accepted, and
+%% the withdrawal it invented (2) is not signed.
+forged_process_is_not_used_test_() ->
+    {timeout, 120, fun() ->
+        Hostile = ar_wallet:new(),
+        HostileAddr = hb_util:human_id(ar_wallet:to_address(Hostile)),
+        Twice = reschedule(Hostile, fun(A) ->
+            case redeem(A) of true -> [A, A]; false -> [A] end end),
+        St = replica_setup(<<"forged-process">>, fun(_) ->
+            fun(Path, Body) ->
+                case is_map(Body) andalso hb_maps:get(<<"type">>, Body, none, #{}) of
+                    <<"Process">> -> Body#{ <<"scheduler-location">> => HostileAddr };
+                    _ -> Twice(Path, Body)
+                end
+            end
+        end),
+        St1 = pass(St),
+        ?assertEqual(nomatch, binary:match(raw(<<"signs">>, St1), <<"2=">>)),
+        ?assertEqual(<<>>, raw(<<"signs">>, St1))
+    end}.
+
+%% A server adds a commitment of its own to an assignment. Only PUSD's
+%% scheduler's signature is used, so the chain carries on past it.
+added_commitment_is_not_used_test_() ->
+    {timeout, 120, fun() ->
+        Stranger = ar_wallet:new(),
+        Add = fun(Path, Body) ->
+            case binary:match(Path, <<"schedule">>) of
+                nomatch -> Body;
+                _ ->
+                    Opts = #{ <<"hashpath">> => ignore },
+                    Loaded = hb_cache:ensure_all_loaded(Body, Opts),
+                    As = hb_maps:get(<<"assignments">>, Loaded, #{}, Opts),
+                    Loaded#{ <<"assignments">> => maps:map(
+                        fun(<<"0">>, A) -> hb_message:commit(A, #{ <<"priv-wallet">> => Stranger });
+                           (_, A) -> A
+                        end, As) }
+            end
+        end,
+        St = replica_setup(<<"added-commitment">>, fun(_) -> Add end),
+        St1 = pass(St),
+        ?assertEqual(<<"1=", (true_signature(St1))/binary, ";">>, raw(<<"signs">>, St1))
+    end}.
+
+%% State another computation on this node left in the shared hot cache under
+%% PUSD's ID is not the replica's: it computes PUSD itself.
+hot_cache_is_not_read_test_() ->
+    {timeout, 120, fun() ->
+        St = #{ cfg := Cfg, me := Me } = replica_setup(<<"hot-cache">>, fun honest/1),
+        Pusd = maps:get(<<"pusd">>, Cfg),
+        Table = lib_process_cache_hot,
+        case ets:whereis(Table) of
+            undefined ->
+                Self = self(),
+                spawn(fun() -> ets:new(Table, [named_table, public, ordered_set]),
+                    Self ! table, receive after infinity -> ok end end),
+                receive table -> ok end;
+            _ -> ok
+        end,
+        Fake = #{
+            <<"bridgeinfo">> => hb_json:encode(#{ <<"attestors">> => [#{ <<"ao">> => Me }],
+                <<"namespace">> => 0, <<"epoch">> => 2 }),
+            <<"withdrawals">> => hb_json:encode([#{ <<"id">> => <<"9">>, <<"chain">> => <<"base">>,
+                <<"status">> => <<"pending">>, <<"token">> => <<?TEST_TOKEN>>, <<"amount">> => <<"999">>,
+                <<"sigs">> => #{}, <<"to">> => <<"0x4444444444444444444444444444444444444444">> }])
+        },
+        [ets:insert(Table, {{Pusd, Slot}, Fake}) || Slot <- [0, 1]],
+        St1 = try pass(St) after [ets:delete(Table, {Pusd, Slot}) || Slot <- [0, 1]] end,
+        ?assertEqual(<<"1=", (true_signature(St1))/binary, ";">>, raw(<<"signs">>, St1))
+    end}.
+
+%% Replace the Redeem's message with `Make()' and re-sign the assignment as
+%% PUSD's (compromised) scheduler, keeping its slot and chain.
+replace_redeem(Wallet, Make) ->
+    tamper_redeem(fun(A) ->
+        Orig = hb_maps:get(<<"body">>, A, #{}, #{}),
+        hb_message:commit((maps:without([<<"commitments">>], A))#{ <<"body">> => Make(Orig) },
+            #{ <<"priv-wallet">> => Wallet })
+    end).
+
+%% A genuinely signed Redeem addressed to another process, scheduled on PUSD:
+%% it is not PUSD's message, and nothing is signed.
+message_for_another_process_is_not_used_test_() ->
+    {timeout, 120, fun() ->
+        Other = hb_util:human_id(crypto:strong_rand_bytes(32)),
+        Make = fun(_Orig) ->
+            hb_message:commit(#{ <<"action">> => <<"Redeem">>, <<"to">> => ?TEST_TO,
+                <<"amount">> => <<"5">>, <<"target">> => Other },
+                #{ <<"priv-wallet">> => ar_wallet:new() }, <<"httpsig@1.0">>)
+        end,
+        St = replica_setup(<<"other-target">>, fun(W) -> replace_redeem(W, Make) end),
+        St1 = pass(St),
+        ?assertEqual(<<>>, raw(<<"signs">>, St1)),
+        ?assertMatch(#{ stopped := <<"message is for another process", _/binary>> },
+            maps:get(replica, St1))
+    end}.
+
+%% An hmac names whoever it claims to: a message whose only commitment is an
+%% hmac carrying a committer is unsigned, and nothing is signed.
+hmac_is_not_a_signature_test_() ->
+    {timeout, 120, fun() ->
+        Claimed = hb_committer:uri(hb_util:human_id(ar_wallet:to_address(ar_wallet:new()))),
+        Make = fun(Orig) ->
+            Pusd = hb_maps:get(<<"target">>, Orig, none, #{}),
+            M = hb_message:commit(#{ <<"action">> => <<"Redeem">>, <<"to">> => ?TEST_TO,
+                <<"amount">> => <<"5">>, <<"target">> => Pusd }, #{}, #{ <<"type">> => <<"unsigned">> }),
+            M#{ <<"commitments">> => maps:map(fun(_, C) -> C#{ <<"committer">> => Claimed } end,
+                maps:get(<<"commitments">>, M)) }
+        end,
+        St = replica_setup(<<"hmac">>, fun(W) -> replace_redeem(W, Make) end),
+        St1 = pass(St),
+        ?assertEqual(<<>>, raw(<<"signs">>, St1))
+    end}.
+
+%% A cursor that cannot be read means starting over from what verifies, not a
+%% crash.
+unreadable_cursor_starts_over_test_() ->
+    {timeout, 120, fun() ->
+        St = #{ cfg := Cfg } = replica_setup(<<"cursor">>, fun honest/1),
+        _ = pass(St),
+        Cursor = <<(maps:get(<<"replica-dir">>, Cfg))/binary, "/", (maps:get(<<"pusd">>, Cfg))/binary,
+            ".cursor.json">>,
+        ok = file:write_file(Cursor, <<"not json">>),
+        St2 = pass(St),
+        ?assertMatch(#{ member := true, last_error := null }, St2)
+    end}.
