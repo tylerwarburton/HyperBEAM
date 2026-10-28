@@ -48,9 +48,15 @@ read(BaseStoreOpts, #{ <<"read">> := Key }, NodeOpts) ->
                 {error, not_found} ->
                     ?event({gateway_read, {opts, StoreOpts}, {id, ID}, {subpath, Rest}}),
                     try hb_client_gateway:read(ID, GatewayReadOpts) of
-                        {error, _} ->
-                            ?event({read_not_found, {key, ID}}),
-                            {error, not_found};
+                        {error, Reason} ->
+                            case is_miss(Reason) of
+                                true ->
+                                    ?event({read_not_found, {key, ID}}),
+                                    {error, not_found};
+                                false ->
+                                    ?event(gateway, {read_unavailable, {key, ID}}),
+                                    {error, gateway_unavailable}
+                            end;
                         {ok, Message} ->
                             ?event({read_found, {key, ID}}),
                             hb_store_remote_node:maybe_cache(StoreOpts, Message),
@@ -77,6 +83,16 @@ read(BaseStoreOpts, #{ <<"read">> := Key }, NodeOpts) ->
             ?event({ignoring_non_id, Key}),
             {error, not_found}
     end.
+
+%% @doc Whether a failed gateway read is a real miss: the gateway answered and
+%% had no such item, or there is no gateway to ask. A request that failed, timed
+%% out or got an error status is not a miss but `gateway_unavailable', so a
+%% caller that remembers misses does not remember a transient failure.
+is_miss(not_found) -> true;
+is_miss({no_viable_route, _, _}) -> true;
+is_miss({no_viable_responses, Responses = [_ | _]}) ->
+    lists:all(fun({ok, Res}) -> is_map(Res); (_) -> false end, Responses);
+is_miss(_) -> false.
 
 %% @doc Normalize the routes in the given `Opts`.
 opts(Opts) ->
