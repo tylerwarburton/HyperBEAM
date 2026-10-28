@@ -1,4 +1,6 @@
 # paralith/v0.11 at a given tree (git archive -> src.tar), default profile. Bench only.
+# src.tar must have each submodule appended (git -C <sm> archive --prefix=<sm>/):
+# native/lib/secp256k1 and native/lib/blst.
 FROM erlang:27
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake git pkg-config libssl-dev libncurses-dev ca-certificates curl unzip \
@@ -7,6 +9,7 @@ ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/ca
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
 COPY src.tar /src.tar
 RUN mkdir /app && tar -xf /src.tar -C /app && rm /src.tar
+RUN for sm in native/lib/secp256k1 native/lib/blst; do [ -n "$(ls -A /app/$sm 2>/dev/null)" ] || { echo "src.tar lacks $sm" >&2; exit 1; }; done
 WORKDIR /app
 # Makefile's buildinfo needs a git HEAD; the zip has none.
 RUN git config --global user.email b@b && git config --global user.name b \
