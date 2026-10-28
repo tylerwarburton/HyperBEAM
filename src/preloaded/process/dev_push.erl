@@ -17,7 +17,7 @@
 %% visible here is not locked out once it appears.
 -define(MISSING_TARGETS, dev_push_missing_targets).
 -define(MISSING_TARGETS_MAX, 100000).
--define(DEFAULT_MISSING_TARGET_TTL, 600).
+-define(DEFAULT_MISSING_TARGET_TTL, 60).
 
 %% @doc Push either a message or an assigned slot number. If a `Process' is
 %% provided in the `body' of the request, it will be scheduled (initializing
@@ -249,12 +249,20 @@ do_push(PrimaryProcess, Assignment, Opts) ->
             {error, Result}
     end.
 
-%% @doc Read an outbox target, skipping the store chain for a target that
-%% failed to resolve within the last `push-missing-target-ttl' seconds.
+%% @doc Read an outbox target. A target that was not found within the last
+%% `push-missing-target-ttl' seconds is read from the local stores only, so
+%% only the remote fallthrough is skipped: an id this node stores or spawns
+%% after the miss is found at once, and that clears the entry.
 read_target(Target, Opts) ->
-    TTL = hb_opts:get(push_missing_target_ttl, ?DEFAULT_MISSING_TARGET_TTL, Opts),
+    TTL = hb_opts:get(<<"push-missing-target-ttl">>, ?DEFAULT_MISSING_TARGET_TTL, Opts),
     case recently_missing(Target, TTL) of
-        true -> {error, not_found};
+        true ->
+            case hb_cache:read(Target, hb_store:scope(Opts, local)) of
+                {ok, _} = Found ->
+                    forget_missing(Target),
+                    Found;
+                _ -> {error, not_found}
+            end;
         false ->
             case hb_cache:read(Target, Opts) of
                 {error, not_found} ->
@@ -263,6 +271,10 @@ read_target(Target, Opts) ->
                 Other -> Other
             end
     end.
+
+forget_missing(Target) ->
+    try ets:delete(?MISSING_TARGETS, Target) catch error:badarg -> true end,
+    ok.
 
 recently_missing(Target, TTL) when is_binary(Target), is_integer(TTL), TTL > 0 ->
     try ets:lookup(?MISSING_TARGETS, Target) of
@@ -1098,6 +1110,20 @@ read_target_remembers_miss_test() ->
     ?assertNot(recently_missing(Off, 600)),
     {ok, Found} = hb_cache:write(#{ <<"greeting">> => <<"hello">> }, Opts),
     ?assertMatch({ok, _}, read_target(Found, Opts)).
+
+%% @doc A target this node stores right after a failed push is found at once,
+%% not after the TTL, and its entry is cleared.
+read_target_finds_local_write_after_miss_test() ->
+    Store = hb_test_utils:test_store(),
+    hb_store:start(Store),
+    Opts = #{ <<"store">> => [Store], <<"priv-wallet">> => ar_wallet:new() },
+    Msg = hb_message:commit(#{ <<"spawned">> => <<"late">> }, Opts),
+    ID = hb_message:id(Msg, signed, Opts),
+    ?assertEqual({error, not_found}, read_target(ID, Opts)),
+    ?assert(recently_missing(ID, 60)),
+    {ok, _} = hb_cache:write(Msg, Opts),
+    ?assertMatch({ok, _}, read_target(ID, Opts)),
+    ?assertNot(recently_missing(ID, 60)).
 
 %% The test groups run sequentially with respect to each other but each
 %% group is internally parallel. Splitting keeps the WASM-heavy core
