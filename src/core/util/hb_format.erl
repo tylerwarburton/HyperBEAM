@@ -421,6 +421,17 @@ escape_format(Str) when is_list(Str) ->
     end;
 escape_format(Else) -> Else.
 
+%% @doc The pattern of a device name after a `~', compiled once: each line
+%% that is printed escapes every one of its parts with it.
+device_name_regex() ->
+    case persistent_term:get({?MODULE, device_name_regex}, undefined) of
+        undefined ->
+            {ok, MP} = re:compile("~([a-z\\-_]+@[0-9]+\\.[0-9]+)"),
+            persistent_term:put({?MODULE, device_name_regex}, MP),
+            MP;
+        MP -> MP
+    end.
+
 %% @doc Format an error message as a string.
 error(ErrorMsg, Opts) ->
     Type = hb_maps:get(<<"type">>, ErrorMsg, <<"[No type]">>, Opts),
