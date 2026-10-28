@@ -535,6 +535,31 @@ the numbers below with the reason they moved.
      naming a slot the restart lost (93 and 183 refusals). ff752f851 on the
      same run gives 244 messages two slots or more.
 
+11. **A slot is computed, pushed or served only once it is durable** (ours).
+   Contracts key items on (sender process, slot), so nothing derived from
+   slot N may leave the node before N's assignment is flushed: a crash
+   would lose N, and the scheduler would give N to another message. With
+   the grouped flush, an assignment is in the store (readable by `get`)
+   from its write until its batch's flush, ~6 ms of signing per later
+   request; a `now` in that window read it, computed it and could push it.
+   - The scheduling server keeps each process's newest durable slot in a
+     node-wide table: the latest on disk when it starts, the batch's last
+     slot after each flush that succeeds (before anyone is answered). A
+     failed flush leaves it where it was.
+   - Compute's local read (`next`, lookahead), the schedule served to other
+     nodes and clients (`schedule`, also `next`'s fallback) and `slot`'s
+     `current` stop at it. A process not scheduled here is not limited.
+     `aggressive` mode answers before writing, so it sets no limit.
+   - Test: a batch whose flush fails (journal `fail_sync`, as a crash after
+     the write would leave it) has its slot in the store, readable, but not
+     given to compute or served; failed before the change.
+     `dev_scheduler,dev_scheduler_server,dev_scheduler_cache,
+     hb_store_irreplaceable,hb_store_offsite_journal,hb_store_lmdb` 65/67
+     (the two redirect failures as before), `dev_process,
+     dev_process_worker,dev_push,hb_process_test_vectors` 64/64. All ten in
+     one VM fail with `io_error` on base too (19 failures): more LMDB stores
+     than a VM's address space maps at 2 TiB each.
+
 Already better in RC7, so we do not port our version: the `hb_escape` header
 escaping, the `hb_name` delete fix, RSA CRT signing.
 
