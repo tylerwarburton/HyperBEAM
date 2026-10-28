@@ -1,24 +1,30 @@
 %%% @doc A stateless device for verifiable randomness: it checks time-lock
-%%% puzzle answers (a validator's trapdoor reveal, or anyone's Wesolowski
+%%% puzzle answers (a validator's reveal of its secret, or anyone's Wesolowski
 %%% crack), checks a BLS randomness-beacon signature, and derives bytes from a
 %%% seed. Every key is a pure function of its inputs, so a process may call it
 %%% from inside its computation (for example `ao.resolve' from Lua) and every
 %%% node that replays the process reaches the same result. It was `vrf@1.0'.
 %%%
+%%% All puzzles live in one group of unknown order: the integers modulo the
+%%% RSA-2048 challenge number N, whose factors nobody knows. The generator is
+%%% g = (int(expand("rng/timelock/g", 2112)) mod N)^2 mod N, where
+%%% expand(s, n) is the first n bits of
+%%% SHA-256(s ++ "|0") ++ SHA-256(s ++ "|1") ++ ... A validator commits
+%%% c = g^alpha and its output is y = c^(2^T) = h^alpha, with h = g^(2^T).
+%%% Outputs are returned in canonical form y* = min(y, N - y).
+%%%
 %%% Keys:
 %%% <pre>
-%%%     derive-x       Inputs: `modulus' (hex), `seed' (binary). Returns
-%%%                    `valid' and `x' (hex), the puzzle input
-%%%                    (int(expand(seed, bits(N) + 64)) mod N)^2 mod N, where
-%%%                    expand(s, n) is the first n bits of
-%%%                    SHA-256(s ++ "|0") ++ SHA-256(s ++ "|1") ++ ...
-%%%     verify-reveal  Inputs: `modulus', `seed', `t' (decimal), `y' (hex),
-%%%                    `p' (hex). Valid iff 1 < p < N, N rem p = 0 and
-%%%                    y = x^(2^t mod (p-1)(q-1)) mod N. Returns `valid', `x'.
-%%%     verify-crack   Inputs: `modulus', `seed', `t', `y', `proof' (hex).
-%%%                    Valid iff 0 < y < N, 0 < proof < N and
+%%%     generator      No inputs. Returns `valid', `g' and `n' (hex).
+%%%     verify-reveal  Inputs: `c', `alpha', `h' (hex). Valid iff 0 < c < N,
+%%%                    0 < h < N, alpha has at most 512 bits and
+%%%                    g^alpha = c (mod N). Returns `valid' and `y', the hex
+%%%                    of canonical(h^alpha mod N).
+%%%     verify-crack   Inputs: `x', `y', `proof' (hex), `t' (decimal). Valid
+%%%                    iff 0 < x, y, proof < N, t =< 2^32 and
 %%%                    proof^l * x^(2^t mod l) = y (mod N), with l the
-%%%                    Wesolowski challenge prime. Returns `valid', `x'.
+%%%                    Wesolowski challenge prime. Returns `valid' and `y',
+%%%                    the hex of canonical(y).
 %%%     verify-bls     Inputs: `public-key' (hex, 48-byte compressed G1 point),
 %%%                    `message' (binary), `signature' (hex, 96-byte compressed
 %%%                    G2 point). Returns `valid' (boolean). When the signature
@@ -32,12 +38,12 @@
 %%%                    ++ ..., each counter written in decimal.
 %%% </pre>
 %%%
-%%% The time-lock keys follow the Random-Process protocol (SPEC.md 2.3-2.5)
+%%% The time-lock keys follow the Random-Process protocol (SPEC.md 2.3-2.5, 3)
 %%% and match its JavaScript reference (`provider/timelock.mjs') bit for bit.
 %%% Hex integers are lowercase without leading zeros, as `BigInt.toString(16)'
 %%% writes them; other spellings are refused, since the challenge prime hashes
-%%% the hex as given. Sizes are capped: moduli and hex inputs at 4096 bits,
-%%% seeds at 4096 bytes, `t' at 2^32.
+%%% the hex as given. Sizes are capped: group elements at 512 hex digits (N
+%%% has 2048 bits), `alpha' at 128 (512 bits), `t' at 2^32.
 %%%
 %%% The BLS scheme is the IETF "minimal-pubkey-size" variant over BLS12-381
 %%% (`blst_nif'): keys in G1, signatures in G2, ciphersuite
@@ -48,62 +54,68 @@
 %%% never an error.
 -module(dev_timelock).
 -export([device_info/1]).
--export([derive_x/3, verify_reveal/3, verify_crack/3]).
+-export([generator/3, verify_reveal/3, verify_crack/3]).
 -export([verify_bls/3, derive/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -define(MAX_DERIVE_BYTES, 1024).
--define(MAX_HEX_CHARS, 1024). % 4096 bits
--define(MAX_SEED_BYTES, 4096).
+-define(MAX_ELEMENT_HEX, 512). % N has 2048 bits
+-define(MAX_ALPHA_HEX, 128). % 512 bits
 -define(MAX_T, (1 bsl 32)).
 -define(MAX_COUNTER, (1 bsl 64)).
 -define(MAX_INT_DIGITS, 20). % 2^64 has 20
+
+%% The RSA-2048 challenge number (RSA Laboratories, 1991; SPEC 2.3), as hex.
+%% Its factors were never published, so nobody knows the order of the group.
+-define(N_HEX,
+    <<
+        "c7970ceedcc3b0754490201a7aa613cd73911081c790f5f1a8726f463550bb5b"
+        "7ff0db8e1ea1189ec72f93d1650011bd721aeeacc2acde32a04107f0648c2813"
+        "a31f5b0b7765ff8b44b4b6ffc93384b646eb09c7cf5e8592d40ea33c80039f35"
+        "b4f14a04b51f7bfd781be4d1673164ba8eb991c2c4d730bbbe35f592bdef524a"
+        "f7e8daefd26c66fc02c479af89d64d373f442709439de66ceb955f3ea37d5159"
+        "f6135809f85334b5cb1813addc80cd05609f10ac6a95ad65872c909525bdad32"
+        "bc729592642920f24c61dc5b3c3b7923e56b16a4d9d373d8721f24a3fc0f1b31"
+        "31f55615172866bccc30f95054c824e733a5eb6817f7bc16399d48c6361cc7e5"
+    >>
+).
 
 %% @doc Device metadata: the five keys, and nothing else.
 device_info(_Base) ->
     #{
         exports =>
             [
-                <<"derive-x">>, <<"verify-reveal">>, <<"verify-crack">>,
+                <<"generator">>, <<"verify-reveal">>, <<"verify-crack">>,
                 <<"verify-bls">>, <<"derive">>
             ]
     }.
 
-%% @doc The puzzle input `x' for a modulus and a seed.
--spec derive_x(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
-    {ok, #{ valid := boolean(), _ => _ }}.
-derive_x(Base, Req, Opts) ->
-    safe(
-        fun() ->
-            maybe
-                {ok, {_, N}} ?= modulus_input(Base, Req, Opts),
-                {ok, Seed} ?= seed_input(Base, Req, Opts),
-                {checked, puzzle_x(N, Seed), ok}
-            end
-        end
-    ).
+%% @doc The built-in group: the generator `g' and the modulus `n', in hex.
+-spec generator(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
+    {ok, #{ valid := true, _ => _ }}.
+generator(_Base, _Req, _Opts) ->
+    #{ g := G } = params(),
+    {ok, #{ <<"valid">> => true, <<"g">> => to_hex(G), <<"n">> => ?N_HEX }}.
 
-%% @doc Check a validator's reveal: the factor `p' of the modulus and the
-%% answer `y' it computed with that trapdoor.
+%% @doc Check a validator's reveal: its secret `alpha' opens the commit `c',
+%% and its output is h^alpha.
 -spec verify_reveal(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
     {ok, #{ valid := boolean(), _ => _ }}.
 verify_reveal(Base, Req, Opts) ->
     safe(
         fun() ->
             maybe
-                {ok, {_, N}} ?= modulus_input(Base, Req, Opts),
-                {ok, Seed} ?= seed_input(Base, Req, Opts),
-                {ok, T} ?= t_input(Base, Req, Opts),
-                {ok, {_, Y}} ?= hex_int_input(<<"y">>, Base, Req, Opts),
-                {ok, {_, P}} ?= hex_int_input(<<"p">>, Base, Req, Opts),
-                X = puzzle_x(N, Seed),
-                {checked, X, check_reveal(N, X, T, Y, P)}
+                {ok, {_, C}} ?= element_input(<<"c">>, Base, Req, Opts),
+                {ok, {_, H}} ?= element_input(<<"h">>, Base, Req, Opts),
+                {ok, {_, Alpha}} ?=
+                    hex_int_input(<<"alpha">>, ?MAX_ALPHA_HEX, Base, Req, Opts),
+                check_reveal(C, Alpha, H)
             end
         end
     ).
 
-%% @doc Check a crack: the answer `y' found by `t' squarings and its
+%% @doc Check a crack: the answer `y' found by `t' squarings of `x' and its
 %% Wesolowski proof.
 -spec verify_crack(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
     {ok, #{ valid := boolean(), _ => _ }}.
@@ -111,45 +123,50 @@ verify_crack(Base, Req, Opts) ->
     safe(
         fun() ->
             maybe
-                {ok, {NHex, N}} ?= modulus_input(Base, Req, Opts),
-                {ok, Seed} ?= seed_input(Base, Req, Opts),
+                {ok, {XHex, X}} ?= element_input(<<"x">>, Base, Req, Opts),
+                {ok, {YHex, Y}} ?= element_input(<<"y">>, Base, Req, Opts),
+                {ok, {_, Proof}} ?= element_input(<<"proof">>, Base, Req, Opts),
                 {ok, T} ?= t_input(Base, Req, Opts),
-                {ok, {YHex, Y}} ?= hex_int_input(<<"y">>, Base, Req, Opts),
-                {ok, {_, Proof}} ?= hex_int_input(<<"proof">>, Base, Req, Opts),
-                X = puzzle_x(N, Seed),
-                {checked, X, check_crack(NHex, N, X, T, YHex, Y, Proof)}
+                check_crack(XHex, X, T, YHex, Y, Proof)
             end
         end
     ).
 
-%% @doc SPEC 2.4 step 2: `p' is a proper factor of N, and `y' is x raised to
-%% 2^t, reduced through phi(N) = (p-1)(q-1).
-check_reveal(N, X, T, Y, P) ->
-    maybe
-        true ?= (P > 1 andalso P < N) orelse {error, <<"p-out-of-range">>},
-        true ?= (N rem P =:= 0) orelse {error, <<"p-not-a-factor">>},
-        Phi = (P - 1) * (N div P - 1),
-        true ?= mod_pow(X, mod_pow(2, T, Phi), N) =:= Y,
-        ok
+%% @doc SPEC 3: g^alpha = c (mod N); the output is canonical(h^alpha mod N).
+check_reveal(C, Alpha, H) ->
+    #{ n := N, g := G } = params(),
+    case mod_pow(G, Alpha, N) =:= C of
+        true -> {ok, canonical(mod_pow(H, Alpha, N), N)};
+        false -> {error, <<"verify-failed">>}
     end.
 
 %% @doc SPEC 2.5: proof^l * x^(2^t mod l) = y (mod N).
-check_crack(NHex, N, X, T, YHex, Y, Proof) ->
-    maybe
-        true ?= (Y > 0 andalso Y < N) orelse {error, <<"y-out-of-range">>},
-        true ?=
-            (Proof > 0 andalso Proof < N)
-                orelse {error, <<"proof-out-of-range">>},
-        L = challenge_prime(NHex, to_hex(X), YHex, T),
-        R = mod_pow(2, T, L),
-        true ?= (mod_pow(Proof, L, N) * mod_pow(X, R, N)) rem N =:= Y,
-        ok
+check_crack(XHex, X, T, YHex, Y, Proof) ->
+    #{ n := N } = params(),
+    L = challenge_prime(XHex, YHex, T),
+    R = mod_pow(2, T, L),
+    case (mod_pow(Proof, L, N) * mod_pow(X, R, N)) rem N =:= Y of
+        true -> {ok, canonical(Y, N)};
+        false -> {error, <<"verify-failed">>}
     end.
 
-%% @doc SPEC 2.3: x = (int(expand(seed, bits(N) + 64)) mod N)^2 mod N.
-puzzle_x(N, Seed) ->
-    V = expand(Seed, bit_length(N) + 64) rem N,
-    (V * V) rem N.
+%% @doc y* = min(y, N - y): y and N - y pass the same checks, so they count
+%% as one output.
+canonical(Y, N) -> min(Y, N - Y).
+
+%% @doc The constants, computed once per node and kept in a persistent term:
+%% N, g (SPEC 2.3) and the primes below 1000.
+params() ->
+    case persistent_term:get(?MODULE, undefined) of
+        undefined ->
+            N = binary_to_integer(?N_HEX, 16),
+            V = expand(<<"rng/timelock/g">>, 2112) rem N,
+            Params = #{ n => N, g => (V * V) rem N, small => small_primes() },
+            persistent_term:put(?MODULE, Params),
+            Params;
+        Params ->
+            Params
+    end.
 
 %% @doc The first `Bits' bits, big-endian, of
 %% SHA-256(Seed ++ "|0") ++ SHA-256(Seed ++ "|1") ++ ...
@@ -167,17 +184,18 @@ expand(Seed, Bits) ->
     V.
 
 %% @doc The Wesolowski challenge: the first prime at or above the first 128
-%% bits of SHA-256("rng/wesolowski|N|x|y|t"), with bits 127 and 0 set.
-challenge_prime(NHex, XHex, YHex, T) ->
+%% bits of SHA-256("rng/wesolowski|x|y|t"), with bits 127 and 0 set.
+challenge_prime(XHex, YHex, T) ->
     <<C:128, _/binary>> =
         crypto:hash(
             sha256,
             <<
-                "rng/wesolowski|", NHex/binary, "|", XHex/binary, "|",
-                YHex/binary, "|", (integer_to_binary(T))/binary
+                "rng/wesolowski|", XHex/binary, "|", YHex/binary, "|",
+                (integer_to_binary(T))/binary
             >>
         ),
-    next_prime(C bor (1 bsl 127) bor 1, small_primes()).
+    #{ small := Small } = params(),
+    next_prime(C bor (1 bsl 127) bor 1, Small).
 
 next_prime(C, Small) ->
     case is_probable_prime(C, Small) of
@@ -244,7 +262,7 @@ bit_length(N) ->
 to_hex(N) -> string:lowercase(integer_to_binary(N, 16)).
 
 %% @doc Run a time-lock key, turning its outcome (or any crash) into a result
-%% message. `x' is included whenever it was computed.
+%% message: `{ok, Y}' gives `valid' and the canonical output `y'.
 safe(Fun) ->
     Result =
         try Fun()
@@ -253,12 +271,8 @@ safe(Fun) ->
             {error, <<"internal-error">>}
         end,
     case Result of
-        {checked, X, ok} ->
-            {ok, #{ <<"valid">> => true, <<"x">> => to_hex(X) }};
-        {checked, X, Failure} ->
-            {ok, (invalid(Failure))#{ <<"x">> => to_hex(X) }};
-        Failure ->
-            {ok, invalid(Failure)}
+        {ok, Y} -> {ok, #{ <<"valid">> => true, <<"y">> => to_hex(Y) }};
+        Failure -> {ok, invalid(Failure)}
     end.
 
 %% @doc Verify a BLS signature over a message under a public key.
@@ -376,12 +390,12 @@ int_input(Key, Base, Req, Opts) ->
     end.
 
 %% @doc Find a hex integer, lowercase without leading zeros, of at most
-%% `?MAX_HEX_CHARS' digits. Returns the hex as given and its value.
-hex_int_input(Key, Base, Req, Opts) ->
+%% `Max' digits. Returns the hex as given and its value.
+hex_int_input(Key, Max, Base, Req, Opts) ->
     maybe
         {ok, Hex} ?= binary_input(Key, Base, Req, Opts),
         true ?=
-            byte_size(Hex) =< ?MAX_HEX_CHARS
+            byte_size(Hex) =< Max
                 orelse {error, <<Key/binary, "-too-large">>},
         true ?= is_hex(Hex) orelse {error, <<"invalid-", Key/binary>>},
         true ?= is_canonical_hex(Hex)
@@ -403,22 +417,13 @@ is_canonical_hex(<<"0">>) -> true;
 is_canonical_hex(<<"0", _/binary>>) -> false;
 is_canonical_hex(Hex) -> string:lowercase(Hex) =:= Hex.
 
-%% @doc The modulus: a hex integer above 1.
-modulus_input(Base, Req, Opts) ->
+%% @doc A group element: a hex integer with 0 < value < N.
+element_input(Key, Base, Req, Opts) ->
     maybe
-        {ok, {_, N}} = Ok ?= hex_int_input(<<"modulus">>, Base, Req, Opts),
-        true ?= N > 1 orelse {error, <<"modulus-out-of-range">>},
+        {ok, {_, V}} = Ok ?= hex_int_input(Key, ?MAX_ELEMENT_HEX, Base, Req, Opts),
+        #{ n := N } = params(),
+        true ?= (V > 0 andalso V < N) orelse {error, <<Key/binary, "-out-of-range">>},
         Ok
-    end.
-
-%% @doc The seed: a binary of at most `?MAX_SEED_BYTES' bytes.
-seed_input(Base, Req, Opts) ->
-    maybe
-        {ok, Seed} ?= binary_input(<<"seed">>, Base, Req, Opts),
-        true ?=
-            byte_size(Seed) =< ?MAX_SEED_BYTES
-                orelse {error, <<"seed-too-large">>},
-        {ok, Seed}
     end.
 
 %% @doc The squaring count: an integer from 0 to 2^32, or its decimal
@@ -456,22 +461,19 @@ resolve_device(Key, Inputs) ->
     ).
 
 %% @doc Every time-lock vector from the reference implementation gives the
-%% same `valid' and `x' as it does there.
+%% same `valid' and outputs (`y', `g', `n') as it does there.
 timelock_vectors_test_() ->
     [
         {
             Name,
             fun() ->
                 {ok, Res} = resolve_device(Key, Inputs),
-                ?assertEqual(
-                    maps:get(<<"valid">>, Expected),
-                    hb_maps:get(<<"valid">>, Res, undefined, #{})
+                maps:foreach(
+                    fun(K, V) ->
+                        ?assertEqual({K, V}, {K, hb_maps:get(K, Res, undefined, #{})})
+                    end,
+                    maps:remove(<<"l">>, Expected)
                 ),
-                case maps:find(<<"x">>, Expected) of
-                    {ok, X} ->
-                        ?assertEqual(X, hb_maps:get(<<"x">>, Res, undefined, #{}));
-                    error -> ok
-                end,
                 case maps:get(<<"valid">>, Expected) of
                     true -> ok;
                     false ->
@@ -499,8 +501,7 @@ challenge_prime_test() ->
             ?assertEqual(
                 binary_to_integer(maps:get(<<"l">>, E), 16),
                 challenge_prime(
-                    maps:get(<<"modulus">>, I),
-                    maps:get(<<"x">>, E),
+                    maps:get(<<"x">>, I),
                     maps:get(<<"y">>, I),
                     binary_to_integer(maps:get(<<"t">>, I))
                 )
@@ -508,16 +509,25 @@ challenge_prime_test() ->
         end,
         Cracks
     ),
-    {{N, X, Y, T}, L} = dev_timelock_test_vectors:fixed_challenge_prime(),
-    Prime = challenge_prime(N, X, Y, T),
+    {{X, Y, T}, L} = dev_timelock_test_vectors:fixed_challenge_prime(),
+    Prime = challenge_prime(X, Y, T),
     ?assertEqual(binary_to_integer(L, 16), Prime),
     ?assertEqual(128, bit_length(Prime)).
+
+%% @doc The built-in N is the 2048-bit RSA challenge number and g is a
+%% square below it.
+params_test() ->
+    #{ n := N, g := G, small := Small } = params(),
+    ?assertEqual(2048, bit_length(N)),
+    ?assertEqual(?N_HEX, to_hex(N)),
+    ?assert(G > 1 andalso G < N),
+    ?assertEqual(168, length(Small)),
+    ?assertEqual(params(), persistent_term:get(?MODULE)).
 
 %% @doc The primality test refuses Carmichael numbers and small composites,
 %% and accepts small and large primes.
 primality_test() ->
-    Small = small_primes(),
-    ?assertEqual(168, length(Small)),
+    #{ small := Small } = params(),
     ?assertNot(is_probable_prime(561, Small)),
     ?assertNot(is_probable_prime(1, Small)),
     ?assertNot(is_probable_prime(1009 * 1013, Small)),
@@ -529,73 +539,79 @@ primality_test() ->
 %% @doc Malformed and oversized inputs give `valid: false' with a reason, and
 %% `t' may also be given as an integer.
 timelock_malformed_inputs_test() ->
-    [{_, <<"verify-reveal">>, Good, _}] =
-        [
-            V
-        ||
-            {<<"1024-t1024-reveal-valid-p">>, _, _, _} = V
-                <- dev_timelock_test_vectors:timelock_vectors()
-        ],
-    Reveal =
-        fun(Inputs) ->
-            {ok, Res} = resolve_device(<<"verify-reveal">>, Inputs),
+    Vectors =
+        maps:from_list(
+            [
+                {Name, Inputs}
+            ||
+                {Name, _, Inputs, _} <- dev_timelock_test_vectors:timelock_vectors()
+            ]
+        ),
+    Reveal = maps:get(<<"t1024-reveal-valid">>, Vectors),
+    Crack = maps:get(<<"t1024-crack-valid">>, Vectors),
+    Run =
+        fun(Key, Inputs) ->
+            {ok, Res} = resolve_device(Key, Inputs),
             {
                 hb_maps:get(<<"valid">>, Res, undefined, #{}),
                 hb_maps:get(<<"reason">>, Res, undefined, #{})
             }
         end,
-    ?assertEqual({true, undefined}, Reveal(Good)),
+    ?assertEqual({true, undefined}, Run(<<"verify-reveal">>, Reveal)),
+    ?assertEqual({true, undefined}, Run(<<"verify-crack">>, Crack)),
     ?assertEqual(
         {true, undefined},
-        Reveal(Good#{ <<"t">> => binary_to_integer(maps:get(<<"t">>, Good)) })
+        Run(
+            <<"verify-crack">>,
+            Crack#{ <<"t">> => binary_to_integer(maps:get(<<"t">>, Crack)) }
+        )
     ),
-    Upper = string:uppercase(maps:get(<<"y">>, Good)),
-    Huge = binary:copy(<<"f">>, ?MAX_HEX_CHARS + 1),
+    Upper = string:uppercase(maps:get(<<"c">>, Reveal)),
+    Huge = binary:copy(<<"f">>, ?MAX_ELEMENT_HEX + 1),
     lists:foreach(
-        fun({Inputs, Reason}) ->
-            ?assertEqual({false, Reason}, Reveal(Inputs))
+        fun({Key, Inputs, Reason}) ->
+            ?assertEqual({false, Reason}, Run(Key, Inputs))
         end,
         [
-            {maps:remove(<<"p">>, Good), <<"missing-p">>},
-            {maps:remove(<<"modulus">>, Good), <<"missing-modulus">>},
-            {Good#{ <<"y">> => Upper }, <<"non-canonical-y">>},
-            {Good#{ <<"y">> => <<"0", (maps:get(<<"y">>, Good))/binary>> },
-                <<"non-canonical-y">>},
-            {Good#{ <<"y">> => <<>> }, <<"invalid-y">>},
-            {Good#{ <<"y">> => <<"0x12">> }, <<"invalid-y">>},
-            {Good#{ <<"y">> => 12 }, <<"invalid-y">>},
-            {Good#{ <<"modulus">> => Huge }, <<"modulus-too-large">>},
-            {Good#{ <<"modulus">> => <<"1">> }, <<"modulus-out-of-range">>},
-            {Good#{ <<"p">> => Huge }, <<"p-too-large">>},
-            {Good#{ <<"seed">> => binary:copy(<<"s">>, ?MAX_SEED_BYTES + 1) },
-                <<"seed-too-large">>},
-            {Good#{ <<"t">> => <<"4294967297">> }, <<"t-out-of-range">>},
-            {Good#{ <<"t">> => <<"99999999999999999999">> }, <<"t-out-of-range">>},
-            {Good#{ <<"t">> => -1 }, <<"t-out-of-range">>},
-            {Good#{ <<"t">> => <<"01024">> }, <<"invalid-t">>},
-            {Good#{ <<"t">> => <<"-1">> }, <<"invalid-t">>},
-            {Good#{ <<"t">> => <<"1e3">> }, <<"invalid-t">>},
-            {Good#{ <<"t">> => 1.5 }, <<"invalid-t">>},
-            {Good#{ <<"p">> => <<"2">> }, <<"p-not-a-factor">>},
-            {Good#{ <<"p">> => <<"1">> }, <<"p-out-of-range">>},
-            {Good#{ <<"y">> => <<"1">> }, <<"verify-failed">>}
+            {<<"verify-reveal">>, maps:remove(<<"alpha">>, Reveal), <<"missing-alpha">>},
+            {<<"verify-reveal">>, maps:remove(<<"h">>, Reveal), <<"missing-h">>},
+            {<<"verify-reveal">>, Reveal#{ <<"c">> => Upper }, <<"non-canonical-c">>},
+            {<<"verify-reveal">>,
+                Reveal#{ <<"c">> => <<"0", (maps:get(<<"c">>, Reveal))/binary>> },
+                <<"non-canonical-c">>},
+            {<<"verify-reveal">>, Reveal#{ <<"c">> => <<>> }, <<"invalid-c">>},
+            {<<"verify-reveal">>, Reveal#{ <<"c">> => <<"0x12">> }, <<"invalid-c">>},
+            {<<"verify-reveal">>, Reveal#{ <<"c">> => 12 }, <<"invalid-c">>},
+            {<<"verify-reveal">>, Reveal#{ <<"c">> => Huge }, <<"c-too-large">>},
+            {<<"verify-reveal">>, Reveal#{ <<"c">> => <<"0">> }, <<"c-out-of-range">>},
+            {<<"verify-reveal">>, Reveal#{ <<"h">> => ?N_HEX }, <<"h-out-of-range">>},
+            {<<"verify-reveal">>,
+                Reveal#{ <<"alpha">> => binary:copy(<<"f">>, ?MAX_ALPHA_HEX + 1) },
+                <<"alpha-too-large">>},
+            {<<"verify-reveal">>, Reveal#{ <<"alpha">> => <<"1">> }, <<"verify-failed">>},
+            {<<"verify-crack">>, maps:remove(<<"proof">>, Crack), <<"missing-proof">>},
+            {<<"verify-crack">>, Crack#{ <<"x">> => ?N_HEX }, <<"x-out-of-range">>},
+            {<<"verify-crack">>, Crack#{ <<"y">> => <<"0">> }, <<"y-out-of-range">>},
+            {<<"verify-crack">>, Crack#{ <<"proof">> => Huge }, <<"proof-too-large">>},
+            {<<"verify-crack">>, Crack#{ <<"t">> => <<"4294967297">> }, <<"t-out-of-range">>},
+            {<<"verify-crack">>, Crack#{ <<"t">> => <<"99999999999999999999">> },
+                <<"t-out-of-range">>},
+            {<<"verify-crack">>, Crack#{ <<"t">> => -1 }, <<"t-out-of-range">>},
+            {<<"verify-crack">>, Crack#{ <<"t">> => <<"01024">> }, <<"invalid-t">>},
+            {<<"verify-crack">>, Crack#{ <<"t">> => <<"-1">> }, <<"invalid-t">>},
+            {<<"verify-crack">>, Crack#{ <<"t">> => <<"1e3">> }, <<"invalid-t">>},
+            {<<"verify-crack">>, Crack#{ <<"t">> => 1.5 }, <<"invalid-t">>},
+            {<<"verify-crack">>, Crack#{ <<"t">> => <<"1023">> }, <<"verify-failed">>}
         ]
     ),
-    % `x' comes back whenever it was computed, even for a wrong answer.
-    {ok, Wrong} =
-        resolve_device(<<"verify-reveal">>, Good#{ <<"y">> => <<"1">> }),
-    {ok, Derived} =
-        resolve_device(
-            <<"derive-x">>,
-            maps:with([<<"modulus">>, <<"seed">>], Good)
-        ),
+    % A reveal and a crack of the same commit give the same canonical output.
+    {ok, R} = resolve_device(<<"verify-reveal">>, Reveal),
+    {ok, K} = resolve_device(<<"verify-crack">>, Crack),
+    ?assertEqual(maps:get(<<"c">>, Reveal), maps:get(<<"x">>, Crack)),
     ?assertEqual(
-        hb_maps:get(<<"x">>, Derived, undefined, #{}),
-        hb_maps:get(<<"x">>, Wrong, undefined, #{})
-    ),
-    {ok, NoSeed} = resolve_device(<<"derive-x">>, maps:with([<<"modulus">>], Good)),
-    ?assertEqual(false, hb_maps:get(<<"valid">>, NoSeed, undefined, #{})),
-    ?assertEqual(<<"missing-seed">>, hb_maps:get(<<"reason">>, NoSeed, undefined, #{})).
+        hb_maps:get(<<"y">>, R, undefined, #{}),
+        hb_maps:get(<<"y">>, K, undefined, #{})
+    ).
 
 %% @doc Every interop vector from the beacon's JavaScript (noble-curves)
 %% verifies, or fails, exactly as it does there.
@@ -777,19 +793,16 @@ lua_module() ->
     function check_reveal(base, req)
         local status, res = ao.resolve({
             path = "/~timelock@1.0/verify-reveal",
-            modulus = req.modulus,
-            seed = req.seed,
-            t = req.t,
-            y = req.y,
-            p = req.p
+            c = req.c,
+            alpha = req.alpha,
+            h = req.h
         })
         return res
     end
     function check_crack(base, req)
         local status, res = ao.resolve({
             path = "/~timelock@1.0/verify-crack",
-            modulus = req.modulus,
-            seed = req.seed,
+            x = req.x,
             t = req.t,
             y = req.y,
             proof = req.proof
@@ -857,18 +870,20 @@ lua_timelock_test() ->
                     <- dev_timelock_test_vectors:timelock_vectors()
             ]
         ),
-    {_, #{ <<"x">> := X }} = maps:get(<<"1024-t1024-derive-x">>, Vectors),
     lists:foreach(
-        fun({Func, Name, Valid}) ->
-            {Inputs, _} = maps:get(Name, Vectors),
+        fun({Func, Name}) ->
+            {Inputs, Expected} = maps:get(Name, Vectors),
             {ok, Res} = hb_ao:resolve(Base, Inputs#{ <<"path">> => Func }, #{}),
-            ?assertEqual(Valid, hb_ao:get(<<"valid">>, Res, #{})),
-            ?assertEqual(X, hb_ao:get(<<"x">>, Res, #{}))
+            ?assertEqual(maps:get(<<"valid">>, Expected), hb_ao:get(<<"valid">>, Res, #{})),
+            case maps:find(<<"y">>, Expected) of
+                {ok, Y} -> ?assertEqual(Y, hb_ao:get(<<"y">>, Res, #{}));
+                error -> ok
+            end
         end,
         [
-            {<<"check_reveal">>, <<"1024-t1024-reveal-valid-p">>, true},
-            {<<"check_reveal">>, <<"1024-t1024-reveal-wrong-y">>, false},
-            {<<"check_crack">>, <<"1024-t1024-crack-valid">>, true},
-            {<<"check_crack">>, <<"1024-t1024-crack-corrupt-proof">>, false}
+            {<<"check_reveal">>, <<"t1024-reveal-valid">>},
+            {<<"check_reveal">>, <<"t1024-reveal-wrong-alpha">>},
+            {<<"check_crack">>, <<"t1024-crack-valid">>},
+            {<<"check_crack">>, <<"t1024-crack-corrupt-proof">>}
         ]
     ).
