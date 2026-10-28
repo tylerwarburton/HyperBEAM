@@ -47,6 +47,7 @@
 %%% the base message. Malformed inputs give `valid: false' with a `reason',
 %%% never an error.
 -module(dev_timelock).
+-export([device_info/1]).
 -export([derive_x/3, verify_reveal/3, verify_crack/3]).
 -export([verify_bls/3, derive/3]).
 -include("include/hb.hrl").
@@ -56,6 +57,18 @@
 -define(MAX_HEX_CHARS, 1024). % 4096 bits
 -define(MAX_SEED_BYTES, 4096).
 -define(MAX_T, (1 bsl 32)).
+-define(MAX_COUNTER, (1 bsl 64)).
+-define(MAX_INT_DIGITS, 20). % 2^64 has 20
+
+%% @doc Device metadata: the five keys, and nothing else.
+device_info(_Base) ->
+    #{
+        exports =>
+            [
+                <<"derive-x">>, <<"verify-reveal">>, <<"verify-crack">>,
+                <<"verify-bls">>, <<"derive">>
+            ]
+    }.
 
 %% @doc The puzzle input `x' for a modulus and a seed.
 -spec derive_x(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
@@ -278,6 +291,7 @@ derive(Base, Req, Opts) ->
             {ok, Counter} ?= int_input(<<"counter">>, Base, Req, Opts),
             {ok, Bytes} ?= int_input(<<"bytes">>, Base, Req, Opts),
             true ?= Counter >= 0 orelse {error, <<"counter-negative">>},
+            true ?= Counter =< ?MAX_COUNTER orelse {error, <<"counter-too-large">>},
             true ?=
                 (Bytes >= 1 andalso Bytes =< ?MAX_DERIVE_BYTES)
                     orelse {error, <<"bytes-out-of-range">>},
@@ -351,6 +365,10 @@ hex_input(Key, Base, Req, Opts) ->
 int_input(Key, Base, Req, Opts) ->
     maybe
         {ok, Value} ?= input(Key, Base, Req, Opts),
+        % Parsing a long decimal costs quadratic time: refuse it unread.
+        true ?=
+            not (is_binary(Value) andalso byte_size(Value) > ?MAX_INT_DIGITS)
+                orelse {error, <<Key/binary, "-too-large">>},
         {ok, _Int} ?= hb_util:safe_int(Value)
     else
         {error, invalid} -> {error, <<"invalid-", Key/binary>>};
@@ -707,6 +725,17 @@ derive_test() ->
                 <<"counter-negative">>},
             {#{ <<"seed">> => Seed, <<"counter">> => <<"x">>, <<"bytes">> => 8 },
                 <<"invalid-counter">>},
+            {#{ <<"seed">> => Seed, <<"counter">> => (1 bsl 64) + 1, <<"bytes">> => 8 },
+                <<"counter-too-large">>},
+            {#{ <<"seed">> => Seed, <<"counter">> => <<"18446744073709551617">>,
+                    <<"bytes">> => 8 },
+                <<"counter-too-large">>},
+            {#{ <<"seed">> => Seed, <<"counter">> => binary:copy(<<"1">>, 200000),
+                    <<"bytes">> => 8 },
+                <<"counter-too-large">>},
+            {#{ <<"seed">> => Seed, <<"counter">> => 0,
+                    <<"bytes">> => binary:copy(<<"1">>, 200000) },
+                <<"bytes-too-large">>},
             {#{ <<"counter">> => 0, <<"bytes">> => 8 }, <<"missing-seed">>}
         ]
     ).
