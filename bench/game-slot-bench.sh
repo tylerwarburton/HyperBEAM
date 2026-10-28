@@ -7,6 +7,8 @@
 # Runs docker locally, or on a box with GAME_BENCH_SSH="root@<host> -i <key>".
 # A throwaway container (3 CPUs); nothing running is touched. Exits non-zero
 # when the worker's mean ms per slot is above the limit. ~2 minutes.
+# HB_CONFIG is unset for the test VM: images built from bench/Dockerfile.branch
+# set it to /data/config.json for the node, which a test run does not have.
 set -euo pipefail
 IMAGE=${1:?usage: game-slot-bench.sh <image> [players] [slots] [max-worker-ms]}
 PLAYERS=${2:-300}
@@ -24,7 +26,7 @@ trap 'D rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
 D run -d --name "$NAME" --cpus 3 --entrypoint sleep "$IMAGE" infinity >/dev/null
 D exec -i "$NAME" sh -c 'cat > /app/src/core/game_slot_bench.erl' < "$SRC"
 OUT=$(D exec -e "GAME_BENCH=$PLAYERS:$SLOTS:/tmp/game-bench:$MAX" "$NAME" sh -c \
-  'cd /app && rebar3 device test --with-core --module=game_slot_bench 2>&1' || true)
+  'unset HB_CONFIG; cd /app && rebar3 device test --with-core --module=game_slot_bench 2>&1' || true)
 LINE=$(printf '%s' "$OUT" | tr -d '\n' | tr -s ' ' | grep -o 'GAME_BENCH.*\] ok\|GAME_BENCH.*failed' || true)
 if [ -z "$LINE" ]; then
   printf '%s\n' "$OUT" | tail -40; echo "game slot bench: no result" >&2; exit 1
