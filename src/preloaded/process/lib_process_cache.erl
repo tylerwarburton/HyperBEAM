@@ -15,7 +15,7 @@ read(ProcID, Opts) ->
 read(ProcID, SlotRef, RawOpts) ->
     Opts = lib_process:cache_opts(RawOpts),
     ?event({reading_computed_result, ProcID, SlotRef}),
-    case is_integer(SlotRef) andalso hot_get(ProcID, SlotRef) of
+    case is_integer(SlotRef) andalso hot_get(ProcID, SlotRef, Opts) of
         {ok, Hot} -> {ok, Hot};
         _ ->
             case is_integer(SlotRef) andalso blob_read(ProcID, SlotRef, Opts) of
@@ -237,7 +237,7 @@ checkpoint_slots(Opts) ->
     end.
 
 base_exists(ProcID, Slot, Opts) ->
-    case hot_get(ProcID, Slot) of
+    case hot_get(ProcID, Slot, Opts) of
         {ok, _} -> true;
         not_found when Slot >= 0 ->
             blob_exists(ProcID, Slot, Opts) orelse
@@ -333,6 +333,15 @@ hot_trim(ProcID, Keep) ->
         false -> ok
     end.
 
+%% The hot cache is node-wide and keyed by process ID alone, so only a
+%% computation that writes it (`process-delta-cache') reads it: one with its
+%% own stores never gets a state computed from another's.
+hot_get(ProcID, Slot, Opts) ->
+    case hot_slots(Opts) of
+        0 -> not_found;
+        _ -> hot_get(ProcID, Slot)
+    end.
+
 hot_get(ProcID, Slot) ->
     try ets:lookup(?HOT, {ProcID, Slot}) of
         [{_, Msg}] -> {ok, Msg};
@@ -341,6 +350,12 @@ hot_get(ProcID, Slot) ->
     end.
 
 %% @doc The newest hot slot of a process, at or below `Limit'.
+hot_latest(ProcID, Limit, Opts) ->
+    case hot_slots(Opts) of
+        0 -> not_found;
+        _ -> hot_latest(ProcID, Limit)
+    end.
+
 hot_latest(ProcID, Limit) ->
     Upper = case Limit of undefined -> infinity; _ -> Limit + 1 end,
     try ets:prev(?HOT, {ProcID, Upper}) of
@@ -429,7 +444,7 @@ latest(ProcID, RawRequiredPath, Limit, RawOpts) ->
                 )
         end,
     ?event({required_path_converted, {proc_id, ProcID}, {required_path, RequiredPath}}),
-    case hot_latest(ProcID, Limit) of
+    case hot_latest(ProcID, Limit, Opts) of
         {ok, HotSlot, HotMsg} ->
             case path_exists(RequiredPath, HotMsg, Opts) of
                 true -> {ok, HotSlot, HotMsg};
