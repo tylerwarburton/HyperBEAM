@@ -24,7 +24,7 @@ them belong to the old node and are replaced at the next fresh deploy.
 | `hb_store_export` | `hb_store_offsite_journal` | Wraps a store and journals every write, append-only and resumable, to a slow or remote target |
 | `hb_store_gc` | `hb_store_retention` | Retention planning: which computed slots can be collected |
 | `hb_process_delta` | `hb_state_patch` | The patch-list format shared by `lua-patch@1.0` and the process cache |
-| (new) | `timelock@1.0` | Stateless time-lock puzzle checks (trapdoor reveal, Wesolowski crack), BLS12-381 beacon-signature check (`blst` NIF) and seed derivation for Lua processes; was `vrf@1.0`; see `docs/devices/timelock-at-1-0.md` |
+| (new) | `timelock@1.0` | Stateless time-lock puzzle checks (trapdoor reveal, Wesolowski crack), BLS12-381 beacon-signature check (`blst` NIF) and seed derivation for Lua processes; was `vrf@1.0`; see `docs/devices/timelock-at-1-0.md`. **Not final** (2026-10-27): the RandAO audit found protocol-soundness bugs (the modulus owner can forge a Wesolowski crack with phi(N); y vs N-y is not pinned; `verify-reveal` checks neither N = p*q with distinct primes of the right size nor a pinned T). Fixes to follow; nothing in v1 uses it. A node whose `blst_nif` does not load refuses to start |
 
 ## Node config the port requires
 
