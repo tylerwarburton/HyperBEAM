@@ -477,6 +477,38 @@ the numbers below with the reason they moved.
 9. **Clients and contracts** (monorepo): httpsig keyids are base64url, and
    the committer is the `publickey:` URI, not an address, so `signer()` has to
    map it. Lands with the fresh deploy.
+10. **A signed message is assigned at most once per process** (ours, not
+   from the old fork). Signed messages are public, so anyone could post one
+   again and run it again (a `Monster.Feed`, a shop buy). The scheduler now
+   refuses it: `409`, `{status, body, process, message, slot}`, the slot it
+   already has; no slot is taken.
+   - **Which ID:** every signature commitment ID of the message (those with a
+     `committer`). Each is `sha256` of its signature and checked against it on
+     verify, so the ANS-104 item and the httpsig form of one signature have
+     the same ID, and a key cannot be relabelled. A second signature added to
+     a message does not make it new (its first ID is still assigned). The
+     same content signed again is a new signature and is assigned. Unsigned
+     messages (only on a node that accepts them) are not deduplicated.
+   - **Index:** `~scheduler@1.0/message-slots/<proc>/<sig-id>` -> slot, in the
+     scheduler's store (the irreplaceable store when set, so journalled
+     offsite), written beside the assignment and committed by the same
+     synced flush before the client is answered. One read per signature per
+     schedule; nothing in memory.
+   - **Crash:** a hit counts only if that slot is at or below the latest and
+     its assignment carries the ID, so a row whose assignment never landed
+     (or a slot reused after a failed flush) refuses nothing. Only the
+     latest slot can be unflushed, so a starting server writes the latest
+     assignment's rows again. Tested: restart from disk, a real `kill -9`
+     of the VM (scratch, outside eunit), both torn cases.
+   - **Aggressive mode** (not ours, `local_confirmation`) answers before the
+     write, so a re-post inside that window can still be assigned.
+   - Cost (bench box, synced LMDB, signed ANS-104 messages, two runs):
+     `schedule/2` 15.0-16.3 -> 17.1-17.6 ms median; game slot bench
+     schedule_med 32.1-32.2 -> 34.2-34.4 ms, worker 8.3-8.6 -> 8.3-8.4 ms.
+   - Tests: `dev_scheduler,dev_scheduler_server,dev_scheduler_cache,
+     dev_process,hb_store_irreplaceable,hb_process_test_vectors` 67/69, the
+     same two redirect failures as before. Tests that posted one signed
+     message several times now sign each.
 
 Already better in RC7, so we do not port our version: the `hb_escape` header
 escaping, the `hb_name` delete fix, RSA CRT signing.
