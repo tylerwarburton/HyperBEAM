@@ -491,24 +491,48 @@ the numbers below with the reason they moved.
      messages (only on a node that accepts them) are not deduplicated.
    - **Index:** `~scheduler@1.0/message-slots/<proc>/<sig-id>` -> slot, in the
      scheduler's store (the irreplaceable store when set, so journalled
-     offsite), written beside the assignment and committed by the same
-     synced flush before the client is answered. One read per signature per
-     schedule; nothing in memory.
-   - **Crash:** a hit counts only if that slot is at or below the latest and
-     its assignment carries the ID, so a row whose assignment never landed
-     (or a slot reused after a failed flush) refuses nothing. Only the
-     latest slot can be unflushed, so a starting server writes the latest
-     assignment's rows again. Tested: restart from disk, a real `kill -9`
-     of the VM (scratch, outside eunit), both torn cases.
-   - **Aggressive mode** (not ours, `local_confirmation`) answers before the
-     write, so a re-post inside that window can still be assigned.
-   - Cost (bench box, synced LMDB, signed ANS-104 messages, two runs):
-     `schedule/2` 15.0-16.3 -> 17.1-17.6 ms median; game slot bench
-     schedule_med 32.1-32.2 -> 34.2-34.4 ms, worker 8.3-8.6 -> 8.3-8.4 ms.
-   - Tests: `dev_scheduler,dev_scheduler_server,dev_scheduler_cache,
-     dev_process,hb_store_irreplaceable,hb_process_test_vectors` 67/69, the
-     same two redirect failures as before. Tests that posted one signed
-     message several times now sign each.
+     offsite). The row is written right after its assignment, inside the
+     grouped flush's batch (below), and committed by that batch's synced
+     flush before anyone is answered. A lookup is one exact-key `get` per
+     signature (`exact => true`: it sees the batch's unflushed writes, and
+     never takes the prefix scan, which commits pending writes first: 13 us
+     clean, 1.3 ms dirty, and it would have broken the batch). Nothing in
+     memory.
+   - **Within a batch:** a duplicate of a message earlier in the same batch
+     is found from the unflushed writes. Its 409 is queued and sent in the
+     confirm phase, after the flush; a failed flush sends nothing.
+   - **Crash:** commits keep write order, so the disk holds a prefix of the
+     writes and an assignment can lack its rows only among the last batch:
+     a starting server writes the rows of the last 32 slots again. A hit
+     counts only if that slot is at or below the latest and its assignment
+     carries the ID, so a row whose assignment never landed refuses
+     nothing. A failed flush stops the scheduler server (the batch may be on
+     disk all the same, e.g. a commit whose sync failed), and the next
+     request starts one from the store, never reusing a slot number.
+   - **Aggressive mode** (not ours: `local_confirmation`) writes the rows
+     too, but answers before writing, so a re-post inside that window can
+     still be assigned.
+   - **Node config:** no node config sets `verify-assignments` (default
+     `true`: a message must be signed and verify), so unsigned messages
+     never reach the scheduler on our nodes.
+   - Tests: re-post (as ANS-104 item, httpsig form, with an extra
+     signature), re-signed content, 20 concurrent identical posts, restart
+     from disk, torn rows, a miss reads no prefix, a duplicate inside one
+     batch refused only after its flush, a failed flush answers nobody and
+     stops the server, the last batch's rows repaired at start (the last
+     four failed before their fix). `dev_scheduler,dev_scheduler_server,
+     dev_scheduler_cache,dev_process,hb_store_irreplaceable,
+     hb_store_offsite_journal,hb_store_lmdb,hb_process_test_vectors` 92/94,
+     the same two redirect failures as ff752f851. Tests that posted one
+     signed message several times now sign each. Test LMDB stores in
+     `dev_scheduler_server` map 1 GiB: a VM's address space holds ~60 of the
+     default 2 TiB, and the full run went past it (`io_error` at open).
+   - kill -9 mid-burst with every third message posted twice at once (1,500
+     messages, c=16, killed at 3 s and 6 s), then every message tried posted
+     again after the restart: no confirmed slot lost (276 and 550, each
+     refused again naming its slot), no message with two slots, no 409
+     naming a slot the restart lost (93 and 183 refusals). ff752f851 on the
+     same run gives 244 messages two slots or more.
 
 Already better in RC7, so we do not port our version: the `hb_escape` header
 escaping, the `hb_name` delete fix, RSA CRT signing.
@@ -739,6 +763,14 @@ order.
 |---|---:|---:|---:|---:|
 | ff752f851 | 73.9-74.3 | 37.9-41.0 ms | 213-215 ms | 43.6-46.8 ms |
 | grouped flush | 91.0-102.7 | 29.5-33.5 ms | 155-175 ms | 44.6-51.9 ms |
+
+With the replay rule on top (`paralith/v0.11-sched`, `"force-signed": false`,
+1,000 messages at c=16, three interleaved runs, 2026-10-28):
+
+| Build | Schedule /s (one process, c=16) | Node CPU / msg | Post p50 |
+|---|---:|---:|---:|
+| ff752f851 | 75.3-78.7 | 29.0-30.0 ms | 201-208 ms |
+| grouped flush + replay rule | 114.2-115.9 | 23.9-25.5 ms | 137-139 ms |
 
 kill -9 mid-burst then restart on the same store (`docker kill -s KILL`, two
 timings): no confirmed slot missing on either build, and the scheduler resumes

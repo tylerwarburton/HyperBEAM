@@ -174,6 +174,15 @@ write(Opts, Req, _NodeOpts) ->
 %% @param PathReq Request of the form `#{<<"read">> => Path}`.
 %% @returns `{ok, Value}` on success, `{composite, Children}` for a key with
 %%          keys below it, or `{error, not_found}` on failure
+%% A request with `exact => true' reads the key's own value only: one
+%% `elmdb:get' (pending writes included), never the prefix scan, which
+%% commits the pending writes before it reads.
+read(Opts, #{ <<"read">> := Path, <<"exact">> := true }, _NodeOpts) ->
+    case read_direct(ensure_env(Opts), hb_path:to_binary(Path)) of
+        not_found -> {error, not_found};
+        {error, Type, _} -> {error, Type};
+        Read -> Read
+    end;
 read(Opts, #{ <<"read">> := Path }, _NodeOpts) when is_binary(Path) ->
     read_result(Opts, Path);
 read(Opts, #{ <<"read">> := Path }, _NodeOpts) ->
