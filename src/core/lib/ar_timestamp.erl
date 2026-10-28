@@ -21,14 +21,27 @@ start() ->
 %% @doc Spawn a new server and its refresher.
 spawn_server() ->
     TSServer =
-        spawn(fun() -> cache(hb_client_remote:arweave_timestamp()) end),
+        spawn(fun() ->
+            ets:new(?MODULE, [named_table, protected, {read_concurrency, true}]),
+            cache(hb_client_remote:arweave_timestamp())
+        end),
     spawn(fun() -> link(TSServer), refresher(TSServer) end),
     register(?MODULE, TSServer),
     TSServer.
 
-%% @doc Get the current timestamp from the server, starting the server if it
-%% isn't already running.
+%% @doc Get the current timestamp: read from the server's table, so that no
+%% caller waits on the server. Every assignment the scheduler builds reads it,
+%% and a request to the one server process queued the scheduler behind every
+%% other caller's request. Until the table holds a value, ask the server,
+%% starting it if it isn't already running.
 get() ->
+    try ets:lookup(?MODULE, current) of
+        [{current, Timestamp}] -> Timestamp;
+        [] -> get_from_server()
+    catch error:badarg -> get_from_server()
+    end.
+
+get_from_server() ->
     ?event(getting_ar_timestamp),
     PID = start(),
     ?event({got_ar_timestamp_pid, PID}),
@@ -42,6 +55,7 @@ get() ->
 
 %% @doc Cache the current timestamp from Arweave.
 cache(Current) ->
+    ets:insert(?MODULE, {current, Current}),
     ?event(cache_waiting),
     receive
         {get, Pid} ->
