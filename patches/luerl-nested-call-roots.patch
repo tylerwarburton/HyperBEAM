@@ -1,0 +1,21 @@
+--- a/src/luerl_emul.erl
++++ b/src/luerl_emul.erl
+@@ -316,11 +316,14 @@
+     {Ret,St1} = functioncall(Func, Args, St0),
+     {Ret,St1}.
+ 
+-functioncall(Func, Args, #luerl{stk=Stk}=St0) ->
++%%  The new frame goes on top of the caller's call stack rather than in
++%%  place of it, so a collection during the call still sees the suspended
++%%  frames beneath it as roots. The stacks are reset on return.
++functioncall(Func, Args, #luerl{stk=Stk,cs=Cs}=St0) ->
+     Fr = #call_frame{func=Func,args=Args,lvs=[],env=[],is=[],cont=[]},
+-    Cs0 = [Fr],
+-    {_Lvs,[Ret|_],_Env,Cs1,St1} = call_function(Func, Args, Stk, Cs0, St0),
+-    {Ret,St1#luerl{stk=Stk,cs=Cs1}}.		%Reset the stacks
++    Cs0 = [Fr|Cs],
++    {_Lvs,[Ret|_],_Env,_Cs1,St1} = call_function(Func, Args, Stk, Cs0, St0),
++    {Ret,St1#luerl{stk=Stk,cs=Cs}}.		%Reset the stacks
+ 
+ methodcall(Obj, Meth, Args, St0) ->
+     %% Get the function to call from object and method.
