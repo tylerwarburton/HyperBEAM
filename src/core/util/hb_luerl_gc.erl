@@ -199,3 +199,44 @@ collect_inside_generic_for_test() ->
             "return s\n"
         >>,
     ?assertMatch({ok, [63], _}, luerl:do_dec(Script, Install(luerl:init()))).
+
+%% @doc A collection from a function that Luerl calls from Erlang (`pcall',
+%% nested `pcall', an error value's `__tostring', `table.sort''s comparator,
+%% `string.gsub''s replacement, an `__index' or `__eq' metamethod, a call
+%% with varargs) keeps the caller's frames (Luerl 1.3 has no `xpcall'):
+%% Luerl used to start such a call on a new call stack, so the suspended Lua
+%% beneath was no root and its locals were freed. Needs
+%% `patches/luerl-nested-call-roots.patch'.
+collect_inside_nested_calls_test() ->
+    {ok, St0} =
+        luerl:set_table_keys(
+            [<<"collectgarbage">>],
+            #erl_mfa{ m = ?MODULE, f = collectgarbage, a = nil },
+            luerl:init()
+        ),
+    Script =
+        <<
+            "local function gc() collectgarbage('collect') end\n"
+            "local function outer(f, ...)\n"
+            "  local mine = { 'alice', 100 }\n"
+            "  local list = { 1, 2, 3 }\n"
+            "  f(...)\n"
+            "  return mine[1] .. mine[2] .. #list\n"
+            "end\n"
+            "local seen = {}\n"
+            "seen[#seen + 1] = outer(function() pcall(gc) end)\n"
+            "local raised = setmetatable({}, { __tostring = function() gc(); return 'x' end })\n"
+            "seen[#seen + 1] = outer(function() pcall(error, raised) end)\n"
+            "seen[#seen + 1] = outer(function() pcall(function() pcall(gc) end) end)\n"
+            "local meta = setmetatable({}, { __index = function(t, k) gc(); return k end })\n"
+            "seen[#seen + 1] = outer(function() local v = meta.key end)\n"
+            "seen[#seen + 1] = outer(function() table.sort({ 3, 1, 2 },\n"
+            "  function(a, b) gc(); return a < b end) end)\n"
+            "seen[#seen + 1] = outer(function() string.gsub('ab', '%w', function(c) gc(); return c end) end)\n"
+            "local eq = { __eq = function() gc(); return true end }\n"
+            "seen[#seen + 1] = outer(function() local e = setmetatable({}, eq) == setmetatable({}, eq) end)\n"
+            "seen[#seen + 1] = outer(function(...) pcall(gc); return select('#', ...) end, 1, 2)\n"
+            "return table.concat(seen, ' ')\n"
+        >>,
+    Expected = iolist_to_binary(lists:join(<<" ">>, lists:duplicate(8, <<"alice1003">>))),
+    ?assertMatch({ok, [Expected], _}, luerl:do_dec(Script, St0)).

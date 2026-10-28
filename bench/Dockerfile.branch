@@ -16,7 +16,8 @@ RUN git config --global user.email b@b && git config --global user.name b \
     && git config --global --add safe.directory /app \
     && git init -q && git add -A && git commit -qm v0.11-RC7 \
     && printf '%s\n' 'port = 8734.' > /app/config.flat
-RUN rebar3 get-deps && patch -p1 --forward --batch -d _build/default/lib/elmdb < patches/elmdb-delete.patch
+RUN rebar3 get-deps && patch -p1 --forward --batch -d _build/default/lib/elmdb < patches/elmdb-delete.patch \
+    && patch -p1 --forward --batch -d _build/default/lib/luerl < patches/luerl-nested-call-roots.patch
 RUN rebar3 release 2>&1 | tail -40; test -x /app/_build/default/rel/hb/bin/hb
 VOLUME /data
 WORKDIR /data
