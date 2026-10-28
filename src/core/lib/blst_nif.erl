@@ -11,9 +11,12 @@
 
 -on_load(init/0).
 
+%% @doc Load the NIF. If it does not load, neither does this module, and
+%% `hb_app' refuses to start the node: a node either has `timelock@1.0' whole
+%% or does not run.
 init() ->
 	PrivDir = code:priv_dir(hb),
-	ok = erlang:load_nif(filename:join([PrivDir, "blst_nif"]), 0).
+	erlang:load_nif(filename:join([PrivDir, "blst_nif"]), 0).
 
 %% @doc Verify `Signature' over `Message' under `PublicKey'. Both points must
 %% decode, lie on the curve and in their prime-order subgroup, and the key
