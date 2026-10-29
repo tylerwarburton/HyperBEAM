@@ -10,10 +10,11 @@
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
-%% Outbox targets that recently failed to resolve, e.g. wallet addresses. Each
-%% miss falls through the store chain to the Arweave gateway, so without this
-%% every push to a wallet waits on a gateway round trip. One rule: the cache
-%% only ever saves the remote lookup of an id the gateway said does not exist.
+%% Outbox targets that recently failed to resolve, e.g. wallet addresses. A
+%% target the node does not hold is looked up in the background (see
+%% `held_locally/2'); this cache saves repeating that gateway round trip. One
+%% rule: the cache only ever saves the remote lookup of an id the gateway said
+%% does not exist.
 %% Only IDs and only `{error, not_found}' are remembered; a remembered target is
 %% still read from the local stores; and each target is looked up remotely
 %% again once its entry is `push-missing-target-ttl' seconds old (0 disables).
@@ -22,7 +23,7 @@
 %% evict the entries that are there.
 -define(MISSING_TARGETS, dev_push_missing_targets).
 -define(MISSING_TARGETS_MAX, 100000).
--define(DEFAULT_MISSING_TARGET_TTL, 60).
+-define(DEFAULT_MISSING_TARGET_TTL, 3600).
 
 %% @doc Push either a message or an assigned slot number. If a `Process' is
 %% provided in the `body' of the request, it will be scheduled (initializing
@@ -421,6 +422,65 @@ push_result_message(MsgToPush, Origin, Opts) ->
             ),
             #{};
         TargetID ->
+            case held_locally(TargetID, Opts) of
+                true -> push_held_target(TargetID, MsgToPush, Origin, Opts);
+                false -> defer_delivery(TargetID, MsgToPush, Origin, Opts)
+            end
+    end.
+
+%% @doc A push only ever waits on the local stores. A target this node does not
+%% hold -- a wallet address in a `Recipient', a process scheduled elsewhere --
+%% is looked up, and the message delivered, by a process of its own, so a slow
+%% or unreachable gateway delays that one delivery and nothing else.
+held_locally(_TargetID, #{ <<"push-remote-target">> := true }) -> true;
+held_locally(TargetID, Opts) ->
+    is_binary(TargetID) andalso
+        element(1, hb_cache:read(TargetID, hb_store:scope(Opts, local))) == ok.
+
+%% @doc Deliver one outbox message to a target this node does not hold, in the
+%% background. A target the gateway recently said does not exist is refused
+%% here without a lookup.
+defer_delivery(TargetID, MsgToPush, Origin, Opts) ->
+    TTL = hb_opts:get(<<"push-missing-target-ttl">>, ?DEFAULT_MISSING_TARGET_TTL, Opts),
+    case recently_missing(TargetID, TTL) of
+        true ->
+            (target_process_not_found(TargetID))#{
+                <<"reason">> => <<"target-not-found-recently">>
+            };
+        false ->
+            detach(
+                fun() ->
+                    Res =
+                        push_result_message(
+                            MsgToPush,
+                            Origin,
+                            Opts#{ <<"push-remote-target">> => true }
+                        ),
+                    ?event(push, {deferred_delivery_done, {target, TargetID},
+                        {result, Res}}, Opts)
+                end
+            ),
+            #{
+                <<"response">> => <<"deferred">>,
+                <<"status">> => 202,
+                <<"target">> => TargetID
+            }
+    end.
+
+%% @doc Run `Fun' in a process that is not linked to the caller and carries the
+%% caller's server ID and AO-Core call stack. Returns its pid.
+detach(Fun) ->
+    ServerID = get(server_id),
+    Stack = get(ao_stack),
+    spawn(
+        fun() ->
+            put(server_id, ServerID),
+            put(ao_stack, Stack),
+            Fun()
+        end
+    ).
+
+push_held_target(TargetID, MsgToPush, Origin, Opts) ->
             ?event(push,
                 {pushing_child,
                     {target, TargetID},
@@ -492,8 +552,7 @@ push_result_message(MsgToPush, Origin, Opts) ->
                         <<"target">> => TargetID,
                         <<"reason">> => Error
                     }
-            end
-    end.
+            end.
 
 %% @doc Push a downstream resultant message that has already been scheduled.
 %% We determine whether to push the message locally or remotely based on the
@@ -2346,6 +2405,110 @@ wait_until_loop(Pred, Deadline) ->
                     wait_until_loop(Pred, Deadline)
             end
     end.
+
+push_isolation_test_() ->
+    {inorder, [
+        {timeout, 60, fun test_blackholed_gateway_does_not_delay_push/0}
+    ]}.
+
+%% @doc A Sender whose message at `MsgSlot' sends one message to each of
+%% `Targets' (`receiver' for the Receiver process) in that order, on a node
+%% with the given extra stores after its local one.
+setup_sender(Targets, ExtraStores) ->
+    hb_process_test_vectors:init(),
+    Opts = #{
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"cache-control">> => [],
+        <<"store">> => [hb_test_utils:test_store(hb_store_lmdb) | ExtraStores]
+    },
+    [Sender, Receiver] =
+        [
+            begin
+                P = hb_process_test_vectors:aos_process(Opts),
+                {ok, _} = hb_cache:write(P, Opts),
+                {ok, _} =
+                    hb_ao:resolve(P, #{ <<"method">> => <<"POST">>,
+                        <<"path">> => <<"schedule">>, <<"body">> => P }, Opts),
+                P
+            end
+        || _ <- [sender, receiver]
+        ],
+    ReceiverID = hb_message:id(Receiver, all, Opts),
+    Sends =
+        << <<"Send({ Target = \"",
+                (case T of receiver -> ReceiverID; _ -> T end)/binary,
+                "\", Action = \"Note\" })\n">>
+        || T <- Targets >>,
+    {ok, MsgSched} = hb_process_test_vectors:schedule_aos_call(Sender, Sends, Opts),
+    {ok, MsgSlot} = hb_ao:resolve(MsgSched, #{ <<"path">> => <<"slot">> }, Opts),
+    {Sender, Receiver, MsgSlot, Opts}.
+
+receiver_slot(Receiver, Opts) ->
+    {ok, Slot} = hb_ao:resolve(Receiver, #{ <<"path">> => <<"slot/current">> }, Opts),
+    Slot.
+
+%% @doc A gateway that accepts connections and never answers. Returns its URL
+%% and a function giving the number of connections it has accepted.
+blackhole() ->
+    Self = self(),
+    Ref = make_ref(),
+    Pid =
+        spawn(fun() ->
+            {ok, L} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}]),
+            {ok, Port} = inet:port(L),
+            Self ! {Ref, Port},
+            Counter = counters:new(1, []),
+            Self ! {Ref, counter, Counter},
+            Accept =
+                fun Loop(Held) ->
+                    {ok, S} = gen_tcp:accept(L),
+                    counters:add(Counter, 1, 1),
+                    Loop([S | Held])
+                end,
+            Accept([])
+        end),
+    Port = receive {Ref, P} -> P end,
+    Counter = receive {Ref, counter, C} -> C end,
+    {Pid, <<"http://127.0.0.1:", (integer_to_binary(Port))/binary>>,
+        fun() -> counters:get(Counter, 1) end}.
+
+%% @doc The 2026-10-28 soak: a token's `Credit-Notice' targets the wallet in a
+%% transfer's `Recipient', and the push waited on the gateway's
+%% `HEAD ~arweave@2.9/raw=<wallet>' (up to 30 s) before it delivered the
+%% `Debit-Notice' to a local process. With the gateway blackholed, the local
+%% delivery is made at once, the wallet's is handed to the background, which
+%% does reach the gateway, and the push returns without waiting for it.
+test_blackholed_gateway_does_not_delay_push() ->
+    {Hole, URL, Accepted} = blackhole(),
+    Arweave =
+        #{
+            <<"store-module">> => hb_store_arweave,
+            <<"index-store">> => [hb_test_utils:test_store()],
+            <<"remote-index">> => true,
+            <<"routes">> =>
+                [#{ <<"template">> => <<"^/~arweave@2.9/raw">>,
+                    <<"node">> => #{ <<"prefix">> => URL } }]
+        },
+    Wallet = hb_util:human_id(ar_wallet:to_address(ar_wallet:new())),
+    {Sender, Receiver, MsgSlot, Opts} = setup_sender([Wallet, receiver], [Arweave]),
+    Before = receiver_slot(Receiver, Opts),
+    % Compute the slot first: the push's own work is what is timed.
+    {ok, _} = hb_ao:resolve(Sender,
+        #{ <<"path">> => <<"compute">>, <<"slot">> => MsgSlot }, Opts),
+    {Micros, {ok, Pushed}} =
+        timer:tc(fun() ->
+            hb_ao:resolve(Sender,
+                #{ <<"path">> => <<"push">>, <<"slot">> => MsgSlot,
+                    <<"max-depth">> => 0 }, Opts)
+        end),
+    ?event(debug_push, {pushed, Pushed, {ms, Micros div 1000}}),
+    ?assertMatch(T when T < 3000000, Micros),
+    ?assertMatch(#{ <<"1">> := #{ <<"response">> := <<"deferred">> } }, Pushed),
+    ?assertMatch(#{ <<"2">> := #{ <<"slot">> := _ } }, Pushed),
+    ?assertEqual(Before + 1, receiver_slot(Receiver, Opts)),
+    % The wallet's lookup did go to the gateway, from the background.
+    ?assert(wait_until(fun() -> Accepted() >= 1 end, 5000)),
+    exit(Hole, kill).
 
 -ifdef(ENABLE_GENESIS_WASM).
 %% @doc Test that a message that generates another message which resides on an
