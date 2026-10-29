@@ -53,8 +53,9 @@ Settings our v0.11 nodes run with, each one decided or measured:
 A node holds at most `max-writes-in-flight` writes at once (default 8 per
 scheduler: 16 on a 2-CPU node). A write is any request that is not `GET`,
 `HEAD` or `OPTIONS`. One past the bound is answered at once with **503 and
-`retry-after: 1`**, before its body is read, verified or stored: it was never
-accepted, so a client may re-send the same signed item. Reads are never
+`retry-after: 1`** and **`hb-admission: busy`**, before its body is read,
+verified or stored: it was never accepted, so a client may re-send the same
+signed item. Only the header says so: a proxy's 503 does not. Reads are never
 refused. The bound is read when the server starts.
 
 Why: past its capacity a node that accepts every write spends its cores on
