@@ -539,19 +539,10 @@ push_held_target(TargetID, MsgToPush, Origin, Opts) ->
                     <<"await-inprogress">> => true
                 }
             ) of
-                {ok, Assignment} ->
-                    % Analyze the result of the message push.
-                    NextSlotOnProc = hb_ao:get(<<"slot">>, Assignment, Opts),
-                    PushedMsg = hb_ao:get(<<"body">>, Assignment, Opts),
-                    PushTarget =
-                        case hb_ao:get(<<"resolve">>, PushedMsg, Opts) of
-                            <<"error">> ->
-                                hb_ao:get(<<"target">>, PushedMsg, Opts);
-                            _ -> TargetID
-                        end,
-                    % Get the ID of the message that was pushed. We already have
-                    % the 'origin' message, but we need the signed ID.
-                    PushedMsgID = hb_message:id(PushedMsg, all, Opts),
+                {ok, Receipt} ->
+                    NextSlotOnProc = hb_maps:get(<<"slot">>, Receipt, undefined, Opts),
+                    PushTarget = hb_maps:get(<<"target">>, Receipt, TargetID, Opts),
+                    PushedMsgID = hb_maps:get(<<"id">>, Receipt, undefined, Opts),
                     ?event(push_short,
                         {pushed_message_to,
                             {process, PushTarget},
@@ -784,9 +775,7 @@ calculate_base_id(GivenProcess, Opts) ->
     BaseID.
 
 %% @doc Schedule one message of a slot's outbox on its target process, and
-%% return the target's assignment. The assignment is stored as the result of
-%% this key, so a repeat push of the slot returns it instead of scheduling the
-%% message again.
+%% return its `receipt/3'.
 -spec schedule(
     #{ process := binary() },
     #{ slot := integer(), 'outbox-key' := binary() },
@@ -875,15 +864,27 @@ schedule(Base, Req, Opts) ->
                     };
                 _ -> {error, target_process_not_found(Target)}
             end,
-        {ok,
-            hb_ao:set(
-                Assignment,
-                <<"cache-control">>,
-                <<"store">>,
-                Opts#{ <<"hashpath">> => ignore }
-            )
-        }
+        {ok, receipt(Target, Assignment, Opts)}
     end.
+
+%% @doc What a push keeps of an outbox message it scheduled: the slot on the
+%% target, the signed message's ID and the process it went to. It is stored as
+%% the result of the `schedule' key, so a repeat push of the slot returns it
+%% instead of scheduling the message again. The message itself is kept by the
+%% target's scheduler; a copy here is a row retention may never delete.
+receipt(Target, Assignment, Opts) ->
+    PushedMsg = hb_ao:get(<<"body">>, Assignment, Opts),
+    PushTarget =
+        case hb_ao:get(<<"resolve">>, PushedMsg, Opts) of
+            <<"error">> -> hb_ao:get(<<"target">>, PushedMsg, Opts);
+            _ -> Target
+        end,
+    #{
+        <<"slot">> => hb_ao:get(<<"slot">>, Assignment, Opts),
+        <<"id">> => hb_message:id(PushedMsg, all, Opts),
+        <<"target">> => PushTarget,
+        <<"cache-control">> => <<"store">>
+    }.
 
 %% @doc Add the necessary keys to the message to be scheduled, then schedule it.
 %% If the remote scheduler does not support the given codec, it will be
@@ -916,10 +917,17 @@ schedule_result(TargetProcess, MsgToPush, Codec, Origin, Opts) ->
     ?event(push, {prepared_msg, {msg, AugmentedMsg}}, Opts),
     % Load the `accept-id`'d wallet into the `Opts` map, if requested.
     SignedMsg = apply_security(AugmentedMsg, TargetProcess, Codec, Opts),
-    % Verify the signed message before writing to cache
     true = hb_message:verify(SignedMsg, signers, Opts),
-    % Write the signed message to cache before including it in the schedule request
-    {ok, _} = hb_cache:write(SignedMsg, Opts),
+    % Written where the scheduler keeps the messages it assigns (the
+    % irreplaceable store, where there is one): the same rows as the body of
+    % its assignment, so the message reads back by its ID at no extra cost. A
+    % copy in the main store would be a row retention may never delete.
+    {ok, _} =
+        hb_cache:write(
+            SignedMsg,
+            Opts#{ <<"store">> => hb_opts:get(scheduler_store,
+                hb_opts:get(store, no_viable_store, Opts), Opts) }
+        ),
     ScheduleReq = #{
         <<"path">> => <<"schedule">>,
         <<"method">> => <<"POST">>,
@@ -944,7 +952,7 @@ schedule_result(TargetProcess, MsgToPush, Codec, Origin, Opts) ->
                 hb_ao:resolve(
                     {as, <<"process@1.0">>, TargetProcess},
                     ScheduleReq,
-                    Opts#{ <<"cache-control">> => <<"always">> }
+                    Opts#{ <<"cache-control">> => [<<"no-store">>] }
                 )
         end,
     ?event(push, {push_sched_result, {status, ErlStatus}, {response, Res}}, Opts),
