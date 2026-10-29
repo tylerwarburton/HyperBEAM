@@ -10,10 +10,11 @@
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
-%% Outbox targets that recently failed to resolve, e.g. wallet addresses. Each
-%% miss falls through the store chain to the Arweave gateway, so without this
-%% every push to a wallet waits on a gateway round trip. One rule: the cache
-%% only ever saves the remote lookup of an id the gateway said does not exist.
+%% Outbox targets that recently failed to resolve, e.g. wallet addresses. A
+%% target the node does not hold is looked up in the background (see
+%% `held_locally/2'); this cache saves repeating that gateway round trip. One
+%% rule: the cache only ever saves the remote lookup of an id the gateway said
+%% does not exist.
 %% Only IDs and only `{error, not_found}' are remembered; a remembered target is
 %% still read from the local stores; and each target is looked up remotely
 %% again once its entry is `push-missing-target-ttl' seconds old (0 disables).
@@ -22,7 +23,7 @@
 %% evict the entries that are there.
 -define(MISSING_TARGETS, dev_push_missing_targets).
 -define(MISSING_TARGETS_MAX, 100000).
--define(DEFAULT_MISSING_TARGET_TTL, 60).
+-define(DEFAULT_MISSING_TARGET_TTL, 3600).
 
 %% @doc Push either a message or an assigned slot number. If a `Process' is
 %% provided in the `body' of the request, it will be scheduled (initializing
@@ -100,10 +101,42 @@ push(Base, Req, Opts) ->
         _ -> push_with_mode(Process, Req, Opts)
     end.
 
+%% @doc A push runs to the end of its outbox whatever happens to the caller.
+%% Each outbox message is delivered only by the push of its slot, and an HTTP
+%% request's process is killed when its client disconnects: a push run inside
+%% it stopped half way through an outbox, and the rest was never delivered.
+%% So a synchronous push runs in a process of its own and the caller waits for
+%% its result.
 push_with_mode(Process, Req, Opts) ->
     case is_async(Process, Req, Opts) of
-        true -> spawn(fun() -> do_push(Process, Req, Opts) end);
-        false -> do_push(Process, Req, Opts)
+        true -> detach(fun() -> do_push(Process, Req, Opts) end);
+        false -> await_detached(fun() -> do_push(Process, Req, Opts) end)
+    end.
+
+%% @doc Run `Fun' in a detached process and return (or raise) what it does.
+await_detached(Fun) ->
+    Caller = self(),
+    Ref = make_ref(),
+    Pid =
+        detach(
+            fun() ->
+                Caller !
+                    {Ref,
+                        try {ok, Fun()}
+                        catch Class:Reason:Stack -> {raise, Class, Reason, Stack}
+                        end}
+            end
+        ),
+    Mon = erlang:monitor(process, Pid),
+    receive
+        {Ref, {ok, Res}} ->
+            erlang:demonitor(Mon, [flush]),
+            Res;
+        {Ref, {raise, Class, Reason, Stack}} ->
+            erlang:demonitor(Mon, [flush]),
+            erlang:raise(Class, Reason, Stack);
+        {'DOWN', Mon, process, Pid, Reason} ->
+            erlang:error({push_failed, Reason})
     end.
 
 %% @doc Determine if the push is asynchronous. The boolean `async' key
@@ -421,6 +454,65 @@ push_result_message(MsgToPush, Origin, Opts) ->
             ),
             #{};
         TargetID ->
+            case held_locally(TargetID, Opts) of
+                true -> push_held_target(TargetID, MsgToPush, Origin, Opts);
+                false -> defer_delivery(TargetID, MsgToPush, Origin, Opts)
+            end
+    end.
+
+%% @doc A push only ever waits on the local stores. A target this node does not
+%% hold -- a wallet address in a `Recipient', a process scheduled elsewhere --
+%% is looked up, and the message delivered, by a process of its own, so a slow
+%% or unreachable gateway delays that one delivery and nothing else.
+held_locally(_TargetID, #{ <<"push-remote-target">> := true }) -> true;
+held_locally(TargetID, Opts) ->
+    is_binary(TargetID) andalso
+        element(1, hb_cache:read(TargetID, hb_store:scope(Opts, local))) == ok.
+
+%% @doc Deliver one outbox message to a target this node does not hold, in the
+%% background. A target the gateway recently said does not exist is refused
+%% here without a lookup.
+defer_delivery(TargetID, MsgToPush, Origin, Opts) ->
+    TTL = hb_opts:get(<<"push-missing-target-ttl">>, ?DEFAULT_MISSING_TARGET_TTL, Opts),
+    case recently_missing(TargetID, TTL) of
+        true ->
+            (target_process_not_found(TargetID))#{
+                <<"reason">> => <<"target-not-found-recently">>
+            };
+        false ->
+            detach(
+                fun() ->
+                    Res =
+                        push_result_message(
+                            MsgToPush,
+                            Origin,
+                            Opts#{ <<"push-remote-target">> => true }
+                        ),
+                    ?event(push, {deferred_delivery_done, {target, TargetID},
+                        {result, Res}}, Opts)
+                end
+            ),
+            #{
+                <<"response">> => <<"deferred">>,
+                <<"status">> => 202,
+                <<"target">> => TargetID
+            }
+    end.
+
+%% @doc Run `Fun' in a process that is not linked to the caller and carries the
+%% caller's server ID and AO-Core call stack. Returns its pid.
+detach(Fun) ->
+    ServerID = get(server_id),
+    Stack = get(ao_stack),
+    spawn(
+        fun() ->
+            put(server_id, ServerID),
+            put(ao_stack, Stack),
+            Fun()
+        end
+    ).
+
+push_held_target(TargetID, MsgToPush, Origin, Opts) ->
             ?event(push,
                 {pushing_child,
                     {target, TargetID},
@@ -447,19 +539,10 @@ push_result_message(MsgToPush, Origin, Opts) ->
                     <<"await-inprogress">> => true
                 }
             ) of
-                {ok, Assignment} ->
-                    % Analyze the result of the message push.
-                    NextSlotOnProc = hb_ao:get(<<"slot">>, Assignment, Opts),
-                    PushedMsg = hb_ao:get(<<"body">>, Assignment, Opts),
-                    PushTarget =
-                        case hb_ao:get(<<"resolve">>, PushedMsg, Opts) of
-                            <<"error">> ->
-                                hb_ao:get(<<"target">>, PushedMsg, Opts);
-                            _ -> TargetID
-                        end,
-                    % Get the ID of the message that was pushed. We already have
-                    % the 'origin' message, but we need the signed ID.
-                    PushedMsgID = hb_message:id(PushedMsg, all, Opts),
+                {ok, Receipt} ->
+                    NextSlotOnProc = hb_maps:get(<<"slot">>, Receipt, undefined, Opts),
+                    PushTarget = hb_maps:get(<<"target">>, Receipt, TargetID, Opts),
+                    PushedMsgID = hb_maps:get(<<"id">>, Receipt, undefined, Opts),
                     ?event(push_short,
                         {pushed_message_to,
                             {process, PushTarget},
@@ -492,8 +575,7 @@ push_result_message(MsgToPush, Origin, Opts) ->
                         <<"target">> => TargetID,
                         <<"reason">> => Error
                     }
-            end
-    end.
+            end.
 
 %% @doc Push a downstream resultant message that has already been scheduled.
 %% We determine whether to push the message locally or remotely based on the
@@ -693,9 +775,7 @@ calculate_base_id(GivenProcess, Opts) ->
     BaseID.
 
 %% @doc Schedule one message of a slot's outbox on its target process, and
-%% return the target's assignment. The assignment is stored as the result of
-%% this key, so a repeat push of the slot returns it instead of scheduling the
-%% message again.
+%% return its `receipt/3'.
 -spec schedule(
     #{ process := binary() },
     #{ slot := integer(), 'outbox-key' := binary() },
@@ -784,15 +864,27 @@ schedule(Base, Req, Opts) ->
                     };
                 _ -> {error, target_process_not_found(Target)}
             end,
-        {ok,
-            hb_ao:set(
-                Assignment,
-                <<"cache-control">>,
-                <<"store">>,
-                Opts#{ <<"hashpath">> => ignore }
-            )
-        }
+        {ok, receipt(Target, Assignment, Opts)}
     end.
+
+%% @doc What a push keeps of an outbox message it scheduled: the slot on the
+%% target, the signed message's ID and the process it went to. It is stored as
+%% the result of the `schedule' key, so a repeat push of the slot returns it
+%% instead of scheduling the message again. The message itself is kept by the
+%% target's scheduler; a copy here is a row retention may never delete.
+receipt(Target, Assignment, Opts) ->
+    PushedMsg = hb_ao:get(<<"body">>, Assignment, Opts),
+    PushTarget =
+        case hb_ao:get(<<"resolve">>, PushedMsg, Opts) of
+            <<"error">> -> hb_ao:get(<<"target">>, PushedMsg, Opts);
+            _ -> Target
+        end,
+    #{
+        <<"slot">> => hb_ao:get(<<"slot">>, Assignment, Opts),
+        <<"id">> => hb_message:id(PushedMsg, all, Opts),
+        <<"target">> => PushTarget,
+        <<"cache-control">> => <<"store">>
+    }.
 
 %% @doc Add the necessary keys to the message to be scheduled, then schedule it.
 %% If the remote scheduler does not support the given codec, it will be
@@ -825,10 +917,17 @@ schedule_result(TargetProcess, MsgToPush, Codec, Origin, Opts) ->
     ?event(push, {prepared_msg, {msg, AugmentedMsg}}, Opts),
     % Load the `accept-id`'d wallet into the `Opts` map, if requested.
     SignedMsg = apply_security(AugmentedMsg, TargetProcess, Codec, Opts),
-    % Verify the signed message before writing to cache
     true = hb_message:verify(SignedMsg, signers, Opts),
-    % Write the signed message to cache before including it in the schedule request
-    {ok, _} = hb_cache:write(SignedMsg, Opts),
+    % Written where the scheduler keeps the messages it assigns (the
+    % irreplaceable store, where there is one): the same rows as the body of
+    % its assignment, so the message reads back by its ID at no extra cost. A
+    % copy in the main store would be a row retention may never delete.
+    {ok, _} =
+        hb_cache:write(
+            SignedMsg,
+            Opts#{ <<"store">> => hb_opts:get(scheduler_store,
+                hb_opts:get(store, no_viable_store, Opts), Opts) }
+        ),
     ScheduleReq = #{
         <<"path">> => <<"schedule">>,
         <<"method">> => <<"POST">>,
@@ -853,7 +952,7 @@ schedule_result(TargetProcess, MsgToPush, Codec, Origin, Opts) ->
                 hb_ao:resolve(
                     {as, <<"process@1.0">>, TargetProcess},
                     ScheduleReq,
-                    Opts#{ <<"cache-control">> => <<"always">> }
+                    Opts#{ <<"cache-control">> => [<<"no-store">>] }
                 )
         end,
     ?event(push, {push_sched_result, {status, ErlStatus}, {response, Res}}, Opts),
@@ -2346,6 +2445,135 @@ wait_until_loop(Pred, Deadline) ->
                     wait_until_loop(Pred, Deadline)
             end
     end.
+
+push_isolation_test_() ->
+    {inorder, [
+        {timeout, 60, fun test_blackholed_gateway_does_not_delay_push/0},
+        {timeout, 60, fun test_push_outlives_its_caller/0}
+    ]}.
+
+%% @doc A Sender whose message at `MsgSlot' sends one message to each of
+%% `Targets' (`receiver' for the Receiver process) in that order, on a node
+%% with the given extra stores after its local one.
+setup_sender(Targets, ExtraStores) ->
+    hb_process_test_vectors:init(),
+    Opts = #{
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"cache-control">> => [],
+        <<"store">> => [hb_test_utils:test_store(hb_store_lmdb) | ExtraStores]
+    },
+    [Sender, Receiver] =
+        [
+            begin
+                P = hb_process_test_vectors:aos_process(Opts),
+                {ok, _} = hb_cache:write(P, Opts),
+                {ok, _} =
+                    hb_ao:resolve(P, #{ <<"method">> => <<"POST">>,
+                        <<"path">> => <<"schedule">>, <<"body">> => P }, Opts),
+                P
+            end
+        || _ <- [sender, receiver]
+        ],
+    ReceiverID = hb_message:id(Receiver, all, Opts),
+    Sends =
+        << <<"Send({ Target = \"",
+                (case T of receiver -> ReceiverID; _ -> T end)/binary,
+                "\", Action = \"Note\" })\n">>
+        || T <- Targets >>,
+    {ok, MsgSched} = hb_process_test_vectors:schedule_aos_call(Sender, Sends, Opts),
+    {ok, MsgSlot} = hb_ao:resolve(MsgSched, #{ <<"path">> => <<"slot">> }, Opts),
+    {Sender, Receiver, MsgSlot, Opts}.
+
+receiver_slot(Receiver, Opts) ->
+    {ok, Slot} = hb_ao:resolve(Receiver, #{ <<"path">> => <<"slot/current">> }, Opts),
+    Slot.
+
+%% @doc A gateway that accepts connections and never answers. Returns its URL
+%% and a function giving the number of connections it has accepted.
+blackhole() ->
+    Self = self(),
+    Ref = make_ref(),
+    Pid =
+        spawn(fun() ->
+            {ok, L} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}]),
+            {ok, Port} = inet:port(L),
+            Self ! {Ref, Port},
+            Counter = counters:new(1, []),
+            Self ! {Ref, counter, Counter},
+            Accept =
+                fun Loop(Held) ->
+                    {ok, S} = gen_tcp:accept(L),
+                    counters:add(Counter, 1, 1),
+                    Loop([S | Held])
+                end,
+            Accept([])
+        end),
+    Port = receive {Ref, P} -> P end,
+    Counter = receive {Ref, counter, C} -> C end,
+    {Pid, <<"http://127.0.0.1:", (integer_to_binary(Port))/binary>>,
+        fun() -> counters:get(Counter, 1) end}.
+
+%% @doc The 2026-10-28 soak: a token's `Credit-Notice' targets the wallet in a
+%% transfer's `Recipient', and the push waited on the gateway's
+%% `HEAD ~arweave@2.9/raw=<wallet>' (up to 30 s) before it delivered the
+%% `Debit-Notice' to a local process. With the gateway blackholed, the local
+%% delivery is made at once, the wallet's is handed to the background, which
+%% does reach the gateway, and the push returns without waiting for it.
+test_blackholed_gateway_does_not_delay_push() ->
+    {Hole, URL, Accepted} = blackhole(),
+    Arweave =
+        #{
+            <<"store-module">> => hb_store_arweave,
+            <<"index-store">> => [hb_test_utils:test_store()],
+            <<"remote-index">> => true,
+            <<"routes">> =>
+                [#{ <<"template">> => <<"^/~arweave@2.9/raw">>,
+                    <<"node">> => #{ <<"prefix">> => URL } }]
+        },
+    Wallet = hb_util:human_id(ar_wallet:to_address(ar_wallet:new())),
+    {Sender, Receiver, MsgSlot, Opts} = setup_sender([Wallet, receiver], [Arweave]),
+    Before = receiver_slot(Receiver, Opts),
+    % Compute the slot first: the push's own work is what is timed.
+    {ok, _} = hb_ao:resolve(Sender,
+        #{ <<"path">> => <<"compute">>, <<"slot">> => MsgSlot }, Opts),
+    {Micros, {ok, Pushed}} =
+        timer:tc(fun() ->
+            hb_ao:resolve(Sender,
+                #{ <<"path">> => <<"push">>, <<"slot">> => MsgSlot,
+                    <<"max-depth">> => 0 }, Opts)
+        end),
+    ?event(debug_push, {pushed, Pushed, {ms, Micros div 1000}}),
+    ?assertMatch(T when T < 3000000, Micros),
+    ?assertMatch(#{ <<"1">> := #{ <<"response">> := <<"deferred">> } }, Pushed),
+    ?assertMatch(#{ <<"2">> := #{ <<"slot">> := _ } }, Pushed),
+    ?assertEqual(Before + 1, receiver_slot(Receiver, Opts)),
+    % The wallet's lookup did go to the gateway, from the background.
+    ?assert(wait_until(fun() -> Accepted() >= 1 end, 5000)),
+    exit(Hole, kill).
+
+%% @doc The 2026-10-28 soak lost a beacon round's results: the push of the
+%% round ran in the HTTP request's process, the client went away (its
+%% container was stopped) after 8 of the outbox's messages were scheduled, and
+%% the request's process was killed with the rest undelivered. Nothing else
+%% ever pushes that slot. Here the caller is killed once the first message has
+%% landed, and every message is still scheduled.
+test_push_outlives_its_caller() ->
+    N = 12,
+    {Sender, Receiver, MsgSlot, Opts} =
+        setup_sender(lists:duplicate(N, receiver), []),
+    Before = receiver_slot(Receiver, Opts),
+    Caller =
+        spawn(fun() ->
+            hb_ao:resolve(Sender,
+                #{ <<"path">> => <<"push">>, <<"slot">> => MsgSlot,
+                    <<"max-depth">> => 0 }, Opts)
+        end),
+    ?assert(wait_until(fun() -> receiver_slot(Receiver, Opts) > Before end, 30000)),
+    exit(Caller, shutdown),
+    Landed = receiver_slot(Receiver, Opts) - Before,
+    ?event(debug_push, {landed_when_caller_killed, Landed}),
+    ?assert(Landed < N),
+    ?assert(wait_until(fun() -> receiver_slot(Receiver, Opts) == Before + N end, 30000)).
 
 -ifdef(ENABLE_GENESIS_WASM).
 %% @doc Test that a message that generates another message which resides on an

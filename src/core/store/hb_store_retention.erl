@@ -176,10 +176,60 @@ plan(Store, P, Keep, Recent) ->
     Slots = fun(Kind) -> slots(Store, P, Kind) end,
     Snaps = lists:reverse(Slots(<<"s">>)),
     Full = Slots(<<"f">>),
-    case Slots(<<"d">>) of
-        [] -> plan_full(P, Snaps, Full, Keep, Recent);
-        _ -> plan_delta(P, Snaps, Full, Slots, Keep)
+    Rows =
+        case Slots(<<"d">>) of
+            [] -> plan_full(P, Snaps, Full, Keep, Recent);
+            _ -> plan_delta(P, Snaps, Full, Slots, Keep)
+        end,
+    with_chunks(Store, P, Rows).
+
+%% A row longer than a page is stored as chunks `<row>.<n>' (see
+%% `lib_process_cache'): each doomed row's chunks go right after it, so a
+%% reader finds a whole row or none. Chunks whose row is gone (a run
+%% stopped between the two) go too, below the newest row of their kind: a
+%% row being written has its chunks written first.
+with_chunks(Store, P, Rows) ->
+    Kinds = [<<"d">>, <<"f">>],
+    Chunks = [ {Kind, chunk_names(Store, P, Kind)} || Kind <- Kinds ],
+    Doomed = lists:flatmap(fun(Row) -> [Row | row_chunks(P, Row, Chunks)] end, Rows),
+    Orphans =
+        lists:flatmap(
+            fun({Kind, Cs}) ->
+                Live = slots(Store, P, Kind),
+                Newest = lists:max([-1 | Live]),
+                [ chunk_key(P, Kind, S, N) || {S, N} <- Cs,
+                  S < Newest, not lists:member(S, Live) ]
+            end,
+            Chunks),
+    Doomed ++ Orphans.
+
+row_chunks(P, Row, Chunks) ->
+    lists:flatmap(
+        fun({Kind, Cs}) ->
+            case row_slot(P, Kind, Row) of
+                {ok, Slot} -> [ chunk_key(P, Kind, Slot, N) || {S, N} <- Cs, S == Slot ];
+                error -> []
+            end
+        end,
+        Chunks).
+
+%% The slot of `Row' when it is a row of `Kind' of `P'.
+row_slot(P, Kind, Row) ->
+    Prefix = <<?NS/binary, "/", P/binary, "/", Kind/binary, "/">>,
+    case Row of
+        <<Prefix:(byte_size(Prefix))/binary, Slot/binary>> -> {ok, binary_to_integer(Slot)};
+        _ -> error
     end.
+
+chunk_key(P, Kind, Slot, N) -> <<(key(P, Kind, Slot))/binary, ".", N/binary>>.
+
+%% The chunks (`<12 digits>.<n>') of a kind, as `{Slot, N}'.
+chunk_names(Store, P, Kind) ->
+    [ {binary_to_integer(Slot), Part}
+    || Name <- list(Store, <<?NS/binary, "/", P/binary, "/", Kind/binary>>),
+       [Slot, Part] <- [binary:split(Name, <<".">>)],
+       is_integer(catch binary_to_integer(Slot)),
+       is_integer(catch binary_to_integer(Part)) ].
 
 %% A full-state process (no delta rows): every row stands alone. Keep the
 %% newest `Keep' snapshot checkpoints and the newest `Recent' states; every
@@ -249,13 +299,22 @@ split(N, L) -> lists:split(N, L).
 
 is_retention_key(<<"pstate/", Rest/binary>>) ->
     case binary:split(Rest, <<"/">>, [global]) of
-        [P, Kind, Slot] ->
+        [P, Kind, SlotPart] ->
             ?IS_ID(P) andalso lists:member(Kind, [<<"s">>, <<"d">>, <<"f">>])
-                andalso byte_size(Slot) == 12
-                andalso is_integer(catch binary_to_integer(Slot));
+                andalso is_slot_part(SlotPart);
         _ -> false
     end;
 is_retention_key(_) -> false.
+
+%% A slot (12 digits), or a chunk of one (`<12 digits>.<n>').
+is_slot_part(Part) ->
+    {Slot, Chunk} =
+        case binary:split(Part, <<".">>) of
+            [S] -> {S, <<"1">>};
+            [S, C] -> {S, C}
+        end,
+    byte_size(Slot) == 12 andalso is_integer(catch binary_to_integer(Slot))
+        andalso is_integer(catch binary_to_integer(Chunk)).
 
 key(P, Kind, Slot) ->
     iolist_to_binary([?NS, "/", P, "/", Kind, "/", io_lib:format("~12..0B", [Slot])]).
@@ -384,4 +443,21 @@ plan_full_state_test() ->
     Q = hb_util:human_id(crypto:strong_rand_bytes(32)),
     ok = hb_store:write([Main], maps:from_list(
         [ {key(Q, <<"f">>, S), <<"x">>} || S <- lists:seq(0, 4) ]), #{}),
-    ?assertEqual([ key(Q, <<"f">>, 1), key(Q, <<"f">>, 0) ], plan(Main, Q, 2, 3)).
+    ?assertEqual([ key(Q, <<"f">>, 1), key(Q, <<"f">>, 0) ], plan(Main, Q, 2, 3)).
+
+%% @doc A chunked row's chunks go right after it; chunks left without their
+%% row go too, unless they belong to the newest slot (a row being written).
+plan_chunks_test() ->
+    Main = hb_test_utils:test_store(hb_store_lmdb, <<"ret-chunks">>),
+    ok = hb_store:start([Main], #{}, #{}),
+    P = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    C = fun(S, N) -> <<(key(P, <<"f">>, S))/binary, ".", (integer_to_binary(N))/binary>> end,
+    ok = hb_store:write([Main], maps:from_list(
+        [ {key(P, <<"f">>, S), <<"pstate-chunks:2">>} || S <- [1, 2, 3] ] ++
+        [ {C(S, N), <<"x">>} || S <- [0, 1, 2, 3, 4], N <- [1, 2] ]), #{}),
+    ?assertEqual(
+        [ key(P, <<"f">>, 2), C(2, 1), C(2, 2), key(P, <<"f">>, 1), C(1, 1), C(1, 2),
+          C(0, 1), C(0, 2) ],
+        plan(Main, P, 2, 1)),
+    ?assert(lists:all(fun is_retention_key/1, plan(Main, P, 2, 1))),
+    ?assertNot(is_retention_key(<<(key(P, <<"f">>, 1))/binary, ".x">>)).

@@ -575,9 +575,19 @@ legacy_slots(ProcID, Opts) ->
 %%% namespace, and only of it, below the newest checkpoints it keeps.
 %%% A full-state process (no delta: `lua@5.3a', WASM, native devices) writes
 %%% every slot as an `f' row. Negative slots keep RC7's layout.
+%%%
+%%% A value longer than `?BLOB_CHUNK' bytes is written as chunks of at most
+%%% that size, `<key>.<n>' for n = 1.., and then `<key>' itself holding
+%%% `?CHUNKED' and the chunk count. LMDB stores a value above half a page on
+%%% its own run of contiguous pages and can reuse a freed run only for a value
+%%% that fits it: rewriting a 60 KB state every slot and deleting old ones left
+%%% the file growing with most of its pages free. A chunk fits one page, and
+%%% any free page takes it.
 
 -define(BLOB_NS, <<"pstate">>).
 -define(BLOB_VSN, 1).
+-define(BLOB_CHUNK, 4000).
+-define(CHUNKED, "pstate-chunks:").
 
 blob_store(Opts) ->
     case hb_util:atom(hb_opts:get(<<"process-state-blobs">>, false, Opts)) of
@@ -607,13 +617,53 @@ blob_prefix(ProcID, Kind) ->
 pad_slot(Slot) ->
     iolist_to_binary(io_lib:format("~12..0B", [Slot])).
 
+blob_put(Store, Key, Value, Opts) when byte_size(Value) =< ?BLOB_CHUNK ->
+    blob_write(Store, #{ Key => Value }, Key, Opts);
 blob_put(Store, Key, Value, Opts) ->
-    case hb_store:write([Store], #{ Key => Value }, Opts) of
+    Chunks = chunks(Value),
+    % The chunks first, so a key that names chunks always has them.
+    ok =
+        blob_write(
+            Store,
+            maps:from_list(
+                [ {chunk_key(Key, N), C}
+                || {N, C} <- lists:zip(lists:seq(1, length(Chunks)), Chunks) ]
+            ),
+            Key,
+            Opts
+        ),
+    blob_write(
+        Store,
+        #{ Key => <<?CHUNKED, (integer_to_binary(length(Chunks)))/binary>> },
+        Key,
+        Opts
+    ).
+
+blob_write(Store, Rows, Key, Opts) ->
+    case hb_store:write([Store], Rows, Opts) of
         ok -> ok;
         Error -> erlang:error({process_state_blob_write_failed, Key, Error})
     end.
 
+chunks(<<C:?BLOB_CHUNK/binary, Rest/binary>>) when Rest =/= <<>> -> [C | chunks(Rest)];
+chunks(Last) -> [Last].
+
+chunk_key(Key, N) -> <<Key/binary, ".", (integer_to_binary(N))/binary>>.
+
 blob_get(Store, Key, Opts) ->
+    case blob_raw(Store, Key, Opts) of
+        {ok, <<?CHUNKED, Count/binary>>} ->
+            Parts =
+                [ blob_raw(Store, chunk_key(Key, N), Opts)
+                || N <- lists:seq(1, binary_to_integer(Count)) ],
+            case lists:all(fun(P) -> P =/= not_found end, Parts) of
+                true -> {ok, iolist_to_binary([ B || {ok, B} <- Parts ])};
+                false -> not_found
+            end;
+        Other -> Other
+    end.
+
+blob_raw(Store, Key, Opts) ->
     case hb_store:read([Store], #{ <<"read">> => Key }, Opts) of
         {ok, Bin} when is_binary(Bin) -> {ok, Bin};
         _ -> not_found
@@ -641,8 +691,8 @@ blob_exists(ProcID, Slot, Opts) ->
     case blob_store(Opts) of
         none -> false;
         Store ->
-            blob_get(Store, blob_key(ProcID, <<"d">>, Slot), Opts) =/= not_found
-                orelse blob_get(Store, blob_key(ProcID, <<"f">>, Slot), Opts) =/= not_found
+            blob_raw(Store, blob_key(ProcID, <<"d">>, Slot), Opts) =/= not_found
+                orelse blob_raw(Store, blob_key(ProcID, <<"f">>, Slot), Opts) =/= not_found
     end.
 
 %% @doc The slots of `Kind' (`d', `f' or `s') a process holds, ascending.
@@ -1112,3 +1162,26 @@ state_blobs_full_state_test() ->
     {ok, R} = read(ProcID, 1, Opts),
     ?assertEqual(<<"1">>, hb_maps:get(<<"count">>, R)),
     ?assertMatch({ok, 2, _}, latest(ProcID, [<<"snapshot">>], undefined, Opts)).
+
+%% @doc A state longer than a page is stored as page-sized chunks and reads
+%% back whole; a row with a chunk missing reads as absent, not truncated.
+state_blobs_chunked_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb),
+    Opts = #{ <<"store">> => Store, <<"process-state-blobs">> => true,
+              <<"process-hot-cache-slots">> => 0 },
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Big = hb_util:encode(crypto:strong_rand_bytes(50000)),
+    {ok, _} = write(ProcID, 0, #{ <<"big">> => Big, <<"snapshot">> => <<"vm">> }, Opts),
+    {ok, R} = read(ProcID, 0, Opts),
+    ?assertEqual(Big, hb_maps:get(<<"big">>, R)),
+    Key = blob_key(ProcID, <<"f">>, 0),
+    {ok, Names} = hb_store:list([Store], blob_prefix(ProcID, <<"f">>), #{}),
+    Chunks = [ N || N <- Names, binary:match(N, <<".">>) =/= nomatch ],
+    ?assert(length(Chunks) >= 10),
+    [ ?assertMatch({ok, B} when byte_size(B) =< ?BLOB_CHUNK,
+          blob_raw(Store, <<(blob_prefix(ProcID, <<"f">>))/binary, "/", N/binary>>, Opts))
+    || N <- Chunks ],
+    ?assertEqual([0], blob_slots(ProcID, <<"f">>, Store)),
+    #{ <<"db">> := DB } = hb_store:find(Store),
+    {ok, 1} = elmdb:delete_batch(DB, [chunk_key(Key, 2)]),
+    ?assertEqual(not_found, blob_get(Store, Key, Opts)).
