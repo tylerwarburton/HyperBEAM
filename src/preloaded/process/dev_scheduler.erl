@@ -2259,7 +2259,10 @@ single_resolution(Opts) ->
 many_clients(Opts) ->
     BenchTime = 0.25,
     Processes = hb_opts:get(workers, 25, Opts),
-    {Node, HTTPOpts} = http_init(Opts),
+    % Every worker's write must be accepted: this measures scheduling, not the
+    % node's write bound.
+    {Node, HTTPOpts} =
+        http_init(Opts#{ <<"max-writes-in-flight">> => Processes }),
     PMsg = hb_message:commit(test_process(HTTPOpts), HTTPOpts),
     % Each a new signed message: one is assigned at most once.
     MkBase = fun() -> hb_message:commit(#{
