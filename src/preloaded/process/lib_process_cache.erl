@@ -4,7 +4,7 @@
 %%% message ID.
 -module(lib_process_cache).
 -export([fresh/3, fresh/4]).
--export([latest/2, latest/3, latest/4]).
+-export([latest/2, latest/3, latest/4, latest_slot/2]).
 -export([read/2, read/3, refresh/3, write/4]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").

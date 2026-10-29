@@ -411,26 +411,41 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
                     end
             end;
         CurrentSlot when CurrentSlot > TargetSlot ->
-            % The cache should already have the result, so we should never end up
-            % here. Depending on the type of process, 'rewinding' may require
-            % re-computing from a significantly earlier checkpoint, so for now
-            % we throw an error.
+            % The slot is behind the state held here and not in the cache:
+            % retention deleted its row. Recompute it from the nearest kept
+            % checkpoint at or below it, or from the start, in a state of its
+            % own. The state held here is not rewound, and the answer is
+            % marked as read back, so a worker never continues from it.
             ?event(
                 compute,
-                {error_already_calculated_slot,
+                {recomputing_below_held_state,
                     {target, TargetSlot},
                     {current, CurrentSlot}
                 },
                 Opts
             ),
-            throw(
-                {error,
-                    {already_calculated_slot,
-                        {target, TargetSlot},
-                        {current, CurrentSlot}
-                    }
-                }
-            )
+            {ok, Restored} =
+                ensure_loaded_state(
+                    hb_maps:get(<<"process">>, Base, Base, Opts),
+                    Req#{ <<"slot">> => TargetSlot },
+                    Opts
+                ),
+            case hb_ao:get(<<"at-slot">>, Restored, Opts#{ <<"hashpath">> => ignore }) of
+                RestoredSlot when is_integer(RestoredSlot), RestoredSlot > TargetSlot ->
+                    throw(
+                        {error,
+                            {already_calculated_slot,
+                                {target, TargetSlot},
+                                {current, RestoredSlot}
+                            }
+                        }
+                    );
+                _ ->
+                    case compute_to_slot(ProcID, Restored, Req, TargetSlot, Opts) of
+                        {ok, Recomputed} -> {ok, mark_cached_state(Recomputed, Opts)};
+                        Other -> Other
+                    end
+            end
     end.
 
 %% @doc Compute a single slot for a process, given an initialized state.

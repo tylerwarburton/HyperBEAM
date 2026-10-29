@@ -592,6 +592,41 @@ now_results_test_parallel_() ->
         ?assertEqual({ok, <<"4">>}, hb_ao:resolve(Base, <<"now/results/data">>, Opts))
     end}.
 
+%% @doc Run-9 soak: retention deletes a computed slot's row while the worker
+%% holds a later state. A read of that slot must recompute it from the nearest
+%% kept checkpoint, not answer that it is `already calculated' (an empty 400).
+read_below_retention_floor_test_() ->
+    {timeout, 60, fun() ->
+        Opts = test_opts(#{
+            <<"process-state-blobs">> => true,
+            <<"process-hot-cache-slots">> => 0,
+            <<"process-snapshot-slots">> => 3,
+            <<"process-snapshot-target">> => false,
+            <<"store-retention-checkpoints">> => 1,
+            <<"store-retention-recent-slots">> => 1
+        }),
+        Base =
+            lua_process(
+                <<"function inc(base) base.count = (base.count or 0) + 1 return base end">>,
+                Opts
+            ),
+        [ schedule_test_message(Base, <<"inc">>, #{ <<"path">> => <<"inc">> }, Opts)
+        || _ <- lists:seq(1, 8) ],
+        {ok, Head} =
+            hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 7 }, Opts),
+        ?assertEqual(8, hb_ao:get(<<"count">>, Head, Opts)),
+        #{ deleted := Deleted } = hb_store_retention:retain(Opts),
+        ?assert(Deleted > 0),
+        % Read from the live state at slot 7, as the process worker does.
+        {ok, Old} =
+            hb_ao:resolve(Head, #{ <<"path">> => <<"compute">>, <<"slot">> => 4 }, Opts),
+        ?assertEqual(5, hb_ao:get(<<"count">>, Old, Opts)),
+        % And from the definition, below every kept checkpoint.
+        {ok, First} =
+            hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 1 }, Opts),
+        ?assertEqual(2, hb_ao:get(<<"count">>, First, Opts))
+    end}.
+
 %% @doc A slot whose execution returns an error is skipped: the error
 %% becomes the slot's results over the state before the slot, the slot is
 %% stored, and computing carries on to the next slot from that state.
