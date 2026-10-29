@@ -55,8 +55,31 @@ compute_group(Base, Req, TargetSlot, Opts) ->
             ),
             ungrouped_exec;
         false ->
-            ProcID
+            case below_head(ProcID, TargetSlot, Opts) of
+                true ->
+                    % A slot behind the newest computed one that is no longer
+                    % cached (retention deleted it) is recomputed from a kept
+                    % checkpoint in the requester, never in the worker: the
+                    % replay would hold every message to the process behind
+                    % one late read.
+                    ?event(worker,
+                        {recompute_below_head_off_worker,
+                            {proc_id, ProcID},
+                            {slot, TargetSlot}
+                        },
+                        Opts
+                    ),
+                    ungrouped_exec;
+                false -> ProcID
+            end
     end.
+
+below_head(ProcID, Slot, Opts) when is_integer(Slot) ->
+    case (catch lib_process_cache:latest_slot(ProcID, Opts)) of
+        {ok, Head} when is_integer(Head) -> Slot < Head;
+        _ -> false
+    end;
+below_head(_ProcID, _Slot, _Opts) -> false.
 
 %% @doc Return `true' if the requested compute result is already cached.
 compute_cached(ProcID, not_found, Opts) ->
@@ -457,10 +480,11 @@ grouper_skips_when_slot_cached_test() ->
         ungrouped_exec,
         hb_persistent:group(M1, Uncached, POpts)
     ),
-    % Cache slots are not assumed to be gap-free. A lower slot that
-    % has not actually been written must still go through the worker.
+    % A lower slot that is not cached (retention deleted it) is recomputed
+    % in the requester from a kept checkpoint, never in the worker, whose
+    % queue every message to the process waits in.
     MissingLower = #{ <<"path">> => <<"compute">>, <<"slot">> => 4 },
-    ?assertEqual(ProcessGroup, hb_persistent:group(M1, MissingLower, POpts)),
+    ?assertEqual(ungrouped_exec, hb_persistent:group(M1, MissingLower, POpts)),
     % A request for a slot beyond what we cached must still be
     % serialised through the worker.
     Beyond = #{ <<"path">> => <<"compute">>, <<"slot">> => 999 },
