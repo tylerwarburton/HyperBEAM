@@ -129,6 +129,9 @@
 -define(DEFAULT_ERROR_DETAILS_MAX_SIZE, 32*1024).
 %% At most this many media ranges in `accept' are considered.
 -define(MAX_ACCEPT_RANGES, 100).
+%% The default bound on writes in flight, per scheduler (PARALITH.md, "Write
+%% admission").
+-define(WRITES_IN_FLIGHT_PER_CORE, 8).
 
 %%% HTTP server start and management functions.
 
@@ -435,6 +438,7 @@ new_server(RawNodeMsg) ->
         #{ <<"port">> := _ } -> stop_tls(ServerID), [];
         _ -> prepare_tls(TLS, Wallet, ServerID, NodeMsg)
     end,
+    admission_start(ServerID, NodeMsg),
     {Port, Listener} = try
         case case {Protocol, TLSOpts} of
                 {http3, []} -> start_http3(ServerID, PrometheusOpts, NodeMsg);
@@ -701,9 +705,83 @@ init(Req, {ServerID, MaxBody}) ->
         {<<"OPTIONS">>, {tls_http_01, _}} ->
             request_body(Req, ServerID, MaxBody);
         {<<"OPTIONS">>, _} -> cors_reply(Req, ServerID);
-        _ ->
-            request_body(Req, ServerID, MaxBody)
+        {Method, _} ->
+            case admit(Method, ServerID) of
+                ok -> request_body(Req, ServerID, MaxBody);
+                full -> overloaded_reply(Req)
+            end
     end.
+
+%%% Write admission.
+%%%
+%%% A node accepts at most `max-writes-in-flight' writes at once. A write is a
+%%% request whose method is not safe (RFC 9110: anything but `GET', `HEAD' and
+%%% `OPTIONS'), which is every request that can schedule a message. A write
+%%% that arrives while the bound is full is answered at once with a 503 and a
+%%% `retry-after', before its body is read, verified or stored, so it was
+%%% never accepted and the client may send it again. Reads are never refused.
+%%%
+%%% Past its capacity a node that accepts every write spends its cores on
+%%% verifying, signing and storing writes that then time out, and its confirmed
+%%% throughput falls instead of levelling off (PARALITH.md, "Write admission").
+%%% A write is in flight while its request process lives: a watcher releases
+%%% its place when that process exits, however it exits.
+
+%% @doc Create the server's write counter and record its bound. The bound is
+%% read once, when the server starts.
+admission_start(ServerID, NodeMsg) ->
+    Limit =
+        hb_util:int(
+            hb_opts:get(
+                max_writes_in_flight,
+                ?WRITES_IN_FLIGHT_PER_CORE * erlang:system_info(schedulers_online),
+                NodeMsg
+            )
+        ),
+    persistent_term:put(
+        {?MODULE, admission, ServerID},
+        {atomics:new(1, []), Limit}
+    ).
+
+%% @doc Take a place for a write, or return `full'. Reads always pass.
+admit(<<"GET">>, _ServerID) -> ok;
+admit(<<"HEAD">>, _ServerID) -> ok;
+admit(_Method, ServerID) ->
+    case persistent_term:get({?MODULE, admission, ServerID}, undefined) of
+        undefined -> ok;
+        {Counter, Limit} ->
+            case atomics:add_get(Counter, 1, 1) > Limit of
+                true ->
+                    atomics:sub(Counter, 1, 1),
+                    full;
+                false ->
+                    Self = self(),
+                    spawn(
+                        fun() ->
+                            Ref = erlang:monitor(process, Self),
+                            receive {'DOWN', Ref, process, _, _} ->
+                                atomics:sub(Counter, 1, 1)
+                            end
+                        end
+                    ),
+                    ok
+            end
+    end.
+
+%% @doc The reply to a write that the node did not accept.
+overloaded_reply(Req) ->
+    Req2 = cowboy_req:reply(
+        503,
+        #{
+            <<"retry-after">> => <<"1">>,
+            <<"content-type">> => <<"text/plain">>,
+            <<"access-control-allow-origin">> => <<"*">>,
+            <<"access-control-expose-headers">> => <<"retry-after">>
+        },
+        <<"Node is at its write limit; the message was not accepted.">>,
+        Req
+    ),
+    {ok, Req2, no_state}.
 
 %% @doc Read and handle a request body within the node's limits.
 request_body(Req, ServerID, MaxBody) ->
@@ -2640,6 +2718,55 @@ cors_get_test() ->
         hb_util:bin(byte_size(Body)),
         proplists:get_value(<<"content-length">>, Headers)
     ).
+
+%% @doc A write past the bound is refused with a 503 and a `retry-after',
+%% before it is parsed; a read is served.
+write_admission_refuses_writes_test() ->
+    Opts = isolated_test_opts(),
+    URL = start_node(Opts#{ <<"max-writes-in-flight">> => 0 }),
+    Raw =
+        fun(Method) ->
+            hb_http_client:request(
+                #{
+                    peer => URL,
+                    path => <<"/~meta@1.0/info">>,
+                    method => Method,
+                    headers => #{},
+                    body => <<"not a message">>
+                },
+                Opts
+            )
+        end,
+    {ok, 503, Headers, _} = Raw(<<"POST">>),
+    ?assertEqual(<<"1">>, proplists:get_value(<<"retry-after">>, Headers)),
+    ?assertMatch({ok, 200, _, _}, Raw(<<"GET">>)).
+
+%% @doc A write holds its place while its request process lives, and gives it
+%% back when the process exits, even when it is killed.
+write_admission_releases_test() ->
+    ServerID = {?MODULE, write_admission_releases_test},
+    admission_start(ServerID, #{ <<"max-writes-in-flight">> => 1 }),
+    Parent = self(),
+    Holder =
+        spawn(fun() ->
+            Parent ! {admitted, admit(<<"POST">>, ServerID)},
+            receive never -> ok end
+        end),
+    receive {admitted, First} -> ?assertEqual(ok, First) end,
+    ?assertEqual(full, admit(<<"POST">>, ServerID)),
+    ?assertEqual(ok, admit(<<"GET">>, ServerID)),
+    exit(Holder, kill),
+    Wait =
+        fun Wait(0) -> timeout;
+            Wait(N) ->
+                Self = self(),
+                Pid = spawn(fun() -> Self ! {try_admit, admit(<<"POST">>, ServerID)} end),
+                receive {try_admit, ok} -> _ = Pid, ok;
+                        {try_admit, full} -> timer:sleep(10), Wait(N - 1)
+                end
+        end,
+    ?assertEqual(ok, Wait(100)),
+    persistent_term:erase({?MODULE, admission, ServerID}).
 
 index_test() ->
     NodeURL = start_node(),
