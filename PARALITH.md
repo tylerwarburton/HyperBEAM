@@ -46,6 +46,39 @@ Settings our v0.11 nodes run with, each one decided or measured:
 | `process-state-blobs` | `true` | computed slots as one row each under `pstate/`, the only rows retention may delete. Every node |
 | `store-retention` (+ `-checkpoints` 2, `-interval-ms` 600000, `-first-ms` 60000, `-batch-keys` 1000, `-max-cpu-pct` 25, `-max-candidates` 1000000) | `true`, defaults | delete computed states below the newest two snapshot checkpoints. Every node. Needs `patches/elmdb-delete.patch` in the build |
 | LMDB `sync` | leave unset (now `true` by default; `false` opts out) | RC7 opened every LMDB `no_sync`: a host crash could corrupt the tree, as on the old fork's main node 2026-10-20. +3 ms a game slot |
+| `max-writes-in-flight` | leave unset (default 8 per scheduler) | see "Write admission" |
+
+## Write admission
+
+A node holds at most `max-writes-in-flight` writes at once (default 8 per
+scheduler: 16 on a 2-CPU node). A write is any request that is not `GET`,
+`HEAD` or `OPTIONS`. One past the bound is answered at once with **503 and
+`retry-after: 1`**, before its body is read, verified or stored: it was never
+accepted, so a client may re-send the same signed item. Reads are never
+refused. The bound is read when the server starts.
+
+Why: past its capacity a node that accepts every write spends its cores on
+writes that then time out, and confirmed throughput falls instead of levelling
+off. Measured 2026-10-29 on a 2-CPU scratch node (`--cpus 2`), one game of 300
+players, composed writes (`POST /<pid>~process@1.0/push`, what the app and the
+swarm send), round trip of the confirmed writes:
+
+| offered | no bound: confirmed, p50 / p95 | bound 16: confirmed, p50 / p95, 503s |
+|---:|---|---|
+| 20 msg/s (1x) | 18.6 msg/s, 3.5 / 6.4 s | 19.1 msg/s, 0.6 / 1.0 s, 3% |
+| 40 msg/s (2x) | 15.3 msg/s, >=30 / >=30 s (62% timed out) | 22.1 msg/s, 0.9 / 1.0 s, 44% |
+| 60 msg/s (3x) | 11.0 msg/s, >=30 / >=30 s (82% timed out) | 22.1 msg/s, 0.9 / 1.0 s, 63% |
+| 4 shards, 60 msg/s | 13.9 msg/s, >=30 / >=30 s | 18.7 msg/s, 0.8 / 2.0 s |
+
+A bound of 32 gave 20.0 msg/s at p95 2.0 s at 3x: an accepted write waits
+about bound / throughput, so 8 per scheduler keeps it near a second at the
+~11 msg/s per core this game reaches. The load gate (15 msg/s) still passes
+with no 503.
+
+What it does not cover: a client that schedules (`POST .../schedule`) and then
+reads the slot. That POST returns before the slot is computed, so the bound
+never sees the backlog; the load gate's own path collapses as before (40 msg/s:
+15.1 confirmed; 60: 11.1).
 
 ## Ship gate: ms per game slot (required before a node build ships)
 
