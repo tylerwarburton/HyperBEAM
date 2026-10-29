@@ -101,10 +101,42 @@ push(Base, Req, Opts) ->
         _ -> push_with_mode(Process, Req, Opts)
     end.
 
+%% @doc A push runs to the end of its outbox whatever happens to the caller.
+%% Each outbox message is delivered only by the push of its slot, and an HTTP
+%% request's process is killed when its client disconnects: a push run inside
+%% it stopped half way through an outbox, and the rest was never delivered.
+%% So a synchronous push runs in a process of its own and the caller waits for
+%% its result.
 push_with_mode(Process, Req, Opts) ->
     case is_async(Process, Req, Opts) of
-        true -> spawn(fun() -> do_push(Process, Req, Opts) end);
-        false -> do_push(Process, Req, Opts)
+        true -> detach(fun() -> do_push(Process, Req, Opts) end);
+        false -> await_detached(fun() -> do_push(Process, Req, Opts) end)
+    end.
+
+%% @doc Run `Fun' in a detached process and return (or raise) what it does.
+await_detached(Fun) ->
+    Caller = self(),
+    Ref = make_ref(),
+    Pid =
+        detach(
+            fun() ->
+                Caller !
+                    {Ref,
+                        try {ok, Fun()}
+                        catch Class:Reason:Stack -> {raise, Class, Reason, Stack}
+                        end}
+            end
+        ),
+    Mon = erlang:monitor(process, Pid),
+    receive
+        {Ref, {ok, Res}} ->
+            erlang:demonitor(Mon, [flush]),
+            Res;
+        {Ref, {raise, Class, Reason, Stack}} ->
+            erlang:demonitor(Mon, [flush]),
+            erlang:raise(Class, Reason, Stack);
+        {'DOWN', Mon, process, Pid, Reason} ->
+            erlang:error({push_failed, Reason})
     end.
 
 %% @doc Determine if the push is asynchronous. The boolean `async' key
@@ -2408,7 +2440,8 @@ wait_until_loop(Pred, Deadline) ->
 
 push_isolation_test_() ->
     {inorder, [
-        {timeout, 60, fun test_blackholed_gateway_does_not_delay_push/0}
+        {timeout, 60, fun test_blackholed_gateway_does_not_delay_push/0},
+        {timeout, 60, fun test_push_outlives_its_caller/0}
     ]}.
 
 %% @doc A Sender whose message at `MsgSlot' sends one message to each of
@@ -2509,6 +2542,30 @@ test_blackholed_gateway_does_not_delay_push() ->
     % The wallet's lookup did go to the gateway, from the background.
     ?assert(wait_until(fun() -> Accepted() >= 1 end, 5000)),
     exit(Hole, kill).
+
+%% @doc The 2026-10-28 soak lost a beacon round's results: the push of the
+%% round ran in the HTTP request's process, the client went away (its
+%% container was stopped) after 8 of the outbox's messages were scheduled, and
+%% the request's process was killed with the rest undelivered. Nothing else
+%% ever pushes that slot. Here the caller is killed once the first message has
+%% landed, and every message is still scheduled.
+test_push_outlives_its_caller() ->
+    N = 12,
+    {Sender, Receiver, MsgSlot, Opts} =
+        setup_sender(lists:duplicate(N, receiver), []),
+    Before = receiver_slot(Receiver, Opts),
+    Caller =
+        spawn(fun() ->
+            hb_ao:resolve(Sender,
+                #{ <<"path">> => <<"push">>, <<"slot">> => MsgSlot,
+                    <<"max-depth">> => 0 }, Opts)
+        end),
+    ?assert(wait_until(fun() -> receiver_slot(Receiver, Opts) > Before end, 30000)),
+    exit(Caller, shutdown),
+    Landed = receiver_slot(Receiver, Opts) - Before,
+    ?event(debug_push, {landed_when_caller_killed, Landed}),
+    ?assert(Landed < N),
+    ?assert(wait_until(fun() -> receiver_slot(Receiver, Opts) == Before + N end, 30000)).
 
 -ifdef(ENABLE_GENESIS_WASM).
 %% @doc Test that a message that generates another message which resides on an
