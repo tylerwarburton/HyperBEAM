@@ -246,7 +246,27 @@ the numbers below with the reason they moved.
    `aos_process_benchmark_test_` sometimes (6 slots in 178-316 ms, limit
    250 ms).
 5. **Worker, process cache, `hb_persistent`**: each measured on its own.
-6. **Push**.
+6. **Push**. Found by the 2026-10-28 RandAO soak (24 h, 144 GB):
+   - **A push never waits on a gateway.** An outbox target the local stores
+     do not hold (a wallet in a token's `Credit-Notice`, a process
+     scheduled elsewhere) is looked up and delivered by a process of its
+     own; its entry in the push reply is `deferred` (202). In the soak
+     every one of 821 `HEAD ~arweave@2.9/raw=<id>` in 3.5 h came from a
+     `/push`, for 51 wallet ids, 817 of them 404, p90 30.3 s, each holding
+     the rest of the outbox and every client push queued behind it. A
+     gateway 404 is remembered for `push-missing-target-ttl` (now 3600 s).
+   - **A push outlives its caller.** It ran in the HTTP request's process,
+     which cowboy kills when the client disconnects, so the rest of the
+     outbox was never delivered (soak: beacon round `EiHAA/356135` stopped
+     after 8 results when the provider's container was stopped). It now
+     runs in its own process. A node crash mid-push can still drop the
+     rest of an outbox.
+   - **A pushed message leaves a receipt, not copies.** Each delivered
+     message left three copies in the main store (signed message, cached
+     scheduling result, assignment as the cached `schedule` result), rows
+     retention may never delete. The message goes to the scheduler's store
+     (same rows as its assignment's body) and the cached result is
+     slot/ID/target.
 7. **Stores**: ported (2026-10-27), rewritten for RC7's layout (plain
    key/value writes, no links or groups):
    - **LMDB sync**: every commit is synced unless a store sets
@@ -423,6 +443,16 @@ the numbers below with the reason they moved.
    content-addressed rows (on this bench far smaller: 878 vs 6,327 MiB);
    a read below the floor recomputes from the start; LMDB keeps its
    high-water mark.
+
+   **State blobs are page-sized chunks** (2026-10-29, the RandAO soak:
+   main store +3.3 GB/h, 144 GB in 24 h, with retention on). LMDB puts a
+   value above half a page on its own run of contiguous pages and reuses a
+   freed run only for a value that fits it. A full-state process writes a
+   20-60 KB `f` row every slot; retention deletes them, but the freed pages
+   are scattered among small rows, so the file kept growing with much of
+   it free (scratch node: 127 MB free in a 220 MB file, still growing). A
+   row over 4,000 bytes is now `<row>.1..n` (a page each) and `<row>` =
+   `pstate-chunks:<n>`; retention deletes the chunks with their row.
 
    Re-audit fixes (each with a test that failed first):
    - The journal wrapper sets `max-retries => 0`: `hb_store` treated a
