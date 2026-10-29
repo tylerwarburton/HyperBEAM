@@ -717,8 +717,9 @@ init(Req, {ServerID, MaxBody}) ->
 %%% A node accepts at most `max-writes-in-flight' writes at once. A write is a
 %%% request whose method is not safe (RFC 9110: anything but `GET', `HEAD' and
 %%% `OPTIONS'), which is every request that can schedule a message. A write
-%%% that arrives while the bound is full is answered at once with a 503 and a
-%%% `retry-after', before its body is read, verified or stored, so it was
+%%% that arrives while the bound is full is answered at once with a 503, a
+%%% `retry-after' and `hb-admission: busy', before its body is read, verified
+%%% or stored, so it was
 %%% never accepted and the client may send it again. Reads are never refused.
 %%%
 %%% Past its capacity a node that accepts every write spends its cores on
@@ -774,9 +775,12 @@ overloaded_reply(Req) ->
         503,
         #{
             <<"retry-after">> => <<"1">>,
+            % A proxy's 503 says nothing about acceptance; this one does.
+            <<"hb-admission">> => <<"busy">>,
             <<"content-type">> => <<"text/plain">>,
             <<"access-control-allow-origin">> => <<"*">>,
-            <<"access-control-expose-headers">> => <<"retry-after">>
+            <<"access-control-expose-headers">> =>
+                <<"retry-after, hb-admission">>
         },
         <<"Node is at its write limit; the message was not accepted.">>,
         Req
@@ -2739,6 +2743,7 @@ write_admission_refuses_writes_test() ->
         end,
     {ok, 503, Headers, _} = Raw(<<"POST">>),
     ?assertEqual(<<"1">>, proplists:get_value(<<"retry-after">>, Headers)),
+    ?assertEqual(<<"busy">>, proplists:get_value(<<"hb-admission">>, Headers)),
     ?assertMatch({ok, 200, _, _}, Raw(<<"GET">>)).
 
 %% @doc A write holds its place while its request process lives, and gives it
