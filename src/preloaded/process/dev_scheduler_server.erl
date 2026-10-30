@@ -296,9 +296,12 @@ compute_on_schedule(#{ current := Before }, After = #{ current := Now })
         when Now =< Before ->
     After;
 compute_on_schedule(_Before, After = #{ opts := Opts }) ->
-    case hb_util:atom(hb_opts:get(<<"process-compute-on-schedule">>, true, Opts)) of
+    Enabled =
+        hb_util:atom(hb_opts:get(<<"process-compute-on-schedule">>, true, Opts))
+            =/= false,
+    case Enabled andalso workers(Opts) of
         false -> After;
-        _ ->
+        true ->
             #{ follower := Follower } = State = with_follower(After),
             Follower ! {compute, maps:get(current, State)},
             State
@@ -344,14 +347,13 @@ follow(Proc, Opts) ->
 %% The scheduler runs nested inside a resolution, so `hb_ao' has stripped
 %% `spawn-worker' from its options: ask for the process's worker again, as a
 %% push does, or every follow-up compute would restore the process anew.
-follower_opts(Opts) ->
-    Workers =
-        hb_opts:get(<<"process-workers">>, false, Opts) == true orelse
-            hb_opts:get(<<"process-worker-spawn">>, false, Opts) == true,
-    case Workers of
-        true -> Opts#{ <<"spawn-worker">> => true };
-        false -> Opts
-    end.
+%% Without workers every follow-up compute would restore the process from
+%% its last checkpoint, so a node without them has no follower.
+follower_opts(Opts) -> Opts#{ <<"spawn-worker">> => true }.
+
+workers(Opts) ->
+    hb_opts:get(<<"process-workers">>, false, Opts) == true orelse
+        hb_opts:get(<<"process-worker-spawn">>, false, Opts) == true.
 
 newest_requested(Slot) ->
     receive {compute, Next} -> newest_requested(max(Slot, Next))
