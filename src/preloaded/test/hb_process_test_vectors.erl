@@ -595,6 +595,37 @@ now_results_test_parallel_() ->
 %% @doc Run-9 soak: retention deletes a computed slot's row while the worker
 %% holds a later state. A read of that slot must recompute it from the nearest
 %% kept checkpoint, not answer that it is `already calculated' (an empty 400).
+%% @doc A lua@5.3a process publishes a mixed-case key (`balance-<address>',
+%% as PUSD does) on every slot. Its value stays the value: on prod e50c10a0d
+%% it became `[new, [old, ...]]' from the second write on.
+mixed_case_key_stays_a_value_test_() ->
+    {timeout, 60, fun() ->
+        Opts = test_opts(#{
+            <<"process-state-blobs">> => true,
+            <<"process-delta-cache">> => true,
+            <<"process-hot-cache-slots">> => 0
+        }),
+        Base =
+            lua_process(
+                <<"function inc(base) "
+                  "N = (N or 0) + 1 "
+                  "base['balance-UEzu0jQBQIgGJnQ'] = tostring(N) "
+                  "return base end">>,
+                Opts
+            ),
+        [ schedule_test_message(Base, <<"inc">>, #{ <<"path">> => <<"inc">> }, Opts)
+        || _ <- lists:seq(1, 4) ],
+        {ok, S1} =
+            hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 1 }, Opts),
+        ?assertEqual(<<"2">>, hb_ao:get(<<"balance-UEzu0jQBQIgGJnQ">>, S1, Opts)),
+        % Computed onward from the state read back from the cache.
+        {ok, S3} =
+            hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 3 }, Opts),
+        ?assertEqual(<<"4">>, hb_ao:get(<<"balance-UEzu0jQBQIgGJnQ">>, S3, Opts)),
+        {ok, Now} = hb_ao:resolve(Base, <<"now/balance-uezu0jqbqiggjnq">>, Opts),
+        ?assertEqual(<<"4">>, Now)
+    end}.
+
 read_below_retention_floor_test_() ->
     {timeout, 60, fun() ->
         Opts = test_opts(#{

@@ -716,18 +716,20 @@ do_decode(EncMsg = [{_K, _V} | _], Opts) when is_list(EncMsg) ->
     do_decode(
         maps:map(
             fun(Key, V) -> decode_value(Key, do_decode(V, Opts)) end,
-            hb_ao:normalize_keys(
-                maps:from_list(
-                    [
-                        {K, V}
-                    ||
-                        {K, V} <- EncMsg,
-                        not is_list(K),
-                        not is_function(V),
-                        not is_tuple(V)
-                    ]
-                ),
-                Opts
+            one_spelling(
+                hb_ao:normalize_keys(
+                    maps:from_list(
+                        [
+                            {K, V}
+                        ||
+                            {K, V} <- EncMsg,
+                            not is_list(K),
+                            not is_function(V),
+                            not is_tuple(V)
+                        ]
+                    ),
+                    Opts
+                )
             )
         ),
         Opts
@@ -752,6 +754,26 @@ decode_value(<<"commitments">>, Commitments) when is_map(Commitments) ->
     map_committers(fun hb_committer:uri/1, Commitments);
 decode_value(_Key, Value) ->
     Value.
+
+%% @doc A message has one key per lowercase spelling: RC7 stores and looks
+%% a key up by its lowercase form. A state comes into Lua with its keys
+%% lowercased, so a contract that writes `balance-<Address>' again leaves
+%% the table holding both spellings, and the message held both values as a
+%% list (`[new, [old, ...]]', PUSD on prod e50c10a0d). The spelling that is
+%% not already lowercase is the one the contract wrote in this call: it wins.
+one_spelling(Map) ->
+    maps:fold(
+        fun(Key, _Value, Acc) when is_binary(Key) ->
+                Lower = hb_util:lowercase_key(Key),
+                case Lower =/= Key andalso is_map_key(Lower, Acc) of
+                    true -> maps:remove(Lower, Acc);
+                    false -> Acc
+                end;
+           (_Key, _Value, Acc) -> Acc
+        end,
+        Map,
+        Map
+    ).
 
 %% @doc Encode a HyperBEAM `structured@1.0' message into a Lua term. Arweave
 %% committers are given to Lua as their addresses, because Lua code compares
