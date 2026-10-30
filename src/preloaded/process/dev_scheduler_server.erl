@@ -138,7 +138,8 @@ start(ProcID, Proc, Opts) ->
                     wallets => commitment_wallets(Proc, Opts),
                     committment_spec => commitment_spec(Proc, Opts),
                     mode => mode(Opts, remote_confirmation),
-                    opts => Opts
+                    opts => Opts,
+                    proc => Proc
                 }
             )
         end
@@ -267,13 +268,74 @@ server(State) ->
         {schedule, Message, Reply, AbortTime} ->
             Requests =
                 [{Message, Reply, AbortTime} | queued(?MAX_BATCH - 1)],
-            server(assign_batch(State, Requests));
+            server(compute_on_schedule(State, assign_batch(State, Requests)));
         {info, Reply} ->
             Reply ! {info, State},
             server(State);
         stop ->
             ?event({stopping_scheduling_server, {proc_id, maps:get(id, State)}}),
             ok
+    end.
+
+%% @doc A slot this node assigns is computed promptly, whoever scheduled it:
+%% otherwise a process nobody pushes or computes (PUSD, a token, a vault)
+%% sits at its last computed slot, and `/now', served from the cache, trails
+%% its schedule until somebody asks for a slot. One follower per process asks
+%% for the newest assigned slot, through the process's worker like any
+%% compute; slots assigned while it waits fold into one request, and a slot
+%% already computed (by a push, say) is a cache hit. It never computes
+%% anything a reader would not, and never twice. `process-compute-on-
+%% schedule' false turns it off.
+compute_on_schedule(#{ current := Before }, After = #{ current := Now })
+        when Now =< Before ->
+    After;
+compute_on_schedule(_Before, After = #{ opts := Opts }) ->
+    case hb_util:atom(hb_opts:get(<<"process-compute-on-schedule">>, true, Opts)) of
+        false -> After;
+        _ ->
+            #{ follower := Follower } = State = with_follower(After),
+            Follower ! {compute, maps:get(current, State)},
+            State
+    end.
+
+with_follower(State = #{ follower := Pid }) when is_pid(Pid) ->
+    case is_process_alive(Pid) of
+        true -> State;
+        false -> with_follower(maps:remove(follower, State))
+    end;
+with_follower(State = #{ proc := Proc, opts := Opts }) ->
+    ServerID = get(server_id),
+    Server = self(),
+    Follower =
+        spawn(fun() ->
+            put(server_id, ServerID),
+            erlang:monitor(process, Server),
+            follow(Proc, Opts)
+        end),
+    State#{ follower => Follower }.
+
+follow(Proc, Opts) ->
+    receive
+        {compute, Slot} ->
+            Target = newest_requested(Slot),
+            try
+                hb_ao:resolve(
+                    Proc,
+                    #{ <<"path">> => <<"compute">>, <<"slot">> => Target },
+                    Opts#{ <<"cache-control">> => [<<"no-store">>] }
+                )
+            catch Class:Reason ->
+                ?event(warning, {compute_on_schedule_failed,
+                    {slot, Target}, {class, Class}, {reason, Reason}})
+            end,
+            follow(Proc, Opts);
+        {'DOWN', _, process, _, _} ->
+            ok
+    end.
+
+newest_requested(Slot) ->
+    receive {compute, Next} -> newest_requested(max(Slot, Next))
+    after 0 -> Slot
     end.
 
 %% @doc The schedule requests already in the mailbox, oldest first, at most

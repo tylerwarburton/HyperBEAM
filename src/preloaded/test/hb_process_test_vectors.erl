@@ -598,6 +598,47 @@ now_results_test_parallel_() ->
 %% @doc A lua@5.3a process publishes a mixed-case key (`balance-<address>',
 %% as PUSD does) on every slot. Its value stays the value: on prod e50c10a0d
 %% it became `[new, [old, ...]]' from the second write on.
+%% @doc Prod PUSD, 2026-10-29: the attestors' mints were scheduled and never
+%% computed, as nobody pushed or computed the process, and `/now' served from
+%% the cache stayed at the last computed slot for 15 minutes. A slot this
+%% node assigns is computed by itself: `/now' reaches it with no reader.
+compute_on_schedule_test_() ->
+    {timeout, 60, fun() ->
+        Opts = test_opts(#{
+            <<"process-now-from-cache">> => true,
+            <<"spawn-worker">> => true,
+            <<"process-workers">> => true,
+            <<"process-worker-spawn">> => true
+        }),
+        Base =
+            lua_process(
+                <<"function inc(base) base.count = (base.count or 0) + 1 return base end">>,
+                Opts
+            ),
+        Count = fun() ->
+            {ok, C} = hb_ao:resolve(Base, <<"now/count">>, Opts),
+            C
+        end,
+        schedule_test_message(Base, <<"inc">>, #{ <<"path">> => <<"inc">> }, Opts),
+        {ok, _} =
+            hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 0 }, Opts),
+        [ schedule_test_message(Base, <<"inc">>, #{ <<"path">> => <<"inc">> }, Opts)
+        || _ <- lists:seq(1, 3) ],
+        Deadline = erlang:monotonic_time(millisecond) + 10000,
+        Wait =
+            fun Loop() ->
+                case Count() of
+                    4 -> ok;
+                    Other ->
+                        case erlang:monotonic_time(millisecond) > Deadline of
+                            true -> {stale, Other};
+                            false -> timer:sleep(100), Loop()
+                        end
+                end
+            end,
+        ?assertEqual(ok, Wait())
+    end}.
+
 mixed_case_key_stays_a_value_test_() ->
     {timeout, 60, fun() ->
         Opts = test_opts(#{
