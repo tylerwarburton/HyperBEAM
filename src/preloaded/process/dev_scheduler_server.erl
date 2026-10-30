@@ -284,8 +284,14 @@ server(State) ->
 %% for the newest assigned slot, through the process's worker like any
 %% compute; slots assigned while it waits fold into one request, and a slot
 %% already computed (by a push, say) is a cache hit. It never computes
-%% anything a reader would not, and never twice. `process-compute-on-
-%% schedule' false turns it off.
+%% anything a reader would not, and never twice.
+%%
+%% It waits `process-compute-on-schedule-ms' (1,000) first. A compute that a
+%% request asks for with `push' (`now&push=0' from a cron, `compute&push')
+%% pushes the slots it computes, and only those: had the follower computed
+%% them first, that push would never happen. A slot nobody computes within
+%% the wait is computed by the node. `process-compute-on-schedule' false
+%% turns it off.
 compute_on_schedule(#{ current := Before }, After = #{ current := Now })
         when Now =< Before ->
     After;
@@ -310,13 +316,15 @@ with_follower(State = #{ proc := Proc, opts := Opts }) ->
         spawn(fun() ->
             put(server_id, ServerID),
             erlang:monitor(process, Server),
-            follow(Proc, Opts)
+            follow(Proc, follower_opts(Opts))
         end),
     State#{ follower => Follower }.
 
 follow(Proc, Opts) ->
     receive
         {compute, Slot} ->
+            timer:sleep(hb_util:int(
+                hb_opts:get(<<"process-compute-on-schedule-ms">>, 1000, Opts))),
             Target = newest_requested(Slot),
             try
                 hb_ao:resolve(
@@ -331,6 +339,18 @@ follow(Proc, Opts) ->
             follow(Proc, Opts);
         {'DOWN', _, process, _, _} ->
             ok
+    end.
+
+%% The scheduler runs nested inside a resolution, so `hb_ao' has stripped
+%% `spawn-worker' from its options: ask for the process's worker again, as a
+%% push does, or every follow-up compute would restore the process anew.
+follower_opts(Opts) ->
+    Workers =
+        hb_opts:get(<<"process-workers">>, false, Opts) == true orelse
+            hb_opts:get(<<"process-worker-spawn">>, false, Opts) == true,
+    case Workers of
+        true -> Opts#{ <<"spawn-worker">> => true };
+        false -> Opts
     end.
 
 newest_requested(Slot) ->
@@ -814,8 +834,10 @@ count_calls(N, Parent) ->
 dedupe_setup(Tag) ->
     Wallet = hb:wallet(),
     Store = small_store(hb_test_utils:test_store(hb_store_lmdb, Tag)),
+    % These tests count the store's reads: no follow-up computes.
     Opts = #{ <<"priv-wallet">> => Wallet, <<"store">> => [Store],
-              <<"scheduling-mode">> => local_confirmation },
+              <<"scheduling-mode">> => local_confirmation,
+              <<"process-compute-on-schedule">> => false },
     ok = hb_store:start([Store], #{}, Opts),
     Proc = dedupe_proc(Opts),
     ProcID = hb_util:human_id(hb_message:id(Proc, all, Opts)),

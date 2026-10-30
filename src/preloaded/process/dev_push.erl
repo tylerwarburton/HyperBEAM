@@ -1879,10 +1879,14 @@ test_remote_routed_push() ->
     % Next, create the second node and process. We do this before node 1 such 
     % that the routes of node 1 and the target of process 1's message are known
     % when we create them.
+    % Both nodes run in this VM and share its process hot cache: a slot
+    % node 2 computes on its own would be found by node 1, which the test
+    % checks never computes process 2.
     N2Opts =
         #{
             <<"store">> => N2Store,
-            <<"priv-wallet">> => N2Wallet
+            <<"priv-wallet">> => N2Wallet,
+            <<"process-compute-on-schedule">> => false
         },
     N2 = hb_http_server:start_node(N2Opts),
     % Create the second process on the second node.

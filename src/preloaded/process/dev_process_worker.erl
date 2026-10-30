@@ -652,7 +652,10 @@ worker_setup() ->
             <<"priv-wallet">> => Wallet,
             <<"spawn-worker">> => true,
             <<"process-workers">> => true,
-            <<"await-inprogress">> => named
+            <<"await-inprogress">> => named,
+            % These tests drive the worker by hand; the scheduler's own
+            % follow-up computes would answer their requests first.
+            <<"process-compute-on-schedule">> => false
         },
     Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
     Process =
