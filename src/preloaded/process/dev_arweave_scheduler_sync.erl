@@ -477,7 +477,7 @@ assignment_provenance(Height, Opts) ->
                 ),
                 true = is_binary(NativeHash),
                 true = Timestamp >= 0,
-                {ok, hb_util:encode(NativeHash), Timestamp}
+                {ok, canonical_block_hash(NativeHash), Timestamp}
             catch
                 _:_ -> assignment_provenance_error(Height)
             end;
@@ -493,6 +493,14 @@ assignment_provenance_error(Height) ->
             <<"block-height">> => Height
         }
     }.
+
+canonical_block_hash(NativeHash) when byte_size(NativeHash) =:= 48 ->
+    hb_util:encode(NativeHash);
+canonical_block_hash(EncodedHash) when byte_size(EncodedHash) =:= 64 ->
+    NativeHash = hb_util:decode(EncodedHash),
+    48 = byte_size(NativeHash),
+    EncodedHash = hb_util:encode(NativeHash),
+    EncodedHash.
 
 assignment_provenance_missing_test() ->
     Store = hb_test_utils:test_store(hb_store_volatile, <<"ar-sched-provenance">>),
@@ -1406,7 +1414,7 @@ sparse_materialization_test() ->
     {ok, _} = dev_arweave_scheduler_cache:write_header(HeaderA, Opts),
     {ok, _} = dev_arweave_scheduler_cache:write_header(HeaderB, Opts),
     Hash100 = crypto:strong_rand_bytes(48),
-    Hash101 = crypto:strong_rand_bytes(48),
+    Hash101 = hb_util:encode(crypto:strong_rand_bytes(48)),
     {ok, _} = dev_arweave_scheduler_cache:write_block(
         100,
         #{ <<"height">> => 100, <<"indep-hash">> => Hash100,
@@ -1482,7 +1490,7 @@ sparse_materialization_test() ->
     ?assertEqual(101, hb_maps:get(<<"block-height">>, Assignment3, Opts)),
     ?assertEqual(0, hb_maps:get(<<"block-index">>, Assignment3, Opts)),
     ?assertEqual(
-        hb_util:encode(Hash101),
+        Hash101,
         hb_maps:get(<<"block-hash">>, Assignment3, Opts)
     ),
     ?assertEqual(1700000120, hb_maps:get(<<"timestamp">>, Assignment3, Opts)),
