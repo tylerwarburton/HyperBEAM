@@ -550,6 +550,8 @@ the numbers below with the reason they moved.
      process materializations and assignments from `scheduler-store` and the
      node's main store. This lets a coordinated PUSD rollout pin its own
      inclusive boundary without changing or rebuilding any local schedule.
+     The dedicated store is write-first; the normal node stores remain read
+     fallbacks so data-bearing process definitions still resolve their bodies.
 
    Node config for an attestor: `on.start.device` = `bridge-attestor@1.0`
    (was `bridge@1.0`); the `bridge` block uses (`pusd`, `scheduler-url`,
