@@ -210,9 +210,12 @@ loop(St) ->
 %% a call's arguments: class, reason and module:function/arity:line only.
 failure(C, R, T) ->
     Reason = scrub(R),
-    Shown = iolist_to_binary(io_lib:format("~0p:~0p", [C, Reason])),
+    Frames = [frame(F) || F <- T],
+    Shown = iolist_to_binary(io_lib:format("~0p:~0p ~0p", [
+        C, Reason, lists:sublist(Frames, 3)
+    ])),
     {binary:part(Shown, 0, min(512, byte_size(Shown))),
-        {pass_failed, C, Reason, [frame(F) || F <- T]}}.
+        {pass_failed, C, Reason, Frames}}.
 
 frame({M, F, A, Loc}) ->
     Arity = case A of N when is_integer(N) -> N; Args -> length(Args) end,
