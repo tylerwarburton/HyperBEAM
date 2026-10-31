@@ -235,13 +235,14 @@ arweave_assignment(A, Pusd, Slot, Opts) when is_map(A) ->
     Get = fun(K) -> hb_ao:get(K, A, not_found, Opts#{ <<"hashpath">> => ignore }) end,
     Hash = Get(<<"block-hash">>),
     try
-        hb_util:int(Get(<<"slot">>)) =:= Slot
+        Valid = hb_util:int(Get(<<"slot">>)) =:= Slot
             andalso hb_util:human_id(Get(<<"process">>)) =:= Pusd
             andalso Get(<<"type">>) =:= <<"Assignment">>
             andalso hb_util:int(Get(<<"block-height">>)) >= 0
             andalso hb_util:int(Get(<<"block-index">>)) >= 0
             andalso hb_util:int(Get(<<"timestamp">>)) >= 0
-            andalso is_binary(Hash) andalso byte_size(Hash) =:= 64
+            andalso is_binary(Hash) andalso byte_size(Hash) =:= 64,
+        case Valid of true -> A; false -> false end
     catch _:_ -> false
     end;
 arweave_assignment(_, _, _, _) -> false.
