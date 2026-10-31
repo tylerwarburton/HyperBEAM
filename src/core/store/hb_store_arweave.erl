@@ -124,6 +124,13 @@ read_remote_offset(
             Opts
         ),
     ?event(arweave_offsets, {remote_index, {id, {explicit, ID}}, {result, Res}}),
+    case remote_offset_result(Res) of
+        not_found -> read_direct_tx_offset(ID, Opts);
+        Offset -> Offset
+    end;
+read_remote_offset(_, _, _) -> not_found.
+
+remote_offset_result(Res) ->
     case Res of
         {ok,
             #{
@@ -153,8 +160,75 @@ read_remote_offset(
             }};
         _ ->
             not_found
+    end.
+
+%% A core Arweave node exposes a confirmed L1 transaction's data-tree end
+%% offset and size without requiring a gateway or a second HyperBEAM node.
+%% This fallback is deliberately L1-only: an ANS-104 item has no `/tx' offset
+%% of its own and continues through the normal remote index/gateway stores.
+read_direct_tx_offset(ID, Opts) ->
+    Res = hb_http:request(
+        #{
+            <<"method">> => <<"GET">>,
+            <<"path">> => <<"/arweave/tx/", ID/binary, "/offset">>
+        },
+        Opts
+    ),
+    ?event(arweave_offsets, {direct_tx_offset, {id, {explicit, ID}}, {result, Res}}),
+    direct_tx_offset_result(Res, Opts).
+
+direct_tx_offset_result({ok, Res}, _Opts) when is_map(Res) ->
+    Body = case maps:get(<<"body">>, Res, Res) of
+        Bin when is_binary(Bin) ->
+            try hb_json:decode(Bin) catch _:_ -> #{} end;
+        Map when is_map(Map) -> Map;
+        _ -> #{}
+    end,
+    case Body of
+        #{ <<"offset">> := End0, <<"size">> := Size0 } ->
+            try
+                EndOffset = hb_util:int(End0),
+                Size = hb_util:int(Size0),
+                StartOffset = EndOffset - Size + 1,
+                true = Size >= 0 andalso StartOffset >= 0,
+                {Version, CodecName, StartOffset, Length} =
+                    hb_store_arweave_offset:decode(
+                        hb_store_arweave_offset:encode(
+                            <<"tx@1.0">>, StartOffset, Size
+                        )
+                    ),
+                {ok, #{
+                    <<"version">> => Version,
+                    <<"codec">> => CodecName,
+                    <<"start">> => StartOffset,
+                    <<"length">> => Length
+                }}
+            catch _:_ -> not_found
+            end;
+        _ -> not_found
     end;
-read_remote_offset(_, _, _) -> not_found.
+direct_tx_offset_result(_, _) -> not_found.
+
+direct_tx_offset_result_test() ->
+    ?assertEqual(
+        {ok, #{
+            <<"version">> => 1,
+            <<"codec">> => <<"tx@1.0">>,
+            <<"start">> => 8766,
+            <<"length">> => 1235
+        }},
+        direct_tx_offset_result(
+            {ok, #{ <<"body">> => <<"{\"offset\":\"10000\",\"size\":\"1235\"}">> }},
+            #{}
+        )
+    ),
+    ?assertEqual(
+        not_found,
+        direct_tx_offset_result(
+            {ok, #{ <<"body">> => <<"{\"offset\":\"2\",\"size\":\"4\"}">> }},
+            #{}
+        )
+    ).
 
 %% @doc Read the data at the given key, reading the `local-store' first if
 %% available. The reads use the node's options, overridden by the options in
