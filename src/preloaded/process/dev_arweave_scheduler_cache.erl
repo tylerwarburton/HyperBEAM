@@ -18,17 +18,23 @@
 
 -define(CACHE_PREFIX, <<"~arweave-scheduler@1.0">>).
 
-%% @doc Use the scheduler store when one is configured. Otherwise, use the
-%% stores of the node's `store' list whose scope is `local'.
+%% @doc Use the Arweave scheduler's dedicated store when configured, then the
+%% generic scheduler store for compatibility. Otherwise use the local-scoped
+%% stores from the node's main `store' list. Keeping the L1 index separate
+%% allows a coordinated rollout boundary without disturbing local schedules.
 opts(Opts) ->
     Opts#{
         <<"store">> =>
             hb_opts:get(
-                scheduler_store,
+                arweave_scheduler_store,
                 hb_opts:get(
-                    store,
-                    no_viable_store,
-                    hb_store:scope(Opts, local)
+                    scheduler_store,
+                    hb_opts:get(
+                        store,
+                        no_viable_store,
+                        hb_store:scope(Opts, local)
+                    ),
+                    Opts
                 ),
                 Opts
             )
@@ -264,6 +270,20 @@ block_path(Height) ->
     hb_path:to_binary([?CACHE_PREFIX, <<"blocks">>, hb_util:bin(Height)]).
 
 %%% Tests
+
+opts_prefer_arweave_scheduler_store_test() ->
+    Main = hb_test_utils:test_store(hb_store_volatile, <<"main">>),
+    Generic = hb_test_utils:test_store(hb_store_volatile, <<"generic">>),
+    Arweave = hb_test_utils:test_store(hb_store_volatile, <<"arweave">>),
+    Selected = opts(#{
+        <<"store">> => [Main],
+        <<"scheduler-store">> => [Generic],
+        <<"arweave-scheduler-store">> => [Arweave]
+    }),
+    ?assertEqual([Arweave], maps:get(<<"store">>, Selected)),
+    ?assertEqual([Generic], maps:get(<<"store">>, opts(#{
+        <<"store">> => [Main], <<"scheduler-store">> => [Generic]
+    }))).
 
 linked_spawn_uses_process_store_test() ->
     Source = hb_test_utils:test_store(hb_store_volatile, <<"linked-source">>),

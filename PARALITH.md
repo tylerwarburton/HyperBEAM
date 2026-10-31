@@ -546,6 +546,10 @@ the numbers below with the reason they moved.
    - `arweave-scheduler@1.0` assignments now commit the canonical block hash
      and timestamp beside height and transaction index. Assignment creation
      fails closed if that cached block provenance is missing or malformed.
+   - `arweave-scheduler-store` optionally isolates the L1 global index,
+     process materializations and assignments from `scheduler-store` and the
+     node's main store. This lets a coordinated PUSD rollout pin its own
+     inclusive boundary without changing or rebuilding any local schedule.
 
    Node config for an attestor: `on.start.device` = `bridge-attestor@1.0`
    (was `bridge@1.0`); the `bridge` block uses (`pusd`, `scheduler-url`,
@@ -568,6 +572,7 @@ the numbers below with the reason they moved.
    planners.
    The subsequent full bridge run passed 33/33 with L1 transaction construction
    and the Arweave/local retry policies.
+   The dedicated-store precedence test passes in the packaged scheduler cache.
 9. **Clients and contracts** (monorepo): httpsig keyids are base64url, and
    the committer is the `publickey:` URI, not an address, so `signer()` has to
    map it. Lands with the fresh deploy.
