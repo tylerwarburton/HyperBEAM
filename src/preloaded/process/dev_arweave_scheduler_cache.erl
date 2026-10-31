@@ -7,7 +7,7 @@
 -export([opts/1]).
 -export([read_global/1, write_global/2]).
 -export([read_process/2, write_process/3, list_processes/1]).
--export([write_header/2, read_header/2]).
+-export([write_header/2, write_execution_header/2, read_header/2]).
 -export([write_block/3, read_block/2]).
 -export([ensure_target_root/2]).
 -export([write_target/4, write_targets/2, read_target/3, list_targets/2]).
@@ -57,6 +57,19 @@ list_processes(RawOpts) ->
 %% @doc Cache a signed transaction header under its TXID.
 write_header(Header, RawOpts) ->
     hb_cache:write(Header, opts(RawOpts)).
+
+%% @doc Publish a verified L1 process/message header to the ordinary local
+%% store chain so process execution can resolve an assignment's body. Scheduler
+%% indexes and assignments remain isolated in `arweave-scheduler-store'.
+write_execution_header(Header, RawOpts) ->
+    ExecutionOpts = RawOpts#{
+        <<"store">> => hb_opts:get(
+            store,
+            no_viable_store,
+            hb_store:scope(RawOpts, local)
+        )
+    },
+    hb_cache:write(Header, ExecutionOpts).
 
 %% @doc Read a cached signed transaction header by TXID.
 read_header(TXID, RawOpts) ->
