@@ -419,7 +419,7 @@ load_tx(ID, StartOffset, Length, Opts) ->
                         Opts)};
                 _ ->
                     maybe
-                        {ok, Data} ?= read_chunks(StartOffset, Length, Opts),
+                        {ok, Data} ?= read_tx_data(ID, StartOffset, Length, Opts),
                         TX = TXHeader#tx{data = Data},
                         % The data must be the data that the signature covers.
                         true ?= ar_tx:verify(TX) orelse {error, data_mismatch},
@@ -434,6 +434,41 @@ load_tx(ID, StartOffset, Length, Opts) ->
         end,
         hb_store_arweave_chunk_fetch_duration_seconds,
         [load_tx]
+    ).
+
+%% Prefer verified weave chunks. A newly mined transaction's partition may
+%% not have reached the selected data nodes yet, while a gateway already has
+%% its raw payload. Gateway bytes remain untrusted here: `load_tx/4' verifies
+%% them against the signed transaction immediately after this function.
+read_tx_data(ID, StartOffset, Length, Opts) ->
+    case read_chunks(StartOffset, Length, Opts) of
+        {ok, Data} -> {ok, Data};
+        _ ->
+            Gateway = hb_util:bin(hb_opts:get(
+                <<"arweave-raw-gateway">>, <<"https://arweave.net">>, Opts)),
+            Res = hb_http:request(
+                #{
+                    <<"method">> => <<"GET">>,
+                    <<"path">> => <<Gateway/binary, "/raw/", ID/binary>>
+                },
+                Opts
+            ),
+            gateway_tx_data_result(Res, Length)
+    end.
+
+gateway_tx_data_result({ok, #{ <<"body">> := Data }}, Length)
+        when is_binary(Data), byte_size(Data) =:= Length ->
+    {ok, Data};
+gateway_tx_data_result(_, _) -> {error, not_found}.
+
+gateway_tx_data_result_test() ->
+    ?assertEqual(
+        {ok, <<1, 2, 3>>},
+        gateway_tx_data_result({ok, #{ <<"body">> => <<1, 2, 3>> }}, 3)
+    ),
+    ?assertEqual(
+        {error, not_found},
+        gateway_tx_data_result({ok, #{ <<"body">> => <<1, 2>> }}, 3)
     ).
 
 %% @doc Read the chunks from the given start offset and length using the 
