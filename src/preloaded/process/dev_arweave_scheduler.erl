@@ -185,8 +185,10 @@ status(_Base, _Req, Opts) ->
 %% schedule/slot paths keep their existing status semantics; this key is
 %% read-only and never changes the scheduler algorithm.
 diagnose(Base, Req, Opts) ->
-    ProcessID = find_process_id(Base, Req, Opts),
-    try dev_arweave_scheduler_sync:process(ProcessID, Opts) of
+    try
+        ProcessID = find_process_id(Base, Req, Opts),
+        dev_arweave_scheduler_sync:process(ProcessID, Opts)
+    of
         {ok, State} ->
             {ok, #{ <<"status">> => <<"ok">>, <<"state">> => State }};
         {error, Reason} ->

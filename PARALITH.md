@@ -546,6 +546,8 @@ the numbers below with the reason they moved.
    - `arweave-scheduler@1.0` assignments now commit the canonical block hash
      and timestamp beside height and transaction index. Assignment creation
      fails closed if that cached block provenance is missing or malformed.
+     Native 48-byte and already encoded 64-character block hashes normalize to
+     exactly the same canonical 64-character assignment field.
    - `arweave-scheduler-store` optionally isolates the L1 global index,
      process materializations and assignments from `scheduler-store` and the
      node's main store. This lets a coordinated PUSD rollout pin its own
