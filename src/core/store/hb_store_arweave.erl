@@ -437,24 +437,44 @@ load_tx(ID, StartOffset, Length, Opts) ->
     ).
 
 %% Prefer verified weave chunks. A newly mined transaction's partition may
-%% not have reached the selected data nodes yet, while a gateway already has
-%% its raw payload. Gateway bytes remain untrusted here: `load_tx/4' verifies
-%% them against the signed transaction immediately after this function.
+%% not have reached the selected data nodes yet, while its accepting core peer
+%% or a gateway already has the payload. Every returned byte remains untrusted
+%% here: `load_tx/4' verifies it against the signed transaction immediately.
 read_tx_data(ID, StartOffset, Length, Opts) ->
     case read_chunks(StartOffset, Length, Opts) of
         {ok, Data} -> {ok, Data};
-        _ ->
-            Gateway = hb_util:bin(hb_opts:get(
-                <<"arweave-raw-gateway">>, <<"https://arweave.net">>, Opts)),
-            Res = hb_http:request(
-                #{
-                    <<"method">> => <<"GET">>,
-                    <<"path">> => <<Gateway/binary, "/raw/", ID/binary>>
-                },
-                Opts
-            ),
-            gateway_tx_data_result(Res, Length)
+        _ -> read_tx_data_from_core(ID, StartOffset, Length, Opts)
     end.
+
+%% A chain peer that accepted the transaction normally has its fresh chunks
+%% before the partition-selected archival nodes do. Restrict only this retry's
+%% route; all ordinary chunk reads retain the range-aware default router.
+read_tx_data_from_core(ID, StartOffset, Length, Opts) ->
+    Core = hb_util:bin(hb_opts:get(
+        <<"arweave-node">>, hb_opts:get(gateway, not_found, Opts), Opts)),
+    CoreRoutes = [#{
+        <<"template">> => #{
+            <<"path">> => <<"^/arweave/chunk">>,
+            <<"method">> => <<"GET">>
+        },
+        <<"node">> => #{ <<"match">> => <<"^/arweave">>, <<"with">> => Core }
+    }],
+    case read_chunks(StartOffset, Length, Opts#{ <<"routes">> => CoreRoutes }) of
+        {ok, Data} -> {ok, Data};
+        _ -> read_tx_data_from_gateway(ID, Length, Opts)
+    end.
+
+read_tx_data_from_gateway(ID, Length, Opts) ->
+    Gateway = hb_util:bin(hb_opts:get(
+        <<"arweave-raw-gateway">>, <<"https://arweave.net">>, Opts)),
+    Res = hb_http:request(
+        #{
+            <<"method">> => <<"GET">>,
+            <<"path">> => <<Gateway/binary, "/raw/", ID/binary>>
+        },
+        Opts
+    ),
+    gateway_tx_data_result(Res, Length).
 
 gateway_tx_data_result({ok, #{ <<"body">> := Data }}, Length)
         when is_binary(Data), byte_size(Data) =:= Length ->
