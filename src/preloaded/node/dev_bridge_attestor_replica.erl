@@ -214,7 +214,12 @@ step(A, #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers,
         % a process at all must name PUSD.
         need(message_for_process(Body, Pusd, Slot + 1, Opts),
             <<"message is for another process">>),
-        {ok, Kept#{ <<"body">> => Body }, hb_message:id(Kept, all, Opts)}
+        AssignmentID =
+            case SchedulerDevice of
+                <<"arweave-scheduler@1.0">> -> none;
+                _ -> hb_message:id(Kept, all, Opts)
+            end,
+        {ok, Kept#{ <<"body">> => Body }, AssignmentID}
     catch
         throw:{refused, Why} -> {refused, Why};
         Class:Reason:Stacktrace ->
@@ -264,8 +269,12 @@ accept(Kept, Id, R = #{ pusd := Pusd, slot := Slot, chain := Chain, proc := Proc
     Stored = hb_message:id(Kept, signed, ROpts),
     ok = hb_cache:link(Stored, slot_path(Pusd, Slot + 1, SchedulerDevice), ROpts),
     ok = hb_store:flush(hb_opts:get(store, [], ROpts), ROpts),
-    Next = R#{ slot := Slot + 1, last := Stored,
-        chain := hb_path:hashpath(Chain, Id, hb_path:hashpath_alg(Proc, Opts), Opts) },
+    NextChain =
+        case SchedulerDevice of
+            <<"arweave-scheduler@1.0">> -> Chain;
+            _ -> hb_path:hashpath(Chain, Id, hb_path:hashpath_alg(Proc, Opts), Opts)
+        end,
+    Next = R#{ slot := Slot + 1, last := Stored, chain := NextChain },
     ok = write_durably(File, hb_json:encode(#{ <<"slot">> => Slot + 1,
         <<"chain">> => maps:get(chain, Next), <<"last">> => Stored })),
     Next.
