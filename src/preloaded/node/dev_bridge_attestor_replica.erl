@@ -85,6 +85,7 @@ load(Pusd, Url, NodeOpts, Dir) ->
     ROpts = (maps:without([<<"hashpath">>, <<"lua-device-preload">>], NodeOpts))#{
         <<"store">> => [Store],
         <<"scheduler-store">> => [Store],
+        <<"arweave-scheduler-store">> => [Store],
         <<"process-store">> => [Store],
         <<"process-workers">> => false,
         <<"spawn-worker">> => false,
@@ -101,7 +102,8 @@ load(Pusd, Url, NodeOpts, Dir) ->
     },
     R = #{ pusd => Pusd, url => Url, opts => ROpts, http => NodeOpts,
         cursor => <<Base/binary, ".cursor.json">>,
-        proc => undefined, schedulers => [], slot => -1, chain => Pusd, last => none,
+        proc => undefined, schedulers => [], scheduler_device => <<"scheduler@1.0">>,
+        slot => -1, chain => Pusd, last => none,
         stopped => null },
     resume(process(R)).
 
@@ -119,7 +121,9 @@ process(R = #{ pusd := Pusd, url := Url, opts := ROpts, http := Opts }) ->
         undefined -> R#{ stopped := <<"PUSD's process is not available yet">> };
         Proc ->
             {ok, _} = hb_cache:write(Proc, ROpts),
-            R#{ proc := Proc, schedulers := schedulers(Proc, ROpts) }
+            R#{ proc := Proc, schedulers := schedulers(Proc, ROpts),
+                scheduler_device := hb_maps:get(
+                    <<"scheduler-device">>, Proc, <<"scheduler@1.0">>, ROpts) }
     end.
 
 first_process([], _Pusd, _Opts) -> undefined;
@@ -133,11 +137,12 @@ first_process([Get | Rest], Pusd, Opts) ->
 %% Pick up at the cursor if it names what the store holds; otherwise start
 %% over from slot 0.
 resume(R = #{ proc := undefined }) -> R;
-resume(R = #{ cursor := File, pusd := Pusd, opts := ROpts }) ->
+resume(R = #{ cursor := File, pusd := Pusd, opts := ROpts,
+        scheduler_device := SchedulerDevice }) ->
     try
         {ok, Bin} = file:read_file(File),
         #{ <<"slot">> := Slot, <<"chain">> := Chain, <<"last">> := Last } = hb_json:decode(Bin),
-        {ok, A} = hb_cache:read(slot_path(Pusd, Slot), ROpts),
+        {ok, A} = hb_cache:read(slot_path(Pusd, Slot, SchedulerDevice), ROpts),
         Last = hb_message:id(hb_cache:ensure_all_loaded(A, ROpts), signed, ROpts),
         R#{ slot := Slot, chain := Chain, last := Last }
     catch _:_ -> R
@@ -183,25 +188,65 @@ fetch(#{ pusd := Pusd, url := Url, http := Opts }, From) ->
 
 %% `A' as the next slot: what PUSD's scheduler vouches for, carrying what the
 %% message's signer vouches for, and the ID the chain continues with.
-step(A, #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers, http := Opts }) ->
+step(A, #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers,
+        scheduler_device := SchedulerDevice, http := Opts }) ->
     try
-        Kept = need(vouched(A, Schedulers, Opts), <<"assignment not signed by the scheduler">>),
+        Kept =
+            case SchedulerDevice of
+                <<"arweave-scheduler@1.0">> ->
+                    need(arweave_assignment(A, Pusd, Slot + 1, Opts),
+                        <<"invalid Arweave assignment provenance">>);
+                _ ->
+                    need(vouched(A, Schedulers, Opts),
+                        <<"assignment not signed by the scheduler">>)
+            end,
         Get = fun(K) -> hb_ao:get(K, Kept, not_found, Opts#{ <<"hashpath">> => ignore }) end,
         need(hb_util:int(Get(<<"slot">>)) =:= Slot + 1, <<"slot out of order">>),
         need(hb_util:human_id(Get(<<"process">>)) =:= Pusd, <<"assignment for another process">>),
-        need(Get(<<"base-hashpath">>) =:= Chain, <<"assignment breaks the hash chain">>),
+        need(
+            SchedulerDevice =:= <<"arweave-scheduler@1.0">>
+                orelse Get(<<"base-hashpath">>) =:= Chain,
+            <<"assignment breaks the hash chain">>
+        ),
         Body = need(vouched(hb_cache:ensure_all_loaded(Get(<<"body">>), Opts), any, Opts),
             <<"message signature does not verify">>),
         % The vouched assignment says whose slot this is; a message that names
         % a process at all must name PUSD.
-        need(case hb_maps:get(<<"target">>, Body, none, Opts) of
-                none -> true;
-                Target -> (catch hb_util:human_id(Target)) =:= Pusd
-            end, <<"message is for another process">>),
+        need(message_for_process(Body, Pusd, Slot + 1, Opts),
+            <<"message is for another process">>),
         {ok, Kept#{ <<"body">> => Body }, hb_message:id(Kept, all, Opts)}
     catch
         throw:{refused, Why} -> {refused, Why};
         _:_ -> {refused, <<"malformed assignment">>}
+    end.
+
+arweave_assignment(A, Pusd, Slot, Opts) when is_map(A) ->
+    Get = fun(K) -> hb_ao:get(K, A, not_found, Opts#{ <<"hashpath">> => ignore }) end,
+    Hash = Get(<<"block-hash">>),
+    try
+        hb_util:int(Get(<<"slot">>)) =:= Slot
+            andalso hb_util:human_id(Get(<<"process">>)) =:= Pusd
+            andalso Get(<<"type">>) =:= <<"Assignment">>
+            andalso hb_util:int(Get(<<"block-height">>)) >= 0
+            andalso hb_util:int(Get(<<"block-index">>)) >= 0
+            andalso hb_util:int(Get(<<"timestamp">>)) >= 0
+            andalso is_binary(Hash) andalso byte_size(Hash) =:= 64
+    catch _:_ -> false
+    end;
+arweave_assignment(_, _, _, _) -> false.
+
+message_for_process(Body, Pusd, Slot, Opts) ->
+    Target = hb_maps:get(<<"target">>, Body, none, Opts),
+    AssignTo = hb_maps:get(<<"assign-to">>, Body, none, Opts),
+    case {Target, AssignTo, Slot} of
+        {T, _, _} when T =/= none ->
+            (catch hb_util:human_id(T)) =:= Pusd;
+        {none, A, _} when is_binary(A) ->
+            lists:member(Pusd, binary:split(A, <<",">>, [global, trim_all]));
+        {none, none, 0} ->
+            hb_maps:get(<<"type">>, Body, none, Opts) =:= <<"Process">>
+                andalso (catch hb_message:id(Body, all, Opts)) =:= Pusd;
+        _ -> false
     end.
 
 need(false, Why) -> throw({refused, Why});
@@ -209,11 +254,11 @@ need(true, _) -> true;
 need(Value, _) -> Value.
 
 accept(Kept, Id, R = #{ pusd := Pusd, slot := Slot, chain := Chain, proc := Proc, opts := ROpts,
-        http := Opts, cursor := File }) ->
+        scheduler_device := SchedulerDevice, http := Opts, cursor := File }) ->
     % Kept where the scheduler cache keeps a slot, so PUSD computes from it.
     {ok, _} = hb_cache:write(Kept, ROpts),
     Stored = hb_message:id(Kept, signed, ROpts),
-    ok = hb_cache:link(Stored, slot_path(Pusd, Slot + 1), ROpts),
+    ok = hb_cache:link(Stored, slot_path(Pusd, Slot + 1, SchedulerDevice), ROpts),
     ok = hb_store:flush(hb_opts:get(store, [], ROpts), ROpts),
     Next = R#{ slot := Slot + 1, last := Stored,
         chain := hb_path:hashpath(Chain, Id, hb_path:hashpath_alg(Proc, Opts), Opts) },
@@ -232,7 +277,12 @@ write_durably(File, Bin) ->
 
 %% Where the scheduler cache keeps a slot (dev_scheduler_cache's layout; that
 %% module is another package, so it is not called).
-slot_path(Pusd, Slot) ->
+slot_path(Pusd, Slot, <<"arweave-scheduler@1.0">>) ->
+    hb_path:to_binary(
+        [<<"~arweave-scheduler@1.0">>, <<"assignments">>, Pusd,
+            integer_to_binary(Slot)]
+    );
+slot_path(Pusd, Slot, _) ->
     hb_path:to_binary([<<"~scheduler@1.0">>, <<"assignments">>, Pusd, integer_to_binary(Slot)]).
 
 %% The schedulers PUSD names, as committer URIs.
