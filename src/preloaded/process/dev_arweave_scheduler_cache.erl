@@ -23,21 +23,17 @@
 %% stores from the node's main `store' list. Keeping the L1 index separate
 %% allows a coordinated rollout boundary without disturbing local schedules.
 opts(Opts) ->
-    Main = hb_opts:get(store, no_viable_store, Opts),
-    Store = case hb_opts:get(arweave_scheduler_store, undefined, Opts) of
-        undefined ->
+    Opts#{
+        <<"store">> => hb_opts:get(
+            arweave_scheduler_store,
             hb_opts:get(
                 scheduler_store,
                 hb_opts:get(store, no_viable_store, hb_store:scope(Opts, local)),
                 Opts
-            );
-        Dedicated -> store_list(Dedicated) ++ store_list(Main)
-    end,
-    Opts#{ <<"store">> => Store }.
-
-store_list(Store) when is_map(Store) -> [Store];
-store_list(Stores) when is_list(Stores) -> Stores;
-store_list(Store) -> [Store].
+            ),
+            Opts
+        )
+    }.
 
 %% @doc Read and write the linked global synchronization record.
 read_global(Opts) -> read_state(global_path(), Opts).
@@ -279,7 +275,7 @@ opts_prefer_arweave_scheduler_store_test() ->
         <<"scheduler-store">> => [Generic],
         <<"arweave-scheduler-store">> => [Arweave]
     }),
-    ?assertEqual([Arweave, Main], maps:get(<<"store">>, Selected)),
+    ?assertEqual([Arweave], maps:get(<<"store">>, Selected)),
     ?assertEqual([Generic], maps:get(<<"store">>, opts(#{
         <<"store">> => [Main], <<"scheduler-store">> => [Generic]
     }))).
