@@ -121,10 +121,23 @@ process(R = #{ pusd := Pusd, url := Url, opts := ROpts, http := Opts }) ->
         undefined -> R#{ stopped := <<"PUSD's process is not available yet">> };
         Proc ->
             {ok, _} = hb_cache:write(Proc, ROpts),
-            R#{ proc := Proc, schedulers := schedulers(Proc, ROpts),
-                scheduler_device := hb_maps:get(
-                    <<"scheduler-device">>, Proc, <<"scheduler@1.0">>, ROpts) }
+            SchedulerDevice = hb_maps:get(
+                <<"scheduler-device">>, Proc, <<"scheduler@1.0">>, ROpts),
+            R#{ proc := replica_process(Proc, SchedulerDevice),
+                schedulers := schedulers(Proc, ROpts),
+                scheduler_device := SchedulerDevice }
     end.
+
+%% The replica has already verified and copied each assignment into its own
+%% local scheduler store. Preserve the signed process as identity, but execute
+%% that isolated copy through `scheduler@1.0'; it intentionally has no global
+%% Arweave sync record and performs no network scheduling of its own.
+replica_process(Proc, <<"arweave-scheduler@1.0">>) ->
+    Proc#{
+        <<"process">> => Proc,
+        <<"scheduler-device">> => <<"scheduler@1.0">>
+    };
+replica_process(Proc, _) -> Proc.
 
 first_process([], _Pusd, _Opts) -> undefined;
 first_process([Get | Rest], Pusd, Opts) ->
@@ -293,11 +306,6 @@ write_durably(File, Bin) ->
 
 %% Where the scheduler cache keeps a slot (dev_scheduler_cache's layout; that
 %% module is another package, so it is not called).
-slot_path(Pusd, Slot, <<"arweave-scheduler@1.0">>) ->
-    hb_path:to_binary(
-        [<<"~arweave-scheduler@1.0">>, <<"assignments">>, Pusd,
-            integer_to_binary(Slot)]
-    );
 slot_path(Pusd, Slot, _) ->
     hb_path:to_binary([<<"~scheduler@1.0">>, <<"assignments">>, Pusd, integer_to_binary(Slot)]).
 
