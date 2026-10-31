@@ -374,11 +374,15 @@ decode_table([{Key, Value} | Rest], Opts, Acc) ->
 
 %% @doc Encode AO-Core maps as Lua tables without eagerly loading whole trees.
 encode(Map, Opts) when is_map(Map) ->
-    case hb_util:is_ordered_list(Map, Opts) of
-        true -> encode(hb_util:message_to_ordered_list(Map), Opts);
+    Normalized = assign_to_target(Map),
+    case hb_util:is_ordered_list(Normalized, Opts) of
+        true -> encode(hb_util:message_to_ordered_list(Normalized), Opts);
         false ->
             maps:to_list(
-                maps:map(fun(Key, Value) -> encode_value(Key, Value, Opts) end, Map)
+                maps:map(
+                    fun(Key, Value) -> encode_value(Key, Value, Opts) end,
+                    Normalized
+                )
             )
     end;
 encode(List, Opts) when is_list(List) ->
@@ -400,9 +404,9 @@ encode_value(<<"commitments">>, Commitments, Opts) when is_map(Commitments) ->
         maps:fold(
             fun(ID, Commitment = #{ <<"committer">> := Committer }, Acc) ->
                     Acc#{
-                        ID => Commitment#{
+                        ID => assign_to_commitment(Commitment#{
                             <<"committer">> => hb_util:committer_address(Committer)
-                        }
+                        })
                     };
                (_ID, _Unsigned, Acc) ->
                     Acc
@@ -414,7 +418,45 @@ encode_value(<<"commitments">>, Commitments, Opts) when is_map(Commitments) ->
 encode_value(_Key, Value, Opts) ->
     encode(Value, Opts).
 
+%% An L1 message uses the signed `Assign-To' tag because a process has no
+%% private key and should not receive AR. The contract door speaks AO-Core and
+%% requires `target'. Expose the single-process form as its equivalent target;
+%% the verified commitment is translated below by the same rule.
+assign_to_target(Map) ->
+    case {maps:is_key(<<"target">>, Map), maps:get(<<"assign-to">>, Map, undefined)} of
+        {false, Target} when is_binary(Target), byte_size(Target) =:= 43 ->
+            Map#{ <<"target">> => Target };
+        _ -> Map
+    end.
+
+assign_to_commitment(Commitment) ->
+    case maps:get(<<"committed">>, Commitment, []) of
+        Committed when is_list(Committed) ->
+            case lists:member(<<"assign-to">>, Committed)
+                    andalso not lists:member(<<"target">>, Committed) of
+                true -> Commitment#{ <<"committed">> => [<<"target">> | Committed] };
+                false -> Commitment
+            end;
+        _ -> Commitment
+    end.
+
 %%% Tests
+
+assign_to_target_test() ->
+    Target = <<"TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT">>,
+    ?assertEqual(Target, maps:get(<<"target">>, assign_to_target(
+        #{ <<"assign-to">> => Target }
+    ))),
+    ?assertEqual(
+        <<"native">>,
+        maps:get(<<"target">>, assign_to_target(
+            #{ <<"assign-to">> => Target, <<"target">> => <<"native">> }
+        ))
+    ),
+    Commitment = assign_to_commitment(
+        #{ <<"committed">> => [<<"assign-to">>, <<"action">>] }
+    ),
+    ?assert(lists:member(<<"target">>, maps:get(<<"committed">>, Commitment))).
 
 %% @doc Compare execution latency at a fixed public-state size. This is kept
 %% out of EUnit so correctness tests do not acquire timing assertions.
