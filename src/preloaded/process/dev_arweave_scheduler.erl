@@ -186,7 +186,7 @@ status(_Base, _Req, Opts) ->
 %% read-only and never changes the scheduler algorithm.
 diagnose(Base, Req, Opts) ->
     ProcessID = find_process_id(Base, Req, Opts),
-    case dev_arweave_scheduler_sync:process(ProcessID, Opts) of
+    try dev_arweave_scheduler_sync:process(ProcessID, Opts) of
         {ok, State} ->
             {ok, #{ <<"status">> => <<"ok">>, <<"state">> => State }};
         {error, Reason} ->
@@ -194,6 +194,12 @@ diagnose(Base, Req, Opts) ->
         Other ->
             {ok, #{ <<"status">> => <<"unexpected">>,
                 <<"detail">> => hb_util:bin(Other) }}
+    catch
+        Class:Reason:Stack ->
+            Detail = iolist_to_binary(io_lib:format("~0p:~0p", [Class, Reason])),
+            Frames = iolist_to_binary(io_lib:format("~0p", [lists:sublist(Stack, 5)])),
+            {ok, #{ <<"status">> => <<"exception">>,
+                <<"detail">> => Detail, <<"stack">> => Frames }}
     end.
 
 checkpoint(State) -> {ok, State}.
