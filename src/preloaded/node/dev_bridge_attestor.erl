@@ -57,6 +57,8 @@
 %%%   `bridge-replica'), interval, fast-interval, fast-window (ms), keys-file,
 %%%   state-file, follow-file,
 %%%   fast-ledgers => #{ LedgerProcess => #{ node => SchedulerURL } },
+%%%   scheduler-device (`scheduler@1.0' or `arweave-scheduler@1.0'),
+%%%   arweave-resend-ms (default 30 minutes),
 %%%   base => #{ rpc, contract, chain-id, confirmations, from-block, log-range },
 %%%   solana => #{ rpc, program, commitment }, sui => #{ rpc, package, bridge }
 -module(dev_bridge_attestor).
@@ -69,6 +71,7 @@
 
 -define(NAME, {<<"bridge-attestor@1.0">>, loop}).
 -define(RESEND_MS, 60000).
+-define(ARWEAVE_RESEND_MS, 1800000).
 -define(NUDGE_GAP_MS, 10000).
 %% Nudges ignored after a capped fast stretch. Fixed, not `interval': a slow
 %% idle interval saves RPC spend and must not slow a busy bridge down.
@@ -565,11 +568,20 @@ item_id(_) -> <<"?">>.
 %% message is a slot.
 once(Key, St = #{ sent := Sent }, Fun) ->
     Now = os:system_time(millisecond),
-    case Now - maps:get(Key, Sent, 0) < ?RESEND_MS of
+    Cfg = maps:get(cfg, St),
+    Resend = resend_ms(Cfg),
+    case Now - maps:get(Key, Sent, 0) < Resend of
         true -> St;
         false ->
             Fun(),
             St#{ sent := Sent#{ Key => Now } }
+    end.
+
+resend_ms(Cfg) ->
+    case maps:get(<<"scheduler-device">>, Cfg, <<"scheduler@1.0">>) of
+        <<"arweave-scheduler@1.0">> ->
+            cfg_ms(Cfg, <<"arweave-resend-ms">>, ?ARWEAVE_RESEND_MS);
+        _ -> ?RESEND_MS
     end.
 
 %%% Signatures ----------------------------------------------------------------
@@ -704,14 +716,59 @@ send(Tags, #{ cfg := Cfg, opts := Opts }) ->
     send_at(Pusd, maps:get(<<"scheduler-url">>, Cfg), Tags,
         #{ cfg => Cfg, opts => Opts }).
 
-send_at(Process, Node, Tags, #{ opts := Opts }) ->
-    % `subject: self' or the scheduler schedules the request body.
-    Signed = hb_message:commit(Tags#{ <<"target">> => Process, <<"type">> => <<"Message">>,
-        <<"subject">> => <<"self">> }, Opts, <<"httpsig@1.0">>),
-    Res = hb_http:post(Node,
-        <<"/", Process/binary, "~process@1.0/schedule">>, Signed, Opts),
+send_at(Process, Node, Tags, #{ cfg := Cfg, opts := Opts }) ->
+    Res = case maps:get(<<"scheduler-device">>, Cfg, <<"scheduler@1.0">>) of
+        <<"arweave-scheduler@1.0">> -> send_l1(Process, Tags, Opts);
+        _ ->
+            % `subject: self' or the local scheduler schedules the request body.
+            Signed = hb_message:commit(Tags#{ <<"target">> => Process,
+                <<"type">> => <<"Message">>, <<"subject">> => <<"self">> },
+                Opts, <<"httpsig@1.0">>),
+            hb_http:post(Node,
+                <<"/", Process/binary, "~process@1.0/schedule">>, Signed, Opts)
+    end,
     ?event(bridge, {sent, maps:get(<<"action">>, Tags), Res}),
     Res.
+
+%% An Arweave-scheduled process accepts only a signed, data-free L1 transaction
+%% header. `Assign-To' routes it without paying the one-time native-recipient
+%% premium for a process id that can never own a private key.
+send_l1(Process, Tags, Opts) ->
+    maybe
+        {ok, Price0} ?= hb_ao:resolve(
+            #{ <<"device">> => <<"arweave@2.9">> },
+            #{ <<"path">> => <<"/price">>, <<"size">> => 0 },
+            Opts
+        ),
+        {ok, Anchor} ?= hb_ao:resolve(
+            #{ <<"device">> => <<"arweave@2.9">> },
+            #{ <<"path">> => <<"/tx_anchor">> },
+            Opts
+        ),
+        Wallet = hb_opts:get(priv_wallet, no_viable_wallet, Opts),
+        Unsigned = l1_unsigned(Process, Tags),
+        Signed = ar_tx:normalize(ar_tx:sign(
+            Unsigned#tx{ anchor = Anchor, reward = hb_util:int(Price0) },
+            Wallet
+        )),
+        Committed = hb_message:convert(
+            Signed, <<"structured@1.0">>, <<"tx@1.0">>, Opts
+        ),
+        hb_ao:resolve(
+            #{ <<"device">> => <<"arweave@2.9">> },
+            Committed#{ <<"path">> => <<"tx">>, <<"method">> => <<"POST">> },
+            Opts
+        )
+    end.
+
+l1_unsigned(Process, Tags) ->
+    AppTags = [{K, hb_util:bin(V)} || {K, V} <- lists:sort(maps:to_list(Tags))],
+    ar_tx:normalize(#tx{
+        format = 2,
+        data = <<>>,
+        data_size = 0,
+        tags = [{<<"Assign-To">>, Process}, {<<"Type">>, <<"Message">>} | AppTags]
+    }).
 
 %% PUSD (`Pusd', the configured one or a successor) as this node computed it:
 %% `{ok, View, Replica}' with the replica's slot and where it stopped, if it
@@ -866,6 +923,15 @@ next_interval_test() ->
     ?assertEqual(15000, next_interval(Cfg, 2000, 2000)),
     ?assertEqual(5000, next_interval(#{}, 0, 1)).
 
+resend_interval_test() ->
+    ?assertEqual(?RESEND_MS, resend_ms(#{})),
+    ?assertEqual(?ARWEAVE_RESEND_MS,
+        resend_ms(#{ <<"scheduler-device">> => <<"arweave-scheduler@1.0">> })),
+    ?assertEqual(900000, resend_ms(#{
+        <<"scheduler-device">> => <<"arweave-scheduler@1.0">>,
+        <<"arweave-resend-ms">> => 900000
+    })).
+
 nudge_arm_test() ->
     Cfg = #{ <<"interval">> => 15000, <<"fast-window">> => 100000 },
     St0 = #{ nudge_at => 0, fast_since => 0, fast_until => 0 },
@@ -1008,6 +1074,18 @@ fast_ledger_exit_plans_test() ->
     [{lane, _, Rejection}] = exit_plans(Ledger, [Exit], [Rejected]),
     ?assertEqual(<<"no reserve">>, maps:get(<<"error">>, Rejection)),
     ?assertEqual([], exit_plans(Ledger, [Exit#{ <<"status">> => <<"accepted">> }], [])).
+
+l1_unsigned_test() ->
+    Process = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    TX = l1_unsigned(Process, #{ <<"action">> => <<"Bridge-Sign">>,
+        <<"withdrawalid">> => <<"7">> }),
+    ?assertEqual(2, TX#tx.format),
+    ?assertEqual(0, TX#tx.data_size),
+    ?assertEqual(<<>>, TX#tx.data),
+    ?assertEqual(<<>>, TX#tx.target),
+    ?assertEqual({<<"Assign-To">>, Process},
+        lists:keyfind(<<"Assign-To">>, 1, TX#tx.tags)),
+    ?assert(lists:member({<<"action">>, <<"Bridge-Sign">>}, TX#tx.tags)).
 
 local_withdrawal_test() ->
     St = #{ namespace => 300 },
