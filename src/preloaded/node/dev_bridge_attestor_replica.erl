@@ -120,12 +120,35 @@ process(R = #{ pusd := Pusd, url := Url, opts := ROpts, http := Opts }) ->
     case first_process(Candidates, Pusd, Opts) of
         undefined -> R#{ stopped := <<"PUSD's process is not available yet">> };
         Proc ->
-            {ok, _} = hb_cache:write(Proc, ROpts),
-            SchedulerDevice = hb_maps:get(
-                <<"scheduler-device">>, Proc, <<"scheduler@1.0">>, ROpts),
-            R#{ proc := replica_process(Proc, SchedulerDevice),
-                schedulers := schedulers(Proc, ROpts),
-                scheduler_device := SchedulerDevice }
+            case copy_module(Proc, Opts, ROpts) of
+                ok ->
+                    {ok, _} = hb_cache:write(Proc, ROpts),
+                    SchedulerDevice = hb_maps:get(
+                        <<"scheduler-device">>, Proc, <<"scheduler@1.0">>, ROpts),
+                    R#{ proc := replica_process(Proc, SchedulerDevice),
+                        schedulers := schedulers(Proc, ROpts),
+                        scheduler_device := SchedulerDevice };
+                _ -> R#{ stopped := <<"PUSD's module is not available yet">> }
+            end
+    end.
+
+copy_module(Proc, SourceOpts, ReplicaOpts) ->
+    case hb_maps:get(<<"module">>, Proc, none, SourceOpts) of
+        ModuleID when is_binary(ModuleID), byte_size(ModuleID) =:= 43 ->
+            case hb_cache:read(ModuleID, SourceOpts) of
+                {ok, RawModule} ->
+                    Module = hb_cache:ensure_all_loaded(RawModule, SourceOpts),
+                    case catch hb_message:verify(Module, all, SourceOpts) of
+                        true ->
+                            case hb_cache:write(Module, ReplicaOpts) of
+                                {ok, _} -> ok;
+                                Error -> Error
+                            end;
+                        _ -> {error, invalid_module_signature}
+                    end;
+                Error -> Error
+            end;
+        _ -> ok
     end.
 
 %% The replica has already verified and copied each assignment into its own
