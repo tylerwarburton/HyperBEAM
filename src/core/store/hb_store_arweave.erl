@@ -116,13 +116,16 @@ read_remote_offset(
         Opts
     ) ->
     Res =
-        hb_http:request(
-            #{
-                <<"method">> => <<"HEAD">>,
-                <<"path">> => <<"/~arweave@2.9/raw=", ID/binary>>
-            },
-            Opts
-        ),
+        try
+            hb_http:request(
+                #{
+                    <<"method">> => <<"HEAD">>,
+                    <<"path">> => <<"/~arweave@2.9/raw=", ID/binary>>
+                },
+                Opts
+            )
+        catch _:_ -> {error, remote_offset_unavailable}
+        end,
     ?event(arweave_offsets, {remote_index, {id, {explicit, ID}}, {result, Res}}),
     case remote_offset_result(Res) of
         not_found -> read_direct_tx_offset(ID, Opts);
