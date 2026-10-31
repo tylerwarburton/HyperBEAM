@@ -296,6 +296,8 @@ initialize_process(
         {ok, Header, #tx{}} ?= fetch_header(ProcessID, Opts),
         {ok, _} ?=
             dev_arweave_scheduler_cache:write_header(Header, Opts),
+        {ok, _} ?=
+            dev_arweave_scheduler_cache:write_execution_header(Header, Opts),
         ok ?=
             write_assignment(
                 ProcessID,
@@ -524,15 +526,25 @@ assignment_provenance_missing_test() ->
 %% @doc Fetch and route one transaction at its canonical block ordinate.
 index_transaction(Height, Index, TXID, Opts) ->
     case fetch_header(TXID, Opts) of
-        {ok, _Header, TX} ->
+        {ok, Header, TX} ->
             Ordinate = ordinate(Height, Index),
-            {ok,
-                [
-                    {Address, Ordinate, TXID}
-                ||
-                    Address <- transaction_targets(TX)
-                ]
-            };
+            Targets = transaction_targets(TX),
+            case Targets of
+                [] -> {ok, []};
+                _ ->
+                    case dev_arweave_scheduler_cache:write_execution_header(
+                            Header, Opts) of
+                        {ok, _} ->
+                            {ok,
+                                [
+                                    {Address, Ordinate, TXID}
+                                ||
+                                    Address <- Targets
+                                ]
+                            };
+                        Error -> Error
+                    end
+            end;
         {error, #{ <<"status">> := 422 }} -> {ok, []};
         Error -> Error
     end.
