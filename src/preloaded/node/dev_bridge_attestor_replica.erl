@@ -217,7 +217,11 @@ step(A, #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers,
         {ok, Kept#{ <<"body">> => Body }, hb_message:id(Kept, all, Opts)}
     catch
         throw:{refused, Why} -> {refused, Why};
-        _:_ -> {refused, <<"malformed assignment">>}
+        Class:Reason:Stacktrace ->
+            ?event(bridge, {replica_malformed_assignment,
+                {class, Class}, {reason, Reason}, {trace, Stacktrace}}),
+            {refused, <<"malformed assignment: ",
+                (hb_util:bin(io_lib:format("~p:~p", [Class, Reason])))/binary>>}
     end.
 
 arweave_assignment(A, Pusd, Slot, Opts) when is_map(A) ->
