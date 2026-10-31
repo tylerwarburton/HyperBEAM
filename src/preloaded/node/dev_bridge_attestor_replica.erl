@@ -226,7 +226,9 @@ step(A, #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers,
             ?event(bridge, {replica_malformed_assignment,
                 {class, Class}, {reason, Reason}, {trace, Stacktrace}}),
             {refused, <<"malformed assignment: ",
-                (hb_util:bin(io_lib:format("~p:~p", [Class, Reason])))/binary>>}
+                (hb_util:bin(io_lib:format("~p:~p ~p", [
+                    Class, Reason, lists:sublist(Stacktrace, 2)
+                ])))/binary>>}
     end.
 
 arweave_assignment(A, Pusd, Slot, Opts) when is_map(A) ->
