@@ -531,11 +531,20 @@ the numbers below with the reason they moved.
    - v0.11's relay refuses internal hosts (`hosts-block-internal`, on by
      default): a `pusd-node` or RPC URL on localhost or a private IP is
      refused. Ours are public.
+   - Fast-ledger relay is additive. The root publishes `ledgerdeposits` and
+     `ledgerexits`; each configured lane publishes `laneinfo` and
+     `laneexits`. Every node relays its own credit, acknowledgement, exit and
+     accepted/rejected result votes. It never predicts a withdrawal id or
+     release signature: an accepted exit continues through the ordinary
+     `Bridge-Sign` path after the root creates the real withdrawal.
+   - `arweave-scheduler@1.0` assignments now commit the canonical block hash
+     and timestamp beside height and transaction index. Assignment creation
+     fails closed if that cached block provenance is missing or malformed.
 
    Node config for an attestor: `on.start.device` = `bridge-attestor@1.0`
-   (was `bridge@1.0`); the `bridge` block is unchanged (`pusd`, `pusd-node`,
+   (was `bridge@1.0`); the `bridge` block uses (`pusd`, `scheduler-url`,
    `interval`, `fast-interval`, `fast-window`, `keys-file`, `state-file`,
-   `follow-file`, `base`, `solana`, `sui`). Endpoints moved to
+   `follow-file`, optional `fast-ledgers`, `base`, `solana`, `sui`). Endpoints moved to
    `/~bridge-attestor@1.0/{keys,status,nudge}`.
 
    Tests (`hb-v11-dev`, `--module=dev_bridge_attestor,
@@ -547,6 +556,9 @@ the numbers below with the reason they moved.
    the box through v0.11's relay (public endpoints; Solana not, as its RPC
    is private). `evm-rpc`'s network tests use publicnode: eth.merkle.io
    refuses the box.
+   The 2026-10-31 packaged-device run for scheduler provenance plus the bridge
+   attestor passed 44/44, including fail-closed provenance and both fast-ledger
+   planners.
 9. **Clients and contracts** (monorepo): httpsig keyids are base64url, and
    the committer is the `publickey:` URI, not an address, so `signer()` has to
    map it. Lands with the fresh deploy.

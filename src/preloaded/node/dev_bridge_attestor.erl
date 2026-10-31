@@ -11,7 +11,8 @@
 %%%   3. attests each unminted deposit with `Bridge-Mint';
 %%%   4. signs each pending withdrawal for its chain with `Bridge-Sign';
 %%%   5. acknowledges each release it saw with `Bridge-Released';
-%%%   6. votes on each open membership proposal its operator approved
+%%%   6. relays root credits and fast-ledger exits in both directions;
+%%%   7. votes on each open membership proposal its operator approved
 %%%      (`Attestor-Approve' on PUSD), signing the new set for every chain.
 %%%
 %%% Succession: when PUSD publishes a `successor' (its set voted to move), the
@@ -55,6 +56,7 @@
 %%%   nothing it serves is used unverified), replica-dir (default
 %%%   `bridge-replica'), interval, fast-interval, fast-window (ms), keys-file,
 %%%   state-file, follow-file,
+%%%   fast-ledgers => #{ LedgerProcess => #{ node => SchedulerURL } },
 %%%   base => #{ rpc, contract, chain-id, confirmations, from-block, log-range },
 %%%   solana => #{ rpc, program, commitment }, sui => #{ rpc, package, bridge }
 -module(dev_bridge_attestor).
@@ -266,6 +268,8 @@ act(View, St) ->
 
 attest(Info, View, St = #{ cfg := Cfg, me := Me }) ->
     Withdrawals = case key(<<"withdrawals">>, View) of L when is_list(L) -> L; _ -> [] end,
+    LedgerDeposits = case key(<<"ledgerdeposits">>, View) of L1 when is_list(L1) -> L1; _ -> [] end,
+    LedgerReceipts = case key(<<"ledgerexits">>, View) of L2 when is_list(L2) -> L2; _ -> [] end,
     Member = lists:any(fun(A) -> maps:get(<<"ao">>, A, <<>>) =:= Me end,
         maps:get(<<"attestors">>, Info, [])),
     case Member of
@@ -281,15 +285,16 @@ attest(Info, View, St = #{ cfg := Cfg, me := Me }) ->
             St2 = attest_deposits(Info, St1),
             St3 = sign_withdrawals(Withdrawals, St2),
             St4 = acknowledge(Withdrawals, St3),
-            St5 = lists:foldl(
+            St5 = relay_fast_ledgers(Info, LedgerDeposits, LedgerReceipts, St4),
+            St6 = lists:foldl(
                 fun(P, S) ->
                     guard(<<"proposal:", (item_id(P))/binary>>, S, fun() ->
                         Id = hb_util:int(maps:get(<<"id">>, P)),
                         once(<<"vote:", (integer_to_binary(Id))/binary>>, S, fun() -> vote(P, S) end)
                     end)
-                end, St4, proposals_to_vote(Info, Me)),
-            save_state(Cfg, St5),
-            St5#{ last_pass => os:system_time(millisecond), last_error => null }
+                end, St5, proposals_to_vote(Info, Me)),
+            save_state(Cfg, St6),
+            St6#{ last_pass => os:system_time(millisecond), last_error => null }
     end.
 
 %% Every chain that is configured, each failing on its own.
@@ -414,6 +419,132 @@ acknowledge(Withdrawals, St = #{ releases := Rel }) ->
                     end)
             end
         end, St, Rel).
+
+%%% Fast ledgers --------------------------------------------------------------
+
+credit_processed(Info, CreditId) ->
+    Credit = maps:get(<<"credit">>, Info, #{}),
+    Floor = hb_util:int(maps:get(<<"floor">>, Credit, 0)),
+    N = hb_util:int(CreditId),
+    N =< Floor orelse lists:member(N,
+        [hb_util:int(X) || X <- maps:get(<<"above">>, Credit, [])]).
+
+credit_plans(Root, Ledger, LaneInfo, Deposits) ->
+    lists:filtermap(
+        fun(D) ->
+            case {maps:get(<<"ledger">>, D, <<>>), maps:get(<<"status">>, D, <<>>)} of
+                {Ledger, <<"ready">>} ->
+                    DepositId = maps:get(<<"id">>, D),
+                    CreditId = maps:get(<<"creditId">>, D),
+                    case credit_processed(LaneInfo, CreditId) of
+                        true ->
+                            {true, {root,
+                                <<"lane-credited:", DepositId/binary>>,
+                                #{ <<"action">> => <<"Ledger-Credited">>,
+                                   <<"depositid">> => DepositId }}};
+                        false ->
+                            {true, {lane,
+                                <<"lane-credit:", Ledger/binary, ":", CreditId/binary>>,
+                                #{ <<"action">> => <<"Ledger-Credit">>, <<"root">> => Root,
+                                   <<"depositid">> => DepositId, <<"creditid">> => CreditId,
+                                   <<"account">> => maps:get(<<"account">>, D),
+                                   <<"quantity">> => maps:get(<<"quantity">>, D) }}}
+                    end;
+                _ -> false
+            end
+        end,
+        Deposits
+    ).
+
+exit_receipts(Receipts) ->
+    maps:from_list([
+        {maps:get(<<"key">>, R), R}
+    || R <- Receipts, is_map(R), maps:is_key(<<"key">>, R)
+    ]).
+
+exit_plans(Ledger, LaneExits, Receipts) ->
+    ReceiptMap = exit_receipts(Receipts),
+    lists:filtermap(
+        fun(E) ->
+            case maps:get(<<"status">>, E, <<>>) of
+                <<"pending">> ->
+                    ExitId = maps:get(<<"id">>, E),
+                    Key = <<Ledger/binary, "|", ExitId/binary>>,
+                    case maps:find(Key, ReceiptMap) of
+                        error ->
+                            {true, {root,
+                                <<"lane-exit:", Key/binary>>,
+                                #{ <<"action">> => <<"Ledger-Exit">>, <<"ledger">> => Ledger,
+                                   <<"exitid">> => ExitId, <<"account">> => maps:get(<<"account">>, E),
+                                   <<"chain">> => maps:get(<<"chain">>, E),
+                                   <<"token">> => maps:get(<<"token">>, E),
+                                   <<"recipient">> => maps:get(<<"to">>, E),
+                                   <<"quantity">> => maps:get(<<"quantity">>, E) }}};
+                        {ok, R} ->
+                            Status = maps:get(<<"status">>, R),
+                            Extra = case Status of
+                                <<"accepted">> -> #{ <<"withdrawalid">> => maps:get(<<"withdrawalId">>, R) };
+                                <<"rejected">> -> #{ <<"error">> => maps:get(<<"error">>, R) }
+                            end,
+                            {true, {lane,
+                                <<"lane-result:", Key/binary, ":", Status/binary>>,
+                                maps:merge(#{ <<"action">> => <<"Ledger-Exit-Result">>,
+                                    <<"exitid">> => ExitId, <<"status">> => Status }, Extra)}}
+                    end;
+                _ -> false
+            end
+        end,
+        LaneExits
+    ).
+
+fast_ledger_node(Spec, Cfg) when is_binary(Spec) -> Spec;
+fast_ledger_node(Spec, Cfg) when is_map(Spec) ->
+    maps:get(<<"node">>, Spec, maps:get(<<"scheduler-url">>, Cfg));
+fast_ledger_node(_, Cfg) -> maps:get(<<"scheduler-url">>, Cfg).
+
+relay_fast_ledgers(Info, Deposits, Receipts, St = #{ cfg := Cfg }) ->
+    Root = maps:get(<<"pusd">>, Cfg),
+    Registered = maps:get(<<"ledgers">>, Info, #{}),
+    Configured = maps:get(<<"fast-ledgers">>, Cfg, #{}),
+    maps:fold(
+        fun(Ledger, Spec, S) ->
+            case maps:is_key(Ledger, Registered) of
+                false -> S;
+                true ->
+                    guard(<<"ledger:", Ledger/binary>>, S, fun() ->
+                        Node = fast_ledger_node(Spec, Cfg),
+                        case lane_view(Ledger, Node, S) of
+                            {ok, LaneView, _Replica} ->
+                                LaneInfo = key(<<"laneinfo">>, LaneView),
+                                LaneExits = case key(<<"laneexits">>, LaneView) of
+                                    L when is_list(L) -> L;
+                                    _ -> []
+                                end,
+                                Plans = credit_plans(Root, Ledger, LaneInfo, Deposits)
+                                    ++ exit_plans(Ledger, LaneExits, Receipts),
+                                lists:foldl(
+                                    fun({Target, RetryKey, Tags}, Acc) ->
+                                        once(RetryKey, Acc, fun() ->
+                                            case Target of
+                                                root -> send(Tags, Acc);
+                                                lane -> send_at(Ledger, Node, Tags, Acc)
+                                            end
+                                        end)
+                                    end,
+                                    S,
+                                    Plans
+                                );
+                            {not_yet, Why} ->
+                                S#{ skipped := (maps:get(skipped, S))#{
+                                    <<"ledger:", Ledger/binary>> => Why
+                                } }
+                        end
+                    end)
+            end
+        end,
+        St,
+        Configured
+    ).
 
 %% One withdrawal or proposal PUSD published that this node cannot sign (a
 %% malformed address, a chain it does not run) is skipped and shown in
@@ -570,11 +701,15 @@ save_follow(Cfg) ->
 %% client does. What becomes of it, the node learns from its replica.
 send(Tags, #{ cfg := Cfg, opts := Opts }) ->
     Pusd = maps:get(<<"pusd">>, Cfg),
+    send_at(Pusd, maps:get(<<"scheduler-url">>, Cfg), Tags,
+        #{ cfg => Cfg, opts => Opts }).
+
+send_at(Process, Node, Tags, #{ opts := Opts }) ->
     % `subject: self' or the scheduler schedules the request body.
-    Signed = hb_message:commit(Tags#{ <<"target">> => Pusd, <<"type">> => <<"Message">>,
+    Signed = hb_message:commit(Tags#{ <<"target">> => Process, <<"type">> => <<"Message">>,
         <<"subject">> => <<"self">> }, Opts, <<"httpsig@1.0">>),
-    Res = hb_http:post(maps:get(<<"scheduler-url">>, Cfg),
-        <<"/", Pusd/binary, "~process@1.0/schedule">>, Signed, Opts),
+    Res = hb_http:post(Node,
+        <<"/", Process/binary, "~process@1.0/schedule">>, Signed, Opts),
     ?event(bridge, {sent, maps:get(<<"action">>, Tags), Res}),
     Res.
 
@@ -585,6 +720,14 @@ view(Pusd, #{ cfg := Cfg, opts := Opts }) ->
     Dir = hb_util:bin(maps:get(<<"replica-dir">>, Cfg, <<"bridge-replica">>)),
     case dev_bridge_attestor_replica:view(Pusd, maps:get(<<"scheduler-url">>, Cfg),
             #{ opts => Opts, dir => Dir }) of
+        {ok, State, ROpts, Replica} -> {ok, {State, ROpts}, Replica};
+        {not_yet, Why} -> {not_yet, Why}
+    end.
+
+lane_view(Ledger, Node, #{ cfg := Cfg, opts := Opts }) ->
+    BaseDir = hb_util:bin(maps:get(<<"replica-dir">>, Cfg, <<"bridge-replica">>)),
+    Dir = <<BaseDir/binary, "/lane-", Ledger/binary>>,
+    case dev_bridge_attestor_replica:view(Ledger, Node, #{ opts => Opts, dir => Dir }) of
         {ok, State, ROpts, Replica} -> {ok, {State, ROpts}, Replica};
         {not_yet, Why} -> {not_yet, Why}
     end.
@@ -831,6 +974,40 @@ minted_test() ->
     ?assert(minted(Info, <<"base">>, 7)),
     ?assertNot(minted(Info, <<"base">>, 6)),
     ?assertNot(minted(Info, <<"sui">>, 1)).
+
+fast_ledger_credit_plans_test() ->
+    Root = <<"root">>, Ledger = <<"ledger">>,
+    Deposit = #{ <<"id">> => <<"base:900">>, <<"creditId">> => <<"2">>,
+        <<"ledger">> => Ledger, <<"account">> => <<"alice">>,
+        <<"quantity">> => <<"10">>, <<"status">> => <<"ready">> },
+    ?assertNot(credit_processed(#{ <<"credit">> => #{ <<"floor">> => 1 } }, <<"2">>)),
+    [{lane, _, Credit}] = credit_plans(Root, Ledger,
+        #{ <<"credit">> => #{ <<"floor">> => 1, <<"above">> => [] } }, [Deposit]),
+    ?assertEqual(<<"2">>, maps:get(<<"creditid">>, Credit)),
+    ?assertEqual(<<"base:900">>, maps:get(<<"depositid">>, Credit)),
+    [{root, _, Ack}] = credit_plans(Root, Ledger,
+        #{ <<"credit">> => #{ <<"floor">> => 2, <<"above">> => [] } }, [Deposit]),
+    ?assertEqual(<<"Ledger-Credited">>, maps:get(<<"action">>, Ack)),
+    ?assertEqual([], credit_plans(Root, Ledger, #{},
+        [Deposit#{ <<"status">> => <<"credited">> }])).
+
+fast_ledger_exit_plans_test() ->
+    Ledger = <<"ledger">>,
+    Exit = #{ <<"id">> => <<"7">>, <<"status">> => <<"pending">>,
+        <<"account">> => <<"alice">>, <<"chain">> => <<"base">>,
+        <<"token">> => <<"0xt">>, <<"to">> => <<"0xrecipient">>,
+        <<"quantity">> => <<"10">> },
+    [{root, _, RootVote}] = exit_plans(Ledger, [Exit], []),
+    ?assertEqual(<<"Ledger-Exit">>, maps:get(<<"action">>, RootVote)),
+    ?assertNot(maps:is_key(<<"releasesig">>, RootVote)),
+    Receipt = #{ <<"key">> => <<"ledger|7">>, <<"status">> => <<"accepted">>,
+        <<"withdrawalId">> => <<"12">> },
+    [{lane, _, Accepted}] = exit_plans(Ledger, [Exit], [Receipt]),
+    ?assertEqual(<<"12">>, maps:get(<<"withdrawalid">>, Accepted)),
+    Rejected = Receipt#{ <<"status">> => <<"rejected">>, <<"error">> => <<"no reserve">> },
+    [{lane, _, Rejection}] = exit_plans(Ledger, [Exit], [Rejected]),
+    ?assertEqual(<<"no reserve">>, maps:get(<<"error">>, Rejection)),
+    ?assertEqual([], exit_plans(Ledger, [Exit#{ <<"status">> => <<"accepted">> }], [])).
 
 local_withdrawal_test() ->
     St = #{ namespace => 300 },
