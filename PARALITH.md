@@ -537,6 +537,12 @@ the numbers below with the reason they moved.
      accepted/rejected result votes. It never predicts a withdrawal id or
      release signature: an accepted exit continues through the ordinary
      `Bridge-Sign` path after the root creates the real withdrawal.
+   - With `bridge.scheduler-device = arweave-scheduler@1.0`, bridge votes are
+     signed zero-data L1 transactions carrying one `Assign-To` tag. The node
+     fetches the current anchor and zero-byte price, signs with its own node
+     wallet and posts through `arweave@2.9`. The retry window becomes 30
+     minutes by default so ten-block confirmation does not create one duplicate
+     transaction per minute; local-scheduler PUSD keeps the one-minute retry.
    - `arweave-scheduler@1.0` assignments now commit the canonical block hash
      and timestamp beside height and transaction index. Assignment creation
      fails closed if that cached block provenance is missing or malformed.
@@ -544,7 +550,8 @@ the numbers below with the reason they moved.
    Node config for an attestor: `on.start.device` = `bridge-attestor@1.0`
    (was `bridge@1.0`); the `bridge` block uses (`pusd`, `scheduler-url`,
    `interval`, `fast-interval`, `fast-window`, `keys-file`, `state-file`,
-   `follow-file`, optional `fast-ledgers`, `base`, `solana`, `sui`). Endpoints moved to
+   `follow-file`, optional `fast-ledgers`, optional `scheduler-device` and
+   `arweave-resend-ms`, `base`, `solana`, `sui`). Endpoints moved to
    `/~bridge-attestor@1.0/{keys,status,nudge}`.
 
    Tests (`hb-v11-dev`, `--module=dev_bridge_attestor,
@@ -559,6 +566,8 @@ the numbers below with the reason they moved.
    The 2026-10-31 packaged-device run for scheduler provenance plus the bridge
    attestor passed 44/44, including fail-closed provenance and both fast-ledger
    planners.
+   The subsequent full bridge run passed 33/33 with L1 transaction construction
+   and the Arweave/local retry policies.
 9. **Clients and contracts** (monorepo): httpsig keyids are base64url, and
    the committer is the `publickey:` URI, not an address, so `signer()` has to
    map it. Lands with the fresh deploy.
