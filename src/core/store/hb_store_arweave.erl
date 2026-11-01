@@ -324,11 +324,15 @@ do_read(StoreOpts, ID, Opts) ->
                     end
             end;
         not_found ->
-            ?event(
-                arweave_offsets,
-                {miss, {id, {explicit, ID}}}
-            ),
-            not_found
+            case read_tx_data_from_local(ID, 0, Opts) of
+                {ok, Data} -> load_tx_from_data(ID, Data, Opts);
+                _ ->
+                    ?event(
+                        arweave_offsets,
+                        {miss, {id, {explicit, ID}}}
+                    ),
+                    not_found
+            end
     end.
 
 %% @doc Add the offset that a read succeeded at to the local index, unless the
