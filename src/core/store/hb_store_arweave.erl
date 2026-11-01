@@ -505,13 +505,10 @@ read_tx_data_from_json(Gateway, ID, Length, Opts) ->
 %% without the redirect used by `https://arweave.net/<id>'.
 read_tx_data_from_content_gateway(ID, Length, Opts) ->
     Host = base32:encode(hb_util:native_id(ID), [lower, nopad]),
-    Res = hb_http:request(
-        #{
-            <<"method">> => <<"GET">>,
-            <<"path">> => <<"https://", Host/binary, ".arweave.net/", ID/binary>>
-        },
-        Opts
-    ),
+    Peer = <<"https://", Host/binary, ".arweave.net:443">>,
+    % Use request/4 intentionally: request/2 invokes the node router, whose
+    % Arweave rule sends transaction paths to the data-less core peer.
+    Res = hb_http:request(<<"GET">>, Peer, <<"/", ID/binary>>, Opts),
     gateway_tx_data_result(Res, Length).
 
 gateway_tx_data_result({ok, #{ <<"body">> := Data }}, Length)
