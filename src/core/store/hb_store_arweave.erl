@@ -494,7 +494,25 @@ read_tx_data_from_json(Gateway, ID, Length, Opts) ->
         },
         Opts
     ),
-    gateway_tx_json_data_result(Res, Length).
+    case gateway_tx_json_data_result(Res, Length) of
+        Found = {ok, _} -> Found;
+        _ -> read_tx_data_from_content_gateway(ID, Length, Opts)
+    end.
+
+%% Gateway routing can intentionally replace `/tx/<id>' with a core peer,
+%% whose header response omits data. Arweave's immutable content hostname is
+%% derived from the native transaction id and returns the payload directly,
+%% without the redirect used by `https://arweave.net/<id>'.
+read_tx_data_from_content_gateway(ID, Length, Opts) ->
+    Host = base32:encode(hb_util:native_id(ID), [lower, nopad]),
+    Res = hb_http:request(
+        #{
+            <<"method">> => <<"GET">>,
+            <<"path">> => <<"https://", Host/binary, ".arweave.net/", ID/binary>>
+        },
+        Opts
+    ),
+    gateway_tx_data_result(Res, Length).
 
 gateway_tx_data_result({ok, #{ <<"body">> := Data }}, Length)
         when is_binary(Data), byte_size(Data) =:= Length ->
@@ -538,6 +556,11 @@ gateway_tx_data_result_test() ->
             {ok, #{ <<"body">> => hb_json:encode(#{ <<"data">> => Encoded }) }},
             2
         )
+    ),
+    ID = <<"V9LX-yfznypDu0QnIZKpFIRKcii-XVOXcKRe0WGWScY">>,
+    ?assertEqual(
+        <<"k7jnp6zh6opsuq53iqtsdevjcsceu4rixzovhf3qurpncymwjhda">>,
+        base32:encode(hb_util:native_id(ID), [lower, nopad])
     ).
 
 %% @doc Read the chunks from the given start offset and length using the 
