@@ -477,12 +477,43 @@ read_tx_data_from_gateway(ID, Length, Opts) ->
         },
         Opts
     ),
-    gateway_tx_data_result(Res, Length).
+    case gateway_tx_data_result(Res, Length) of
+        Found = {ok, _} -> Found;
+        _ -> read_tx_data_from_json(Gateway, ID, Length, Opts)
+    end.
+
+%% Modern Arweave gateways no longer consistently serve the legacy `/raw'
+%% route. The signed L1 transaction JSON still carries the same base64url data.
+%% `load_tx/4' verifies these bytes against the signed header immediately after
+%% this fallback returns, so the gateway remains an untrusted transport.
+read_tx_data_from_json(Gateway, ID, Length, Opts) ->
+    Res = hb_http:request(
+        #{
+            <<"method">> => <<"GET">>,
+            <<"path">> => <<Gateway/binary, "/tx/", ID/binary>>
+        },
+        Opts
+    ),
+    gateway_tx_json_data_result(Res, Length).
 
 gateway_tx_data_result({ok, #{ <<"body">> := Data }}, Length)
         when is_binary(Data), byte_size(Data) =:= Length ->
     {ok, Data};
 gateway_tx_data_result(_, _) -> {error, not_found}.
+
+gateway_tx_json_data_result({ok, #{ <<"body">> := Body }}, Length)
+        when is_binary(Body) ->
+    try hb_json:decode(Body) of
+        #{ <<"data">> := Encoded } when is_binary(Encoded) ->
+            gateway_tx_json_decoded(hb_util:decode(Encoded), Length);
+        _ -> {error, not_found}
+    catch _:_ -> {error, not_found}
+    end;
+gateway_tx_json_data_result(_, _) -> {error, not_found}.
+
+gateway_tx_json_decoded(Data, Length)
+        when is_binary(Data), byte_size(Data) =:= Length -> {ok, Data};
+gateway_tx_json_decoded(_, _) -> {error, not_found}.
 
 gateway_tx_data_result_test() ->
     ?assertEqual(
@@ -492,6 +523,21 @@ gateway_tx_data_result_test() ->
     ?assertEqual(
         {error, not_found},
         gateway_tx_data_result({ok, #{ <<"body">> => <<1, 2>> }}, 3)
+    ),
+    Encoded = hb_util:encode(<<1, 2, 3>>),
+    ?assertEqual(
+        {ok, <<1, 2, 3>>},
+        gateway_tx_json_data_result(
+            {ok, #{ <<"body">> => hb_json:encode(#{ <<"data">> => Encoded }) }},
+            3
+        )
+    ),
+    ?assertEqual(
+        {error, not_found},
+        gateway_tx_json_data_result(
+            {ok, #{ <<"body">> => hb_json:encode(#{ <<"data">> => Encoded }) }},
+            2
+        )
     ).
 
 %% @doc Read the chunks from the given start offset and length using the 
