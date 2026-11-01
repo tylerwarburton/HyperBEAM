@@ -722,8 +722,10 @@ once(Key, St = #{ sent := Sent }, Fun) ->
     case Now - maps:get(Key, Sent, 0) < Resend of
         true -> St;
         false ->
-            Fun(),
-            St#{ sent := Sent#{ Key => Now } }
+            case Fun() of
+                {ok, _} -> St#{ sent := Sent#{ Key => Now } };
+                Other -> error({send_failed, Other})
+            end
     end.
 
 resend_ms(Cfg) ->
