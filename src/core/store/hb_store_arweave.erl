@@ -378,18 +378,22 @@ load_item(ExpectedID, StartOffset, Length, Opts) ->
 %% the start of the first chunk of the data and runs for the length of the data
 %% segment, ignoring header size.
 %% Pending TX offsets are fetched by ID.
-load_tx(ID, relative, _Length, Opts) ->
+load_tx(ID, relative, Length, Opts) ->
     hb_prometheus:measure_and_report(
         fun() ->
-            hb_ao:resolve(
-                #{ <<"device">> => <<"arweave@2.9">> },
-                #{
-                    <<"path">> => <<"pending">>,
-                    <<"pending">> => ID,
-                    <<"exclude-data">> => false
-                },
-                Opts
-            )
+            case read_tx_data_from_local(ID, Length, Opts) of
+                {ok, Data} -> load_tx_from_data(ID, Data, Opts);
+                _ ->
+                    hb_ao:resolve(
+                        #{ <<"device">> => <<"arweave@2.9">> },
+                        #{
+                            <<"path">> => <<"pending">>,
+                            <<"pending">> => ID,
+                            <<"exclude-data">> => false
+                        },
+                        Opts
+                    )
+            end
         end,
         hb_store_arweave_chunk_fetch_duration_seconds,
         [load_tx]
@@ -438,6 +442,21 @@ load_tx(ID, StartOffset, Length, Opts) ->
         hb_store_arweave_chunk_fetch_duration_seconds,
         [load_tx]
     ).
+
+load_tx_from_data(ID, Data, Opts) ->
+    {ok, StructuredTXHeader} = hb_ao:resolve(
+        #{ <<"device">> => <<"arweave@2.9">> },
+        #{ <<"path">> => <<"tx">>, <<"tx">> => ID, <<"exclude-data">> => true },
+        Opts
+    ),
+    TXHeader = hb_message:convert(
+        StructuredTXHeader, <<"tx@1.0">>, <<"structured@1.0">>, Opts),
+    TX = TXHeader#tx{data = Data},
+    case ar_tx:verify(TX) of
+        true -> {ok, hb_message:convert(
+            TX, <<"structured@1.0">>, <<"tx@1.0">>, Opts)};
+        false -> {error, data_mismatch}
+    end.
 
 %% Prefer verified weave chunks. A newly mined transaction's partition may
 %% not have reached the selected data nodes yet, while its accepting core peer
