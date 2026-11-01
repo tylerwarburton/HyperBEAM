@@ -475,12 +475,12 @@ read_tx_data(ID, StartOffset, Length, Opts) ->
 %% An operator may seed public L1 payload bytes while Arweave data chunks are
 %% still propagating. This is not a trust path: load_tx/4 verifies the complete
 %% signed transaction and data root immediately after these bytes return.
-read_tx_data_from_local(ID, Length, Opts) ->
+read_tx_data_from_local(ID, _Length, Opts) ->
     Dir = hb_util:bin(hb_opts:get(
         <<"arweave-bootstrap-dir">>, <<"/app/cache-arweave/bootstrap">>, Opts)),
     File = filename:join(binary_to_list(Dir), binary_to_list(ID)),
     case file:read_file(File) of
-        {ok, Data} when byte_size(Data) =:= Length -> {ok, Data};
+        {ok, Data} -> {ok, Data};
         _ -> {error, not_found}
     end.
 
