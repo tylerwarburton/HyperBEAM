@@ -9,7 +9,8 @@
 %%%   3. attests each unminted deposit with `Bridge-Mint';
 %%%   4. signs each pending withdrawal for its chain with `Bridge-Sign';
 %%%   5. acknowledges each release it saw with `Bridge-Released';
-%%%   6. votes on each open membership proposal its operator approved
+%%%   6. relays root credits, fast-ledger exits and ledger moves;
+%%%   7. votes on each open membership proposal its operator approved
 %%%      (`Attestor-Approve' on PUSD), signing the new set for every chain.
 %%%
 %%% Succession: when PUSD publishes a `successor' (its set voted to move), the
@@ -35,7 +36,7 @@
 %%% pass happens, never what it does, so anyone may send one; passes are still
 %%% at least `fast-interval' apart however many arrive. A nudge re-arms fast
 %%% mode at most once per NUDGE_GAP_MS, and one fast stretch lasts at most three
-%%% `fast-window's; after that, nudges wait out one idle `interval'.
+%%% `fast-window's; after that, nudges wait out COOL_MS.
 %%%
 %%% The cursors and the deposits and releases still waiting are kept in the
 %%% `state-file', so a restart picks up where the node left off.
@@ -43,18 +44,22 @@
 %%% Configuration, under the node option `bridge':
 %%%   pusd, pusd-node (the URL of the node that runs PUSD; omit when it is this
 %%%   node), interval, fast-interval, fast-window (ms), keys-file, state-file, follow-file,
+%%%   fast-ledgers => #{ LedgerProcess => #{ node => URL } },
 %%%   base => #{ rpc, contract, chain-id, confirmations, from-block, log-range },
 %%%   solana => #{ rpc, program, commitment }, sui => #{ rpc, package, bridge }
 -module(dev_bridge).
 -export([info/1, start/3, status/3, keys/3, nudge/3]).
 -export([proposals_to_vote/2, successor_ok/3]).
--export([withdrawal_signature/4, minted/3]).
+-export([withdrawal_signature/5, minted/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -define(NAME, {<<"bridge@1.0">>, loop}).
 -define(RESEND_MS, 60000).
 -define(NUDGE_GAP_MS, 10000).
+%% Nudges ignored after a capped fast stretch. Fixed, not `interval': a slow
+%% idle interval saves RPC spend and must not slow a busy bridge down.
+-define(COOL_MS, 15000).
 
 info(_) ->
     #{ exports => [<<"start">>, <<"status">>, <<"keys">>, <<"nudge">>] }.
@@ -180,7 +185,7 @@ cfg_ms(Cfg, Key, Default) -> hb_util:int(maps:get(Key, Cfg, Default)).
 
 %% Fast mode for a nudge, within limits: at most one arming per NUDGE_GAP_MS,
 %% one stretch of fast passes capped at three `fast-window's, and a capped
-%% stretch followed by one idle `interval' before the next can start.
+%% stretch followed by COOL_MS before the next can start.
 nudge_arm(Now, Cfg, St = #{ nudge_at := NudgeAt, fast_since := Since0, fast_until := Until0 }) ->
     Window = cfg_ms(Cfg, <<"fast-window">>, 120000),
     Cap = 3 * Window,
@@ -188,7 +193,7 @@ nudge_arm(Now, Cfg, St = #{ nudge_at := NudgeAt, fast_since := Since0, fast_unti
     Since = case Fast of true -> Since0; false -> Now end,
     Until = min(Now + Window, Since + Cap),
     Cooling = not Fast andalso Until0 =:= Since0 + Cap
-        andalso Now < Until0 + cfg_ms(Cfg, <<"interval">>, 5000),
+        andalso Now < Until0 + ?COOL_MS,
     case Now - NudgeAt < ?NUDGE_GAP_MS orelse Cooling orelse Until =< Until0 of
         true -> ignore;
         false -> {ok, St#{ nudge_at := Now, fast_since := Since, fast_until := Until }}
@@ -203,6 +208,9 @@ pass(St) ->
 
 attest(Info, St = #{ cfg := Cfg, me := Me }) ->
     Withdrawals = case published(<<"withdrawals">>, St) of L when is_list(L) -> L; _ -> [] end,
+    LedgerDeposits = case published(<<"ledgerdeposits">>, St) of L1 when is_list(L1) -> L1; _ -> [] end,
+    LedgerReceipts = case published(<<"ledgerexits">>, St) of L2 when is_list(L2) -> L2; _ -> [] end,
+    MoveReceipts = case published(<<"ledgermoves">>, St) of L3 when is_list(L3) -> L3; _ -> [] end,
     Member = lists:any(fun(A) -> maps:get(<<"ao">>, A, <<>>) =:= Me end,
         maps:get(<<"attestors">>, Info, [])),
     case Member of
@@ -215,15 +223,18 @@ attest(Info, St = #{ cfg := Cfg, me := Me }) ->
             % What was found is on disk before the cursors pass it.
             save_state(Cfg, St1),
             St2 = attest_deposits(Info, St1),
-            St3 = sign_withdrawals(Withdrawals, St2),
+            Epoch = hb_util:int(maps:get(<<"epoch">>, Info)),
+            St3 = sign_withdrawals(Withdrawals, Epoch, St2),
             St4 = acknowledge(Withdrawals, St3),
-            St5 = lists:foldl(
+            St5 = relay_fast_ledgers(Info, LedgerDeposits, LedgerReceipts,
+                MoveReceipts, Epoch, St4),
+            St6 = lists:foldl(
                 fun(P, S) ->
                     Id = hb_util:int(maps:get(<<"id">>, P)),
                     once(<<"vote:", (integer_to_binary(Id))/binary>>, S, fun() -> vote(P, S) end)
-                end, St4, proposals_to_vote(Info, Me)),
-            save_state(Cfg, St5),
-            St5#{ last_pass => os:system_time(millisecond), last_error => null }
+                end, St5, proposals_to_vote(Info, Me)),
+            save_state(Cfg, St6),
+            St6#{ last_pass => os:system_time(millisecond), last_error => null }
     end.
 
 %% Every chain that is configured, each failing on its own.
@@ -302,7 +313,7 @@ attest_deposits(Info, St = #{ deposits := Deps }) ->
             end
         end, St, Deps).
 
-sign_withdrawals(Withdrawals, St = #{ me := Me }) ->
+sign_withdrawals(Withdrawals, Epoch, St = #{ me := Me }) ->
     lists:foldl(
         fun(W, S) ->
             Sigs = maps:get(<<"sigs">>, W, #{}),
@@ -316,7 +327,7 @@ sign_withdrawals(Withdrawals, St = #{ me := Me }) ->
                     % message's own httpsig signature, and the scheduler refuses
                     % a message that carries both.
                     once(<<"sign:", Id/binary>>, S, fun() ->
-                        Sig = withdrawal_signature(W, maps:get(cfg, S), maps:get(keys, S),
+                        Sig = withdrawal_signature(W, Epoch, maps:get(cfg, S), maps:get(keys, S),
                             maps:get(namespace, S)),
                         send(#{ <<"action">> => <<"Bridge-Sign">>, <<"withdrawalid">> => Id,
                             <<"releasesig">> => Sig }, S)
@@ -339,6 +350,274 @@ acknowledge(Withdrawals, St = #{ releases := Rel }) ->
             end
         end, St, Rel).
 
+%%% Fast ledgers --------------------------------------------------------------
+
+credit_processed(Info, CreditId) ->
+    Credit = maps:get(<<"credit">>, Info, #{}),
+    Floor = hb_util:int(maps:get(<<"floor">>, Credit, 0)),
+    N = hb_util:int(CreditId),
+    N =< Floor orelse lists:member(N,
+        [hb_util:int(X) || X <- maps:get(<<"above">>, Credit, [])]).
+
+credit_plans(Root, Ledger, LaneInfo, Deposits) ->
+    lists:filtermap(
+        fun(D) ->
+            case {maps:get(<<"ledger">>, D, <<>>), maps:get(<<"status">>, D, <<>>)} of
+                {Ledger, <<"ready">>} ->
+                    DepositId = maps:get(<<"id">>, D),
+                    CreditId = maps:get(<<"creditId">>, D),
+                    case credit_processed(LaneInfo, CreditId) of
+                        true ->
+                            {true, {root,
+                                <<"lane-credited:", DepositId/binary>>,
+                                #{ <<"action">> => <<"Ledger-Credited">>,
+                                   <<"depositid">> => DepositId }}};
+                        false ->
+                            {true, {lane,
+                                <<"lane-credit:", Ledger/binary, ":", CreditId/binary>>,
+                                #{ <<"action">> => <<"Ledger-Credit">>, <<"root">> => Root,
+                                   <<"depositid">> => DepositId, <<"creditid">> => CreditId,
+                                   <<"account">> => maps:get(<<"account">>, D),
+                                   <<"quantity">> => maps:get(<<"quantity">>, D) }}}
+                    end;
+                _ -> false
+            end
+        end,
+        Deposits
+    ).
+
+exit_receipts(Receipts) ->
+    maps:from_list([
+        {maps:get(<<"key">>, R), R}
+    || R <- Receipts, is_map(R), maps:is_key(<<"key">>, R)
+    ]).
+
+exit_plans(Ledger, LaneExits, Receipts) ->
+    ReceiptMap = exit_receipts(Receipts),
+    lists:filtermap(
+        fun(E) ->
+            case maps:get(<<"status">>, E, <<>>) of
+                <<"pending">> ->
+                    ExitId = maps:get(<<"id">>, E),
+                    Key = <<Ledger/binary, "|", ExitId/binary>>,
+                    case maps:find(Key, ReceiptMap) of
+                        error ->
+                            {true, {root,
+                                <<"lane-exit:", Key/binary>>,
+                                #{ <<"action">> => <<"Ledger-Exit">>, <<"ledger">> => Ledger,
+                                   <<"exitid">> => ExitId, <<"account">> => maps:get(<<"account">>, E),
+                                   <<"chain">> => maps:get(<<"chain">>, E),
+                                   <<"token">> => maps:get(<<"token">>, E),
+                                   <<"recipient">> => maps:get(<<"to">>, E),
+                                   <<"quantity">> => maps:get(<<"quantity">>, E) }}};
+                        {ok, R} ->
+                            Status = maps:get(<<"status">>, R),
+                            Extra = case Status of
+                                <<"accepted">> -> #{ <<"withdrawalid">> => maps:get(<<"withdrawalId">>, R) };
+                                <<"rejected">> -> #{ <<"error">> => maps:get(<<"error">>, R) }
+                            end,
+                            {true, {lane,
+                                <<"lane-result:", Key/binary, ":", Status/binary>>,
+                                maps:merge(#{ <<"action">> => <<"Ledger-Exit-Result">>,
+                                    <<"exitid">> => ExitId, <<"status">> => Status }, Extra)}}
+                    end;
+                _ -> false
+            end
+        end,
+        LaneExits
+    ).
+
+move_receipts(Receipts) ->
+    maps:from_list([
+        {maps:get(<<"key">>, R), R}
+    || R <- Receipts, is_map(R), maps:is_key(<<"key">>, R)
+    ]).
+
+%% @doc Root votes for pending locks whose exact source and destination are
+%% both in this node's registered/configured ledger intersection.
+move_root_plans(Epoch, Ledger, LaneMoves, Receipts, Allowed) ->
+    ReceiptMap = move_receipts(Receipts),
+    lists:filtermap(
+        fun(M) ->
+            MoveId = maps:get(<<"id">>, M, <<>>),
+            Destination = maps:get(<<"destination">>, M, <<>>),
+            Account = maps:get(<<"account">>, M, <<>>),
+            Quantity = maps:get(<<"quantity">>, M, <<>>),
+            Eligible = is_binary(MoveId) andalso MoveId =/= <<>>
+                andalso is_binary(Destination) andalso is_binary(Account)
+                andalso is_binary(Quantity)
+                andalso maps:get(<<"status">>, M, <<>>) =:= <<"pending">>
+                andalso maps:get(<<"source">>, M, <<>>) =:= Ledger
+                andalso maps:is_key(Destination, Allowed),
+            case Eligible of
+                false -> false;
+                true ->
+                    Key = <<Ledger/binary, "|", MoveId/binary>>,
+                    case maps:is_key(Key, ReceiptMap) of
+                        true -> false;
+                        false ->
+                            {true, {root,
+                                <<"ledger-move-root:", Key/binary>>,
+                                #{ <<"action">> => <<"Ledger-Move-Root">>,
+                                   <<"source">> => Ledger,
+                                   <<"destination">> => Destination,
+                                   <<"moveid">> => MoveId,
+                                   <<"account">> => Account,
+                                   <<"quantity">> => Quantity,
+                                   <<"attestorepoch">> => integer_to_binary(Epoch) }}}
+                    end
+            end
+        end,
+        [M || M <- LaneMoves, is_map(M)]
+    ).
+
+%% @doc A durable root receipt drives both destinations independently. This
+%% remains retryable after the source lane has finalized and stopped publishing
+%% a pending move.
+move_receipt_plans(Root, Receipts, Allowed) ->
+    lists:append([
+        move_receipt_plan(Root, R, Allowed)
+    || R <- Receipts, is_map(R)
+    ]).
+
+move_receipt_plan(Root, R, Allowed) ->
+    Source = maps:get(<<"source">>, R, <<>>),
+    Destination = maps:get(<<"destination">>, R, <<>>),
+    MoveId = maps:get(<<"moveId">>, R, <<>>),
+    Account = maps:get(<<"account">>, R, <<>>),
+    Quantity = maps:get(<<"quantity">>, R, <<>>),
+    Status = maps:get(<<"status">>, R, <<>>),
+    Epoch = maps:get(<<"epoch">>, R, undefined),
+    EpochText = try integer_to_binary(hb_util:int(Epoch)) catch _:_ -> undefined end,
+    Error = maps:get(<<"error">>, R, <<>>),
+    Eligible = maps:get(<<"root">>, R, <<>>) =:= Root
+        andalso is_binary(Source) andalso is_binary(Destination)
+        andalso is_binary(MoveId) andalso MoveId =/= <<>>
+        andalso is_binary(Account) andalso is_binary(Quantity)
+        andalso maps:is_key(Source, Allowed)
+        andalso maps:is_key(Destination, Allowed)
+        andalso (Status =:= <<"accepted">> orelse Status =:= <<"rejected">>)
+        andalso is_binary(EpochText)
+        andalso (Status =/= <<"rejected">> orelse
+            (is_binary(Error) andalso Error =/= <<>>)),
+    case Eligible of
+        false -> [];
+        true ->
+            Common = #{ <<"root">> => Root, <<"source">> => Source,
+                <<"destination">> => Destination, <<"moveid">> => MoveId,
+                <<"account">> => Account, <<"quantity">> => Quantity,
+                <<"status">> => Status, <<"attestorepoch">> => EpochText },
+            ResultExtra = case Status of
+                <<"rejected">> -> #{ <<"error">> => Error };
+                <<"accepted">> -> #{}
+            end,
+            Result = {{lane, Source},
+                <<"ledger-move-result:", Source/binary, ":", MoveId/binary,
+                  ":", Status/binary>>,
+                maps:merge(Common#{ <<"action">> => <<"Ledger-Move-Result">> },
+                    ResultExtra)},
+            case Status of
+                <<"rejected">> -> [Result];
+                <<"accepted">> ->
+                    case maps:get(<<"creditId">>, R, undefined) of
+                        CreditId when is_binary(CreditId), CreditId =/= <<>> ->
+                            Credit = {{lane, Destination},
+                                <<"ledger-move-credit:", Destination/binary, ":",
+                                  CreditId/binary>>,
+                                Common#{ <<"action">> => <<"Ledger-Move-Credit">>,
+                                    <<"creditid">> => CreditId }},
+                            [Credit, Result];
+                        _ -> []
+                    end
+            end
+    end.
+
+fast_ledger_node(Spec) when is_binary(Spec) -> Spec;
+fast_ledger_node(Spec) when is_map(Spec) -> maps:get(<<"node">>, Spec, undefined);
+fast_ledger_node(_) -> undefined.
+
+relay_fast_ledgers(Info, Deposits, Receipts, MoveReceipts, Epoch,
+        St = #{ cfg := Cfg }) ->
+    Registered = maps:get(<<"ledgers">>, Info, #{}),
+    Configured = maps:get(<<"fast-ledgers">>, Cfg, #{}),
+    Root = maps:get(<<"pusd">>, Cfg),
+    Allowed = maps:filter(
+        fun(Ledger, _Spec) -> maps:is_key(Ledger, Registered) end,
+        Configured
+    ),
+    St1 = dispatch_move_plans(
+        move_receipt_plans(Root, MoveReceipts, Allowed), St
+    ),
+    maps:fold(
+        fun(Ledger, Spec, S) ->
+            case maps:is_key(Ledger, Allowed) of
+                false -> S;
+                true ->
+                    guard(<<"ledger:", Ledger/binary>>, S, fun() ->
+                        Node = fast_ledger_node(Spec),
+                        LaneInfo = published_at(Ledger, Node, <<"laneinfo">>, S),
+                        LaneExits = case published_at(Ledger, Node, <<"laneexits">>, S) of
+                            L when is_list(L) -> L;
+                            _ -> []
+                        end,
+                        LaneMoves = case published_at(Ledger, Node, <<"lanemoves">>, S) of
+                            L2 when is_list(L2) -> L2;
+                            _ -> []
+                        end,
+                        Plans = credit_plans(Root, Ledger, LaneInfo, Deposits)
+                            ++ exit_plans(Ledger, LaneExits, Receipts),
+                        S2 = dispatch_lane_plans(Ledger, Node, Plans, S),
+                        dispatch_move_plans(
+                            move_root_plans(Epoch, Ledger, LaneMoves,
+                                MoveReceipts, Allowed), S2
+                        )
+                    end)
+            end
+        end,
+        St1,
+        Configured
+    ).
+
+dispatch_lane_plans(_Ledger, _Node, [], St) -> St;
+dispatch_lane_plans(Ledger, Node, [{Destination, Key, Tags}|Rest], St) ->
+    St2 = guard(Key, St, fun() ->
+        once(Key, St, fun() ->
+            case Destination of
+                root -> send(Tags, St);
+                lane -> send_at(Ledger, Node, Tags, St)
+            end
+        end)
+    end),
+    dispatch_lane_plans(Ledger, Node, Rest, St2).
+
+dispatch_move_plans(Plans, St = #{ cfg := Cfg }) ->
+    Configured = maps:get(<<"fast-ledgers">>, Cfg, #{}),
+    lists:foldl(
+        fun({Target, RetryKey, Tags}, Acc) ->
+            guard(RetryKey, Acc, fun() ->
+                once(RetryKey, Acc, fun() ->
+                    case Target of
+                        root -> send(Tags, Acc);
+                        {lane, Ledger} ->
+                            Spec = maps:get(Ledger, Configured),
+                            send_at(Ledger, fast_ledger_node(Spec), Tags, Acc)
+                    end
+                end)
+            end)
+        end,
+        St,
+        Plans
+    ).
+
+%% One malformed or unavailable ledger item must not stop unrelated bridge
+%% work in this pass.
+guard(Key, St, Fun) ->
+    try Fun()
+    catch C:R:T ->
+        ?event(bridge, {skipped, Key, C, R, T}),
+        St
+    end.
+
 %% Send at most once per RESEND_MS per key: PUSD is idempotent, but every
 %% message is a slot.
 once(Key, St = #{ sent := Sent }, Fun) ->
@@ -354,9 +633,10 @@ once(Key, St = #{ sent := Sent }, Fun) ->
 
 %% @doc This node's signature over one withdrawal's release on its chain, as
 %% 0x-hex. The chain's withdrawal id carries PUSD's namespace in the high word.
-withdrawal_signature(W, Cfg, Keys, Namespace) ->
+withdrawal_signature(W, Epoch, Cfg, Keys, Namespace) ->
     Chain = maps:get(<<"chain">>, W),
     C = maps:get(Chain, Cfg),
+    Root = maps:get(<<"pusd">>, Cfg),
     Id = (Namespace bsl 32) bor hb_util:int(maps:get(<<"id">>, W)),
     Token = maps:get(<<"token">>, W),
     To = maps:get(<<"to">>, W),
@@ -365,49 +645,177 @@ withdrawal_signature(W, Cfg, Keys, Namespace) ->
         <<"base">> ->
             hb_bridge_sign:base_sign(
                 hb_bridge_sign:base_release(hb_util:int(maps:get(<<"chain-id">>, C)),
-                    maps:get(<<"contract">>, C), Id, Token, To, Amount),
+                    maps:get(<<"contract">>, C), Root, Epoch, Id, Token, To, Amount),
                 maps:get(base, Keys));
         <<"solana">> ->
             hb_bridge_sign:ed25519_sign(
-                hb_bridge_sign:solana_release(maps:get(<<"program">>, C), Id, Token, To, Amount),
+                hb_bridge_sign:solana_release(maps:get(<<"program">>, C),
+                    Root, Epoch, Id, Token, To, Amount),
                 maps:get(solana, Keys));
         <<"sui">> ->
             hb_bridge_sign:ed25519_sign(
-                hb_bridge_sign:sui_release(maps:get(<<"bridge">>, C), Id, Token, To, Amount),
+                hb_bridge_sign:sui_release(maps:get(<<"bridge">>, C),
+                    Root, Epoch, Id, Token, To, Amount),
                 maps:get(sui, Keys))
     end,
     <<"0x", (hb_bridge_sign:hex(Sig))/binary>>.
 
-%% @doc Open proposals this node's operator approved and it has not voted on.
+%% @doc Approved open/applied proposals this node has not voted on. Applied
+%% proposals keep collecting signatures so one bad chain signature cannot make
+%% an otherwise-settled proposal impossible to submit.
 proposals_to_vote(Info, Me) ->
     [P || P <- maps:get(<<"proposals">>, Info, []),
-        maps:get(<<"status">>, P, <<>>) =:= <<"open">>,
+        (maps:get(<<"status">>, P, <<>>) =:= <<"open">> orelse
+            maps:get(<<"status">>, P, <<>>) =:= <<"applied">>),
         maps:get(Me, maps:get(<<"approvals">>, P, #{}), false) =:= true,
         not maps:is_key(Me, maps:get(<<"votes">>, P, #{}))].
 
+%% @doc The membership proposal's frozen epochs, which must describe the one
+%% transition every chain contract accepts.
+proposal_epochs(P) ->
+    Prior = hb_util:int(maps:get(<<"priorEpoch">>, P)),
+    Current = hb_util:int(maps:get(<<"currentEpoch">>, P)),
+    New = hb_util:int(maps:get(<<"newEpoch">>, P)),
+    case Prior =:= Current andalso New =:= Current + 1 of
+        true -> {Current, New};
+        false -> error({bad_proposal_epochs, Prior, Current, New})
+    end.
+
+%% @doc A migration preserves the current custodian epoch.
+migration_epoch(P) ->
+    Prior = hb_util:int(maps:get(<<"priorEpoch">>, P)),
+    Current = hb_util:int(maps:get(<<"currentEpoch">>, P)),
+    New = hb_util:int(maps:get(<<"newEpoch">>, P)),
+    case Prior =:= Current andalso New =:= Current of
+        true -> Current;
+        false -> error({bad_migration_epochs, Prior, Current, New})
+    end.
+
+%% @doc The administration proposal's frozen current epoch.
+admin_epoch(P) ->
+    Prior = hb_util:int(maps:get(<<"priorEpoch">>, P)),
+    Current = hb_util:int(maps:get(<<"currentEpoch">>, P)),
+    New = hb_util:int(maps:get(<<"newEpoch">>, P)),
+    Epoch = hb_util:int(maps:get(<<"epoch">>, P)),
+    case Prior =:= Current andalso Current =:= New andalso New =:= Epoch of
+        true -> Epoch;
+        false -> error({bad_admin_epochs, Prior, Current, New, Epoch})
+    end.
+
+%% @doc Chain signatures carried by a majority-controlled administration vote.
+admin_vote_tags(P, Cfg, Keys) ->
+    Id = integer_to_binary(hb_util:int(maps:get(<<"id">>, P))),
+    Epoch = admin_epoch(P),
+    EpochText = integer_to_binary(Epoch),
+    Base = #{ <<"action">> => <<"Attestor-Vote">>, <<"proposalid">> => Id,
+        <<"currentepoch">> => EpochText, <<"newepoch">> => EpochText },
+    case maps:get(<<"op">>, P) of
+        <<"add-token">> ->
+            Admin = maps:get(<<"admin">>, P),
+            Chain = maps:get(<<"chain">>, Admin),
+            Token = maps:get(<<"token">>, Admin),
+            maps:merge(Base, admin_chain_signature(Chain, Token,
+                Epoch, Cfg, Keys));
+        <<"unpause">> ->
+            maps:merge(Base, maps:merge(
+                admin_chain_signature(<<"base">>, zero_token(<<"base">>),
+                    Epoch, Cfg, Keys, 2),
+                maps:merge(
+                    admin_chain_signature(<<"solana">>, zero_token(<<"solana">>),
+                        Epoch, Cfg, Keys, 2),
+                    admin_chain_signature(<<"sui">>, zero_token(<<"sui">>),
+                        Epoch, Cfg, Keys, 2)
+                )
+            ));
+        _ -> Base
+    end.
+
+admin_chain_signature(Chain, Token, Epoch, Cfg, Keys) ->
+    admin_chain_signature(Chain, Token, Epoch, Cfg, Keys, 1).
+
+admin_chain_signature(<<"base">>, Token, Epoch, Cfg, Keys, Action) ->
+    C = maps:get(<<"base">>, Cfg),
+    Root = maps:get(<<"pusd">>, Cfg),
+    Sig = hb_bridge_sign:base_sign(
+        hb_bridge_sign:base_admin(
+            hb_util:int(maps:get(<<"chain-id">>, C)), maps:get(<<"contract">>, C),
+            Root, Epoch, Action, Token, true),
+        maps:get(base, Keys)
+    ),
+    #{ <<"basesig">> => signature_hex(Sig) };
+admin_chain_signature(<<"solana">>, Token, Epoch, Cfg, Keys, Action) ->
+    C = maps:get(<<"solana">>, Cfg),
+    Root = maps:get(<<"pusd">>, Cfg),
+    Sig = hb_bridge_sign:ed25519_sign(
+        hb_bridge_sign:solana_admin(
+            maps:get(<<"program">>, C), Root, Epoch, Action, Token, true),
+        maps:get(solana, Keys)
+    ),
+    #{ <<"solanasig">> => signature_hex(Sig) };
+admin_chain_signature(<<"sui">>, Token, Epoch, Cfg, Keys, Action) ->
+    C = maps:get(<<"sui">>, Cfg),
+    Root = maps:get(<<"pusd">>, Cfg),
+    Sig = hb_bridge_sign:ed25519_sign(
+        hb_bridge_sign:sui_admin(
+            maps:get(<<"bridge">>, C), Root, Epoch, Action, Token, true),
+        maps:get(sui, Keys)
+    ),
+    #{ <<"suisig">> => signature_hex(Sig) }.
+
+signature_hex(Sig) -> <<"0x", (hb_bridge_sign:hex(Sig))/binary>>.
+
+zero_token(<<"base">>) -> <<"0x0000000000000000000000000000000000000000">>;
+zero_token(<<"solana">>) -> <<"11111111111111111111111111111111">>;
+zero_token(<<"sui">>) -> <<>>.
+
 %% The vote IS the chain authorisation: this node's signature over the
-%% proposal's whole set, at its epoch, for each chain. A migration changes no
-%% chain, so its vote carries nothing but the proposal.
-vote(#{ <<"op">> := <<"migrate">> } = P, St) ->
-    send(#{ <<"action">> => <<"Attestor-Vote">>,
-        <<"proposalid">> => integer_to_binary(hb_util:int(maps:get(<<"id">>, P))) }, St);
+%% proposal's whole set, at its epoch, for each chain. A migration signs the
+%% exact old-root to successor transition for every chain.
+vote(#{ <<"kind">> := <<"admin">> } = P, St = #{ cfg := Cfg, keys := Keys }) ->
+    send(admin_vote_tags(P, Cfg, Keys), St);
+vote(#{ <<"op">> := <<"migrate">> } = P, St = #{ cfg := Cfg, keys := Keys }) ->
+    Id = hb_util:int(maps:get(<<"id">>, P)),
+    Epoch = migration_epoch(P),
+    Root = maps:get(<<"pusd">>, Cfg),
+    Successor = maps:get(<<"successor">>, P),
+    Hex = fun(S) -> <<"0x", (hb_bridge_sign:hex(S))/binary>> end,
+    B = maps:get(<<"base">>, Cfg), Sol = maps:get(<<"solana">>, Cfg), Sui = maps:get(<<"sui">>, Cfg),
+    send(#{
+        <<"action">> => <<"Attestor-Vote">>, <<"proposalid">> => integer_to_binary(Id),
+        <<"currentepoch">> => integer_to_binary(Epoch), <<"newepoch">> => integer_to_binary(Epoch),
+        <<"basesig">> => Hex(hb_bridge_sign:base_sign(
+            hb_bridge_sign:base_root(hb_util:int(maps:get(<<"chain-id">>, B)),
+                maps:get(<<"contract">>, B), Epoch, Root, Successor), maps:get(base, Keys))),
+        <<"solanasig">> => Hex(hb_bridge_sign:ed25519_sign(
+            hb_bridge_sign:solana_root(maps:get(<<"program">>, Sol),
+                Epoch, Root, Successor), maps:get(solana, Keys))),
+        <<"suisig">> => Hex(hb_bridge_sign:ed25519_sign(
+            hb_bridge_sign:sui_root(maps:get(<<"bridge">>, Sui),
+                Epoch, Root, Successor), maps:get(sui, Keys)))
+    }, St);
 vote(P, St = #{ cfg := Cfg, keys := Keys }) ->
     Id = hb_util:int(maps:get(<<"id">>, P)),
     Set = maps:get(<<"set">>, P),
-    Epoch = hb_util:int(maps:get(<<"epoch">>, P)),
+    {CurrentEpoch, NewEpoch} = proposal_epochs(P),
+    Root = maps:get(<<"pusd">>, Cfg),
     Field = fun(K) -> [maps:get(K, M) || M <- Set] end,
     Hex = fun(S) -> <<"0x", (hb_bridge_sign:hex(S))/binary>> end,
     B = maps:get(<<"base">>, Cfg), Sol = maps:get(<<"solana">>, Cfg), Sui = maps:get(<<"sui">>, Cfg),
     send(#{
         <<"action">> => <<"Attestor-Vote">>, <<"proposalid">> => integer_to_binary(Id),
+        <<"currentepoch">> => integer_to_binary(CurrentEpoch),
+        <<"newepoch">> => integer_to_binary(NewEpoch),
         <<"basesig">> => Hex(hb_bridge_sign:base_sign(
             hb_bridge_sign:base_attestors(hb_util:int(maps:get(<<"chain-id">>, B)),
-                maps:get(<<"contract">>, B), Epoch, Field(<<"base">>)), maps:get(base, Keys))),
+                maps:get(<<"contract">>, B), Root, CurrentEpoch, NewEpoch,
+                Field(<<"base">>)), maps:get(base, Keys))),
         <<"solanasig">> => Hex(hb_bridge_sign:ed25519_sign(
-            hb_bridge_sign:solana_attestors(maps:get(<<"program">>, Sol), Epoch, Field(<<"solana">>)),
+            hb_bridge_sign:solana_attestors(maps:get(<<"program">>, Sol),
+                Root, CurrentEpoch, NewEpoch, Field(<<"solana">>)),
             maps:get(solana, Keys))),
         <<"suisig">> => Hex(hb_bridge_sign:ed25519_sign(
-            hb_bridge_sign:sui_attestors(maps:get(<<"bridge">>, Sui), Epoch, Field(<<"sui">>)),
+            hb_bridge_sign:sui_attestors(maps:get(<<"bridge">>, Sui),
+                Root, CurrentEpoch, NewEpoch, Field(<<"sui">>)),
             maps:get(sui, Keys)))
     }, St).
 
@@ -477,32 +885,40 @@ save_follow(Cfg) ->
 %% scheduler of the node that runs it, as any wallet client does.
 send(Tags, #{ cfg := Cfg, opts := Opts }) ->
     Pusd = maps:get(<<"pusd">>, Cfg),
-    Res = case maps:get(<<"pusd-node">>, Cfg, undefined) of
+    send_at(Pusd, maps:get(<<"pusd-node">>, Cfg, undefined), Tags,
+        #{ cfg => Cfg, opts => Opts }).
+
+send_at(Process, Node, Tags, #{ opts := Opts }) ->
+    Res = case Node of
         undefined ->
-            Signed = hb_message:commit(Tags#{ <<"target">> => Pusd }, Opts, <<"httpsig@1.0">>),
+            Signed = hb_message:commit(Tags#{ <<"target">> => Process }, Opts, <<"httpsig@1.0">>),
             {ok, _} = hb_cache:write(Signed, Opts),
-            {ok, Proc} = hb_cache:read(Pusd, Opts),
+            {ok, Proc} = hb_cache:read(Process, Opts),
             hb_ao:resolve({as, <<"process@1.0">>, Proc},
                 #{ <<"path">> => <<"schedule">>, <<"method">> => <<"POST">>, <<"body">> => Signed }, Opts);
-        Node ->
+        _ ->
             % `subject: self' or the scheduler schedules the request body.
-            Signed = hb_message:commit(Tags#{ <<"target">> => Pusd, <<"type">> => <<"Message">>,
+            Signed = hb_message:commit(Tags#{ <<"target">> => Process, <<"type">> => <<"Message">>,
                 <<"subject">> => <<"self">> }, Opts, <<"httpsig@1.0">>),
-            hb_http:post(Node, <<"/", Pusd/binary, "~process@1.0/schedule">>, Signed, Opts)
+            hb_http:post(Node, <<"/", Process/binary, "~process@1.0/schedule">>, Signed, Opts)
     end,
-    ?event(bridge, {sent, maps:get(<<"action">>, Tags), Res}),
+    ?event(bridge, {sent, maps:get(<<"action">>, Tags), {process, Process}, Res}),
     Res.
 
 %% A published key as decoded JSON, or #{} when absent (the node answers a
 %% missing key with its HTML page, never with an error).
 published(Key, #{ cfg := Cfg, opts := Opts }) ->
     Pusd = maps:get(<<"pusd">>, Cfg),
-    case maps:get(<<"pusd-node">>, Cfg, undefined) of
+    published_at(Pusd, maps:get(<<"pusd-node">>, Cfg, undefined), Key,
+        #{ cfg => Cfg, opts => Opts }).
+
+published_at(Process, Node, Key, #{ opts := Opts }) ->
+    case Node of
         undefined ->
-            {ok, Proc} = hb_cache:read(Pusd, Opts),
+            {ok, Proc} = hb_cache:read(Process, Opts),
             json_value(hb_ao:get(<<"now/", Key/binary>>, Proc, not_found, Opts));
-        Node ->
-            Url = <<Node/binary, "/", Pusd/binary, "~process@1.0/now/", Key/binary>>,
+        _ ->
+            Url = <<Node/binary, "/", Process/binary, "~process@1.0/now/", Key/binary>>,
             case hb_bridge_chains:get_body(Url, Opts) of
                 {ok, Body} -> json_value(Body);
                 _ -> #{}
@@ -655,9 +1071,11 @@ nudge_arm_test() ->
         St2, lists:seq(1020000, 1290000, 10000)),
     ?assertMatch(#{ fast_until := 1300000 }, StN),
     ?assertEqual(ignore, nudge_arm(1299000, Cfg, StN#{ nudge_at := 0 })),
-    % After a capped stretch, one idle interval before the next.
+    % After a capped stretch, COOL_MS before the next, however slow `interval' is.
     ?assertEqual(ignore, nudge_arm(1310000, Cfg, StN)),
-    ?assertMatch({ok, #{ fast_since := 1316000, fast_until := 1416000 }}, nudge_arm(1316000, Cfg, StN)).
+    ?assertMatch({ok, #{ fast_since := 1316000, fast_until := 1416000 }}, nudge_arm(1316000, Cfg, StN)),
+    Slow = Cfg#{ <<"interval">> => 120000 },
+    ?assertMatch({ok, #{ fast_since := 1316000 }}, nudge_arm(1316000, Slow, StN)).
 
 state_file_test() ->
     Dir = <<"/tmp/bridge-state-test">>,
@@ -702,7 +1120,19 @@ proposals_to_vote_test() ->
         P(3, <<"open">>, #{ Me => true }, #{ Me => #{} }),
         P(4, <<"applied">>, #{ Me => true }, #{})
     ] },
-    ?assertEqual([1], [maps:get(<<"id">>, X) || X <- proposals_to_vote(Info, Me)]).
+    ?assertEqual([1, 4], [maps:get(<<"id">>, X) || X <- proposals_to_vote(Info, Me)]).
+
+proposal_epochs_test() ->
+    ?assertEqual({4, 5}, proposal_epochs(#{ <<"priorEpoch">> => 4,
+        <<"currentEpoch">> => 4, <<"newEpoch">> => 5 })),
+    ?assertError({bad_proposal_epochs, 3, 4, 5}, proposal_epochs(#{
+        <<"priorEpoch">> => 3, <<"currentEpoch">> => 4, <<"newEpoch">> => 5 })),
+    ?assertError({bad_proposal_epochs, 4, 4, 6}, proposal_epochs(#{
+        <<"priorEpoch">> => 4, <<"currentEpoch">> => 4, <<"newEpoch">> => 6 })),
+    ?assertEqual(4, migration_epoch(#{ <<"priorEpoch">> => 4,
+        <<"currentEpoch">> => 4, <<"newEpoch">> => 4 })),
+    ?assertError({bad_migration_epochs, 4, 4, 5}, migration_epoch(#{
+        <<"priorEpoch">> => 4, <<"currentEpoch">> => 4, <<"newEpoch">> => 5 })).
 
 successor_ok_test() ->
     Here = <<"here">>,
@@ -749,6 +1179,117 @@ minted_test() ->
     ?assertNot(minted(Info, <<"base">>, 6)),
     ?assertNot(minted(Info, <<"sui">>, 1)).
 
+fast_ledger_credit_plans_test() ->
+    Root = <<"root">>, Ledger = <<"ledger">>,
+    Deposit = #{ <<"id">> => <<"base:900">>, <<"creditId">> => <<"2">>,
+        <<"ledger">> => Ledger, <<"account">> => <<"alice">>,
+        <<"quantity">> => <<"10">>, <<"status">> => <<"ready">> },
+    ?assertNot(credit_processed(#{ <<"credit">> => #{ <<"floor">> => 1 } }, <<"2">>)),
+    [{lane, _, Credit}] = credit_plans(Root, Ledger,
+        #{ <<"credit">> => #{ <<"floor">> => 1, <<"above">> => [] } }, [Deposit]),
+    ?assertEqual(<<"2">>, maps:get(<<"creditid">>, Credit)),
+    ?assertEqual(<<"base:900">>, maps:get(<<"depositid">>, Credit)),
+    [{root, _, Ack}] = credit_plans(Root, Ledger,
+        #{ <<"credit">> => #{ <<"floor">> => 2, <<"above">> => [] } }, [Deposit]),
+    ?assertEqual(<<"Ledger-Credited">>, maps:get(<<"action">>, Ack)),
+    % Canonical holder entry uses the same durable root-credit queue as a
+    % bridge deposit; the id stays intact for the lane's replay witness.
+    Entry = Deposit#{ <<"id">> => <<"entry:alice:1">>,
+        <<"kind">> => <<"entry">>, <<"creditId">> => <<"3">> },
+    [{lane, _, EntryCredit}] = credit_plans(Root, Ledger,
+        #{ <<"credit">> => #{ <<"floor">> => 2, <<"above">> => [] } }, [Entry]),
+    ?assertEqual(<<"entry:alice:1">>, maps:get(<<"depositid">>, EntryCredit)),
+    ?assertEqual(<<"3">>, maps:get(<<"creditid">>, EntryCredit)),
+    ?assertEqual([], credit_plans(Root, Ledger, #{},
+        [Deposit#{ <<"status">> => <<"credited">> }])).
+
+fast_ledger_exit_plans_test() ->
+    Ledger = <<"ledger">>,
+    Exit = #{ <<"id">> => <<"7">>, <<"status">> => <<"pending">>,
+        <<"account">> => <<"alice">>, <<"chain">> => <<"base">>,
+        <<"token">> => <<"0xt">>, <<"to">> => <<"0xrecipient">>,
+        <<"quantity">> => <<"10">> },
+    [{root, _, RootVote}] = exit_plans(Ledger, [Exit], []),
+    ?assertEqual(<<"Ledger-Exit">>, maps:get(<<"action">>, RootVote)),
+    ?assertNot(maps:is_key(<<"releasesig">>, RootVote)),
+    Receipt = #{ <<"key">> => <<"ledger|7">>, <<"status">> => <<"accepted">>,
+        <<"withdrawalId">> => <<"12">> },
+    [{lane, _, Accepted}] = exit_plans(Ledger, [Exit], [Receipt]),
+    ?assertEqual(<<"12">>, maps:get(<<"withdrawalid">>, Accepted)),
+    Rejected = Receipt#{ <<"status">> => <<"rejected">>, <<"error">> => <<"no reserve">> },
+    [{lane, _, Rejection}] = exit_plans(Ledger, [Exit], [Rejected]),
+    ?assertEqual(<<"no reserve">>, maps:get(<<"error">>, Rejection)),
+    ?assertEqual([], exit_plans(Ledger, [Exit#{ <<"status">> => <<"accepted">> }], [])).
+
+fast_ledger_move_plans_test() ->
+    Root = <<"root">>, Source = <<"source">>, Destination = <<"destination">>,
+    Allowed = #{ Source => #{}, Destination => #{} },
+    Move = #{ <<"id">> => <<"7">>, <<"source">> => Source,
+        <<"destination">> => Destination, <<"account">> => <<"alice">>,
+        <<"quantity">> => <<"10">>, <<"status">> => <<"pending">> },
+    [{root, RootKey, RootVote}] = move_root_plans(4, Source, [Move], [], Allowed),
+    ?assertEqual(<<"ledger-move-root:source|7">>, RootKey),
+    ?assertEqual(<<"Ledger-Move-Root">>, maps:get(<<"action">>, RootVote)),
+    ?assertEqual(<<"4">>, maps:get(<<"attestorepoch">>, RootVote)),
+    ?assertEqual([], move_root_plans(4, Source, [Move], [],
+        maps:remove(Destination, Allowed))),
+    Receipt = #{ <<"key">> => <<"source|7">>, <<"root">> => Root,
+        <<"source">> => Source, <<"destination">> => Destination,
+        <<"moveId">> => <<"7">>, <<"creditId">> => <<"9">>,
+        <<"account">> => <<"alice">>, <<"quantity">> => <<"10">>,
+        <<"epoch">> => 4, <<"status">> => <<"accepted">> },
+    ?assertEqual([], move_root_plans(4, Source, [Move], [Receipt], Allowed)),
+    [{{lane, Destination}, CreditKey, Credit},
+     {{lane, Source}, ResultKey, Result}] =
+        move_receipt_plans(Root, [Receipt], Allowed),
+    ?assertEqual(<<"ledger-move-credit:destination:9">>, CreditKey),
+    ?assertEqual(<<"Ledger-Move-Credit">>, maps:get(<<"action">>, Credit)),
+    ?assertEqual(<<"4">>, maps:get(<<"attestorepoch">>, Credit)),
+    ?assertEqual(<<"ledger-move-result:source:7:accepted">>, ResultKey),
+    ?assertEqual(<<"Ledger-Move-Result">>, maps:get(<<"action">>, Result)),
+    Rejected = maps:without([<<"creditId">>], Receipt#{
+        <<"status">> => <<"rejected">>, <<"error">> => <<"cap">> }),
+    [{{lane, Source}, _, Rejection}] = move_receipt_plans(Root, [Rejected], Allowed),
+    ?assertEqual(<<"cap">>, maps:get(<<"error">>, Rejection)),
+    ?assertEqual([], move_receipt_plans(Root, [Receipt], maps:remove(Source, Allowed))),
+    ?assertEqual([], move_receipt_plans(<<"other-root">>, [Receipt], Allowed)).
+
+relay_failure_isolation_test() ->
+    St = #{ marker => true },
+    ?assertEqual(St, guard(<<"ledger:item">>, St,
+        fun() -> error(broken_item) end)).
+
+admin_vote_tags_test() ->
+    Root = <<"qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo">>,
+    Bridge = <<"0x1111111111111111111111111111111111111111">>,
+    SuiBridge = <<"0x034401905bebdf8c04f3cd5f04f442a39372c8dc321c29edfb4f9cb30b23ab96">>,
+    Solana = hb_bridge_sign:base58_encode(binary:copy(<<1>>, 32)),
+    SolanaToken = hb_bridge_sign:base58_encode(binary:copy(<<2>>, 32)),
+    Cfg = #{ <<"pusd">> => Root,
+        <<"base">> => #{ <<"chain-id">> => 8453, <<"contract">> => Bridge },
+        <<"solana">> => #{ <<"program">> => Solana },
+        <<"sui">> => #{ <<"bridge">> => SuiBridge } },
+    Keys = #{ base => binary:copy(<<1>>, 32),
+        solana => binary:copy(<<2>>, 32), sui => binary:copy(<<3>>, 32) },
+    Proposal = #{ <<"id">> => 8, <<"kind">> => <<"admin">>,
+        <<"op">> => <<"add-token">>, <<"priorEpoch">> => 4,
+        <<"currentEpoch">> => 4, <<"newEpoch">> => 4, <<"epoch">> => 4,
+        <<"admin">> => #{ <<"chain">> => <<"solana">>,
+            <<"token">> => SolanaToken } },
+    Add = admin_vote_tags(Proposal, Cfg, Keys),
+    ?assertEqual(<<"4">>, maps:get(<<"currentepoch">>, Add)),
+    ?assertEqual(<<"4">>, maps:get(<<"newepoch">>, Add)),
+    ?assert(maps:is_key(<<"solanasig">>, Add)),
+    ?assertNot(maps:is_key(<<"basesig">>, Add)),
+    ?assertNot(maps:is_key(<<"suisig">>, Add)),
+    Unpause = admin_vote_tags(Proposal#{ <<"op">> => <<"unpause">>,
+        <<"admin">> => #{} }, Cfg, Keys),
+    ?assert(maps:is_key(<<"basesig">>, Unpause)),
+    ?assert(maps:is_key(<<"solanasig">>, Unpause)),
+    ?assert(maps:is_key(<<"suisig">>, Unpause)),
+    ?assertError({bad_admin_epochs, 4, 4, 5, 4},
+        admin_epoch(Proposal#{ <<"newEpoch">> => 5 })).
+
 local_withdrawal_test() ->
     St = #{ namespace => 300 },
     ?assertEqual(<<"7">>, local_withdrawal((300 bsl 32) bor 7, St)),
@@ -760,9 +1301,10 @@ withdrawal_signature_base_test() ->
     W = #{ <<"id">> => <<"7">>, <<"chain">> => <<"base">>,
         <<"token">> => <<"0x2222222222222222222222222222222222222222">>,
         <<"to">> => <<"0x3333333333333333333333333333333333333333">>, <<"amount">> => <<"1234567">> },
-    Cfg = #{ <<"base">> => #{ <<"chain-id">> => 8453,
+    Cfg = #{ <<"pusd">> => <<"qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo">>,
+        <<"base">> => #{ <<"chain-id">> => 8453,
         <<"contract">> => <<"0x1111111111111111111111111111111111111111">> } },
     ?assertEqual(
-        <<"0x78338d741889a13ef8a5523422e3a9827f958407e44e028613ec426bb6ea4a00",
-          "2ac282b54427fc3c6b5b2e80ec6cd10288c4bf425443d5f163e6b343eaca773d1c">>,
-        withdrawal_signature(W, Cfg, #{ base => binary:copy(<<1>>, 32) }, 5)).
+        <<"0x7763e686307224e8f0791bd0b59c7ae7bcb4efdb77d903891d2032fc8cb5f129",
+          "253a9cc81621497731181da8760a91e117de44990e15dfc8681ce92222ded9861b">>,
+        withdrawal_signature(W, 3, Cfg, #{ base => binary:copy(<<1>>, 32) }, 5)).
