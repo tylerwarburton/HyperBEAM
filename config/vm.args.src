@@ -1,1 +1,6 @@
 -sname ${HB_ERL_SNAME:-"hb"}
+## Idle schedulers sleep instead of spinning: on a shared box the spin
+## burned several cores that request and Lua work needed (PARALITH.md).
++sbwt none
++sbwtdcpu none
++sbwtdio none

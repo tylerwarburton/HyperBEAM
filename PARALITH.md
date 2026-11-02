@@ -946,3 +946,17 @@ A second pass (same day) covered `list_from`, the NIF behind `hb_store_lmdb:list
 the first only patched the unused `list/2`, and listing `<id>/commitments` in
 `hb_cache:read_all_commitments` (every Lua slot) still forced a commit -- ~11%
 of node CPU after the first rollout. `match` and the iterators still flush.
+
+## CPU on a shared box (2026-11-02)
+
+Prod after the prefix-read fix: the box at load 28 on 16 cores with 31% CPU
+pressure, the BEAM at 11 cores of OS CPU while Erlang reported 48% scheduler
+use. The difference was schedulers spinning while idle: `config/vm.args.src`
+now sets `+sbwt none +sbwtdcpu none +sbwtdio none`. In the busiest worker (the
+order-book vault, 320 callers waiting), 14% of samples were
+`lib_process:process_id` hashing the whole process definition (330-660 KB,
+module included) for its cache key on every call; the process now keeps its
+last answer and matches it by exact term equality. Another 8% was printing
+debug lines: `hb-node.sh` (paralith-mono) sets
+`HB_PRINT=error,http_error,cron_error,hook_error,warning`, dropping the
+per-request and per-slot lines (3.7 MB of log a minute).

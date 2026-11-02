@@ -25,14 +25,28 @@ process_id(Base, Req, Opts) ->
             process_id(ensure_process_key(Base, Opts), Req, Opts);
         Process ->
             Spec = hb_util:atom(maps:get(<<"commitments">>, Req, <<"signed">>)),
-            Key = {crypto:hash(sha256, term_to_binary(Process)), Spec},
-            case cached_id(Key) of
-                {ok, ID} -> ID;
-                not_found ->
-                    ID = verified_id(Process, Spec, Opts),
-                    cache_id(Key, ID),
+            case get(lib_process_last_id) of
+                {Process, Spec, LastID} -> LastID;
+                _ ->
+                    ID = shared_process_id(Process, Spec, Opts),
+                    put(lib_process_last_id, {Process, Spec, ID}),
                     ID
             end
+    end.
+
+%% A process worker asks for the ID of the same definition several times a
+%% slot, and the definition carries its whole module (hundreds of KB): hashing
+%% it for the shared key below was 14% of a busy worker on prod. The last
+%% answer is kept in the asking process and matched by exact term equality, so
+%% a different definition never matches it.
+shared_process_id(Process, Spec, Opts) ->
+    Key = {crypto:hash(sha256, term_to_binary(Process)), Spec},
+    case cached_id(Key) of
+        {ok, ID} -> ID;
+        not_found ->
+            ID = verified_id(Process, Spec, Opts),
+            cache_id(Key, ID),
+            ID
     end.
 
 %% @doc Verify a process definition and return its ID. Every `now' read, every
