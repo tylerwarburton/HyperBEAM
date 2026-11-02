@@ -414,8 +414,7 @@ escape_format(Str) when is_list(Str) ->
         nomatch -> binary_to_list(Bin);
         _ ->
             re:replace(
-                Bin,
-                "~([a-z\\-_]+@[0-9]+\\.[0-9]+)", "~~\\1",
+                Bin, device_name_regex(), "~~\\1",
                 [global, {return, list}]
             )
     end;
