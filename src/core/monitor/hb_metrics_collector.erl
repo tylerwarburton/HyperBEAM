@@ -60,7 +60,36 @@ collect_mf(_Registry, Callback) ->
         )
     ),
 
+    Phases = hb_phase_timer:read(),
+    Callback(
+        prometheus_model_helpers:create_mf(
+            hb_phase_seconds_total,
+            "Wall time spent in each named phase of the message path "
+            "(hb_phase_timer; node option phase-timers).",
+            counter,
+            ?MODULE,
+            Phases
+        )
+    ),
+    Callback(
+        prometheus_model_helpers:create_mf(
+            hb_phase_count_total,
+            "Number of timed samples of each named phase (hb_phase_timer).",
+            counter,
+            ?MODULE,
+            Phases
+        )
+    ),
+
     ok.
+collect_metrics(hb_phase_seconds_total, Phases) ->
+    prometheus_model_helpers:counter_metrics(
+        [ {[{phase, P}], T / 1_000_000} || {P, T, _N, _Mean} <- Phases ]
+    );
+collect_metrics(hb_phase_count_total, Phases) ->
+    prometheus_model_helpers:counter_metrics(
+        [ {[{phase, P}], N} || {P, _T, N, _Mean} <- Phases ]
+    );
 collect_metrics(system_load, SystemLoad) ->
     %% Return the gauge metric with no labels
     prometheus_model_helpers:gauge_metrics(

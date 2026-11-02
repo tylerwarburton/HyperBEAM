@@ -144,7 +144,9 @@ default_device(Base, Key, Opts) ->
 -spec schedule(#{ scheduler => _, _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
     {ok, _} | {error, _}.
 schedule(Base, Req, Opts) ->
-    lib_process:run_as(<<"scheduler">>, Base, Req, Opts).
+    hb_phase_timer:time(schedule, fun() ->
+        lib_process:run_as(<<"scheduler">>, Base, Req, Opts)
+    end).
 
 -spec slot(#{ scheduler => _, _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
     {ok, _} | {error, _}.
@@ -241,7 +243,11 @@ compute(Base, Req, Opts) ->
                     {error, not_found}
             end;
         Slot ->
-            case lib_process_cache:read(ProcID, Slot, Opts) of
+            CacheRead =
+                hb_phase_timer:time(compute_cache_read, fun() ->
+                    lib_process_cache:read(ProcID, Slot, Opts)
+                end),
+            case CacheRead of
                 {ok, Result} ->
                     % The result is already cached, so we can return it.
                     ?event(
@@ -253,7 +259,10 @@ compute(Base, Req, Opts) ->
                     ),
                     {ok, mark_cached_state(without_snapshot(Result, Opts), Opts)};
                 {error, not_found} ->
-                    {ok, Loaded} = ensure_loaded(ProcBase, Req, Opts),
+                    {ok, Loaded} =
+                        hb_phase_timer:time(ensure_loaded, fun() ->
+                            ensure_loaded(ProcBase, Req, Opts)
+                        end),
                     ?event(compute,
                         {computing, {process_id, ProcID},
                         {to_slot, Slot}},
@@ -371,7 +380,7 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
             % Compute the next state transition.
             NextSlot = CurrentSlot + 1,
             % Get the next input message from the scheduler device.
-            case next(Base, Req, Opts) of
+            case hb_phase_timer:time(slot_next, fun() -> next(Base, Req, Opts) end) of
                 {error, Res} ->
                     % If the scheduler device cannot provide a next message,
                     % we return its error details, along with the current slot.
@@ -833,11 +842,13 @@ now(RawBase, Req, Opts) ->
         false ->
             maybe
                 {ok, CurrentSlot} ?=
-                    hb_ao:resolve(
-                        Base,
-                        #{ <<"path">> => <<"slot/current">> },
-                        Opts
-                    ),
+                    hb_phase_timer:time(now_slot_current, fun() ->
+                        hb_ao:resolve(
+                            Base,
+                            #{ <<"path">> => <<"slot/current">> },
+                            Opts
+                        )
+                    end),
                 ?event({now_called, {process, ProcessID}, {slot, CurrentSlot}}),
                 lib_process_cache:refresh(
                     ProcessID,
@@ -856,7 +867,10 @@ now(RawBase, Req, Opts) ->
         CacheParam ->
             % We are serving the latest known state from the cache, rather
             % than computing it.
-            LatestKnown = lib_process_cache:latest(ProcessID, [], Opts),
+            LatestKnown =
+                hb_phase_timer:time(now_cache_latest, fun() ->
+                    lib_process_cache:latest(ProcessID, [], Opts)
+                end),
             case LatestKnown of
                 {ok, LatestSlot, RawLatestMsg} ->
                     case lib_process_cache:fresh(ProcessID, LatestSlot, Req, Opts) of
@@ -924,12 +938,14 @@ uncached_now(_CacheParam, Base, Req, Opts, _Failure) ->
 -spec push(#{ push => _, _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
     {ok, _} | {error, _}.
 push(Base, Req, Opts) ->
-    lib_process:run_as(
-        <<"push">>,
-        lib_process:ensure_process_key(Base, Opts),
-        Req,
-        Opts
-    ).
+    hb_phase_timer:time(push, fun() ->
+        lib_process:run_as(
+            <<"push">>,
+            lib_process:ensure_process_key(Base, Opts),
+            Req,
+            Opts
+        )
+    end).
 
 %% @doc Ensure that the process message we have in memory is live and
 %% up-to-date.

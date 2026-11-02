@@ -396,6 +396,7 @@ new_server(RawNodeMsg) ->
     % Put server ID into node message so it's possible to update current server
     % params.
     NodeMsgWithID = hb_maps:put(<<"http-server">>, ServerID, NodeMsg),
+    hb_phase_timer:configure(NodeMsg),
     ProtoOpts = listener_protocol_options(ServerID, NodeMsgWithID),
     PrometheusOpts =
         case hb_opts:get(prometheus, not hb_features:test(), NodeMsg) of

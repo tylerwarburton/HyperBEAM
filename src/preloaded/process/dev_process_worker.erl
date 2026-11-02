@@ -290,6 +290,14 @@ await(Worker, GroupName, Base, Req, Opts) ->
                 {group, GroupName},
                 {target_slot, TargetSlot}
             }),
+            % A waiter's whole wait: the worker's queue ahead of it plus its
+            % own `worker_execute'.
+            hb_phase_timer:time(worker_await, fun() ->
+                await_compute(Worker, GroupName, Req, TargetSlot, Opts)
+            end)
+    end.
+
+await_compute(Worker, GroupName, Req, TargetSlot, Opts) ->
             receive
                 {resolved, _, GroupName, {slot, RecvdSlot}, Res}
                         when RecvdSlot == TargetSlot orelse TargetSlot == any ->
@@ -305,7 +313,7 @@ await(Worker, GroupName, Base, Req, Opts) ->
                         {worker, Worker},
                         {group, GroupName}
                     }),
-                    await(Worker, GroupName, Base, Req, Opts);
+                    await_compute(Worker, GroupName, Req, TargetSlot, Opts);
                 {'DOWN', _R, process, Worker, _Reason} ->
                     ?event(debug_compute,
                         {leader_died,
@@ -315,8 +323,7 @@ await(Worker, GroupName, Base, Req, Opts) ->
                         }
                     ),
                     {error, leader_died}
-            end
-    end.
+            end.
 
 %% @doc Notify any waiters for a specific slot of the computed results.
 notify_compute(GroupName, SlotToNotify, Res, Opts) ->
