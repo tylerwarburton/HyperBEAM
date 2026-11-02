@@ -47,7 +47,16 @@ view(Pusd, Url, #{ opts := NodeOpts, dir := Dir }) ->
         #{ proc := Proc, slot := Slot, opts := ROpts } ->
             case hb_ao:resolve(Proc, #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, ROpts) of
                 {ok, State} -> {ok, State, ROpts, Info};
-                _ -> {not_yet, <<"PUSD did not compute at slot ", (integer_to_binary(Slot))/binary>>}
+                _ ->
+                    %% Remote Arweave-root nodes expose the slot route as
+                    %% compute&slot=N. Keep the original resolver first for
+                    %% local processes, then use the canonical HTTP-shaped
+                    %% route before declaring the replica unavailable.
+                    Path = <<"compute&slot=", (integer_to_binary(Slot))/binary>>,
+                    case hb_ao:resolve(Proc, #{ <<"path">> => Path }, ROpts) of
+                        {ok, State2} -> {ok, State2, ROpts, Info};
+                        _ -> {not_yet, <<"PUSD did not compute at slot ", (integer_to_binary(Slot))/binary>>}
+                    end
             end
     end.
 
