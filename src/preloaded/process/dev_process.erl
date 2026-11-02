@@ -844,7 +844,12 @@ now(RawBase, Req, Opts) ->
             LatestKnown = lib_process_cache:latest(ProcessID, [], Opts),
             case LatestKnown of
                 {ok, LatestSlot, RawLatestMsg} ->
-                    case lib_process_cache:fresh(ProcessID, LatestSlot, Req, Opts) of
+                    Fresh =
+                        case lib_process_cache:fresh(ProcessID, LatestSlot, Req, Opts) of
+                            true -> behind_schedule(CacheParam, Base, LatestSlot, Opts);
+                            Other -> Other
+                        end,
+                    case Fresh of
                         {error, _} = Error ->
                             Error;
                         true ->
@@ -890,6 +895,24 @@ now(RawBase, Req, Opts) ->
                 _ ->
                     uncached_now(CacheParam, Base, Req, Opts)
             end
+    end.
+
+%% @doc `/now' is never older than the latest slot the scheduler has: a
+%% cached state behind it (as after a restart, before anything computed the
+%% slots assigned since) is not served; the process computes up to it
+%% instead. Only `process-now-from-cache: always' (cache only, by request)
+%% serves it as it is.
+behind_schedule(Always, _Base, _LatestSlot, _Opts)
+        when Always == always; Always == <<"always">> ->
+    true;
+behind_schedule(_CacheParam, Base, LatestSlot, Opts) ->
+    case hb_ao:resolve(Base, #{ <<"path">> => <<"slot/current">> }, Opts) of
+        {ok, Current} ->
+            case hb_util:safe_int(Current) of
+                {ok, C} when C > LatestSlot -> false;
+                _ -> true
+            end;
+        _ -> true
     end.
 
 uncached_now(CacheParam, Base, Req, Opts) ->

@@ -86,7 +86,64 @@ full_script() ->
     >>.
 
 script(<<"lua@5.3a">>) -> full_script();
-script(_) -> patch_script().
+script(_) ->
+    case os:getenv("RESTART_PLAYERS") of
+        false -> patch_script();
+        N -> game_script(list_to_integer(N))
+    end.
+
+%% A game-shaped state of `Players' players (~300 bytes each, all published
+%% at the first slot); every slot updates and publishes one of them.
+game_script(Players) ->
+    iolist_to_binary([
+        "Players = Players or {}
+"
+        "Count = Count or 0
+"
+        "local N = ", integer_to_list(Players), "
+"
+        "local pad = string.rep('p', 200)
+"
+        "local function rec(i, p)
+"
+        "  return '{\"id\":' .. i .. ',\"level\":' .. p.level .. ',\"xp\":' .. p.xp .. ',\"pad\":\"' .. pad .. '\"}'
+"
+        "end
+"
+        "function compute(req)
+"
+        "  local patches = {}
+"
+        "  if Count == 0 then
+"
+        "    for i = 1, N do
+"
+        "      Players[i] = { level = 1, xp = 0 }
+"
+        "      patches[#patches + 1] = { path = '/player-' .. i, value = rec(i, Players[i]) }
+"
+        "    end
+"
+        "  end
+"
+        "  Count = Count + 1
+"
+        "  local i = (Count % N) + 1
+"
+        "  local p = Players[i]
+"
+        "  p.xp = p.xp + 7
+"
+        "  if p.xp > 100 then p.level = p.level + 1; p.xp = 0 end
+"
+        "  patches[#patches + 1] = { path = '/player-' .. i, value = rec(i, p) }
+"
+        "  patches[#patches + 1] = { path = '/count', value = tostring(Count) }
+"
+        "  return { patches = patches, results = { output = { data = tostring(Count) } } }
+"
+        "end
+"]).
 
 process(Device, Opts) ->
     Address = hb_util:human_id(ar_wallet:to_address(hb_opts:get(<<"priv-wallet">>, undefined, Opts))),
@@ -127,6 +184,13 @@ pstate(Store, ProcID, Kind) ->
 
 say(F, A) -> io:format(user, F ++ "~n", A).
 
+du(Dir) ->
+    case string:lexemes(os:cmd("du -sk " ++ Dir ++ " 2>/dev/null"), "	
+") of
+        [K | _] -> list_to_integer(K);
+        _ -> 0
+    end.
+
 run(["serve", Dir, Port]) ->
     % A real node on the same stores, for an HTTP client: runs until killed.
     % RESTART_CONFIG: a node config file (the test node's rendered JSON),
@@ -146,7 +210,9 @@ run(["serve", Dir, Port]) ->
         <<"port">> => list_to_integer(Port),
         <<"priv-wallet">> => hb:wallet(),
         <<"rate-limit-requests">> => 10000000,
-        <<"rate-limit-max">> => 10000000
+        <<"rate-limit-max">> => 10000000,
+        % The restore's own events (`snapshot_load_res', `found_state_checkpoint').
+        <<"debug-print">> => [compute]
     }),
     say("SERVING ~s", [Url]),
     receive after infinity -> ok end;
@@ -180,19 +246,27 @@ run(["build", Device0, N0, Dir]) ->
     ProcID = hb_util:human_id(hb_message:id(Process, all, Opts)),
     ok = file:write_file(Dir ++ "/proc", term_to_binary({ProcID, N})),
     T0 = erlang:monotonic_time(millisecond),
-    lists:foreach(
-        fun(I) ->
-            schedule(Process, I, Opts),
-            _ = compute(Process, I, Opts),
-            case I rem 5000 of
-                0 when I > 0 -> say("BUILD ~s slot=~p", [Device, I]);
-                _ -> ok
-            end
-        end,
-        lists:seq(0, N - 1)),
+    Cadence = cadence(),
+    Times =
+        lists:map(
+            fun(I) ->
+                {T, _} = timer:tc(fun() -> schedule(Process, I, Opts), _ = compute(Process, I, Opts) end),
+                case I rem 5000 of
+                    0 when I > 0 -> say("BUILD ~s slot=~p", [Device, I]);
+                    _ -> ok
+                end,
+                {I, T div 1000}
+            end,
+            lists:seq(0, N - 1)),
     [Main | _] = hb_opts:get(<<"store">>, [], Opts),
-    say("BUILD ~s done slots=~p ms_per_slot=~p snapshots=~p",
-        [Device, N, (erlang:monotonic_time(millisecond) - T0) div N, pstate(Main, ProcID, <<"s">>)]),
+    Med = fun([]) -> 0; (L) -> lists:nth(length(L) div 2 + 1, lists:sort(L)) end,
+    Mean = fun([]) -> 0; (L) -> lists:sum(L) div length(L) end,
+    Ckpt = [ T || {I, T} <- Times, I > 0, I rem Cadence == 0 ],
+    Other = [ T || {I, T} <- Times, I > 0, I rem Cadence =/= 0 ],
+    say("BUILD ~s cadence=~p done slots=~p ms_per_slot=~p median_other=~p checkpoint_slot_mean=~p "
+        "(n=~p) main_kib=~p irr_kib=~p snapshots=~p",
+        [Device, Cadence, N, (erlang:monotonic_time(millisecond) - T0) div N, Med(Other), Mean(Ckpt),
+         length(Ckpt), du(Dir ++ "/main"), du(Dir ++ "/irr"), pstate(Main, ProcID, <<"s">>)]),
     % A crash, not a clean stop.
     os:cmd("kill -9 " ++ os:getpid());
 run(["resume", Device0, Dir]) ->

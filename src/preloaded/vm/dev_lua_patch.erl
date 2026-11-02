@@ -1876,3 +1876,37 @@ request(Number) ->
             <<"number">> => Number
         }
     }.
+
+%% @doc With `process-now-from-cache', `/now' still never answers with a
+%% state older than the latest scheduled slot: a message scheduled after
+%% the last compute (as after a restart, with nothing computing) is
+%% computed before `/now' answers.
+now_from_cache_is_not_behind_the_schedule_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Opts = #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"spawn-worker">> => true,
+            <<"process-worker-spawn">> => true,
+            <<"process-workers">> => true,
+            <<"await-inprogress">> => named,
+            <<"scheduler-lookahead">> => false,
+            <<"process-delta-cache">> => true,
+            <<"process-state-blobs">> => true,
+            <<"process-snapshot-target">> => false,
+            <<"process-now-from-cache">> => true
+        },
+        Process = delta_process(Opts),
+        {ok, _} = hb_cache:write(Process, Opts),
+        Count = fun() ->
+            {ok, Now} = hb_ao:resolve(Process, <<"now">>, Opts),
+            hb_util:int(hb_ao:get(<<"count">>, hb_cache:ensure_all_loaded(Now, Opts), Opts))
+        end,
+        [ {ok, _} = hb_ao:resolve(Process, schedule_request(Process, N, Opts), Opts)
+        || N <- lists:seq(1, 3) ],
+        {ok, _} = hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => 3 }, Opts),
+        Before = Count(),
+        {ok, _} = hb_ao:resolve(Process, schedule_request(Process, 4, Opts), Opts),
+        ?assertEqual(Before + 1, Count())
+    end}.
