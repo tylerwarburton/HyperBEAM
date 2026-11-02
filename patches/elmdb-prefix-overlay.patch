@@ -1,0 +1,274 @@
+diff --git a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
+index 604e0b1..e85a761 100644
+--- a/native/elmdb_nif/src/lib.rs
++++ b/native/elmdb_nif/src/lib.rs
+@@ -29,7 +29,7 @@ use rustler::{Env, Term, NifResult, Error, Encoder, ResourceArc};
+ use rustler::types::binary::Binary;
+ use rustler::types::binary::NewBinary;
+ use rustler::types::binary::OwnedBinary;
+-use std::collections::{HashMap, HashSet};
++use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+ use std::sync::{Arc, Condvar, Mutex};
+ use std::sync::mpsc::{self, Sender, Receiver};
+@@ -1686,12 +1686,9 @@ fn list<'a>(
+     ensure_worker(&db_handle);
+ 
+     let prefix_bytes = key_prefix.as_slice();
+-    let active_empty = db_handle.active.load().is_empty();
+-    let draining_empty = db_handle.draining.load().is_none();
+-    if !active_empty || !draining_empty {
+-        // A failed flush fails later writes, not this read.
+-        let _ = flush_sync(&db_handle);
+-    }
++    // Pending writes are merged into the listing, not flushed first: see
++    // `overlay_prefix_rows'.
++    let overlay = overlay_prefix_rows(&db_handle, prefix_bytes);
+ 
+     let (live_env, live_db) = match db_handle.fast_get_handles() {
+         Ok(handles) => handles,
+@@ -1724,64 +1721,35 @@ fn list<'a>(
+         }
+     };
+ 
+-    let mut children = Vec::with_capacity(64);
++    let mut children: BTreeSet<Vec<u8>> = BTreeSet::new();
+     let prefix_len = prefix_bytes.len();
+-
+-    let cursor_positioned = cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE).is_ok();
+-
+-    if !cursor_positioned {
+-        return Ok(atoms::not_found().encode(env));
+-    }
+-
+-    let cursor_iter = cursor.iter_from(prefix_bytes);
+-
+-    for (key, _value) in cursor_iter {
+-        if !key.starts_with(prefix_bytes) {
+-            break;
+-        }
+-
++    let mut add_component = |key: &[u8]| {
+         let remaining = &key[prefix_len..];
+-
+-        if remaining.is_empty() {
+-            continue;
+-        }
+-
+-        let next_component = if let Some(sep_pos) = remaining.iter().position(|&b| b == b'/') {
+-            &remaining[..sep_pos]
+-        } else {
+-            remaining
++        let next_component = match remaining.iter().position(|&b| b == b'/') {
++            Some(sep_pos) => &remaining[..sep_pos],
++            None => remaining,
+         };
+-
+-        if next_component.is_empty() {
+-            continue;
++        if !next_component.is_empty() && !children.contains(next_component) {
++            children.insert(next_component.to_vec());
+         }
++    };
+ 
+-        let component_exists = if children.len() < 16 {
+-            children
+-                .iter()
+-                .any(|existing: &Vec<u8>| existing.as_slice() == next_component)
+-        } else {
+-            children.binary_search(&next_component.to_vec()).is_ok()
+-        };
+-
+-        if !component_exists {
+-            let component_vec = next_component.to_vec();
+-            if children.len() < 16 {
+-                children.push(component_vec);
+-            } else if let Err(pos) = children.binary_search(&component_vec) {
+-                children.insert(pos, component_vec);
++    if cursor.get(Some(prefix_bytes), None, MDB_SET_RANGE).is_ok() {
++        for (key, _value) in cursor.iter_from(prefix_bytes) {
++            if !key.starts_with(prefix_bytes) {
++                break;
+             }
++            add_component(key);
+         }
+     }
++    for key in overlay.keys() {
++        add_component(key);
++    }
+ 
+     if children.is_empty() {
+         return Ok(atoms::not_found().encode(env));
+     }
+ 
+-    if children.len() < 16 {
+-        children.sort_unstable();
+-    }
+-
+     let mut result_binaries = Vec::with_capacity(children.len());
+ 
+     for child in children {
+@@ -2051,12 +2019,9 @@ fn read_prefix_rows<'a>(
+     ensure_worker(&db_handle);
+ 
+     let prefix_bytes = key_prefix.as_slice();
+-    let active_empty = db_handle.active.load().is_empty();
+-    let draining_empty = db_handle.draining.load().is_none();
+-    if !active_empty || !draining_empty {
+-        // A failed flush fails later writes, not this read.
+-        let _ = flush_sync(&db_handle);
+-    }
++    // Pending writes are merged into the rows, not flushed first: see
++    // `overlay_prefix_rows'.
++    let overlay = overlay_prefix_rows(&db_handle, prefix_bytes);
+ 
+     let (live_env, live_db) = match db_handle.fast_get_handles() {
+         Ok(handles) => handles,
+@@ -2065,6 +2030,10 @@ fn read_prefix_rows<'a>(
+         }
+     };
+ 
++    if !overlay.is_empty() {
++        return read_prefix_rows_merged(env, &live_env, live_db, prefix_bytes, overlay);
++    }
++
+     let txn = match RawReadTxn::begin(&live_env) {
+         Ok(txn) => txn,
+         Err(error_msg) => {
+@@ -2321,6 +2290,136 @@ fn encode_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Term<'a>> {
+     Ok(binary.release(env).encode(env))
+ }
+ 
++/// The pending (uncommitted) writes under `prefix`, as a prefix read must see
++/// them: the active map over the draining map, as in `get`.
++///
++/// Prefix reads used to `flush_sync` instead whenever anything was pending.
++/// Under steady writes something always is, so every composite read -- every
++/// message read -- waited for a whole write transaction, and readers queued
++/// behind the single writer thread. That was most of a busy process worker's
++/// time (prod, 2026-11-02: the order-book vault, 312 slots behind).
++///
++/// Called before the read transaction begins. A write is in the maps loaded
++/// here or, if a flush moved it out first, committed before the transaction's
++/// snapshot. The draining map is read on both sides of the active map: if it
++/// changed, a flush swapped the maps in between and the read is retried, so a
++/// newer value in the active map is never overridden by an older one.
++/// No tombstones exist: deletes commit in the writer (`do_flush_delete`).
++fn overlay_prefix_rows(db: &LmdbDatabase, prefix: &[u8]) -> BTreeMap<Vec<u8>, Vec<u8>> {
++    let mut rows = BTreeMap::new();
++    // After a failed flush the overlay holds writes that were not committed:
++    // read only the committed data, as `get` does.
++    if db.has_fatal_error.load(Ordering::Relaxed) {
++        return rows;
++    }
++    loop {
++        let draining = db.draining.load_full();
++        let active = db.active.load_full();
++        if !Arc::ptr_eq(&draining, &db.draining.load_full()) {
++            continue;
++        }
++        rows.clear();
++        if let Some(ref old_map) = *draining {
++            old_map.iter_sync(|k, v| {
++                if k.starts_with(prefix) {
++                    rows.insert(k.clone(), v.clone());
++                }
++                true
++            });
++        }
++        active.iter_sync(|k, v| {
++            if k.starts_with(prefix) {
++                rows.insert(k.clone(), v.clone());
++            }
++            true
++        });
++        return rows;
++    }
++}
++
++/// `read_prefix_rows` when writes under the prefix are pending: the committed
++/// rows with the pending ones laid over them, in key order.
++fn read_prefix_rows_merged<'a>(
++    env: Env<'a>,
++    live_env: &Arc<Environment>,
++    live_db: Database,
++    prefix: &[u8],
++    mut rows: BTreeMap<Vec<u8>, Vec<u8>>,
++) -> NifResult<Term<'a>> {
++    let txn = match live_env.begin_ro_txn() {
++        Ok(txn) => txn,
++        Err(_) => {
++            return Ok((
++                atoms::error(),
++                atoms::transaction_error(),
++                "Failed to begin read transaction".to_string(),
++            )
++                .encode(env));
++        }
++    };
++    {
++        let mut cursor = match txn.open_ro_cursor(live_db) {
++            Ok(cursor) => cursor,
++            Err(_) => {
++                return Ok((
++                    atoms::error(),
++                    atoms::database_error(),
++                    "Failed to open cursor".to_string(),
++                )
++                    .encode(env));
++            }
++        };
++        if cursor.get(Some(prefix), None, MDB_SET_RANGE).is_ok() {
++            for (key, value) in cursor.iter_from(prefix) {
++                if !key.starts_with(prefix) {
++                    break;
++                }
++                // A pending write is newer than the committed row.
++                rows.entry(key.to_vec()).or_insert_with(|| value.to_vec());
++            }
++        }
++    }
++    if rows.is_empty() {
++        return Ok(atoms::not_found().encode(env));
++    }
++    let mut total_size = 0usize;
++    for (key, value) in rows.iter() {
++        total_size = match row_bytes_size(total_size, key.len(), value.len()) {
++            Some(size) => size,
++            None => {
++                return Ok((
++                    atoms::error(),
++                    atoms::validation_error(),
++                    "Packed prefix result too large".to_string(),
++                )
++                    .encode(env));
++            }
++        };
++    }
++    let mut binary = NewBinary::new(env, total_size);
++    let mut offsets = Vec::with_capacity(rows.len());
++    {
++        let out = binary.as_mut_slice();
++        let mut offset = 0usize;
++        for (key, value) in rows.iter() {
++            out[offset..offset + key.len()].copy_from_slice(key);
++            let value_offset = offset + key.len();
++            out[value_offset..value_offset + value.len()].copy_from_slice(value);
++            offsets.push((offset, key.len(), value_offset, value.len()));
++            offset = value_offset + value.len();
++        }
++    }
++    let packed = Term::from(binary).into_binary()?;
++    let mut result = Vec::with_capacity(offsets.len());
++    for (key_offset, key_size, value_offset, value_size) in offsets {
++        result.push((
++            packed.make_subbinary(key_offset, key_size)?,
++            packed.make_subbinary(value_offset, value_size)?,
++        ));
++    }
++    Ok((atoms::ok(), result).encode(env))
++}
++
+ fn raw_key_has_prefix(key: &ffi::MDB_val, prefix: &[u8]) -> bool {
+     prefix.is_empty()
+         || key.mv_size >= prefix.len()

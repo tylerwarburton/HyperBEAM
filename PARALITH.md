@@ -925,3 +925,21 @@ Lua offline (`run-local-profile.mjs 28 30`, WASM Lua, so indicative only):
 `User.Info` 4.9 ms, `Monster.Feed` 10.6 ms. Our Lua is about half of a slot,
 not a rounding error. The market handlers are tiny; their cost is in what
 they publish afterwards, not yet attributed.
+
+## Prefix reads merge pending writes (2026-11-02)
+
+`patches/elmdb-prefix-overlay.patch` (applied after `elmdb-delete.patch`).
+elmdb's `read_prefix` and `list` used to commit every pending write
+(`flush_sync`) before reading whenever anything was pending, and under steady
+traffic something always is. Every composite read -- every message read --
+then waited on the single writer thread, and on the irreplaceable store
+(`sync: true`) that wait is an fsync'd commit. They now lay the pending rows
+over the committed ones instead (`overlay_prefix_rows`).
+
+Measured on prod (`main`) under the 1,000-wallet swarm, before the patch:
+`read_prefix` on the irreplaceable store mean 12 ms, p95 45 ms, max 100 ms
+for an ABSENT key (pure flush wait) against 0.02 ms for a `get`; main store
+mean 2.8 ms, p95 13 ms. The order-book vault's worker spent ~55% of its time
+there reading assignments and sat 312 slots behind, with ~150 HTTP and push
+waiters queued on it; token/vault round trips were 61 s / 126 s p50.
+`match` and the iterators still flush.

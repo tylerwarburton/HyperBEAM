@@ -636,22 +636,23 @@ read_prefix_composite_test() ->
         read(StoreOpts, #{ <<"read">> => <<"root">> }, #{})
     ),
     ?assertEqual({ok, [<<"a">>, <<"b">>]}, test_list(StoreOpts, <<"root">>)),
-    % If writes are pending, a read of a key with no value waits for their
-    % commit on a dirty IO scheduler: with one normal scheduler online, this
-    % process runs before the read returns.
+    % Pending writes are part of a composite read and a listing without being
+    % committed first (patches/elmdb-prefix-overlay.patch): a new child
+    % appears, a rewritten value reads as the new one, and a prefix that only
+    % pending rows have is found.
+    ok = flush(StoreOpts, #{}, #{}),
     test_write(StoreOpts, <<"root/d">>, <<"3">>),
-    Online = erlang:system_flag(schedulers_online, 1),
-    Self = self(),
-    spawn(
-        fun() ->
-            Self ! reading,
-            read(StoreOpts, #{ <<"read">> => <<"missing">> }, #{}),
-            Self ! read
-        end
+    test_write(StoreOpts, <<"root/a">>, <<"9">>),
+    test_write(StoreOpts, <<"fresh/x">>, <<"4">>),
+    Expected = {composite, [{<<"a">>, <<"9">>}, <<"b">>, {<<"d">>, <<"3">>}]},
+    ?assertEqual(Expected, read(StoreOpts, #{ <<"read">> => <<"root">> }, #{})),
+    ?assertEqual({ok, [<<"a">>, <<"b">>, <<"d">>]}, test_list(StoreOpts, <<"root">>)),
+    ?assertEqual(
+        {composite, [{<<"x">>, <<"4">>}]},
+        read(StoreOpts, #{ <<"read">> => <<"fresh">> }, #{})
     ),
-    receive reading -> Self ! ran end,
-    First = receive Msg when Msg == ran; Msg == read -> Msg end,
-    erlang:system_flag(schedulers_online, Online),
-    receive Next when Next == ran; Next == read -> ok end,
-    ?assertEqual(ran, First),
+    ?assertEqual({ok, [<<"x">>]}, test_list(StoreOpts, <<"fresh">>)),
+    % The same rows once committed.
+    ok = flush(StoreOpts, #{}, #{}),
+    ?assertEqual(Expected, read(StoreOpts, #{ <<"read">> => <<"root">> }, #{})),
     test_stop(StoreOpts).
