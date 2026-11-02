@@ -652,7 +652,25 @@ read_prefix_composite_test() ->
         read(StoreOpts, #{ <<"read">> => <<"fresh">> }, #{})
     ),
     ?assertEqual({ok, [<<"x">>]}, test_list(StoreOpts, <<"fresh">>)),
+    % A bounded listing places pending children inside its window: `c' is
+    % pending, `a', `b', `d' committed or pending around it.
+    test_write(StoreOpts, <<"root/c/z">>, <<"5">>),
+    Bounded = fun(Req) -> list_children(StoreOpts, <<"root">>, Req) end,
+    ?assertEqual({ok, [<<"a">>, <<"b">>]}, Bounded(#{ <<"limit">> => 2 })),
+    ?assertEqual({ok, [<<"b">>, <<"c">>]}, Bounded(#{ <<"from">> => <<"b">>, <<"limit">> => 2 })),
+    ?assertEqual(
+        {ok, [<<"c">>, <<"b">>]},
+        Bounded(#{ <<"from">> => <<"c">>, <<"limit">> => 2, <<"direction">> => desc })
+    ),
+    ?assertEqual(
+        {ok, [<<"d">>, <<"c">>, <<"b">>, <<"a">>]},
+        Bounded(#{ <<"direction">> => desc })
+    ),
     % The same rows once committed.
     ok = flush(StoreOpts, #{}, #{}),
-    ?assertEqual(Expected, read(StoreOpts, #{ <<"read">> => <<"root">> }, #{})),
+    ?assertEqual(
+        {composite, [{<<"a">>, <<"9">>}, <<"b">>, <<"c">>, {<<"d">>, <<"3">>}]},
+        read(StoreOpts, #{ <<"read">> => <<"root">> }, #{})
+    ),
+    ?assertEqual({ok, [<<"b">>, <<"c">>]}, Bounded(#{ <<"from">> => <<"b">>, <<"limit">> => 2 })),
     test_stop(StoreOpts).

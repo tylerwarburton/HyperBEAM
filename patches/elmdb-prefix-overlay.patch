@@ -1,5 +1,5 @@
 diff --git a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
-index 604e0b1..e85a761 100644
+index 604e0b1..2fc01a2 100644
 --- a/native/elmdb_nif/src/lib.rs
 +++ b/native/elmdb_nif/src/lib.rs
 @@ -29,7 +29,7 @@ use rustler::{Env, Term, NifResult, Error, Encoder, ResourceArc};
@@ -108,7 +108,58 @@ index 604e0b1..e85a761 100644
      let mut result_binaries = Vec::with_capacity(children.len());
  
      for child in children {
-@@ -2051,12 +2019,9 @@ fn read_prefix_rows<'a>(
+@@ -1825,12 +1793,9 @@ fn list_from<'a>(
+     }
+ 
+     let prefix_bytes = key_prefix.as_slice();
+-    let active_empty = db_handle.active.load().is_empty();
+-    let draining_empty = db_handle.draining.load().is_none();
+-    if !active_empty || !draining_empty {
+-        // A failed flush fails later writes, not this read.
+-        let _ = flush_sync(&db_handle);
+-    }
++    // Pending writes are merged into the children, not flushed first: see
++    // `overlay_prefix_rows'.
++    let overlay = overlay_prefix_rows(&db_handle, prefix_bytes);
+ 
+     let (live_env, live_db) = match db_handle.fast_get_handles() {
+         Ok(handles) => handles,
+@@ -2017,6 +1982,34 @@ fn list_from<'a>(
+         .and_then(|(key, _)| key.map(|k| k.to_vec()));
+     }
+ 
++    // Lay the pending children over the committed window. The nearest
++    // `limit` children of the union are among the committed window and the
++    // pending children, so merging, ordering for the walk and cutting again
++    // is exact.
++    if !overlay.is_empty() {
++        let mut merged: BTreeSet<Vec<u8>> = children.into_iter().collect();
++        for key in overlay.keys() {
++            let remaining = &key[prefix_len..];
++            let component = match remaining.iter().position(|&b| b == b'/') {
++                Some(sep_pos) => &remaining[..sep_pos],
++                None => remaining,
++            };
++            let behind = !from_bytes.is_empty()
++                && if backward { component > from_bytes } else { component < from_bytes };
++            if !component.is_empty() && !behind {
++                merged.insert(component.to_vec());
++            }
++        }
++        children = if backward {
++            merged.into_iter().rev().collect()
++        } else {
++            merged.into_iter().collect()
++        };
++        if let Some(limit) = limit {
++            children.truncate(limit);
++        }
++    }
++
+     let mut result_binaries = Vec::with_capacity(children.len());
+     for child in children {
+         let mut binary = OwnedBinary::new(child.len()).ok_or(Error::BadArg)?;
+@@ -2051,12 +2044,9 @@ fn read_prefix_rows<'a>(
      ensure_worker(&db_handle);
  
      let prefix_bytes = key_prefix.as_slice();
@@ -124,7 +175,7 @@ index 604e0b1..e85a761 100644
  
      let (live_env, live_db) = match db_handle.fast_get_handles() {
          Ok(handles) => handles,
-@@ -2065,6 +2030,10 @@ fn read_prefix_rows<'a>(
+@@ -2065,6 +2055,10 @@ fn read_prefix_rows<'a>(
          }
      };
  
@@ -135,7 +186,7 @@ index 604e0b1..e85a761 100644
      let txn = match RawReadTxn::begin(&live_env) {
          Ok(txn) => txn,
          Err(error_msg) => {
-@@ -2321,6 +2290,136 @@ fn encode_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Term<'a>> {
+@@ -2321,6 +2315,136 @@ fn encode_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Term<'a>> {
      Ok(binary.release(env).encode(env))
  }
  

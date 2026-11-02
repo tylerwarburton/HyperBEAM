@@ -942,4 +942,7 @@ for an ABSENT key (pure flush wait) against 0.02 ms for a `get`; main store
 mean 2.8 ms, p95 13 ms. The order-book vault's worker spent ~55% of its time
 there reading assignments and sat 312 slots behind, with ~150 HTTP and push
 waiters queued on it; token/vault round trips were 61 s / 126 s p50.
-`match` and the iterators still flush.
+A second pass (same day) covered `list_from`, the NIF behind `hb_store_lmdb:list`:
+the first only patched the unused `list/2`, and listing `<id>/commitments` in
+`hb_cache:read_all_commitments` (every Lua slot) still forced a commit -- ~11%
+of node CPU after the first rollout. `match` and the iterators still flush.
