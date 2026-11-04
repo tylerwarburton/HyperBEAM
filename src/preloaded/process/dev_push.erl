@@ -163,7 +163,20 @@ worker_spawn_opts(Opts) ->
     end.
 
 %% @doc Push a message or slot number, including its downstream results.
-do_push(PrimaryProcess, Assignment, Opts) ->
+%%
+%% A push's own resolutions -- reading a computed state's outbox, its results,
+%% each downstream target's -- never join another request's in-progress
+%% execution, so they take no part in grouping. With the node's
+%% `await-inprogress' on, every one of them named itself by hashing its base
+%% first (`hb_persistent:default_grouper'), and a push's base is a whole
+%% computed process state: an httpsig commit or a SHA-256 of megabytes, per
+%% read, per hop. On prod (2026-11-04) 55 pushes held 58% of the node's CPU
+%% doing it, the run queue sat at 300-600, and the game shards waited for a
+%% core: 0.8 s of wall time per slot for Lua that runs in 30 ms. The one
+%% deliberate rendezvous, scheduling a held message (`push_held_target/4'),
+%% asks for it explicitly and keeps it.
+do_push(PrimaryProcess, Assignment, RawOpts) ->
+    Opts = RawOpts#{ <<"await-inprogress">> => false },
     Slot = hb_ao:get(<<"slot">>, Assignment, Opts),
     ID = lib_process:process_id(PrimaryProcess, #{}, Opts),
     ?event(push, {push_computing_outbox, {process_id, ID}, {slot, Slot}}),
@@ -172,7 +185,12 @@ do_push(PrimaryProcess, Assignment, Opts) ->
             hb_ao:resolve(
                 {as, <<"process@1.0">>, PrimaryProcess},
                     #{ <<"path">> => <<"compute/results">>, <<"slot">> => Slot },
-                    (worker_spawn_opts(Opts))#{ <<"hashpath">> => ignore }
+                    % The compute itself does group: the process worker's
+                    % grouper names it by process id, which is cheap, and is
+                    % how the push reaches the live worker.
+                    (worker_spawn_opts(
+                        maps:remove(<<"await-inprogress">>, Opts)
+                    ))#{ <<"hashpath">> => ignore }
                 )
         catch
             Class:Reason:Trace ->
