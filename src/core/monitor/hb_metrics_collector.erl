@@ -9,6 +9,7 @@
 ).
 -behaviour(prometheus_collector).
 -include("include/hb_http_client.hrl").
+-include_lib("eunit/include/eunit.hrl").
 %%====================================================================
 %% Collector API
 %%====================================================================
@@ -80,6 +81,26 @@ collect_mf(_Registry, Callback) ->
             Phases
         )
     ),
+    ProcessPhases = hb_phase_timer:read_processes(),
+    Callback(
+        prometheus_model_helpers:create_mf(
+            hb_process_phase_seconds_total,
+            "hb_phase_seconds_total per process (phase-timers-processes "
+            "processes get a label; the rest share `other').",
+            counter,
+            ?MODULE,
+            ProcessPhases
+        )
+    ),
+    Callback(
+        prometheus_model_helpers:create_mf(
+            hb_process_phase_count_total,
+            "hb_phase_count_total per process.",
+            counter,
+            ?MODULE,
+            ProcessPhases
+        )
+    ),
 
     ok.
 collect_metrics(hb_phase_seconds_total, Phases) ->
@@ -89,6 +110,15 @@ collect_metrics(hb_phase_seconds_total, Phases) ->
 collect_metrics(hb_phase_count_total, Phases) ->
     prometheus_model_helpers:counter_metrics(
         [ {[{phase, P}], N} || {P, _T, N, _Mean} <- Phases ]
+    );
+collect_metrics(hb_process_phase_seconds_total, Phases) ->
+    prometheus_model_helpers:counter_metrics(
+        [ {[{phase, P}, {process, Proc}], T / 1_000_000}
+        || {P, Proc, T, _N, _Mean} <- Phases ]
+    );
+collect_metrics(hb_process_phase_count_total, Phases) ->
+    prometheus_model_helpers:counter_metrics(
+        [ {[{phase, P}, {process, Proc}], N} || {P, Proc, _T, N, _Mean} <- Phases ]
     );
 collect_metrics(system_load, SystemLoad) ->
     %% Return the gauge metric with no labels
@@ -158,3 +188,24 @@ hackney_pool_stats() ->
 
 create_gauge(Name, Help, Data) ->
     prometheus_model_helpers:create_mf(Name, Help, gauge, ?MODULE, Data).
+%%====================================================================
+%% Tests
+%%====================================================================
+
+process_phases_render_with_process_label_test() ->
+    application:ensure_all_started(prometheus),
+    hb_phase_timer:reset(),
+    hb_phase_timer:record(slot_execution, <<"proc-a">>, 1_500_000),
+    Registry = hb_metrics_collector_test,
+    prometheus_registry:register_collector(Registry, ?MODULE),
+    try
+        Text = prometheus_text_format:format(Registry),
+        ?assertNotEqual(nomatch, binary:match(Text,
+            <<"hb_process_phase_seconds_total{phase=\"slot_execution\",process=\"proc-a\"} 1.5">>)),
+        ?assertNotEqual(nomatch, binary:match(Text,
+            <<"hb_process_phase_count_total{phase=\"slot_execution\",process=\"proc-a\"} 1">>)),
+        ?assertNotEqual(nomatch, binary:match(Text,
+            <<"hb_phase_seconds_total{phase=\"slot_execution\"} 1.5">>))
+    after
+        prometheus_registry:clear(Registry)
+    end.

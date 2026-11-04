@@ -128,6 +128,8 @@ server(GroupName, RawBase, Opts) ->
     ?event(worker, {waiting_for_req, {group, GroupName}}),
     receive
         {resolve, Listener, GroupName, Req, ListenerOpts} ->
+            % Every phase timed in this worker counts against its process.
+            hb_phase_timer:set_process(GroupName),
             TargetSlot = read_slot(Req, not_found, Opts),
             ?event(worker,
                 {work_received,
@@ -292,7 +294,7 @@ await(Worker, GroupName, Base, Req, Opts) ->
             }),
             % A waiter's whole wait: the worker's queue ahead of it plus its
             % own `worker_execute'.
-            hb_phase_timer:time(worker_await, fun() ->
+            hb_phase_timer:time(worker_await, GroupName, fun() ->
                 await_compute(Worker, GroupName, Req, TargetSlot, Opts)
             end)
     end.
@@ -624,6 +626,12 @@ worker_survives_forced_message_slot_test_() ->
         % And it is still there for the next request, which is the entire point
         % of a persistent worker.
         ?assert(is_process_alive(Worker)),
+        % The slot's phases, timed deep inside the worker, count against its
+        % process.
+        Attributed =
+            [ P || {P, G, _, _, _} <- hb_phase_timer:read_processes(), G == Group ],
+        ?assert(lists:member(worker_execute, Attributed)),
+        ?assert(lists:member(slot_execution, Attributed)),
         exit(Worker, normal)
     end}.
 
