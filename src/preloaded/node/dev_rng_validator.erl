@@ -113,6 +113,7 @@ initial_state(Cfg, Opts) ->
     SignOpts = Opts#{ <<"priv-wallet">> => Wallet },
     Pusher = spawn_link(fun() -> pusher(Cfg, SignOpts) end),
     #{ cfg => Cfg, opts => SignOpts, me => Me, dir => Dir, pusher => Pusher,
+        beacon => followed(Dir, maps:get(<<"beacon">>, Cfg)),
         sent => #{}, status => #{ <<"address">> => Me }, last_error => null, last_pass => 0 }.
 
 loop(St = #{ cfg := Cfg }) ->
@@ -137,19 +138,22 @@ pass(St = #{ me := Me, sent := Sent0, dir := Dir }) ->
     AtSlot = to_int(read(<<"now/at-slot">>, St), 0),
     Info = hb_json:decode(read(<<"now/beaconinfo">>, St)),
     Now = os:system_time(millisecond),
-    {Actions, Oldest} = plan(Info, #{ me => Me, sent => Sent0, at_slot => AtSlot,
-        now => Now, exit => maps:get(<<"exit">>, maps:get(cfg, St), false) =:= true }, Dir),
-    Sent = lists:foldl(fun(A, S) -> act(A, S, St#{ now => Now }) end, Sent0, Actions),
+    Successor = successor(Info, St),
+    {Actions, Oldest} = plan(Info, #{ me => Me, sent => Sent0, at_slot => AtSlot, now => Now,
+        exit => maps:get(<<"exit">>, maps:get(cfg, St), false) =:= true, moving => Successor =/= none }, Dir),
+    Sent = lists:foldl(fun(A, S) -> act(A, S, St#{ now => Now }) end, Sent0, batch(Actions, Info)),
     prune(Dir, Oldest),
     Open = obj(<<"open">>, Info),
     Mine = mine(Info, Me),
+    St1 = follow(Successor, Mine, St#{ sent => Sent }),
     % What was sent is only remembered for ten minutes.
-    St#{ sent => maps:filter(fun(_, {At, _}) -> Now - At < 600000 end, Sent),
+    St1#{ sent => maps:filter(fun(_, {At, _}) -> Now - At < 600000 end, maps:get(sent, St1)),
          last_pass => Now, last_error => null,
          status => #{ <<"address">> => Me, <<"round">> => maps:get(<<"round">>, Info, null),
             <<"open">> => maps:get(<<"round">>, Open, null), <<"phase">> => maps:get(<<"phase">>, Open, null),
             <<"suspended">> => maps:get(<<"suspended">>, Mine, null),
-            <<"exiting">> => maps:get(<<"exiting">>, Mine, null), <<"at-slot">> => AtSlot } }.
+            <<"exiting">> => maps:get(<<"exiting">>, Mine, null), <<"at-slot">> => AtSlot,
+            <<"beacon">> => maps:get(beacon, St1) } }.
 
 %% @doc What to send now, from the beacon's `beaconinfo' and what was already
 %% sent: `{[{Kind, Round, Data}], OldestRound}'. Pure, except a commit's fresh
@@ -172,7 +176,7 @@ plan(Info, Ctx = #{ me := Me, now := Now }, Dir) ->
     % validators are active to finish one: otherwise all-suspended waits forever.
     Rejoin =
         [ {<<"Rejoin">>, Round, #{}}
-        || Member, Suspended, not Exiting, not maps:get(exit, Ctx),
+        || Member, Suspended, not Exiting, not maps:get(exit, Ctx), not maps:get(moving, Ctx, false),
            Bond >= to_int(maps:get(<<"slash">>, Params, 0), 0),
            truthy(<<"idle">>, Mine) orelse Active < MinCommits
                orelse Round >= to_int(maps:get(<<"suspendedAt">>, Mine, 0), 0)
@@ -190,6 +194,7 @@ plan(Info, Ctx = #{ me := Me, now := Now }, Dir) ->
     OpenRound = to_int(maps:get(<<"round">>, Open, 0), 0),
     Commit =
         case Member andalso not Suspended andalso not Exiting andalso not maps:get(exit, Ctx)
+            andalso not maps:get(moving, Ctx, false)
             andalso Active >= MinCommits
             andalso lists:member(maps:get(<<"phase">>, Open, null), [<<"collecting">>, <<"commit">>])
             andalso (to_int(maps:get(<<"pending">>, Open, 0), 0) > 0 orelse truthy(<<"heartbeat">>, Params))
@@ -232,16 +237,81 @@ due(Key, #{ sent := Sent, at_slot := AtSlot, now := Now }, Ms) ->
         {At, Slot} -> Slot =< AtSlot andalso Now - At > Ms
     end.
 
-act({Kind, Round, Data}, Sent, St = #{ now := Now }) ->
-    Slot = try send(Kind, Data, St)
-           catch C:R -> ?event(rng_validator, {send_failed, Kind, C, R}), -1
+%% @doc The messages to send for the actions `plan' returned, as
+%% `{Action, Keys, Data}' where `Keys' are the `{Kind, Round}' it settles. On a
+%% beacon with the `act' feature, the commit and every reveal go as one `Act'
+%% message, halving what a round costs the beacon.
+batch(Actions, Info) ->
+    One = fun({K, R, D}) -> {K, [{K, R}], D} end,
+    IsStep = fun({K, _, _}) -> K =:= <<"Commit">> orelse K =:= <<"Reveal">> end,
+    case lists:member(<<"act">>, list(<<"features">>, Info)) of
+        false -> lists:map(One, Actions);
+        true ->
+            {Steps, Rest} = lists:partition(IsStep, Actions),
+            lists:map(One, Rest) ++
+                case Steps of
+                    [] -> [];
+                    [Step] -> [One(Step)];
+                    _ ->
+                        Commit = [D || {<<"Commit">>, _, D} <- Steps],
+                        Data = (maps:from_list([{<<"commit">>, C} || C <- Commit]))#{
+                            <<"reveals">> => [D || {<<"Reveal">>, _, D} <- Steps] },
+                        [{<<"Act">>, [{K, R} || {K, R, _} <- Steps], Data}]
+                end
+    end.
+
+act({Action, Keys, Data}, Sent, St = #{ now := Now, beacon := Beacon }) ->
+    Slot = try send(Action, Data, St)
+           catch C:R -> ?event(rng_validator, {send_failed, Action, C, R}), -1
            end,
-    ?event(rng_validator, {sent, Kind, Round, Slot}),
+    ?event(rng_validator, {sent, Action, Keys, Slot}),
     case {Slot >= 0, maps:find(pusher, St)} of
-        {true, {ok, Pusher}} -> Pusher ! {push, Slot};
+        {true, {ok, Pusher}} -> Pusher ! {push, Beacon, Slot};
         _ -> ok
     end,
-    Sent#{ {Kind, Round} => {Now, Slot} }.
+    maps:merge(Sent, maps:from_list([{K, {Now, Slot}} || K <- Keys])).
+
+%%% Following a successor -----------------------------------------------------
+
+%% @doc The beacon to move to: `{ok, Id}' when this one names a successor that
+%% names it back as its predecessor, else `none'. Until the move, no new
+%% commits: only what this beacon is still owed is revealed.
+successor(Info, St = #{ beacon := Beacon }) ->
+    case maps:get(<<"successor">>, Info, <<>>) of
+        Next when is_binary(Next), byte_size(Next) =:= 43, Next =/= Beacon ->
+            try hb_json:decode(read(<<"now/beaconinfo">>, St#{ beacon => Next })) of
+                #{ <<"predecessor">> := Beacon } -> {ok, Next};
+                _ -> none
+            catch _:_ -> none
+            end;
+        _ -> none
+    end.
+
+%% Move once nothing is owed here, and remember where we are.
+follow({ok, Next}, Mine, St = #{ dir := Dir, cfg := Cfg }) ->
+    case list(<<"obligations">>, Mine) of
+        [] ->
+            ?event(rng_validator, {following, Next}),
+            File = filename:join(Dir, "beacon.json"),
+            ok = file:write_file(File ++ ".tmp", hb_json:encode(#{
+                <<"configured">> => maps:get(<<"beacon">>, Cfg), <<"beacon">> => Next })),
+            ok = file:rename(File ++ ".tmp", File),
+            St#{ beacon => Next, sent => #{} };
+        _ -> St
+    end;
+follow(none, _Mine, St) -> St.
+
+%% The beacon this validator moved to, while the configured one is unchanged;
+%% a different configured beacon starts the walk again from it.
+followed(Dir, Configured) ->
+    case file:read_file(filename:join(Dir, "beacon.json")) of
+        {ok, Bin} ->
+            case catch hb_json:decode(Bin) of
+                #{ <<"configured">> := Configured, <<"beacon">> := B } when is_binary(B) -> B;
+                _ -> Configured
+            end;
+        _ -> Configured
+    end.
 
 %% Scheduling a message does not compute it: the node's follower waits
 %% (`process-compute-on-schedule-ms') to fold slots, which left the beacon 6-8
@@ -250,9 +320,8 @@ act({Kind, Round, Data}, Sent, St = #{ now := Now }) ->
 %% highest slot, which computes every one before it. Never retried.
 pusher(Cfg, Opts) ->
     receive
-        {push, Slot0} ->
-            Slot = newest(Slot0),
-            Beacon = maps:get(<<"beacon">>, Cfg),
+        {push, Beacon, Slot0} ->
+            Slot = newest(Beacon, Slot0),
             % Nothing a push returns or throws may end the pusher.
             Ok = try hb_http:get(maps:get(<<"node">>, Cfg),
                     <<"/", Beacon/binary, "~process@1.0/push&slot=", (integer_to_binary(Slot))/binary>>, Opts) of
@@ -264,12 +333,11 @@ pusher(Cfg, Opts) ->
             pusher(Cfg, Opts)
     end.
 
-newest(Slot) ->
-    receive {push, S} -> newest(max(Slot, S)) after 0 -> Slot end.
+newest(Beacon, Slot) ->
+    receive {push, Beacon, S} -> newest(Beacon, max(Slot, S)) after 0 -> Slot end.
 
 %% Schedule one signed message on the beacon; its slot, or -1 if unknown.
-send(Action, Data, #{ cfg := Cfg, opts := Opts }) ->
-    Beacon = maps:get(<<"beacon">>, Cfg),
+send(Action, Data, #{ cfg := Cfg, opts := Opts, beacon := Beacon }) ->
     Msg = hb_message:commit(#{
         <<"target">> => Beacon, <<"type">> => <<"Message">>, <<"action">> => Action,
         <<"data">> => hb_json:encode(Data)
@@ -280,8 +348,7 @@ send(Action, Data, #{ cfg := Cfg, opts := Opts }) ->
     to_int(hb_maps:get(<<"slot">>, Res, -1, Opts), -1).
 
 %% A published key of the beacon, as a binary.
-read(Key, #{ cfg := Cfg, opts := Opts }) ->
-    Beacon = maps:get(<<"beacon">>, Cfg),
+read(Key, #{ cfg := Cfg, opts := Opts, beacon := Beacon }) ->
     {ok, Res} = hb_http:get(maps:get(<<"node">>, Cfg),
         <<"/", Beacon/binary, "~process@1.0/", Key/binary>>, Opts),
     case Res of
@@ -434,9 +501,34 @@ exit_then_finalize_test() ->
     ?assertEqual([<<"Finalize-Exit">>], kinds(B)).
 
 pushes_fold_into_newest_slot_test() ->
-    [self() ! {push, S} || S <- [12, 15, 13]],
-    ?assertEqual(15, newest(10)),
-    ?assertEqual(4, newest(4)).
+    [self() ! {push, <<"b">>, S} || S <- [12, 15, 13]],
+    self() ! {push, <<"other">>, 99},
+    ?assertEqual(15, newest(<<"b">>, 10)),
+    ?assertEqual(4, newest(<<"b">>, 4)),
+    receive {push, <<"other">>, 99} -> ok after 0 -> ?assert(false) end.
+
+batch_into_act_test() ->
+    A = [{<<"Rejoin">>, 7, #{}}, {<<"Commit">>, 9, #{ <<"c">> => <<"c9">> }},
+         {<<"Reveal">>, 8, #{ <<"alpha">> => <<"a8">> }}],
+    ?assertEqual([{<<"Rejoin">>, [{<<"Rejoin">>, 7}], #{}},
+        {<<"Act">>, [{<<"Commit">>, 9}, {<<"Reveal">>, 8}],
+            #{ <<"commit">> => #{ <<"c">> => <<"c9">> }, <<"reveals">> => [#{ <<"alpha">> => <<"a8">> }] }}],
+        batch(A, #{ <<"features">> => [<<"act">>] })),
+    % Without the feature, or with one step, nothing is merged.
+    ?assertEqual(3, length(batch(A, #{}))),
+    ?assertEqual([{<<"Commit">>, [{<<"Commit">>, 9}], #{ <<"c">> => <<"c9">> }}],
+        batch([lists:nth(2, A)], #{ <<"features">> => [<<"act">>] })).
+
+no_commit_while_moving_test() ->
+    Open = #{ <<"round">> => 3, <<"phase">> => <<"collecting">> },
+    ?assertEqual({[], 3}, plan(info(Open, #{}), (ctx(#{}))#{ moving => true }, tmp_dir())).
+
+followed_restarts_when_config_changes_test() ->
+    Dir = tmp_dir(),
+    ok = file:write_file(filename:join(Dir, "beacon.json"),
+        hb_json:encode(#{ <<"configured">> => <<"old">>, <<"beacon">> => <<"new">> })),
+    ?assertEqual(<<"new">>, followed(Dir, <<"old">>)),
+    ?assertEqual(<<"other">>, followed(Dir, <<"other">>)).
 
 prune_old_secrets_test() ->
     Dir = tmp_dir(),
