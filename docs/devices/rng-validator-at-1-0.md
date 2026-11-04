@@ -3,26 +3,58 @@
 ## Overview
 
 `~rng-validator@1.0` runs this node as one validator of an Any-Honest RNG
-beacon. The node's `start` hook spawns a loop that reads the beacon's published
-`beaconinfo` and, on every pass:
+beacon (Random-Process `v2/ANY_HONEST.md`). The node's `start` hook spawns a
+loop that reads the beacon's published `beaconinfo` and, on every pass:
 
 1. makes a fresh puzzle when a round can take one: a secret `alpha` and the
    commit `c = g^alpha mod N` in `~rng@1.0`'s fixed group. The secret is
-   written to disk before `Commit` is sent;
-2. sends `Close` once a round's commit window has passed;
-3. sends `Reveal` with the stored secret once the beacon shows the round
-   revealing;
-4. sends `Rejoin` after a suspension while its bond covers the next slash;
-5. with `exit` set, sends `Exit`, then `Finalize-Exit` until it lands.
+   written to disk before the commit is sent;
+2. reveals each stored secret once the beacon shows its round revealing;
+3. says `Ready` whenever it can work and `Pause` when it should stop taking
+   rounds (see below);
+4. sends `Close` once a round's commit window has passed;
+5. with `exit` set, sends `Exit`, then `Finalize-Exit` until it lands;
+6. follows a successor beacon (see below).
 
 Cracking (solving a withheld puzzle without its secret) is not part of this
 device. One crack is minutes of a busy CPU core and needs no validator key, so
 it runs as a separate service that anyone may operate for the beacon's crack
 bounty.
 
-A message the node scheduled is resent only after the beacon has computed past
-its slot (`now/at-slot`) and still shows no effect, so a lagging beacon is never
-flooded.
+On a beacon that lists `act` in `features`, the commit and every reveal of a
+pass go as one `Act` message, which halves what a round costs the beacon.
+
+After every scheduled message the device asks the node to compute it
+(`push&slot=<slot>`), from one pusher process: one push in flight, queued
+requests fold into the highest slot. A message is resent only after the
+beacon has computed past its slot (`now/at-slot`) and still shows no effect, so
+a lagging beacon is never flooded.
+
+## Ready and Pause
+
+On a beacon that lists `ready` in `features`, a ready validator is given
+rounds and is slashed in full for every one it fails (a missed commit or a
+missed reveal). The device:
+
+- says `Ready` when it is a member in good standing (owes no late output), is
+  not exiting, is not following a successor, and there is no `pause` file;
+- says `Pause` when any of those stops being true, and then still commits to a
+  round whose set it is in and reveals everything it committed to.
+
+To take a node offline safely, create `pause` in `secrets-dir`, wait until
+`status` shows `ready: false` and the beacon no longer lists rounds the
+validator owes (a few seconds), then stop the node. Delete the file after the
+restart to rejoin. Stopping a ready validator without pausing costs a slash
+for every round it was given and did not finish.
+
+A beacon without the `ready` feature gets the older suspend/rejoin behaviour.
+
+## Following a successor
+
+When the beacon publishes a `successor` whose own `beaconinfo` names this
+beacon as its `predecessor`, the device pauses, reveals what it still owes,
+then moves and records the move in `secrets-dir/beacon.json`. Setting a
+different `beacon` in the node config starts the walk again from there.
 
 ## Configuration
 
@@ -33,7 +65,7 @@ Under the node option `rng-validator`:
 | `beacon` | The beacon process id (required). |
 | `node` | URL of the node the beacon is scheduled on (required). |
 | `wallet-file` | JWK the validator signs with. Default: the node's wallet. |
-| `secrets-dir` | Where secrets are kept (default `rng-validator-secrets`). Must survive restarts. |
+| `secrets-dir` | Secrets, `beacon.json` and the `pause` file (default `rng-validator-secrets`). Must survive restarts. |
 | `interval` | Milliseconds between passes (default 100). |
 | `exit` | `true` to leave the validator set. |
 
@@ -46,18 +78,19 @@ Under the node option `rng-validator`:
 
 Several start hooks run in order when `on.start` is a list.
 
-Moving from the `anyhonest-validator.mjs` daemon: stop the daemon, copy its
+Moving from the `anyhonest-validator.mjs` daemon: stop the daemon, merge its
 `secrets/*.json` into `secrets-dir` (same format: `<round>.json` holding
-`{c: alpha}`), then start the device with the daemon's wallet as `wallet-file`.
-Without the copy, rounds the daemon committed cannot be revealed: the
-validator stays overdue until they are cracked or abandoned.
+`{c: alpha}`; merge the objects, never skip a file that exists), then start
+the device with the daemon's wallet as `wallet-file`. Without the merge,
+rounds the daemon committed cannot be revealed.
 
 ## Keys
 
 ### `status`
 
-`GET /~rng-validator@1.0/status`: the validator's address, the beacon's round
-and phase, `at-slot`, and the last pass and error.
+`GET /~rng-validator@1.0/status`: the validator's address, the beacon it
+follows, the beacon's round and phase, `ready`, `paused`, `stake`, `faults`,
+`at-slot`, and the last pass and error.
 
 ### `start`
 

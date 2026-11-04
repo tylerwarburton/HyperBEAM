@@ -140,66 +140,97 @@ pass(St = #{ me := Me, sent := Sent0, dir := Dir }) ->
     Now = os:system_time(millisecond),
     Successor = successor(Info, St),
     {Actions, Oldest} = plan(Info, #{ me => Me, sent => Sent0, at_slot => AtSlot, now => Now,
-        exit => maps:get(<<"exit">>, maps:get(cfg, St), false) =:= true, moving => Successor =/= none }, Dir),
+        exit => maps:get(<<"exit">>, maps:get(cfg, St), false) =:= true, moving => Successor =/= none,
+        pause => filelib:is_regular(filename:join(Dir, "pause")) }, Dir),
     Sent = lists:foldl(fun(A, S) -> act(A, S, St#{ now => Now }) end, Sent0, batch(Actions, Info)),
     prune(Dir, Oldest),
     Open = obj(<<"open">>, Info),
     Mine = mine(Info, Me),
-    St1 = follow(Successor, Mine, St#{ sent => Sent }),
+    St1 = follow(Successor, obligations(Info, Me), St#{ sent => Sent }),
     % What was sent is only remembered for ten minutes.
     St1#{ sent => maps:filter(fun(_, {At, _}) -> Now - At < 600000 end, maps:get(sent, St1)),
          last_pass => Now, last_error => null,
          status => #{ <<"address">> => Me, <<"round">> => maps:get(<<"round">>, Info, null),
             <<"open">> => maps:get(<<"round">>, Open, null), <<"phase">> => maps:get(<<"phase">>, Open, null),
             <<"suspended">> => maps:get(<<"suspended">>, Mine, null),
+            <<"ready">> => maps:get(<<"ready">>, Mine, null), <<"paused">> => maps:get(<<"paused">>, Mine, null),
+            <<"stake">> => maps:get(<<"stake">>, Mine, null), <<"faults">> => maps:get(<<"faults">>, Mine, null),
             <<"exiting">> => maps:get(<<"exiting">>, Mine, null), <<"at-slot">> => AtSlot,
             <<"beacon">> => maps:get(beacon, St1) } }.
 
 %% @doc What to send now, from the beacon's `beaconinfo' and what was already
 %% sent: `{[{Kind, Round, Data}], OldestRound}'. Pure, except a commit's fresh
 %% secret, which is written to `Dir' before the commit is returned.
+%%
+%% On a beacon with the `ready' feature a validator is ready (given rounds,
+%% and slashed for every duty it fails) or not. The device says Ready whenever
+%% it can work: a member in good standing, not leaving, not following a
+%% successor, and no `pause' file in `secrets-dir'. It says Pause when one of
+%% those stops being true, then still does every round it was already given.
+%% Older beacons get the suspend/rejoin behaviour they understand.
 plan(Info, Ctx = #{ me := Me, now := Now }, Dir) ->
     Open = obj(<<"open">>, Info),
     Params = obj(<<"params">>, Info),
     Mine = mine(Info, Me),
     Round = to_int(maps:get(<<"round">>, Info, 0), 0),
     MinCommits = to_int(maps:get(<<"minCommits">>, Params, 2), 2),
-    Active = length([V || V <- list(<<"validators">>, Info),
-        not truthy(<<"suspended">>, V), not truthy(<<"exiting">>, V), not truthy(<<"overdue">>, V)]),
+    ReadyMode = lists:member(<<"ready">>, list(<<"features">>, Info)),
+    IsActive = fun(V) when ReadyMode ->
+                       truthy(<<"ready">>, V) andalso not truthy(<<"exiting">>, V) andalso not truthy(<<"overdue">>, V);
+                  (V) ->
+                       not truthy(<<"suspended">>, V) andalso not truthy(<<"exiting">>, V) andalso not truthy(<<"overdue">>, V)
+               end,
+    Active = length([V || V <- list(<<"validators">>, Info), IsActive(V)]),
     Due = fun(Kind, R, Ms) -> due({Kind, R}, Ctx, Ms) end,
     Member = Mine =/= #{},
-    Suspended = truthy(<<"suspended">>, Mine),
     Exiting = truthy(<<"exiting">>, Mine),
-    Bond = to_int(maps:get(<<"bond">>, Mine, 0), 0),
-    % Suspended: rejoin on our own while the bond still covers the next slash.
-    % The cooldown counts finished rounds, so it is waived while too few
-    % validators are active to finish one: otherwise all-suspended waits forever.
-    Rejoin =
-        [ {<<"Rejoin">>, Round, #{}}
-        || Member, Suspended, not Exiting, not maps:get(exit, Ctx), not maps:get(moving, Ctx, false),
-           Bond >= to_int(maps:get(<<"slash">>, Params, 0), 0),
-           truthy(<<"idle">>, Mine) orelse Active < MinCommits
-               orelse Round >= to_int(maps:get(<<"suspendedAt">>, Mine, 0), 0)
-                   + to_int(maps:get(<<"rejoinAfter">>, Params, 0), 0),
-           Due(<<"Rejoin">>, Round, 3000) ],
+    Stopping = maps:get(exit, Ctx) orelse maps:get(moving, Ctx, false) orelse maps:get(pause, Ctx, false),
+    Available = Member andalso IsActive(Mine),
+    Standing =
+        case ReadyMode of
+            true ->
+                Ready = truthy(<<"ready">>, Mine),
+                [ {<<"Ready">>, 0, #{}}
+                || Member, not Ready, not Exiting, not Stopping, not truthy(<<"overdue">>, Mine),
+                   Due(<<"Ready">>, 0, 30000) ] ++
+                [ {<<"Pause">>, 0, #{}}
+                || Member, Ready, not Exiting, Stopping, not maps:get(exit, Ctx), Due(<<"Pause">>, 0, 3000) ];
+            false ->
+                % Suspended: rejoin on our own while the bond still covers the
+                % next slash. The cooldown counts finished rounds, so it is
+                % waived while too few validators are active to finish one.
+                [ {<<"Rejoin">>, Round, #{}}
+                || Member, truthy(<<"suspended">>, Mine), not Exiting, not Stopping,
+                   to_int(maps:get(<<"bond">>, Mine, 0), 0) >= to_int(maps:get(<<"slash">>, Params, 0), 0),
+                   truthy(<<"idle">>, Mine) orelse Active < MinCommits
+                       orelse Round >= to_int(maps:get(<<"suspendedAt">>, Mine, 0), 0)
+                           + to_int(maps:get(<<"rejoinAfter">>, Params, 0), 0),
+                   Due(<<"Rejoin">>, Round, 3000) ]
+        end,
     Leave =
         case maps:get(exit, Ctx) andalso Member of
             false -> [];
             true when not Exiting -> [ {<<"Exit">>, 0, #{}} || Due(<<"Exit">>, 0, 3000) ];
             true -> [ {<<"Finalize-Exit">>, 0, #{}} || Due(<<"Finalize-Exit">>, 0, 30000) ]
         end,
-    % Commit as soon as the cadence allows: every round with the heartbeat on,
-    % else only rounds with requests waiting. A round with fewer active
-    % validators than minCommits can only void; the beacon refuses to open it.
+    % A round taking its first commit is opened only by an available validator
+    % that is not stopping. A round already open is owed by every validator in
+    % its set, stopping or not. The cadence and heartbeat decide when to open.
     OpenRound = to_int(maps:get(<<"round">>, Open, 0), 0),
+    Phase = maps:get(<<"phase">>, Open, null),
+    InSet = lists:member(Me, list(<<"active">>, Open)),
+    MayCommit =
+        case Phase of
+            <<"collecting">> ->
+                Available andalso not Stopping andalso Active >= MinCommits
+                    andalso (to_int(maps:get(<<"pending">>, Open, 0), 0) > 0 orelse truthy(<<"heartbeat">>, Params))
+                    andalso Now >= to_int(maps:get(<<"nextRoundAt">>, Info, 0), 0);
+            <<"commit">> when ReadyMode -> InSet;
+            <<"commit">> -> Available andalso not Stopping;
+            _ -> false
+        end,
     Commit =
-        case Member andalso not Suspended andalso not Exiting andalso not maps:get(exit, Ctx)
-            andalso not maps:get(moving, Ctx, false)
-            andalso Active >= MinCommits
-            andalso lists:member(maps:get(<<"phase">>, Open, null), [<<"collecting">>, <<"commit">>])
-            andalso (to_int(maps:get(<<"pending">>, Open, 0), 0) > 0 orelse truthy(<<"heartbeat">>, Params))
-            andalso Now >= to_int(maps:get(<<"nextRoundAt">>, Info, 0), 0)
-            andalso not maps:is_key(Me, obj(<<"committed">>, Open))
+        case MayCommit andalso not maps:is_key(Me, obj(<<"committed">>, Open))
             andalso Due(<<"Commit">>, OpenRound, 1000) of
             false -> [];
             true ->
@@ -213,21 +244,47 @@ plan(Info, Ctx = #{ me := Me, now := Now }, Dir) ->
     Rounds = list(<<"revealing">>, Info) ++ [Open],
     PerRound = lists:flatmap(fun(X) ->
         R = to_int(maps:get(<<"round">>, X, 0), 0),
-        Phase = maps:get(<<"phase">>, X, null),
+        XPhase = maps:get(<<"phase">>, X, null),
         Deadline = to_int(maps:get(<<"commitDeadline">>, X, 0), 0),
         Mine0 = maps:get(Me, obj(<<"committed">>, X), undefined),
         % If the window has passed by our clock but it still shows commits, ask
         % it to close; reveal only once the beacon shows the round revealing.
         [ {<<"Close">>, R, #{ <<"round">> => R }}
-        || Phase =:= <<"commit">>, Deadline > 0, Now >= Deadline, Due(<<"Close">>, R, 2000) ] ++
+        || XPhase =:= <<"commit">>, Deadline > 0, Now >= Deadline, Due(<<"Close">>, R, 2000) ] ++
         [ {<<"Reveal">>, R, #{ <<"round">> => R, <<"alpha">> => A }}
-        || Phase =:= <<"reveal">>, is_binary(Mine0),
+        || XPhase =:= <<"reveal">>, is_binary(Mine0),
            not lists:member(Me, list(<<"revealed">>, X)),
            Due(<<"Reveal">>, R, 3000),
-           A <- [maps:get(Mine0, secrets(Dir, R), missing)], A =/= missing ]
+           A <- [secret_for(Mine0, secrets(Dir, R))], A =/= missing ]
     end, Rounds),
     Oldest = lists:min([to_int(maps:get(<<"round">>, X, 0), 0) || X <- Rounds]),
-    {Rejoin ++ Leave ++ Commit ++ PerRound, Oldest}.
+    {Standing ++ Leave ++ Commit ++ PerRound, Oldest}.
+
+%% @doc The secret for a commitment the beacon shows whole, or as the prefix a
+%% newer beacon publishes until the round is late.
+secret_for(Shown, Secrets) ->
+    case maps:get(Shown, Secrets, missing) of
+        missing ->
+            Len = byte_size(Shown),
+            case [A || {C, A} <- maps:to_list(Secrets), byte_size(C) > Len, binary:part(C, 0, Len) =:= Shown] of
+                [A | _] -> A;
+                [] -> missing
+            end;
+        A -> A
+    end.
+
+%% @doc Rounds this validator still owes something: a reveal for a round it
+%% committed to, or a commit to the open round whose set it is in.
+obligations(Info, Me) ->
+    Open = obj(<<"open">>, Info),
+    Owed = [R || X <- list(<<"revealing">>, Info) ++ [Open],
+                 maps:is_key(Me, obj(<<"committed">>, X)),
+                 not lists:member(Me, list(<<"revealed">>, X)),
+                 R <- [to_int(maps:get(<<"round">>, X, 0), 0)]],
+    InOpenSet = maps:get(<<"phase">>, Open, null) =:= <<"commit">>
+        andalso lists:member(Me, list(<<"active">>, Open))
+        andalso not maps:is_key(Me, obj(<<"committed">>, Open)),
+    Owed ++ [to_int(maps:get(<<"round">>, Open, 0), 0) || InOpenSet].
 
 %% Sent: #{ {Kind, Round} => {At, Slot} }. Not sent yet, or the beacon has
 %% computed past the slot it was given and `Ms' have passed with no effect.
@@ -288,8 +345,8 @@ successor(Info, St = #{ beacon := Beacon }) ->
     end.
 
 %% Move once nothing is owed here, and remember where we are.
-follow({ok, Next}, Mine, St = #{ dir := Dir, cfg := Cfg }) ->
-    case list(<<"obligations">>, Mine) of
+follow({ok, Next}, Owed, St = #{ dir := Dir, cfg := Cfg }) ->
+    case Owed of
         [] ->
             ?event(rng_validator, {following, Next}),
             File = filename:join(Dir, "beacon.json"),
@@ -299,7 +356,7 @@ follow({ok, Next}, Mine, St = #{ dir := Dir, cfg := Cfg }) ->
             St#{ beacon => Next, sent => #{} };
         _ -> St
     end;
-follow(none, _Mine, St) -> St.
+follow(none, _Owed, St) -> St.
 
 %% The beacon this validator moved to, while the configured one is unchanged;
 %% a different configured beacon starts the walk again from it.
@@ -529,6 +586,59 @@ followed_restarts_when_config_changes_test() ->
         hb_json:encode(#{ <<"configured">> => <<"old">>, <<"beacon">> => <<"new">> })),
     ?assertEqual(<<"new">>, followed(Dir, <<"old">>)),
     ?assertEqual(<<"other">>, followed(Dir, <<"other">>)).
+
+ready_info(Open, Me, Extra) ->
+    maps:merge(#{
+        <<"round">> => 7, <<"nextRoundAt">> => 0, <<"features">> => [<<"act">>, <<"ready">>],
+        <<"params">> => #{ <<"minCommits">> => 2, <<"heartbeat">> => 1 },
+        <<"validators">> => [Me, #{ <<"address">> => <<"other">>, <<"ready">> => true }],
+        <<"open">> => Open, <<"revealing">> => []
+    }, Extra).
+
+ready_when_it_can_work_test() ->
+    Open = #{ <<"round">> => 3, <<"phase">> => <<"collecting">> },
+    NotReady = #{ <<"address">> => ?ME, <<"ready">> => false },
+    {A, _} = plan(ready_info(Open, NotReady, #{}), ctx(#{}), tmp_dir()),
+    ?assertEqual([<<"Ready">>], kinds(A)),
+    % Owing a late output: not in good standing, so no Ready (and no commit).
+    {B, _} = plan(ready_info(Open, NotReady#{ <<"overdue">> => true }, #{}), ctx(#{}), tmp_dir()),
+    ?assertEqual([], kinds(B)),
+    % A pause file: no Ready.
+    {C, _} = plan(ready_info(Open, NotReady, #{}), (ctx(#{}))#{ pause => true }, tmp_dir()),
+    ?assertEqual([], kinds(C)).
+
+pause_still_owes_its_rounds_test() ->
+    Me = #{ <<"address">> => ?ME, <<"ready">> => true },
+    Collecting = #{ <<"round">> => 3, <<"phase">> => <<"collecting">> },
+    % Ready and a pause file: say Pause, and open no new round.
+    {A, _} = plan(ready_info(Collecting, Me, #{}), (ctx(#{}))#{ pause => true }, tmp_dir()),
+    ?assertEqual([<<"Pause">>], kinds(A)),
+    % Paused, but in the set of a round already open: still commit.
+    InSet = #{ <<"round">> => 3, <<"phase">> => <<"commit">>, <<"active">> => [?ME, <<"other">>],
+        <<"committed">> => #{ <<"other">> => <<"x">> } },
+    Paused = #{ <<"address">> => ?ME, <<"ready">> => false, <<"paused">> => true },
+    {B, _} = plan(ready_info(InSet, Paused, #{}), (ctx(#{}))#{ pause => true }, tmp_dir()),
+    ?assertEqual([<<"Commit">>], kinds(B)),
+    % Not in the set: never commit to it.
+    {C, _} = plan(ready_info(InSet#{ <<"active">> => [<<"other">>] }, Me, #{}), ctx(#{}), tmp_dir()),
+    ?assertEqual([], kinds(C)).
+
+reveal_by_prefix_test() ->
+    Dir = tmp_dir(),
+    C = commit(alpha()),
+    save_secret(Dir, 3, C, <<"a1">>),
+    Me = #{ <<"address">> => ?ME, <<"ready">> => true },
+    R = #{ <<"round">> => 3, <<"phase">> => <<"reveal">>,
+        <<"committed">> => #{ ?ME => binary:part(C, 0, 16) }, <<"revealed">> => [] },
+    {A, 3} = plan(ready_info(#{ <<"round">> => 4, <<"phase">> => <<"commit">>, <<"active">> => [] }, Me,
+        #{ <<"revealing">> => [R] }), ctx(#{}), Dir),
+    ?assertEqual([{<<"Reveal">>, 3, #{ <<"round">> => 3, <<"alpha">> => <<"a1">> }}], A).
+
+obligations_test() ->
+    Info = #{ <<"open">> => #{ <<"round">> => 5, <<"phase">> => <<"commit">>, <<"active">> => [?ME] },
+        <<"revealing">> => [#{ <<"round">> => 4, <<"committed">> => #{ ?ME => <<"c">> }, <<"revealed">> => [] },
+                            #{ <<"round">> => 3, <<"committed">> => #{ ?ME => <<"c">> }, <<"revealed">> => [?ME] }] },
+    ?assertEqual([4, 5], obligations(Info, ?ME)).
 
 prune_old_secrets_test() ->
     Dir = tmp_dir(),
