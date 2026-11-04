@@ -135,8 +135,15 @@ loop(St = #{ cfg := Cfg }) ->
 %% One pass: read the beacon, act on what `plan' says, prune old secrets.
 pass(St = #{ me := Me, sent := Sent0, dir := Dir }) ->
     % Before the state read, so the state is at least this far along.
-    AtSlot = to_int(read(<<"now/at-slot">>, St), 0),
+    % Both reads at once, `at-slot' started first, so the state is about as far
+    % along as the slot: one wait per pass instead of two in a row. A slot read
+    % a little late only lets a resend come early, and a resend also needs its
+    % `Ms' to pass.
+    Self = self(),
+    Ref = make_ref(),
+    spawn_link(fun() -> Self ! {Ref, catch read(<<"now/at-slot">>, St)} end),
     Info = hb_json:decode(read(<<"now/beaconinfo">>, St)),
+    AtSlot = receive {Ref, AtBin} -> to_int(AtBin, 0) after 30000 -> 0 end,
     Now = os:system_time(millisecond),
     Successor = successor(Info, St),
     {Actions, Oldest} = plan(Info, #{ me => Me, sent => Sent0, at_slot => AtSlot, now => Now,
@@ -247,10 +254,12 @@ plan(Info, Ctx = #{ me := Me, now := Now }, Dir) ->
         XPhase = maps:get(<<"phase">>, X, null),
         Deadline = to_int(maps:get(<<"commitDeadline">>, X, 0), 0),
         Mine0 = maps:get(Me, obj(<<"committed">>, X), undefined),
-        % If the window has passed by our clock but it still shows commits, ask
-        % it to close; reveal only once the beacon shows the round revealing.
+        % Reveal only once the beacon shows the round revealing. An older beacon
+        % is asked to close a round its window has passed; a `ready' beacon
+        % closes rounds by itself on every message, and a Close there is only a
+        % message in the way of the next commit (three a round, 2026-11-04).
         [ {<<"Close">>, R, #{ <<"round">> => R }}
-        || XPhase =:= <<"commit">>, Deadline > 0, Now >= Deadline, Due(<<"Close">>, R, 2000) ] ++
+        || not ReadyMode, XPhase =:= <<"commit">>, Deadline > 0, Now >= Deadline, Due(<<"Close">>, R, 2000) ] ++
         [ {<<"Reveal">>, R, #{ <<"round">> => R, <<"alpha">> => A }}
         || XPhase =:= <<"reveal">>, is_binary(Mine0),
            not lists:member(Me, list(<<"revealed">>, X)),
@@ -540,7 +549,11 @@ close_after_deadline_test() ->
     Open = #{ <<"round">> => 4, <<"phase">> => <<"commit">>, <<"commitDeadline">> => 50,
         <<"committed">> => #{ ?ME => <<"x">> } },
     {A, 4} = plan(info(Open, #{}), ctx(#{}), tmp_dir()),
-    ?assertEqual([<<"Close">>], kinds(A)).
+    ?assertEqual([<<"Close">>], kinds(A)),
+    % A `ready' beacon closes rounds itself: no Close.
+    Me = #{ <<"address">> => ?ME, <<"ready">> => true },
+    {B, 4} = plan(ready_info(Open#{ <<"active">> => [?ME] }, Me, #{}), ctx(#{}), tmp_dir()),
+    ?assertEqual([], kinds(B)).
 
 rejoin_when_suspended_test() ->
     Info = info(#{ <<"round">> => 3, <<"phase">> => <<"collecting">> }, #{
