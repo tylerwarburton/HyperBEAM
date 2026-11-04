@@ -875,7 +875,7 @@ resolve_request(Path, Singleton, NodeMsg) ->
         {ErlStatus, Res} =
             hb_ao:resolve_many(
                 PreProcessedMsgs,
-                HTTPOpts#{ <<"force-message">> => true }
+                (read_opts(Request, HTTPOpts))#{ <<"force-message">> => true }
             ),
         % The result keeps its Erlang status unless the `response' hook returns
         % an error.
@@ -888,6 +888,24 @@ resolve_request(Path, Singleton, NodeMsg) ->
                     get_opts(NodeMsg)
                 )},
         {Request, {ErlStatus, Body}}
+    end.
+
+%% @doc The options a request resolves under. A hashpath has two consumers:
+%% the node's signature on a reply (`force-signed', or the request's
+%% `accept-signature', `accept_signature/2') and result caching. A GET whose
+%% reply is not signed uses neither, and computing it commits each stage's
+%% whole base with httpsig: for `/<pid>~process@1.0/now/<key>' that is the
+%% entire process state, for one key. Measured on the prod node 2026-11-04
+%% from inside it: 3.38M reductions (1.9 s) per vault read with a hashpath,
+%% 0.32M (0.17 s) without; a game shard 2.24M against 0.15M. The swarm's
+%% ~170 reads/s alone held all 15 cores and cut the shards from ~12 to ~3
+%% slots/s.
+read_opts(Request, Opts) ->
+    IsGet = hb_maps:get(<<"method">>, Request, <<"GET">>, Opts) == <<"GET">>,
+    Signed = hb_opts:get(force_signed, false, accept_signature(Request, Opts)),
+    case IsGet andalso Signed =/= true of
+        true -> Opts#{ <<"hashpath">> => ignore };
+        false -> Opts
     end.
 
 %% @doc Execute a hook from the node message upon the user's request, and
@@ -2756,3 +2774,14 @@ force_signed_follows_config_test() ->
     ?assertEqual(false,
         hb_maps:get(<<"force-signed">>,
             set_default_opts(Base#{ <<"force-signed">> => false }), unset, #{})).
+
+%% @doc An unsigned GET resolves without a hashpath; a POST, or a GET whose
+%% reply is signed (by config or `accept-signature'), keeps it.
+read_opts_test() ->
+    Opts = #{ <<"force-signed">> => false },
+    ?assertEqual(ignore,
+        maps:get(<<"hashpath">>, read_opts(#{ <<"method">> => <<"GET">> }, Opts))),
+    ?assertNot(maps:is_key(<<"hashpath">>,
+        read_opts(#{ <<"method">> => <<"POST">> }, Opts))),
+    ?assertNot(maps:is_key(<<"hashpath">>,
+        read_opts(#{ <<"method">> => <<"GET">> }, Opts#{ <<"force-signed">> => true }))).

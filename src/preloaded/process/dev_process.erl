@@ -290,10 +290,16 @@ compute(Base, Req, Opts) ->
 %% that came back behind after a restart caught up at the slow rate and never
 %% reached its worker: the prod vault (1.2 MB state) computed 1.8 slots/s for
 %% hours with 13,731 requests queued behind it, 2026-11-04.
+%% Nor does any nested resolution group: the worker already computes with
+%% `await-inprogress => false', but an inline leader inherited its caller's
+%% (a push's schedule asks for `true'), and `hb_persistent:default_grouper'
+%% then named every `hb_ao:get' of the slot by a SHA-256 of the whole state's
+%% `term_to_binary': 55% of the node's samples, prod 2026-11-04.
 slot_opts(Opts) ->
     Opts#{
         <<"hashpath">> => ignore,
-        <<"result-cache-lookup">> => false
+        <<"result-cache-lookup">> => false,
+        <<"await-inprogress">> => false
     }.
 
 %% @doc Return the slot requested by a `compute' request, or `not_found'.

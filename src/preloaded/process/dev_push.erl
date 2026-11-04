@@ -554,7 +554,14 @@ push_held_target(TargetID, MsgToPush, Origin, Opts) ->
                     <<"cache-control">> => <<"always">>,
                     <<"hashpath">> => update,
                     <<"async-cache">> => false,
-                    <<"await-inprogress">> => true
+                    <<"await-inprogress">> => true,
+                    <<"push-held-message">> =>
+                        {
+                            maps:get(<<"process">>, Origin),
+                            hb_util:int(maps:get(<<"slot">>, Origin)),
+                            hb_util:bin(maps:get(<<"outbox-key">>, Origin)),
+                            MsgToPush
+                        }
                 }
             ) of
                 {ok, Receipt} ->
@@ -805,20 +812,7 @@ schedule(Base, Req, Opts) ->
         Key = hb_maps:get(<<"outbox-key">>, Req, [], Opts),
         ExecutionOpts = lib_process:execution_opts(Opts),
         {ok, Process} ?= hb_cache:read(ProcessID, ExecutionOpts),
-        {ok, Result} ?=
-            hb_ao:resolve(
-                {as, <<"process@1.0">>, Process},
-                #{
-                    <<"path">> => <<"compute/results">>,
-                    <<"slot">> => hb_maps:get(<<"slot">>, Req, [], Opts)
-                },
-                ExecutionOpts
-            ),
-        Outbox =
-            hb_ao:normalize_keys(
-                hb_private:reset(hb_ao:get(<<"outbox">>, Result, Opts))
-            ),
-        RawMsg = hb_maps:get(Key, Outbox, [], Opts),
+        {ok, RawMsg} ?= outbox_message(Process, ProcessID, Req, Key, ExecutionOpts),
         MsgToPush =
             case maybe_evaluate_message(RawMsg, Opts) of
                 {ok, R} -> R;
@@ -883,6 +877,39 @@ schedule(Base, Req, Opts) ->
                 _ -> {error, target_process_not_found(Target)}
             end,
         {ok, receipt(Target, Assignment, Opts)}
+    end.
+
+%% @doc The outbox message that `schedule/3' delivers. A push of a local target
+%% (`push_held_target/4') already holds it: its own push read it from the
+%% slot's results, which the process worker computed on this node. Computing
+%% the slot again to find it was not only repeated work: a push delivers an
+%% outbox in order and waits on each target's downstream chain, so its later
+%% messages reached `schedule' minutes after their slot, by when retention
+%% had deleted every row below the newest checkpoint, and each one replayed
+%% the process from slot 0 -- 246 such replays of the order-book vault at once
+%% on prod, 2026-11-04, ~2,100 slots behind its head. The held message names
+%% its process, slot and outbox key, so it answers only that request. Any
+%% other request -- a remote node's push of an outbox entry -- computes the
+%% slot, as before.
+outbox_message(Process, ProcessID, Req, Key, Opts) ->
+    Slot = hb_util:int(hb_maps:get(<<"slot">>, Req, [], Opts)),
+    BinKey = hb_util:bin(Key),
+    case hb_opts:get(<<"push-held-message">>, undefined, Opts) of
+        {ProcessID, Slot, BinKey, Held} -> {ok, Held};
+        _ ->
+            maybe
+                {ok, Result} ?=
+                    hb_ao:resolve(
+                        {as, <<"process@1.0">>, Process},
+                        #{ <<"path">> => <<"compute/results">>, <<"slot">> => Slot },
+                        Opts
+                    ),
+                Outbox =
+                    hb_ao:normalize_keys(
+                        hb_private:reset(hb_ao:get(<<"outbox">>, Result, Opts))
+                    ),
+                {ok, hb_maps:get(Key, Outbox, [], Opts)}
+            end
     end.
 
 %% @doc What a push keeps of an outbox message it scheduled: the slot on the
@@ -1224,6 +1251,20 @@ parse_redirect(Location, Opts) ->
 %%% Tests
 
 %% @doc A target that failed to resolve is skipped until its entry expires.
+%% @doc A push of a local target schedules the outbox message it holds, and
+%% computes nothing: the held message answers only its own process, slot and
+%% outbox key.
+outbox_message_uses_held_message_test() ->
+    PID = <<"process-id">>,
+    Msg = #{ <<"target">> => <<"t">>, <<"data">> => <<"x">> },
+    Opts = #{ <<"push-held-message">> => {PID, 5, <<"1">>, Msg} },
+    ?assertEqual({ok, Msg},
+        outbox_message(#{}, PID, #{ <<"slot">> => 5 }, <<"1">>, Opts)),
+    ?assertEqual({ok, Msg},
+        outbox_message(#{}, PID, #{ <<"slot">> => <<"5">> }, 1, Opts)),
+    ?assertNotEqual({ok, Msg},
+        catch outbox_message(#{}, PID, #{ <<"slot">> => 6 }, <<"1">>, Opts)).
+
 missing_target_memory_test() ->
     ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
     ?assertNot(recently_missing(ID, 600)),
