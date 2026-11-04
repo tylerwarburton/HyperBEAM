@@ -398,6 +398,7 @@ write_process_assignments(
     ) ->
     case write_process_assignments(ProcessID, Targets, NextSlot, Opts) of
         {ok, NewNextSlot} ->
+            compute_on_schedule(ProcessID, NextSlot, NewNextSlot, Opts),
             NewState =
                 State#{
                     <<"synced-to">> =>
@@ -413,6 +414,42 @@ write_process_assignments(
                 Error -> Error
             end;
         Error -> Error
+    end.
+
+%% @doc A slot this node learns is computed promptly, as `scheduler@1.0'
+%% computes the slots it assigns (`dev_scheduler_server:compute_on_schedule').
+%% An Arweave schedule is pulled, not pushed: a sync writes new slots when
+%% somebody asks, and nothing then computed them, so `/now' stayed at the old
+%% slot. The PUSD bridge waited on exactly that: every attestor had signed a
+%% deposit, PUSD held the three messages at slots 17-19, and the credit never
+%% appeared until a compute was forced by hand (2026-11-04). One compute to
+%% the newest slot, through the process's worker; it discards the state, so
+%% it neither names nor stores it. `process-compute-on-schedule' false turns
+%% it off, as for `scheduler@1.0'.
+compute_on_schedule(_ProcessID, From, To, _Opts) when To =< From -> ok;
+compute_on_schedule(ProcessID, _From, To, Opts) ->
+    case hb_util:atom(hb_opts:get(<<"process-compute-on-schedule">>, true, Opts)) of
+        false -> ok;
+        _ ->
+            spawn(fun() ->
+                try
+                    {ok, Process} = hb_cache:read(ProcessID, Opts),
+                    hb_ao:resolve(
+                        Process,
+                        #{ <<"path">> => <<"compute">>, <<"slot">> => To - 1 },
+                        Opts#{
+                            <<"spawn-worker">> => true,
+                            <<"hashpath">> => ignore,
+                            <<"cache-control">> => [<<"no-store">>]
+                        }
+                    )
+                catch Class:Reason ->
+                    ?event(warning, {arweave_compute_on_schedule_failed,
+                        {process, ProcessID}, {slot, To - 1},
+                        {class, Class}, {reason, Reason}})
+                end
+            end),
+            ok
     end.
 
 write_process_assignments(_ProcessID, [], Slot, _Opts) -> {ok, Slot};
