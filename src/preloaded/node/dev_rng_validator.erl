@@ -110,7 +110,9 @@ initial_state(Cfg, Opts) ->
     Dir = hb_util:list(maps:get(<<"secrets-dir">>, Cfg, <<"rng-validator-secrets">>)),
     ok = filelib:ensure_path(Dir),
     _ = file:change_mode(Dir, 8#700),
-    #{ cfg => Cfg, opts => Opts#{ <<"priv-wallet">> => Wallet }, me => Me, dir => Dir,
+    SignOpts = Opts#{ <<"priv-wallet">> => Wallet },
+    Pusher = spawn(fun() -> pusher(Cfg, SignOpts) end),
+    #{ cfg => Cfg, opts => SignOpts, me => Me, dir => Dir, pusher => Pusher,
         sent => #{}, status => #{ <<"address">> => Me }, last_error => null, last_pass => 0 }.
 
 loop(St = #{ cfg := Cfg }) ->
@@ -235,7 +237,30 @@ act({Kind, Round, Data}, Sent, St = #{ now := Now }) ->
            catch C:R -> ?event(rng_validator, {send_failed, Kind, C, R}), -1
            end,
     ?event(rng_validator, {sent, Kind, Round, Slot}),
+    case {Slot >= 0, maps:find(pusher, St)} of
+        {true, {ok, Pusher}} -> Pusher ! {push, Slot};
+        _ -> ok
+    end,
     Sent#{ {Kind, Round} => {Now, Slot} }.
+
+%% Scheduling a message does not compute it: the node's follower waits
+%% (`process-compute-on-schedule-ms') to fold slots, which left the beacon 6-8
+%% messages behind. `push&slot' computes the slot now and delivers its outbox,
+%% as the old daemon did. One push at a time; queued requests fold into the
+%% highest slot, which computes every one before it. Never retried.
+pusher(Cfg, Opts) ->
+    receive
+        {push, Slot0} ->
+            Slot = newest(Slot0),
+            Beacon = maps:get(<<"beacon">>, Cfg),
+            Res = (catch hb_http:get(maps:get(<<"node">>, Cfg),
+                <<"/", Beacon/binary, "~process@1.0/push&slot=", (integer_to_binary(Slot))/binary>>, Opts)),
+            ?event(rng_validator, {pushed, Slot, element(1, Res)}),
+            pusher(Cfg, Opts)
+    end.
+
+newest(Slot) ->
+    receive {push, S} -> newest(max(Slot, S)) after 0 -> Slot end.
 
 %% Schedule one signed message on the beacon; its slot, or -1 if unknown.
 send(Action, Data, #{ cfg := Cfg, opts := Opts }) ->
@@ -402,6 +427,11 @@ exit_then_finalize_test() ->
     Exiting = info(Open, #{ <<"validators">> => [#{ <<"address">> => ?ME, <<"exiting">> => true }] }),
     {B, _} = plan(Exiting, (ctx(#{}))#{ exit => true }, tmp_dir()),
     ?assertEqual([<<"Finalize-Exit">>], kinds(B)).
+
+pushes_fold_into_newest_slot_test() ->
+    [self() ! {push, S} || S <- [12, 15, 13]],
+    ?assertEqual(15, newest(10)),
+    ?assertEqual(4, newest(4)).
 
 prune_old_secrets_test() ->
     Dir = tmp_dir(),
