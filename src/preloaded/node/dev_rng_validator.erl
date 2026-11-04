@@ -111,7 +111,7 @@ initial_state(Cfg, Opts) ->
     ok = filelib:ensure_path(Dir),
     _ = file:change_mode(Dir, 8#700),
     SignOpts = Opts#{ <<"priv-wallet">> => Wallet },
-    Pusher = spawn(fun() -> pusher(Cfg, SignOpts) end),
+    Pusher = spawn_link(fun() -> pusher(Cfg, SignOpts) end),
     #{ cfg => Cfg, opts => SignOpts, me => Me, dir => Dir, pusher => Pusher,
         sent => #{}, status => #{ <<"address">> => Me }, last_error => null, last_pass => 0 }.
 
@@ -253,9 +253,14 @@ pusher(Cfg, Opts) ->
         {push, Slot0} ->
             Slot = newest(Slot0),
             Beacon = maps:get(<<"beacon">>, Cfg),
-            Res = (catch hb_http:get(maps:get(<<"node">>, Cfg),
-                <<"/", Beacon/binary, "~process@1.0/push&slot=", (integer_to_binary(Slot))/binary>>, Opts)),
-            ?event(rng_validator, {pushed, Slot, element(1, Res)}),
+            % Nothing a push returns or throws may end the pusher.
+            Ok = try hb_http:get(maps:get(<<"node">>, Cfg),
+                    <<"/", Beacon/binary, "~process@1.0/push&slot=", (integer_to_binary(Slot))/binary>>, Opts) of
+                     {ok, _} -> ok;
+                     _ -> error
+                 catch _:_ -> error
+                 end,
+            ?event(rng_validator, {pushed, Slot, Ok}),
             pusher(Cfg, Opts)
     end.
 
