@@ -46,6 +46,12 @@ Under the node option `rng-validator`:
 
 Several start hooks run in order when `on.start` is a list.
 
+Moving from the `anyhonest-validator.mjs` daemon: stop the daemon, copy its
+`secrets/*.json` into `secrets-dir` (same format: `<round>.json` holding
+`{c: alpha}`), then start the device with the daemon's wallet as `wallet-file`.
+Without the copy, rounds the daemon committed cannot be revealed: the
+validator stays overdue until they are cracked or abandoned.
+
 ## Keys
 
 ### `status`
