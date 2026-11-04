@@ -349,7 +349,12 @@ follow(Proc, Opts) ->
 %% push does, or every follow-up compute would restore the process anew.
 %% Without workers every follow-up compute would restore the process from
 %% its last checkpoint, so a node without them has no follower.
-follower_opts(Opts) -> Opts#{ <<"spawn-worker">> => true }.
+%% The follower discards the state it asks for, so it never names it either:
+%% with `hashpath => update' its resolution hashed the whole returned state
+%% for a hashpath nobody reads, about once a second for every busy process
+%% (`worker_slot_does_not_hash_state_test_').
+follower_opts(Opts) ->
+    Opts#{ <<"spawn-worker">> => true, <<"hashpath">> => ignore }.
 
 workers(Opts) ->
     hb_opts:get(<<"process-workers">>, false, Opts) == true orelse

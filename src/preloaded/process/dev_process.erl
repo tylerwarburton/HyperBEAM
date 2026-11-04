@@ -259,9 +259,10 @@ compute(Base, Req, Opts) ->
                     ),
                     {ok, mark_cached_state(without_snapshot(Result, Opts), Opts)};
                 {error, not_found} ->
+                    SlotOpts = slot_opts(Opts),
                     {ok, Loaded} =
                         hb_phase_timer:time(ensure_loaded, fun() ->
-                            ensure_loaded(ProcBase, Req, Opts)
+                            ensure_loaded(ProcBase, Req, SlotOpts)
                         end),
                     ?event(compute,
                         {computing, {process_id, ProcID},
@@ -273,10 +274,27 @@ compute(Base, Req, Opts) ->
                         Loaded,
                         Req,
                         Slot,
-                        Opts
+                        SlotOpts
                     )
             end
     end.
+
+%% @doc The options every slot is computed under, whoever computes it: the
+%% process worker, or the first caller after a restart (an HTTP request, a
+%% push, the compute-on-schedule follower) computing inline before a worker
+%% exists. A computed slot is stored and read by slot number
+%% (`lib_process_cache'), never by ID or hashpath, so the nested resolutions
+%% (`set', `next', `execution', `at-slot') must not content-address the
+%% process state: with `hashpath => update' each commits the whole state with
+%% httpsig. That was fixed for the worker alone (2026-10-27), so a process
+%% that came back behind after a restart caught up at the slow rate and never
+%% reached its worker: the prod vault (1.2 MB state) computed 1.8 slots/s for
+%% hours with 13,731 requests queued behind it, 2026-11-04.
+slot_opts(Opts) ->
+    Opts#{
+        <<"hashpath">> => ignore,
+        <<"result-cache-lookup">> => false
+    }.
 
 %% @doc Return the slot requested by a `compute' request, or `not_found'.
 target_slot(Req, Opts) ->
