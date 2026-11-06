@@ -764,12 +764,16 @@ worker_survives_forced_message_slot_test_() ->
         % And it is still there for the next request, which is the entire point
         % of a persistent worker.
         ?assert(is_process_alive(Worker)),
-        % The slot's phases, timed deep inside the worker, count against its
-        % process.
+        % The worker's phases count against its group; the slot's, timed deep
+        % inside the worker, against the process it computes
+        % (`hb_slot_log:end_slot/8').
         Attributed =
-            [ P || {P, G, _, _, _} <- hb_phase_timer:read_processes(), G == Group ],
-        ?assert(lists:member(worker_execute, Attributed)),
-        ?assert(lists:member(slot_execution, Attributed)),
+            fun(Label) ->
+                [ P || {P, G, _, _, _} <- hb_phase_timer:read_processes(), G == Label ]
+            end,
+        ?assert(lists:member(worker_execute, Attributed(Group))),
+        ProcID = lib_process:process_id(Base, #{}, Opts),
+        ?assert(lists:member(slot_execution, Attributed(ProcID))),
         exit(Worker, normal)
     end}.
 

@@ -146,8 +146,8 @@ compute(Key, RawBase, RawReq, Opts) ->
         {lua_patch_timing, {prep_us, T1 - T0}, {lua_us, T2 - T1}},
         Opts
     ),
-    hb_phase_timer:record(lua_patch_prep, T1 - T0),
-    hb_phase_timer:record(lua_patch_lua, T2 - T1),
+    hb_slot_log:note(lua_patch_prep, T1 - T0),
+    hb_slot_log:note(lua_patch_lua, T2 - T1),
     process_response(collect(InSlot, Base, Req, Response, Opts), Base, OldPriv, Opts).
 
 %% @doc A process can consume tag values as literal URIs. This policy comes
@@ -199,7 +199,7 @@ collect(true, Base, Req, {ok, Values, State}, Opts) ->
     case Interval > 0 andalso slot(Req, Opts) of
         Slot when is_integer(Slot), Slot rem Interval == 0 ->
             {Micros, Collected} = timer:tc(fun() -> hb_luerl_gc:gc(State) end),
-            hb_phase_timer:record(lua_patch_gc, Micros),
+            hb_slot_log:note(lua_patch_gc, Micros),
             {ok, Values, Collected};
         _ -> {ok, Values, State}
     end;
@@ -297,8 +297,8 @@ process_response({ok, [Status, Encoded], NewState}, Base, Priv, Opts) ->
                 },
                 Opts
             ),
-            hb_phase_timer:record(lua_patch_decode, DecodeMicros),
-            hb_phase_timer:record(lua_patch_apply, ApplyMicros),
+            hb_slot_log:note(lua_patch_decode, DecodeMicros),
+            hb_slot_log:note(lua_patch_apply, ApplyMicros),
             case Applied of
                 {ok, Patched, Delta} ->
                     {

@@ -20,9 +20,14 @@
 %%% `hb_process_phase_count_total{phase,process}'. Only the first
 %%% `phase-timers-processes' (default 128) processes get their own label;
 %%% later ones share `other', so throwaway spawns cannot grow the series.
+%%%
+%%% A computed slot is recorded by `hb_slot_log:end_slot/8', against the
+%%% process it computes rather than the caller's label, and the same owner
+%%% process holds that module's table (`slot-log' options, `configure/1').
 -module(hb_phase_timer).
 -export([configure/1, enabled/0, record/2, record/3, time/2, time/3]).
 -export([set_process/1, read/0, read_processes/0, reset/0]).
+-export([label/1, record_node/2, record_label/3]).
 -include_lib("eunit/include/eunit.hrl").
 
 -define(TABLE, hb_phase_timer).
@@ -52,7 +57,7 @@ configure(Opts) ->
         Max -> ok;
         _ -> persistent_term:put(?MAX_KEY, Max)
     end,
-    ok.
+    hb_slot_log:configure(Opts).
 
 %% @doc Whether recording is on.
 enabled() -> persistent_term:get(?ENABLED_KEY, true).
@@ -96,6 +101,22 @@ record(Phase, Process, Micros) when is_integer(Micros) ->
     end,
     ok.
 
+%% @doc Add to the node-wide total of `Phase' only.
+record_node(Phase, Micros) when is_integer(Micros) ->
+    case enabled() of
+        true -> add(Phase, Micros);
+        false -> ok
+    end,
+    ok.
+
+%% @doc Add to `Label''s total of `Phase' only; `Label' comes from `label/1'.
+record_label(Phase, Label, Micros) when is_integer(Micros) ->
+    case enabled() of
+        true -> add({Phase, Label}, Micros);
+        false -> ok
+    end,
+    ok.
+
 %% @doc Run `Fun', record its wall time under `Phase', and return its result.
 time(Phase, Fun) ->
     case enabled() of
@@ -124,18 +145,25 @@ add(Key, Micros) ->
 
 %% A process keeps the label it was given; a new one gets its own while fewer
 %% than the cap have one, `other' after. A racing admission can overshoot the
-%% counter, which only means one fewer label.
+%% counter, which only means one fewer label. Once the cap is reached a miss
+%% is a read, never a write: every slot of an unlabelled process asks.
+%% @doc The label samples for `Process' are counted under.
 label(Process) ->
     ensure_table(),
+    Max = max_processes(),
     try ets:lookup(?PROCS, Process) of
         [_] -> Process;
         [] ->
-            Admitted = ets:update_counter(?PROCS, '$count', 1, {'$count', 0}),
-            case Admitted =< max_processes() of
-                true ->
+            Full =
+                case ets:lookup(?PROCS, '$count') of
+                    [{_, Count}] -> Count >= Max;
+                    [] -> false
+                end,
+            case Full orelse ets:update_counter(?PROCS, '$count', 1, {'$count', 0}) > Max of
+                false ->
                     ets:insert(?PROCS, {Process}),
                     Process;
-                false -> ?OTHER
+                true -> ?OTHER
             end
     catch error:badarg -> ?OTHER
     end.
@@ -166,26 +194,34 @@ reset() ->
     try ets:delete_all_objects(?TABLE) catch error:badarg -> true end,
     try ets:delete_all_objects(?PROCS) catch error:badarg -> true end,
     erase(?LABEL_KEY),
-    ok.
+    hb_slot_log:reset().
 
 %% The tables are owned by a process that never exits: a table dies with its
-%% owner, and the first recorder is usually a short-lived request.
+%% owner, and the first recorder is usually a short-lived request. The slot
+%% log's table is created first, so finding this module's tables means it
+%% exists too; the owner that created it sweeps it every minute.
 ensure_table() ->
-    case ets:whereis(?TABLE) of
-        undefined ->
+    case ets:whereis(?TABLE) =/= undefined andalso
+            ets:whereis(hb_slot_log) =/= undefined of
+        false ->
             Parent = self(),
             Ref = make_ref(),
             {Owner, Mon} =
                 spawn_monitor(
                     fun() ->
-                        try ets:new(?PROCS, [named_table, public, set,
-                                {read_concurrency, true}]) of
-                            _ ->
+                        SlotLog = create(fun hb_slot_log:new_table/0),
+                        Timers =
+                            create(fun() ->
+                                ets:new(?PROCS, [named_table, public, set,
+                                    {read_concurrency, true}]),
                                 ets:new(?TABLE, [named_table, public, set,
-                                    {write_concurrency, true}]),
-                                Parent ! {Ref, created},
-                                receive after infinity -> ok end
-                        catch error:badarg -> Parent ! {Ref, exists}
+                                    {write_concurrency, true}])
+                            end),
+                        Parent ! {Ref, done},
+                        case {SlotLog, Timers} of
+                            {false, false} -> ok;
+                            {true, _} -> sweep_loop();
+                            {false, true} -> receive after infinity -> ok end
                         end
                     end
                 ),
@@ -196,8 +232,18 @@ ensure_table() ->
             end,
             erlang:demonitor(Mon, [flush]),
             ok;
-        _ -> ok
+        true -> ok
     end.
+
+create(Fun) ->
+    try Fun(), true
+    catch error:badarg -> false
+    end.
+
+sweep_loop() ->
+    receive after 60000 -> ok end,
+    catch hb_slot_log:sweep(),
+    sweep_loop().
 
 record_and_read_test() ->
     reset(),
@@ -244,7 +290,10 @@ processes_over_the_cap_share_other_test() ->
             [{p, <<"other">>, 3, 3, 1},
                 {p, <<"proc-1">>, 2, 2, 1},
                 {p, <<"proc-2">>, 1, 1, 1}],
-            read_processes())
+            read_processes()),
+        % Past the cap a miss is a read: the admission counter stays put.
+        [ label(<<"late-", (integer_to_binary(I))/binary>>) || I <- lists:seq(1, 100) ],
+        ?assertEqual([{'$count', 2}], ets:lookup(?PROCS, '$count'))
     after
         configure(#{})
     end.

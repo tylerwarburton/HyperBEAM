@@ -914,6 +914,70 @@ kill -9 mid-burst then restart on the same store (`docker kill -s KILL`, two
 timings): no confirmed slot missing on either build, and the scheduler resumes
 at or above the newest confirmed slot.
 
+## Per-process slot log (`/~hyperbuddy@1.0/slots`, 2026-11-05)
+
+`hb_slot_log` keeps, per AO process, cumulative counters of every computed
+slot (slots, error slots, and the microseconds of prep, execution, store and
+each Lua phase), cumulative counters per action (32 per process, the rest
+under `other`), and a ring of the last `slot-log-size` slots used only for
+percentiles. `GET /~hyperbuddy@1.0/slots?window=60[&pid=<id>]` serves it as
+JSON with `cache-control: no-store`, adding each process's worker phases,
+computed and durable slot, backlog and mailbox, and the node's phase totals
+and delivery backlog. Every process with counters is listed whatever its
+last slot, so a client diffing them keeps its baseline across idle gaps;
+`window` bounds only the ring rows behind the percentiles. The swarm
+supervisor scrapes it every 10 s and diffs the counters; a restart shows as
+a lower `uptime_s`. A `failure` (nothing computed or stored, the slot is
+retried) adds only to `error_slots`; `slots`, `last_slot` and the phase
+counters count computed slots.
+
+Attribution is fixed with it. Every slot is counted once, against the
+process `compute_slot` computed (`hb_phase_timer:label(ProcID)`), on all
+three result branches (`ok`, a stored `error`, an unstored `failure`), and
+`slot_next` is timed per process. Before, an inline slot (computed by a
+request, not a worker) carried no label, about 4.4% of slots, and error slots
+were not timed at all. Lua phases are noted inside the slot's execution
+(`hb_slot_log:run/1`) and added to that slot alone; a nested compute keeps
+its own notes. `/metrics` is unchanged in shape: `phase-timers-processes`
+stays 128, and `slot_execution` now also counts error and failure slots.
+
+Options (node message, read at HTTP server start):
+
+| Option | Default | Effect |
+|---|---|---|
+| `slot-log` | `true` | `false` stops the slot log; phase timers keep working |
+| `slot-log-size` | 128 | ring rows per process, 16-256 |
+| `slot-log-processes` | 512 | processes with their own counters; later ones only add to `unassigned` |
+| `phase-timers` | `true` | `false` also turns the slot log off |
+
+At most 65,536 ring rows in all (`slot-log-processes` is lowered to fit). A
+process idle 15 minutes with no process worker is evicted by a sweep every
+minute in the `hb_phase_timer` table owner, freeing its admission.
+
+Trade-offs, measured in Docker (erlang:27, `hb_slot_log` eunit):
+
+| Measure | Effect |
+|---|---|
+| Speed | `end_slot` 4.2-4.4 us per slot over 100,000 calls (5 us is a 0.1% tax on a 5 ms slot, 0.004% on a 120 ms one). Against the 7 `record/2` calls it replaces, the same within noise. |
+| Endpoint | about 10 ms to build and encode 47 processes x 128 rows (23 KB); paid only when read |
+| Memory | 1.8 MB of ETS for 47 processes x 128 rows; hard cap about 21 MB of rows plus about 1 MB of counters |
+| Storage | none; ETS only, lost on restart |
+| Atoms | none; keys and actions are binaries. Actions are cut to 64 printable ASCII bytes. 10,000 distinct actions add fewer than 10 atoms (eunit). |
+| Reliability | no new process; the endpoint reads ETS only and never blocks |
+| Atomicity | none; observational only |
+
+**It needs a node restart, not a hot load.** The table is created when the
+`hb_phase_timer` owner starts, and the compute path, the Lua device and the
+endpoint change together. A hot load into a running node would create the
+table from the next recorder but leave the old owner, and any slot in flight
+across the swap would be counted by old and new code.
+
+Still to measure before it ships (Tyler, on hb-test with one image):
+`slot-log` true against false, 5 runs each, `slot_execution` and
+`worker_execute` medians within 2%; `npm run load:gate` with `/slots` scraped
+once a second, p95 within 5%. On prod `/~hyperbuddy@1.0/` needs the nginx
+allow-list, since the endpoint lists action names.
+
 ## Where the real game spends a slot
 
 Old fork on the bench node, game on `lua@5.3b`, 28 fixture players, node's own

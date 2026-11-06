@@ -488,7 +488,7 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
             % Compute the next state transition.
             NextSlot = CurrentSlot + 1,
             % Get the next input message from the scheduler device.
-            case hb_phase_timer:time(slot_next, fun() -> next(Base, Req, Opts) end) of
+            case hb_phase_timer:time(slot_next, ProcID, fun() -> next(Base, Req, Opts) end) of
                 {error, Res} ->
                     % If the scheduler device cannot provide a next message,
                     % we return its error details, along with the current slot.
@@ -556,8 +556,10 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
         },
         Opts
     ),
-    {RuntimeMicroSecs, Res} =
-        timer:tc(
+    % The Lua phases of the execution are noted against this slot, and only
+    % this one (`hb_slot_log:run/1').
+    {RuntimeMicroSecs, Res, Notes} =
+        hb_slot_log:run(
             fun() ->
                 lib_process:run_as(
                     <<"execution">>,
@@ -567,6 +569,7 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                 )
             end
         ),
+    Action = slot_action(Req, Opts),
     ?event(
         compute,
         {computed_slot,
@@ -601,9 +604,8 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                         )
                     end
                 ),
-            hb_phase_timer:record(slot_prep, PrepTimeMicroSecs),
-            hb_phase_timer:record(slot_execution, RuntimeMicroSecs),
-            hb_phase_timer:record(slot_store, StoreTimeMicroSecs),
+            hb_slot_log:end_slot(ProcID, Slot, Action, ok, PrepTimeMicroSecs,
+                RuntimeMicroSecs, StoreTimeMicroSecs, Notes),
             ?event(compute_short,
                 {computed_slot,
                     {proc_id, ProcID},
@@ -612,14 +614,7 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                     {prep_ms, PrepTimeMicroSecs div 1000},
                     {execution_ms, RuntimeMicroSecs div 1000},
                     {store_ms, StoreTimeMicroSecs div 1000},
-                    {action,
-                        hb_maps:get(
-                            <<"action">>,
-                            hb_maps:get(<<"body">>, Req, #{}, Opts),
-                            no_action_set,
-                            Opts
-                        )
-                    }
+                    {action, Action}
                 }
             ),
             % Notify waiters only after the slot is readable from the process
@@ -688,20 +683,30 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                     },
                     Opts
                 ),
-            store_result(
-                snapshot_target(Slot, TargetSlot, Opts),
-                ProcID,
-                Slot,
-                ErrState,
-                InitReq,
-                with_assignment_time(Req, Opts)
-            ),
+
+            {StoreTimeMicroSecs, _} =
+                timer:tc(
+                    fun() ->
+                        store_result(
+                            snapshot_target(Slot, TargetSlot, Opts),
+                            ProcID,
+                            Slot,
+                            ErrState,
+                            InitReq,
+                            Opts
+                        )
+                    end
+                ),
+            hb_slot_log:end_slot(ProcID, Slot, Action, error, PrepTimeMicroSecs,
+                RuntimeMicroSecs, StoreTimeMicroSecs, Notes),
             {ok, ErrState};
         {failure, Failure} ->
             % A failure of this node -- a failed read or fetch -- is not a
             % result of the computation, so nothing of it is stored. The
             % process-failure hook sees it, and the failure is answered as
             % it arrived.
+            hb_slot_log:end_slot(ProcID, Slot, Action, failure, PrepTimeMicroSecs,
+                RuntimeMicroSecs, 0, Notes),
             hb_hook:on(
                 <<"process-failure">>,
                 #{
@@ -712,6 +717,13 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                 Opts
             ),
             {failure, Failure}
+    end.
+
+%% The slot message's `action', for the event log and `hb_slot_log'. Reading
+%% it never fails a slot.
+slot_action(Req, Opts) ->
+    try hb_maps:get(<<"action">>, hb_maps:get(<<"body">>, Req, #{}, Opts), no_action_set, Opts)
+    catch _:_ -> no_action_set
     end.
 
 %% @doc Options for a compute this device issues itself, such as the one in
