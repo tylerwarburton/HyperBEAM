@@ -38,8 +38,36 @@ missed reveal). The device:
 
 - says `Ready` when it is a member in good standing (owes no late output), is
   not exiting, is not following a successor, and there is no `pause` file;
+- also needs, before `Ready`: the full stake (bond plus unclaimed earnings,
+  `earnedAtoms`, at least `params.stake`), the beacon's cooldown (`rejoinAt`)
+  passed, its own backoff passed (`rejoinBaseMs` doubled per incident, up to
+  `rejoinCapMs`), and a healthy round trip (below);
 - says `Pause` when any of those stops being true, and then still commits to a
   round whose set it is in and reveals everything it committed to.
+
+Health is measured on the local clock only: the time from sending a commit
+to the first read that shows it (a commit not shown within 30 s counts as
+30 s), over the last 10 minutes, or twice the slowest of the last 20 reads
+when it has not committed lately. `Ready` waits until that is under half of
+`commitWindowMs`. Beacon times (`rejoinAt`, `nextRoundAt`, `commitDeadline`)
+are compared with the local clock moved by the clock offset, the smallest
+`local read time - beaconinfo.at` seen. A local clock that is off by minutes
+therefore neither rejoins early nor looks healthy when it is not.
+
+On a beacon in `mode: request-driven` (its reserve spent), the device opens
+only rounds that have requests. The beacon's `health` is shown in `status`
+and logged when it is not `ok`.
+
+## Joining and topping up
+
+A validator joins by bonding at least `params.stake` RNG to the beacon. With
+`top-up: true` the device does this itself from its wallet: when it has no
+entry yet, or its bond (after a slash) plus earnings is below `stake`, it
+sends one `Transfer` on the beacon's `token` with `Recipient` = the beacon,
+`Quantity` = the shortfall in atoms and `X-Bond: true`. It sends at most one
+per bond value every 10 minutes, and never while exiting, paused or moving.
+The wallet must hold the RNG. Without `top-up`, bond by hand and the device
+says `Ready` once the bond shows.
 
 To take a node offline safely, create `pause` in `secrets-dir`, wait until
 `status` shows `ready: false` and the beacon no longer lists rounds the
@@ -52,7 +80,8 @@ A beacon without the `ready` feature gets the older suspend/rejoin behaviour.
 ## Following a successor
 
 When the beacon publishes a `successor` whose own `beaconinfo` names this
-beacon as its `predecessor`, the device pauses, reveals what it still owes,
+beacon as its `predecessor` (and, on a beacon that publishes
+`successorAck`, once that is true), the device pauses, reveals what it still owes,
 then moves and records the move in `secrets-dir/beacon.json`. Setting a
 different `beacon` in the node config starts the walk again from there.
 
@@ -68,6 +97,7 @@ Under the node option `rng-validator`:
 | `secrets-dir` | Secrets, `beacon.json` and the `pause` file (default `rng-validator-secrets`). Must survive restarts. |
 | `interval` | Milliseconds between passes (default 100). |
 | `exit` | `true` to leave the validator set. |
+| `top-up` | `true` to bond from the wallet: join, and refill a slashed bond to `stake`. Default `false`. |
 
 ```json
 "on": { "start": { "device": "rng-validator@1.0" } },
@@ -90,7 +120,9 @@ rounds the daemon committed cannot be revealed.
 
 `GET /~rng-validator@1.0/status`: the validator's address, the beacon it
 follows, the beacon's round and phase, `ready`, `paused`, `stake`, `faults`,
-`at-slot`, and the last pass and error.
+`at-slot`, `rejoin-at` (local clock), `round-trip`, `clock-offset`,
+`stake-short` (RNG missing for `Ready`), the beacon's `health`, and the last
+pass and error.
 
 ### `start`
 

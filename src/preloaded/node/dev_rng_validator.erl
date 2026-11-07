@@ -10,7 +10,8 @@
 %%%      a round can take it, stores the secret, then sends `Commit';
 %%%   2. asks a round to close (`Close') once its commit window has passed;
 %%%   3. reveals its secret (`Reveal') once the beacon shows the round revealing;
-%%%   4. rejoins (`Rejoin') after a suspension while its bond covers a slash;
+%%%   4. says `Ready' once it is healthy and its stake is full (with `top-up',
+%%%      bonding from the wallet first), and `Pause' when it should stop;
 %%%   5. with `exit' set, sends `Exit', then `Finalize-Exit' until it lands.
 %%%
 %%% Cracking (solving a withheld puzzle without its secret) is NOT done here:
@@ -36,7 +37,11 @@
 %%% Configuration, under the node option `rng-validator':
 %%%   beacon (process id, required), node (URL the beacon is scheduled on,
 %%%   required), wallet-file, secrets-dir (default `rng-validator-secrets'),
-%%%   interval (ms between passes, default 100), exit (true to leave).
+%%%   interval (ms between passes, default 100), exit (true to leave),
+%%%   top-up (true: refill a slashed bond to `stake', from the wallet; only for a
+%%%   registered validator, on the configured beacon (never one reached by
+%%%   following a successor), on the token pinned from that beacon, and for a
+%%%   `stake' of at most 10^7 RNG; otherwise the `bond' command is logged).
 %%% Endpoint, read-only:
 %%%   GET /~rng-validator@1.0/status   address, round, phase, last error
 -module(dev_rng_validator).
@@ -47,6 +52,9 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(NAME, {<<"rng-validator@1.0">>, loop}).
+%% The most RNG an automatic top-up ever covers: a beacon (or a hostile
+%% successor) asking for more gets the `bond' command logged instead.
+-define(MAX_TOP_UP_STAKE, 10000000).
 
 device_info(_) ->
     #{ exports => [<<"start">>, <<"status">>] }.
@@ -114,7 +122,10 @@ initial_state(Cfg, Opts) ->
     Pusher = spawn_link(fun() -> pusher(Cfg, SignOpts) end),
     #{ cfg => Cfg, opts => SignOpts, me => Me, dir => Dir, pusher => Pusher,
         beacon => followed(Dir, maps:get(<<"beacon">>, Cfg)),
-        sent => #{}, status => #{ <<"address">> => Me }, last_error => null, last_pass => 0 }.
+        token => pinned(Dir, maps:get(<<"beacon">>, Cfg)), registry => {undefined, #{}},
+        sent => #{}, status => #{ <<"address">> => Me }, last_error => null, last_pass => 0,
+        probe => probe0(), health => null,
+        backoff => #{ faults => undefined, n => 0, until => 0, ready_since => 0 } }.
 
 loop(St = #{ cfg := Cfg }) ->
     receive
@@ -133,7 +144,7 @@ loop(St = #{ cfg := Cfg }) ->
     end.
 
 %% One pass: read the beacon, act on what `plan' says, prune old secrets.
-pass(St = #{ me := Me, sent := Sent0, dir := Dir }) ->
+pass(StIn = #{ me := Me, sent := Sent0, dir := Dir, probe := Probe0 }) ->
     % Before the state read, so the state is at least this far along.
     % Both reads at once, `at-slot' started first, so the state is about as far
     % along as the slot: one wait per pass instead of two in a row. A slot read
@@ -141,19 +152,40 @@ pass(St = #{ me := Me, sent := Sent0, dir := Dir }) ->
     % `Ms' to pass.
     Self = self(),
     Ref = make_ref(),
-    spawn_link(fun() -> Self ! {Ref, catch read(<<"now/at-slot">>, St)} end),
-    Info = hb_json:decode(read(<<"now/beaconinfo">>, St)),
+    T0 = os:system_time(millisecond),
+    spawn_link(fun() -> Self ! {Ref, catch read(<<"now/at-slot">>, StIn)} end),
+    Info = hb_json:decode(read(<<"now/beaconinfo">>, StIn)),
     AtSlot = receive {Ref, AtBin} -> to_int(AtBin, 0) after 30000 -> 0 end,
     Now = os:system_time(millisecond),
+    Open = obj(<<"open">>, Info),
+    Cfg = maps:get(cfg, StIn),
+    {Mine, Registry} = member(Info, Me, Now, StIn),
+    St = (pin_token(Info, StIn))#{ registry => Registry },
+    Probe1 = probe(Info, Me, Now, Probe0#{ reads := sample(Now - T0, maps:get(reads, Probe0)) }),
+    Offset = offset(Probe1),
+    Backoff = backoff(Mine, obj(<<"params">>, Info), Now, maps:get(backoff, St)),
+    RoundTrip = round_trip(Probe1, Now),
+    Health = health(Info, maps:get(health, St, null)),
     Successor = successor(Info, St),
     {Actions, Oldest} = plan(Info, #{ me => Me, sent => Sent0, at_slot => AtSlot, now => Now,
-        exit => maps:get(<<"exit">>, maps:get(cfg, St), false) =:= true, moving => Successor =/= none,
-        pause => filelib:is_regular(filename:join(Dir, "pause")) }, Dir),
-    Sent = lists:foldl(fun(A, S) -> act(A, S, St#{ now => Now }) end, Sent0, batch(Actions, Info)),
+        beacon_now => Now - Offset,
+        exit => maps:get(<<"exit">>, Cfg, false) =:= true, moving => Successor =/= none,
+        pause => filelib:is_regular(filename:join(Dir, "pause")),
+        top_up => maps:get(<<"top-up">>, Cfg, false) =:= true, mine => Mine,
+        followed => maps:get(beacon, St) =/= maps:get(<<"beacon">>, Cfg),
+        token => maps:get(token, St, undefined),
+        backoff_until => maps:get(until, Backoff), round_trip => RoundTrip }, Dir),
+    % A commit's round trip is timed from its first send until it shows.
+    {Sent, Pending} = lists:foldl(fun(A = {_, Keys, _}, {S, P}) ->
+            T1 = os:system_time(millisecond),
+            P1 = lists:foldl(fun({<<"Commit">>, R}, PAcc) -> maps:merge(#{ R => T1 }, PAcc);
+                                (_, PAcc) -> PAcc end, P, Keys),
+            {act(A, S, St#{ now => Now }), P1}
+        end, {Sent0, maps:get(pending, Probe1)}, batch(Actions, Info)),
     prune(Dir, Oldest),
-    Open = obj(<<"open">>, Info),
-    Mine = mine(Info, Me),
-    St1 = follow(Successor, obligations(Info, Me), St#{ sent => Sent }),
+    St1 = follow(Successor, obligations(Info, Me),
+        St#{ sent => Sent, probe => Probe1#{ pending := Pending }, backoff => Backoff,
+             health => Health }),
     % What was sent is only remembered for ten minutes.
     St1#{ sent => maps:filter(fun(_, {At, _}) -> Now - At < 600000 end, maps:get(sent, St1)),
          last_pass => Now, last_error => null,
@@ -163,6 +195,12 @@ pass(St = #{ me := Me, sent := Sent0, dir := Dir }) ->
             <<"ready">> => maps:get(<<"ready">>, Mine, null), <<"paused">> => maps:get(<<"paused">>, Mine, null),
             <<"stake">> => maps:get(<<"stake">>, Mine, null), <<"faults">> => maps:get(<<"faults">>, Mine, null),
             <<"exiting">> => maps:get(<<"exiting">>, Mine, null), <<"at-slot">> => AtSlot,
+            % Local clock: the beacon's cooldown moved by the clock offset.
+            <<"rejoin-at">> => max(to_int(maps:get(<<"rejoinAt">>, Mine, 0), 0) + Offset, maps:get(until, Backoff)),
+            <<"round-trip">> => case RoundTrip of infinity -> null; _ -> RoundTrip end,
+            <<"clock-offset">> => Offset,
+            <<"stake-short">> => stake_short(Mine, Info, stake_required(Info)),
+            <<"health">> => maps:get(<<"health">>, Info, null),
             <<"beacon">> => maps:get(beacon, St1) } }.
 
 %% @doc What to send now, from the beacon's `beaconinfo' and what was already
@@ -174,11 +212,30 @@ pass(St = #{ me := Me, sent := Sent0, dir := Dir }) ->
 %% it can work: a member in good standing, not leaving, not following a
 %% successor, and no `pause' file in `secrets-dir'. It says Pause when one of
 %% those stops being true, then still does every round it was already given.
-%% Older beacons get the suspend/rejoin behaviour they understand.
+%% Ready never goes straight back into the rounds just failed: not before the
+%% beacon's cooldown (`rejoinAt'), nor this node's own backoff
+%% (`backoff_until'), nor unless the worst recent round trip (`round_trip') is
+%% under half the commit window, and at most once every 30 s. No waiver on
+%% quorum loss: rejoining at once turned slow commits into 108 slashes per
+%% validator (2026-11-06). Ready also needs the full stake: the bond plus
+%% unclaimed earnings (the beacon refills from those) must reach `stake'.
+%% With `top_up', a registered validator's short bond is topped up to `stake'
+%% from the wallet: one `X-Bond' Transfer on the beacon's token, at most once
+%% per bond value every 10 minutes. Never for a validator found in neither
+%% `beaconinfo' nor `beaconvalidators', on a beacon reached by following a
+%% successor (`followed'), on a token other than the one pinned from the
+%% configured beacon (`token'), or for a `stake' above 10^7 RNG: then a
+%% `Bond-Hint' only logs the `bond' command. Older beacons get the
+%% suspend/rejoin behaviour they understand.
+%%
+%% Beacon times (`rejoinAt', `nextRoundAt', `commitDeadline') are compared with
+%% `beacon_now', the local clock moved by the measured offset to the
+%% scheduler's; `now' is only ever compared with other local times.
 plan(Info, Ctx = #{ me := Me, now := Now }, Dir) ->
+    BNow = maps:get(beacon_now, Ctx, Now),
     Open = obj(<<"open">>, Info),
     Params = obj(<<"params">>, Info),
-    Mine = mine(Info, Me),
+    Mine = case maps:get(mine, Ctx, undefined) of undefined -> mine(Info, Me); M -> M end,
     Round = to_int(maps:get(<<"round">>, Info, 0), 0),
     MinCommits = to_int(maps:get(<<"minCommits">>, Params, 2), 2),
     ReadyMode = lists:member(<<"ready">>, list(<<"features">>, Info)),
@@ -197,8 +254,35 @@ plan(Info, Ctx = #{ me := Me, now := Now }, Dir) ->
         case ReadyMode of
             true ->
                 Ready = truthy(<<"ready">>, Mine),
+                Bond = to_int(maps:get(<<"bond">>, Mine, 0), 0),
+                StakeParam = to_int(maps:get(<<"stake">>, Params, 0), 0),
+                TopUp = stake_short(Mine, Info, StakeParam),
+                Token = maps:get(<<"token">>, Info, null),
+                Followed = maps:get(followed, Ctx, false),
+                Pinned = maps:get(token, Ctx, undefined),
+                WantTopUp = maps:get(top_up, Ctx, false) andalso Member andalso TopUp > 0
+                    andalso not Ready andalso not Exiting andalso not Stopping,
+                Refusal =
+                    if
+                        not WantTopUp -> none;
+                        Followed =:= true -> <<"successor beacon">>;
+                        StakeParam > ?MAX_TOP_UP_STAKE -> <<"stake above 10^7 RNG">>;
+                        not is_binary(Token); byte_size(Token) =/= 43; Token =/= Pinned ->
+                            <<"token is not the pinned one">>;
+                        true -> none
+                    end,
+                [ {<<"Bond">>, Bond, #{ <<"token">> => Token,
+                    <<"quantity">> => integer_to_binary(TopUp * unit(Info)) }}
+                || WantTopUp, Refusal =:= none, Due(<<"Bond">>, Bond, 600000) ] ++
+                [ {<<"Bond-Hint">>, Bond, #{ <<"reason">> => Refusal, <<"rng">> => TopUp }}
+                || WantTopUp, Refusal =/= none, Due(<<"Bond-Hint">>, Bond, 600000) ] ++
                 [ {<<"Ready">>, 0, #{}}
                 || Member, not Ready, not Exiting, not Stopping, not truthy(<<"overdue">>, Mine),
+                   stake_short(Mine, Info, stake_required(Info)) =:= 0,
+                   BNow >= to_int(maps:get(<<"rejoinAt">>, Mine, 0), 0),
+                   Now >= maps:get(backoff_until, Ctx, 0),
+                   maps:get(round_trip, Ctx, infinity)
+                       < to_int(maps:get(<<"commitWindowMs">>, Params, 5000), 5000) div 2,
                    Due(<<"Ready">>, 0, 30000) ] ++
                 [ {<<"Pause">>, 0, #{}}
                 || Member, Ready, not Exiting, Stopping, not maps:get(exit, Ctx), Due(<<"Pause">>, 0, 3000) ];
@@ -230,8 +314,11 @@ plan(Info, Ctx = #{ me := Me, now := Now }, Dir) ->
         case Phase of
             <<"collecting">> ->
                 Available andalso not Stopping andalso Active >= MinCommits
-                    andalso (to_int(maps:get(<<"pending">>, Open, 0), 0) > 0 orelse truthy(<<"heartbeat">>, Params))
-                    andalso Now >= to_int(maps:get(<<"nextRoundAt">>, Info, 0), 0);
+                    % Request-driven (reserve spent): only rounds with requests.
+                    andalso (to_int(maps:get(<<"pending">>, Open, 0), 0) > 0
+                             orelse (truthy(<<"heartbeat">>, Params)
+                                     andalso maps:get(<<"mode">>, Info, null) =/= <<"request-driven">>))
+                    andalso BNow >= to_int(maps:get(<<"nextRoundAt">>, Info, 0), 0);
             <<"commit">> when ReadyMode -> InSet;
             <<"commit">> -> Available andalso not Stopping;
             _ -> false
@@ -259,9 +346,11 @@ plan(Info, Ctx = #{ me := Me, now := Now }, Dir) ->
         % closes rounds by itself on every message, and a Close there is only a
         % message in the way of the next commit (three a round, 2026-11-04).
         [ {<<"Close">>, R, #{ <<"round">> => R }}
-        || not ReadyMode, XPhase =:= <<"commit">>, Deadline > 0, Now >= Deadline, Due(<<"Close">>, R, 2000) ] ++
+        || not ReadyMode, XPhase =:= <<"commit">>, Deadline > 0, BNow >= Deadline, Due(<<"Close">>, R, 2000) ] ++
+        % The phase is the node's word: the beacon clock must also show the
+        % commit window over.
         [ {<<"Reveal">>, R, #{ <<"round">> => R, <<"alpha">> => A }}
-        || XPhase =:= <<"reveal">>, is_binary(Mine0),
+        || XPhase =:= <<"reveal">>, BNow >= Deadline, is_binary(Mine0),
            not lists:member(Me, list(<<"revealed">>, X)),
            Due(<<"Reveal">>, R, 3000),
            A <- [secret_for(Mine0, secrets(Dir, R))], A =/= missing ]
@@ -326,6 +415,25 @@ batch(Actions, Info) ->
                 end
     end.
 
+%% A top-up refused (see `plan'): say what to run instead, sending nothing.
+act({<<"Bond-Hint">>, Keys, #{ <<"reason">> := Why, <<"rng">> := Rng }}, Sent, #{ now := Now }) ->
+    ?event(rng_validator, {not_topping_up, Why, {run, iolist_to_binary(["bond ", integer_to_binary(Rng)])}}),
+    maps:merge(Sent, maps:from_list([{K, {Now, -1}} || K <- Keys]));
+%% A bond top-up is a Transfer on the token, to the beacon, tagged `X-Bond'.
+%% The token's slot says nothing about the beacon's, so its resend is timed
+%% only (slot -1).
+act({<<"Bond">>, Keys, #{ <<"token">> := Token, <<"quantity">> := Q }}, Sent,
+        St = #{ now := Now, beacon := Beacon }) ->
+    Slot = try schedule(Token, #{ <<"action">> => <<"Transfer">>, <<"recipient">> => Beacon,
+                   <<"quantity">> => Q, <<"x-bond">> => <<"true">> }, St)
+           catch C:R -> ?event(rng_validator, {send_failed, <<"Bond">>, C, R}), -1
+           end,
+    ?event(rng_validator, {sent, <<"Bond">>, Q, Slot}),
+    case {Slot >= 0, maps:find(pusher, St)} of
+        {true, {ok, Pusher}} -> Pusher ! {push, Token, Slot};
+        _ -> ok
+    end,
+    maps:merge(Sent, maps:from_list([{K, {Now, -1}} || K <- Keys]));
 act({Action, Keys, Data}, Sent, St = #{ now := Now, beacon := Beacon }) ->
     Slot = try send(Action, Data, St)
            catch C:R -> ?event(rng_validator, {send_failed, Action, C, R}), -1
@@ -337,19 +445,122 @@ act({Action, Keys, Data}, Sent, St = #{ now := Now, beacon := Beacon }) ->
     end,
     maps:merge(Sent, maps:from_list([{K, {Now, Slot}} || K <- Keys])).
 
+%%% Rejoin health -------------------------------------------------------------
+
+%% Health is measured on the local clock only. Comparing local time with a
+%% beacon timestamp (`firstCommitAt') mixed two clocks: a skewed node looked
+%% healthy, or never did. Samples:
+%%   reads    every beaconinfo read, local start to local end (ms);
+%%   commits  `{LocalAt, Ms}': own commit sent (local) until a read shows it
+%%            (local), or until it is given up after 30 s (a failure);
+%%   pending  `#{Round => LocalSentAt}', commits not yet seen;
+%%   offsets  local read time minus the beacon's `at' (its slot's scheduler
+%%            time), once per new `at'. The smallest is the clock offset.
+probe0() -> #{ reads => [], commits => [], pending => #{}, offsets => [], last_at => undefined }.
+
+%% The last 20 samples (newest first).
+sample(Ms, List) -> lists:sublist([Ms | List], 20).
+
+probe(Info, Me, Now, Probe = #{ commits := Commits, pending := Pending, offsets := Offsets, last_at := LastAt }) ->
+    Shown = maps:from_list([{to_int(maps:get(<<"round">>, X, 0), 0), maps:is_key(Me, obj(<<"committed">>, X))}
+        || X <- list(<<"revealing">>, Info) ++ [obj(<<"open">>, Info)]]),
+    {Done, Left} = lists:partition(fun({R, At}) ->
+            maps:get(R, Shown, false) orelse Now - At > 30000
+        end, maps:to_list(Pending)),
+    At = to_int(maps:get(<<"at">>, Info, null), undefined),
+    Probe#{ commits := lists:sublist([{Now, Now - T} || {_, T} <- Done] ++ Commits, 20),
+            pending := maps:from_list(Left),
+            offsets := case is_integer(At) andalso At =/= LastAt of
+                           true -> lists:sublist([Now - At | Offsets], 50);
+                           false -> Offsets
+                       end,
+            last_at := At }.
+
+%% @doc Local clock minus the scheduler's: the smallest `Now - at' seen, as
+%% its least delayed read. 0 on a beacon that publishes no `at'.
+offset(#{ offsets := [] }) -> 0;
+offset(#{ offsets := Offsets }) -> lists:min(Offsets).
+
+%% @doc The worst commit round trip of the last 10 minutes; with none, twice
+%% the worst read (a send costs about a read). `infinity' until 20 reads.
+round_trip(#{ reads := Reads, commits := Commits }, Now) when length(Reads) >= 20 ->
+    case [Ms || {At, Ms} <- Commits, Now - At < 600000] of
+        [] -> 2 * lists:max(Reads);
+        Fresh -> max(lists:max(Reads), lists:max(Fresh))
+    end;
+round_trip(_, _) -> infinity.
+
+%% The beacon's own `health' (status ok, degraded or halted), logged on change.
+health(Info, Prev) ->
+    H = maps:get(<<"health">>, Info, null),
+    S = case H of #{ <<"status">> := S0 } -> S0; _ -> null end,
+    case S =/= Prev andalso S =/= null andalso S =/= <<"ok">> of
+        true -> ?event(rng_validator, {beacon_health, H});
+        false -> ok
+    end,
+    S.
+
+%%% Stake ---------------------------------------------------------------------
+
+%% What Ready needs: `stake' (v3: the full stake, every time), or the older
+%% beacon's `rejoinBond' while it publishes one. 0 when neither is published.
+stake_required(Info) ->
+    Params = obj(<<"params">>, Info),
+    Stake = to_int(maps:get(<<"stake">>, Params, 0), 0),
+    to_int(maps:get(<<"rejoinBond">>, Params, Stake), Stake).
+
+%% @doc RNG still missing for `Required': the bond plus the unclaimed earnings
+%% the beacon refills from (`earnedAtoms', when published).
+stake_short(Mine, Info, Required) ->
+    Bond = to_int(maps:get(<<"bond">>, Mine, 0), 0),
+    Earned = to_int(maps:get(<<"earnedAtoms">>, Mine, 0), 0) div unit(Info),
+    max(0, Required - Bond - Earned).
+
+%% Atoms per RNG.
+unit(Info) -> max(1, to_int(maps:get(<<"unit">>, Info, 1000000), 1000000)).
+
+%% @doc This node's own backoff after a fault, on top of the beacon's cooldown:
+%% `rejoinBaseMs' doubled per incident, up to `rejoinCapMs'. A fault while
+%% ready starts an incident; later faults of the same incident (rounds already
+%% held) do not escalate it. Ready for a cap or longer starts the count over.
+backoff(Mine, _Params, _Now, B) when Mine =:= #{} -> B;
+backoff(Mine, Params, Now, B = #{ faults := Prev, n := N0, until := Until0, ready_since := Since0 }) ->
+    Faults = to_int(maps:get(<<"faults">>, Mine, 0), 0),
+    Base = to_int(maps:get(<<"rejoinBaseMs">>, Params, 60000), 60000),
+    Cap = to_int(maps:get(<<"rejoinCapMs">>, Params, 3600000), 3600000),
+    {N, Until} =
+        case is_integer(Prev) andalso Faults > Prev andalso Since0 > 0 of
+            true ->
+                N1 = case Now - Since0 < Cap of true -> N0 + 1; false -> 1 end,
+                ?event(rng_validator, {fault, Faults, {backing_off, N1}}),
+                {N1, Now + min(Cap, Base bsl min(N1 - 1, 32))};
+            false -> {N0, Until0}
+        end,
+    Ready = truthy(<<"ready">>, Mine),
+    Since = if not Ready -> 0; Since0 =:= 0 -> Now; true -> Since0 end,
+    B#{ faults := Faults, n := N, until := Until, ready_since := Since }.
+
 %%% Following a successor -----------------------------------------------------
 
 %% @doc The beacon to move to: `{ok, Id}' when this one names a successor that
-%% names it back as its predecessor, else `none'. Until the move, no new
-%% commits: only what this beacon is still owed is revealed.
+%% names it back as its predecessor, else `none'. A beacon that publishes
+%% `successorAck' (v3) must also show the successor's `Successor-Ack'. Until
+%% the move, no new commits: only what this beacon is still owed is revealed.
 successor(Info, St = #{ beacon := Beacon }) ->
-    case maps:get(<<"successor">>, Info, <<>>) of
-        Next when is_binary(Next), byte_size(Next) =:= 43, Next =/= Beacon ->
+    case named_successor(Info, Beacon) of
+        none -> none;
+        Next ->
             try hb_json:decode(read(<<"now/beaconinfo">>, St#{ beacon => Next })) of
                 #{ <<"predecessor">> := Beacon } -> {ok, Next};
                 _ -> none
             catch _:_ -> none
-            end;
+            end
+    end.
+
+named_successor(Info, Beacon) ->
+    Acked = not maps:is_key(<<"successorAck">>, Info) orelse truthy(<<"successorAck">>, Info),
+    case maps:get(<<"successor">>, Info, <<>>) of
+        Next when Acked, is_binary(Next), byte_size(Next) =:= 43, Next =/= Beacon -> Next;
         _ -> none
     end.
 
@@ -359,10 +570,12 @@ follow({ok, Next}, Owed, St = #{ dir := Dir, cfg := Cfg }) ->
         [] ->
             ?event(rng_validator, {following, Next}),
             File = filename:join(Dir, "beacon.json"),
+            Pinned = case maps:get(token, St, undefined) of T when is_binary(T) -> T; _ -> null end,
             ok = file:write_file(File ++ ".tmp", hb_json:encode(#{
-                <<"configured">> => maps:get(<<"beacon">>, Cfg), <<"beacon">> => Next })),
+                <<"configured">> => maps:get(<<"beacon">>, Cfg), <<"beacon">> => Next, <<"token">> => Pinned })),
             ok = file:rename(File ++ ".tmp", File),
-            St#{ beacon => Next, sent => #{} };
+            % Its rounds are new: commits pending here would only time out.
+            St#{ beacon => Next, sent => #{}, probe => probe0(), registry => {undefined, #{}} };
         _ -> St
     end;
 follow(none, _Owed, St) -> St.
@@ -378,6 +591,60 @@ followed(Dir, Configured) ->
             end;
         _ -> Configured
     end.
+
+%% The token pinned from the configured beacon, saved with the move.
+pinned(Dir, Configured) ->
+    case file:read_file(filename:join(Dir, "beacon.json")) of
+        {ok, Bin} ->
+            case catch hb_json:decode(Bin) of
+                #{ <<"configured">> := Configured, <<"token">> := T } when is_binary(T), byte_size(T) =:= 43 -> T;
+                _ -> undefined
+            end;
+        _ -> undefined
+    end.
+
+%% @doc Pin the token the first time the CONFIGURED beacon names one; a
+%% successor's token never replaces it.
+pin_token(Info, St = #{ cfg := Cfg, beacon := Beacon }) ->
+    case {maps:get(token, St, undefined), Beacon =:= maps:get(<<"beacon">>, Cfg), maps:get(<<"token">>, Info, null)} of
+        {undefined, true, T} when is_binary(T), byte_size(T) =:= 43 -> St#{ token => T };
+        _ -> St
+    end.
+
+%% @doc This validator's entry: from `beaconinfo' (at most 128 validators),
+%% else from the full registry `beaconvalidators', read at most every 30 s
+%% while not listed. `{Entry, Registry}', Entry `#{}' when found in neither.
+member(Info, Me, Now, St) ->
+    case mine(Info, Me) of
+        M when map_size(M) > 0 -> {M, maps:get(registry, St, {undefined, #{}})};
+        _ ->
+            Reg = case maps:get(registry, St, {undefined, #{}}) of
+                {At, _} when At =:= undefined; Now - At > 30000 ->
+                    {Now, registry_entry(catch hb_json:decode(read(<<"now/beaconvalidators">>, St)), Me)};
+                Cached -> Cached
+            end,
+            {element(2, Reg), Reg}
+    end.
+
+%% @doc The registry, in whichever shape `beaconvalidators' holds it: a list,
+%% `{validators: [...]}', or `{address: entry}' (also as JSON text).
+registry_entry(Bin, Me) when is_binary(Bin) ->
+    case catch hb_json:decode(Bin) of
+        V when is_map(V); is_list(V) -> registry_entry(V, Me);
+        _ -> #{}
+    end;
+registry_entry(List, Me) when is_list(List) ->
+    case [V || V <- List, is_map(V), maps:get(<<"address">>, V, null) =:= Me] of
+        [V | _] -> V;
+        [] -> #{}
+    end;
+registry_entry(#{ <<"validators">> := List }, Me) when is_list(List) -> registry_entry(List, Me);
+registry_entry(Map, Me) when is_map(Map) ->
+    case maps:get(Me, Map, undefined) of
+        V when is_map(V) -> V#{ <<"address">> => Me };
+        _ -> #{}
+    end;
+registry_entry(_, _) -> #{}.
 
 %% Scheduling a message does not compute it: the node's follower waits
 %% (`process-compute-on-schedule-ms') to fold slots, which left the beacon 6-8
@@ -403,13 +670,15 @@ newest(Beacon, Slot) ->
     receive {push, Beacon, S} -> newest(Beacon, max(Slot, S)) after 0 -> Slot end.
 
 %% Schedule one signed message on the beacon; its slot, or -1 if unknown.
-send(Action, Data, #{ cfg := Cfg, opts := Opts, beacon := Beacon }) ->
-    Msg = hb_message:commit(#{
-        <<"target">> => Beacon, <<"type">> => <<"Message">>, <<"action">> => Action,
-        <<"data">> => hb_json:encode(Data)
-    }, Opts, #{ <<"device">> => <<"ans104@1.0">>, <<"bundle">> => true }),
+send(Action, Data, St = #{ beacon := Beacon }) ->
+    schedule(Beacon, #{ <<"action">> => Action, <<"data">> => hb_json:encode(Data) }, St).
+
+%% Schedule signed `Tags' on `Target' (the beacon, or its token: one scheduler).
+schedule(Target, Tags, #{ cfg := Cfg, opts := Opts }) ->
+    Msg = hb_message:commit(Tags#{ <<"target">> => Target, <<"type">> => <<"Message">> },
+        Opts, #{ <<"device">> => <<"ans104@1.0">>, <<"bundle">> => true }),
     {ok, Res} = hb_http:post(maps:get(<<"node">>, Cfg),
-        Msg#{ <<"path">> => <<"/", Beacon/binary, "~process@1.0/schedule">> },
+        Msg#{ <<"path">> => <<"/", Target/binary, "~process@1.0/schedule">> },
         Opts#{ <<"http-codec">> => <<"ans104@1.0">> }),
     to_int(hb_maps:get(<<"slot">>, Res, -1, Opts), -1).
 
@@ -501,7 +770,7 @@ info(Open, Extra) ->
         <<"open">> => Open, <<"revealing">> => []
     }, Extra).
 
-ctx(Sent) -> #{ me => ?ME, sent => Sent, at_slot => 10, now => 100000, exit => false }.
+ctx(Sent) -> #{ me => ?ME, sent => Sent, at_slot => 10, now => 100000, exit => false, round_trip => 100 }.
 kinds(Actions) -> [K || {K, _, _} <- Actions].
 
 commit_matches_device_test() ->
@@ -619,6 +888,200 @@ ready_when_it_can_work_test() ->
     % A pause file: no Ready.
     {C, _} = plan(ready_info(Open, NotReady, #{}), (ctx(#{}))#{ pause => true }, tmp_dir()),
     ?assertEqual([], kinds(C)).
+
+ready_waits_out_cooldown_backoff_and_health_test() ->
+    Open = #{ <<"round">> => 3, <<"phase">> => <<"collecting">> },
+    NotReady = #{ <<"address">> => ?ME, <<"ready">> => false },
+    Plan = fun(Me, Ctx) ->
+        kinds(element(1, plan(ready_info(Open, Me, #{}), maps:merge(ctx(#{}), Ctx), tmp_dir())))
+    end,
+    % The beacon's cooldown: not before `rejoinAt'.
+    ?assertEqual([], Plan(NotReady#{ <<"rejoinAt">> => 100001 }, #{})),
+    ?assertEqual([<<"Ready">>], Plan(NotReady#{ <<"rejoinAt">> => 100000 }, #{})),
+    % This node's own backoff.
+    ?assertEqual([], Plan(NotReady, #{ backoff_until => 100001 })),
+    % Round trip under half the commit window (5000 by default), and known.
+    ?assertEqual([], Plan(NotReady, #{ round_trip => 2500 })),
+    ?assertEqual([<<"Ready">>], Plan(NotReady, #{ round_trip => 2499 })),
+    ?assertEqual([], Plan(NotReady, #{ round_trip => infinity })),
+    % At most once every 30 s.
+    ?assertEqual([], Plan(NotReady, #{ sent => #{ {<<"Ready">>, 0} => {100000 - 30000, 1} } })),
+    ?assertEqual([<<"Ready">>], Plan(NotReady, #{ sent => #{ {<<"Ready">>, 0} => {100000 - 30001, 1} } })).
+
+round_trip_needs_full_sample_test() ->
+    P0 = probe0(),
+    ?assertEqual(infinity, round_trip(P0#{ reads := lists:duplicate(19, 10) }, 0)),
+    % No commit seen yet: twice the worst read.
+    Reads = [30 | lists:duplicate(19, 10)],
+    ?assertEqual(60, round_trip(P0#{ reads := Reads }, 0)),
+    % A recent commit round trip counts; one older than 10 minutes does not.
+    ?assertEqual(700, round_trip(P0#{ reads := Reads, commits := [{1000, 700}] }, 1000 + 599999)),
+    ?assertEqual(60, round_trip(P0#{ reads := Reads, commits := [{1000, 700}] }, 1000 + 600000)),
+    ?assertEqual(20, length(sample(1, lists:duplicate(20, 0)))).
+
+%% The probe never compares local time with a beacon timestamp: a beacon clock
+%% 60 s ahead or behind gives the same round trip, and only moves the offset.
+health_is_skew_free_test() ->
+    Run = fun(Skew) ->
+        % Sent round 4's commit at local 1000; first shown at local 1800.
+        P1 = (probe0())#{ pending := #{ 4 => 1000 } },
+        Open = fun(C) -> #{ <<"round">> => 4, <<"phase">> => <<"commit">>, <<"committed">> => C,
+                            <<"firstCommitAt">> => 1200 + Skew } end,
+        P2 = probe(#{ <<"open">> => Open(#{}), <<"at">> => 1200 + Skew }, ?ME, 1500, P1),
+        ?assertEqual(#{ 4 => 1000 }, maps:get(pending, P2)),
+        P3 = probe(#{ <<"open">> => Open(#{ ?ME => <<"c">> }), <<"at">> => 1700 + Skew }, ?ME, 1800, P2),
+        % The same `at' read again later adds no offset sample.
+        P4 = probe(#{ <<"open">> => Open(#{ ?ME => <<"c">> }), <<"at">> => 1700 + Skew }, ?ME, 9000, P3),
+        {maps:get(commits, P4), maps:get(pending, P4), offset(P4)}
+    end,
+    ?assertEqual({[{1800, 800}], #{}, 100}, Run(0)),
+    ?assertEqual({[{1800, 800}], #{}, 100 - 60000}, Run(60000)),
+    ?assertEqual({[{1800, 800}], #{}, 100 + 60000}, Run(-60000)),
+    % A commit never shown is given up after 30 s, as a failed round trip.
+    P = probe(#{ <<"open">> => #{ <<"round">> => 5 } }, ?ME, 31001, (probe0())#{ pending := #{ 4 => 1000 } }),
+    ?assertEqual({[{31001, 30001}], #{}}, {maps:get(commits, P), maps:get(pending, P)}),
+    % No `at' published (older beacon): offset 0.
+    ?assertEqual(0, offset(probe(#{}, ?ME, 5, probe0()))).
+
+%% Beacon times are compared with the beacon's clock (`beacon_now'), so a
+%% local clock 60 s off neither rejoins early nor waits a minute too long.
+beacon_times_use_beacon_clock_test() ->
+    Open = #{ <<"round">> => 3, <<"phase">> => <<"collecting">> },
+    NotReady = #{ <<"address">> => ?ME, <<"ready">> => false, <<"rejoinAt">> => 160000 },
+    Plan = fun(Info, Ctx) -> kinds(element(1, plan(Info, maps:merge(ctx(#{}), Ctx), tmp_dir()))) end,
+    % Local clock 100000, beacon clock 60 s ahead.
+    ?assertEqual([], Plan(ready_info(Open, NotReady, #{}), #{ beacon_now => 159999 })),
+    ?assertEqual([<<"Ready">>], Plan(ready_info(Open, NotReady, #{}), #{ beacon_now => 160000 })),
+    Me = #{ <<"address">> => ?ME, <<"ready">> => true },
+    Next = ready_info(Open, Me, #{ <<"nextRoundAt">> => 160000 }),
+    ?assertEqual([], Plan(Next, #{ beacon_now => 159999 })),
+    ?assertEqual([<<"Commit">>], Plan(Next, #{ beacon_now => 160000 })).
+
+full_stake_ready_test() ->
+    Open = #{ <<"round">> => 3, <<"phase">> => <<"collecting">> },
+    Plan = fun(Me, Params, Ctx) ->
+        Info = ready_info(Open, Me, #{ <<"unit">> => 1000000 }),
+        Info1 = Info#{ <<"params">> => maps:merge(maps:get(<<"params">>, Info), Params) },
+        element(1, plan(Info1, maps:merge(ctx(#{}), Ctx), tmp_dir()))
+    end,
+    Stake = #{ <<"stake">> => 25000 },
+    Short = #{ <<"address">> => ?ME, <<"ready">> => false, <<"bond">> => 24000 },
+    % A slashed bond: no Ready until the stake is full again.
+    ?assertEqual([], kinds(Plan(Short, Stake, #{}))),
+    ?assertEqual([<<"Ready">>], kinds(Plan(Short#{ <<"bond">> => 25000 }, Stake, #{}))),
+    % Unclaimed earnings the beacon refills from count.
+    ?assertEqual([<<"Ready">>], kinds(Plan(Short#{ <<"earnedAtoms">> => <<"1000000000">> }, Stake, #{}))),
+    ?assertEqual([], kinds(Plan(Short#{ <<"earnedAtoms">> => <<"999999999">> }, Stake, #{}))),
+    % An older beacon's `rejoinBond' is what it asks for.
+    ?assertEqual([<<"Ready">>], kinds(Plan(Short, Stake#{ <<"rejoinBond">> => 1000 }, #{}))),
+    % With top-up: refill to the full stake from the wallet, once per bond value.
+    Token = <<"tok", (binary:copy(<<"0">>, 40))/binary>>,
+    Top = fun(Me, Ctx) ->
+        Info = ready_info(Open, Me, #{ <<"unit">> => 1000000, <<"token">> => Token }),
+        Info1 = Info#{ <<"params">> => maps:merge(maps:get(<<"params">>, Info), Stake) },
+        element(1, plan(Info1, maps:merge(ctx(#{}), Ctx#{ top_up => true }), tmp_dir()))
+    end,
+    ?assertEqual([{<<"Bond">>, 24000, #{ <<"token">> => Token, <<"quantity">> => <<"1000000000">> }}],
+        Top(Short, #{ token => Token })),
+    ?assertEqual([], Top(Short, #{ token => Token, sent => #{ {<<"Bond">>, 24000} => {100000 - 1000, -1} } })),
+    % Found in neither beaconinfo nor the registry: never an automatic bond.
+    ?assertEqual([], Top(#{ <<"address">> => <<"someone-else">> }, #{ token => Token })),
+    ?assertEqual([], Top(Short, #{ token => Token, mine => #{} })),
+    % On a successor reached by following, a token not pinned, or a stake
+    % above 10^7 RNG: only the command is logged.
+    ?assertMatch([{<<"Bond-Hint">>, 24000, #{ <<"reason">> := <<"successor beacon">>, <<"rng">> := 1000 }}],
+        Top(Short, #{ token => Token, followed => true })),
+    ?assertMatch([{<<"Bond-Hint">>, 24000, #{ <<"reason">> := <<"token is not the pinned one">> }}],
+        Top(Short, #{ token => <<"evil", (binary:copy(<<"0">>, 39))/binary>> })),
+    ?assertMatch([{<<"Bond-Hint">>, 24000, #{ <<"reason">> := <<"token is not the pinned one">> }}], Top(Short, #{})),
+    Huge = fun(Ctx) ->
+        Info = ready_info(Open, Short, #{ <<"unit">> => 1000000, <<"token">> => Token }),
+        Info1 = Info#{ <<"params">> => maps:merge(maps:get(<<"params">>, Info), #{ <<"stake">> => 10000001 }) },
+        element(1, plan(Info1, maps:merge(ctx(#{}), Ctx#{ top_up => true, token => Token }), tmp_dir()))
+    end,
+    ?assertMatch([{<<"Bond-Hint">>, 24000, #{ <<"reason">> := <<"stake above 10^7 RNG">>, <<"rng">> := 9976001 }}], Huge(#{})),
+    % Never while leaving or paused, and not without the option.
+    ?assertEqual([], Top(Short, #{ token => Token, pause => true })),
+    ?assertEqual([], kinds(Plan(Short, Stake, #{ top_up => false }))).
+
+request_driven_opens_only_requested_rounds_test() ->
+    Me = #{ <<"address">> => ?ME, <<"ready">> => true },
+    Open = #{ <<"round">> => 3, <<"phase">> => <<"collecting">> },
+    Plan = fun(O) -> kinds(element(1, plan(ready_info(O, Me, #{ <<"mode">> => <<"request-driven">> }),
+        ctx(#{}), tmp_dir()))) end,
+    ?assertEqual([], Plan(Open)),
+    ?assertEqual([<<"Commit">>], Plan(Open#{ <<"pending">> => 1 })).
+
+beacon_health_read_test() ->
+    ?assertEqual(null, health(#{}, null)),
+    ?assertEqual(<<"halted">>, health(#{ <<"health">> => #{ <<"status">> => <<"halted">>, <<"eligible">> => 1 } }, null)),
+    ?assertEqual(<<"ok">>, health(#{ <<"health">> => #{ <<"status">> => <<"ok">> } }, <<"halted">>)).
+
+%% The phase is the node's word: no reveal before the beacon clock passes
+%% the round's commitDeadline.
+reveal_waits_for_commit_deadline_test() ->
+    Dir = tmp_dir(),
+    save_secret(Dir, 3, <<"c1">>, <<"a1">>),
+    R = #{ <<"round">> => 3, <<"phase">> => <<"reveal">>, <<"commitDeadline">> => 105000,
+        <<"committed">> => #{ ?ME => <<"c1">> }, <<"revealed">> => [] },
+    Open = #{ <<"round">> => 4, <<"phase">> => <<"commit">>, <<"committed">> => #{ ?ME => <<"x">> } },
+    Info = info(Open, #{ <<"revealing">> => [R] }),
+    ?assertEqual([], element(1, plan(Info, (ctx(#{}))#{ beacon_now => 104999 }, Dir))),
+    ?assertEqual([<<"Reveal">>], kinds(element(1, plan(Info, (ctx(#{}))#{ beacon_now => 105000 }, Dir)))).
+
+registry_entry_shapes_test() ->
+    E = #{ <<"address">> => ?ME, <<"bond">> => 7 },
+    ?assertEqual(E, registry_entry([#{ <<"address">> => <<"o">> }, E], ?ME)),
+    ?assertEqual(E, registry_entry(#{ <<"validators">> => [E] }, ?ME)),
+    ?assertEqual(E, registry_entry(#{ ?ME => #{ <<"bond">> => 7 } }, ?ME)),
+    ?assertEqual(#{}, registry_entry(#{ <<"validators">> => [] }, ?ME)),
+    ?assertEqual(#{}, registry_entry({'EXIT', read_failed}, ?ME)),
+    % Listed in beaconinfo: no registry read at all (St has no node to read).
+    St = #{ registry => {undefined, #{}} },
+    ?assertEqual({E, {undefined, #{}}}, member(#{ <<"validators">> => [E] }, ?ME, 100000, St)),
+    % Not listed, registry read fresh within 30 s: the cached entry.
+    ?assertEqual({E, {90000, E}}, member(#{ <<"validators">> => [] }, ?ME, 100000, #{ registry => {90000, E} })).
+
+pin_token_test() ->
+    B = <<"beacon", (binary:copy(<<"0">>, 37))/binary>>,
+    N = <<"next", (binary:copy(<<"0">>, 39))/binary>>,
+    T = <<"tok", (binary:copy(<<"0">>, 40))/binary>>,
+    T2 = <<"evil", (binary:copy(<<"0">>, 39))/binary>>,
+    Cfg = #{ <<"beacon">> => B },
+    ?assertEqual(T, maps:get(token, pin_token(#{ <<"token">> => T }, #{ cfg => Cfg, beacon => B }))),
+    % Pinned once: a later token is ignored.
+    ?assertEqual(T, maps:get(token, pin_token(#{ <<"token">> => T2 }, #{ cfg => Cfg, beacon => B, token => T }))),
+    % Never pinned from a successor.
+    ?assertEqual(error, maps:find(token, pin_token(#{ <<"token">> => T2 }, #{ cfg => Cfg, beacon => N }))).
+
+successor_needs_ack_test() ->
+    B = <<"beacon", (binary:copy(<<"0">>, 37))/binary>>,
+    N = <<"next", (binary:copy(<<"0">>, 39))/binary>>,
+    % An older beacon publishes no ack: the predecessor check alone decides.
+    ?assertEqual(N, named_successor(#{ <<"successor">> => N }, B)),
+    % A v3 beacon: only once the successor has acked.
+    ?assertEqual(none, named_successor(#{ <<"successor">> => N, <<"successorAck">> => false }, B)),
+    ?assertEqual(N, named_successor(#{ <<"successor">> => N, <<"successorAck">> => true }, B)),
+    ?assertEqual(none, named_successor(#{ <<"successor">> => <<>> }, B)),
+    ?assertEqual(none, named_successor(#{ <<"successor">> => B, <<"successorAck">> => true }, B)).
+
+backoff_doubles_per_incident_test() ->
+    Params = #{ <<"rejoinBaseMs">> => 1000, <<"rejoinCapMs">> => 10000 },
+    B0 = #{ faults => undefined, n => 0, until => 0, ready_since => 0 },
+    Ready = fun(F) -> #{ <<"ready">> => true, <<"faults">> => F } end,
+    Down = fun(F) -> #{ <<"ready">> => false, <<"faults">> => F } end,
+    B1 = backoff(Ready(0), Params, 100, B0),
+    % First fault while ready: wait the base.
+    B2 = backoff(Down(1), Params, 200, B1),
+    ?assertMatch(#{ n := 1, until := 1200 }, B2),
+    % More faults of the same incident (not ready since): no escalation.
+    B3 = backoff(Down(2), Params, 300, B2),
+    ?assertMatch(#{ n := 1, until := 1200 }, B3),
+    % Back, then a fault within the cap: doubled.
+    B4 = backoff(Ready(2), Params, 2000, B3),
+    ?assertMatch(#{ n := 2, until := 4500 }, backoff(Down(3), Params, 2500, B4)),
+    % Ready for the cap or longer: the count starts over.
+    ?assertMatch(#{ n := 1, until := 21000 }, backoff(Down(3), Params, 20000, B4)).
 
 pause_still_owes_its_rounds_test() ->
     Me = #{ <<"address">> => ?ME, <<"ready">> => true },
