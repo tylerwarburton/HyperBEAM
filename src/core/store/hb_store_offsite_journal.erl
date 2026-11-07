@@ -474,6 +474,10 @@ writer_init(Store) ->
     case read_poison(Dir) of
         {poisoned, Reason} ->
             ?event(error, {offsite_journal_refusing, {poisoned, Reason}}),
+            % What the journal confirmed is still the inner store's: replay
+            % it, so reads see it while every write is refused.
+            {PSealed, PMarks, _} = read_marks(Dir),
+            _ = (catch recover_local(Dir, PSealed, PMarks, read_durable(Dir), Store)),
             writer_refusing(Store, {journal_poisoned, Reason});
         none ->
             Clean = hb_file:is_regular(filename:join(Dir, "clean")),
@@ -803,18 +807,41 @@ append_and_write(_Groups, S = #{ poisoned := P }) when P =/= false ->
 append_and_write(Groups0, S = #{ store := Store }) ->
     Groups = dedupe(Groups0),
     Pairs = lists:append(Groups),
-    {Journal, Blobs} = new_blobs(Pairs, maps:get(journaled_blobs, S, #{})),
-    case append({w, Journal}, S) of
-        {ok, S1} ->
-            Inner = inner(Store),
-            Res = write_inner(maps:get(<<"store-module">>, Inner), Inner, Groups),
-            {Res, S1#{ journaled_blobs => Blobs,
-                       pending => mark(Pairs, maps:get(pending, S1)),
-                       unflushed => true,
-                       appended => maps:get(appended, S1) + 1 }};
-        {error, Reason, S1} ->
-            {{error, Reason}, S1}
+    Inner = inner(Store),
+    Mod = maps:get(<<"store-module">>, Inner),
+    case refused_key(Mod, Pairs) of
+        {refused, Key} -> {{error, {invalid_key, Key}}, S};
+        none ->
+            {Journal, Blobs} = new_blobs(Pairs, maps:get(journaled_blobs, S, #{})),
+            case append({w, Journal}, S) of
+                {ok, S1} ->
+                    S2 = S1#{ journaled_blobs => Blobs,
+                              pending => mark(Pairs, maps:get(pending, S1)),
+                              unflushed => true,
+                              appended => maps:get(appended, S1) + 1 },
+                    case write_inner(Mod, Inner, Groups) of
+                        ok -> {ok, S2};
+                        Failure ->
+                            % The frame is journaled and the inner store did
+                            % not take it: refuse everything, so no round
+                            % confirms it, as a failed inner flush did.
+                            S3 = poison(S2, {inner_write_failed, Failure}),
+                            {Failure, S3}
+                    end;
+                {error, Reason, S1} ->
+                    {{error, Reason}, S1}
+            end
     end.
+
+%% A key the inner store refuses every time (LMDB: empty, or over 511 bytes)
+%% is refused before it is journaled: every frame in the journal is one the
+%% inner store took, so a replay can always write it again.
+refused_key(hb_store_lmdb, Pairs) ->
+    case [ K || {K, _} <- Pairs, byte_size(K) == 0 orelse byte_size(K) > 511 ] of
+        [] -> none;
+        [K | _] -> {refused, K}
+    end;
+refused_key(_Mod, _Pairs) -> none.
 
 %% @doc Drop each row that repeats the value its key already has earlier in
 %% the groups (a batch writes the same body once per caller). Only the latest
@@ -881,9 +908,13 @@ write_inner(_Mod, _Inner, []) -> ok;
 write_inner(Mod, Inner, [Group | Groups]) ->
     Res =
         try
-            case [ Row || Row = {K, _} <- Group, not stored_content(Mod, Inner, K) ] of
-                [] -> ok;
-                New -> Mod:write(Inner, maps:from_list(New), #{})
+            case persistent_term:get({?MODULE, fail_inner_write}, false) of
+                true -> {error, transaction_error};   % test hook
+                false ->
+                    case [ Row || Row = {K, _} <- Group, not stored_content(Mod, Inner, K) ] of
+                        [] -> ok;
+                        New -> Mod:write(Inner, maps:from_list(New), #{})
+                    end
             end
         catch C:R -> {error, {C, R}}
         end,
@@ -3412,3 +3443,25 @@ unsynced_inner_keeps_the_round_flush_test() ->
     ?assert(wal(Store#{ <<"inner">> => Inner#{ <<"sync">> => true } })),
     ?assertNot(wal(wrap(Inner#{ <<"sync">> => true },
                         #{ <<"path">> => <<"x">>, <<"inner-commit">> => <<"round">> }))).
+
+%% @doc A key the inner store refuses every time is refused before it is
+%% journaled, so no replay meets a frame it cannot write; an inner write
+%% that fails after its frame is journaled poisons the journal, so no round
+%% confirms that frame.
+refused_writes_never_reach_a_replay_test() ->
+    {Store, Inner, _Target} = test_setup(<<"oj-badkey">>, #{}),
+    Long = binary:copy(<<"k">>, 512),
+    #{ appended := A0 } = status(Store),
+    ?assertMatch({failure, {offsite_journal, {invalid_key, Long}}},
+        write(Store, #{ <<"ok/1">> => <<"1">>, Long => <<"x">> }, #{})),
+    ?assertMatch(#{ appended := A0, poisoned := false }, status(Store)),
+    ok = write(Store, #{ <<"ok/2">> => <<"2">> }, #{}),
+    ok = flush(Store, #{}, #{}),
+    ?assertEqual({error, not_found}, hb_store:read([Inner], <<"ok/1">>, #{})),
+    persistent_term:put({?MODULE, fail_inner_write}, true),
+    try ?assertMatch({failure, _}, write(Store, #{ <<"ok/3">> => <<"3">> }, #{}))
+    after persistent_term:erase({?MODULE, fail_inner_write})
+    end,
+    ?assertMatch(#{ poisoned := {inner_write_failed, _} }, status(Store)),
+    ?assertMatch({failure, _}, flush(Store, #{}, #{})),
+    kill_writer(Store).
