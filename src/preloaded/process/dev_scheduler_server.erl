@@ -1559,7 +1559,7 @@ concurrent_schedules_once_and_durable_test_() ->
         Tracer = spawn(fun() -> collect_trace([], Parent) end),
         {module, CacheMod} = erlang:fun_info(fun dev_scheduler_cache:flush/1, module),
         Flags = [call, {tracer, Tracer}, monotonic_timestamp],
-        erlang:trace_pattern({hb_store_offsite_journal, datasync, 1},
+        erlang:trace_pattern({hb_store_offsite_journal, datasync, 2},
             [{'_', [], [{return_trace}]}], [local]),
         erlang:trace_pattern({CacheMod, write, 3}, true, [global]),
         erlang:trace_pattern({CacheMod, flush_async, 3}, true, [global]),
@@ -1617,7 +1617,7 @@ concurrent_schedules_once_and_durable_test_() ->
                         {trace_ts, P, call, {hb_store_offsite_journal, datasync, _}, _} ->
                             Covered = [ S || {written, S} <- Written ],
                             W(Rest, Written, Syncing#{ P => Covered }, Durable);
-                        {trace_ts, P, return_from, {hb_store_offsite_journal, datasync, 1}, ok, _} ->
+                        {trace_ts, P, return_from, {hb_store_offsite_journal, datasync, 2}, ok, _} ->
                             W(Rest, Written, maps:remove(P, Syncing),
                                 maps:get(P, Syncing, []) ++ Durable);
                         {trace_ts, Server, send, {scheduled, _, A}, _, _} ->
@@ -1717,3 +1717,230 @@ flush_error_after_confirmed_ignored_test() ->
     Ref = make_ref(),
     ?assertExit({scheduler_flush_failed, eio},
         flushed(State#{ flushing := #{ Ref => 1 } }, Ref, {error, eio})).
+
+%%% Crash recovery of a journaled scheduler store, the journal being the
+%%% inner store's write-ahead log: a round confirms on the journal alone and
+%%% the inner store is made durable by checkpoints. Each test confirms slots,
+%%% crashes, and starts a new store and server on the disk the crash left
+%%% (`wal_crash_image/4'). The inner store is the worst a crash may leave
+%%% it: as of its last checkpoint (its data file copied then), with nothing
+%%% committed since. Every test fails if the start does not replay the
+%%% journal (`skip_replay').
+
+-define(OJ, hb_store_offsite_journal).
+
+%% A journaled scheduler whose inner store commits only when told to (no
+%% flusher, no size trigger) and is checkpointed only by the test.
+wal_server(Tag) ->
+    case ets:whereis(hb_store_offsite_journal_synced) of
+        undefined ->
+            ets:new(hb_store_offsite_journal_synced, [named_table, public, set,
+                                                      {heir, whereis(init), none}]);
+        _ -> ok
+    end,
+    Inner = wal_inner(hb_test_utils:test_store(hb_store_lmdb, Tag)),
+    Store = wal_wrap(Inner),
+    Opts = #{ <<"priv-wallet">> => hb:wallet(), <<"store">> => [Store],
+              <<"scheduling-mode">> => local_confirmation,
+              <<"process-compute-on-schedule">> => false },
+    ok = hb_store:start([Store], #{}, Opts),
+    Proc = dedupe_proc(Opts),
+    ProcID = hb_util:human_id(hb_message:id(Proc, all, Opts)),
+    {Opts, ProcID, Proc, start(ProcID, Proc, Opts), Store}.
+
+wal_inner(Store) ->
+    (small_store(Store))#{ <<"flush-every">> => 0, <<"batch-size">> => 1000000000 }.
+
+wal_wrap(Inner) ->
+    ?OJ:wrap(Inner, #{ <<"path">> => <<(maps:get(<<"name">>, Inner))/binary, "-export">>,
+                       <<"fsync-ms">> => 600000, <<"checkpoint-ms">> => 600000 }).
+
+wal_journal(Store) ->
+    hb_util:list(maps:get(<<"name">>, maps:get(<<"inner">>, Store))) ++ "-journal".
+
+%% A copy of the inner store's data file: what its last commit left on disk.
+wal_snapshot(Store) ->
+    Dir = hb_util:list(maps:get(<<"name">>, maps:get(<<"inner">>, Store))),
+    {ok, Bin} = file:read_file(filename:join(Dir, "data.mdb")),
+    Bin.
+
+%% @doc The disk a crash leaves, as a new store on new paths: the inner
+%% store's data file `Snap', and the journal. After a `power' loss each
+%% segment keeps what a sync covered, with the zero fill a host crash leaves
+%% after an open one, and a segment no sync covered is gone; after a `kill'
+%% (the OS survives) every byte written is there.
+wal_crash_image(Store, Snap, Mode, Tag) ->
+    JDir = wal_journal(Store),
+    Inner = wal_inner(hb_test_utils:test_store(hb_store_lmdb, Tag)),
+    Dir = hb_util:list(maps:get(<<"name">>, Inner)),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    ok = file:write_file(filename:join(Dir, "data.mdb"), Snap),
+    NewJ = Dir ++ "-journal",
+    ok = filelib:ensure_dir(filename:join(NewJ, "x")),
+    {ok, Names} = file:list_dir(JDir),
+    lists:foreach(
+        fun(Name) ->
+            {ok, Bin} = file:read_file(filename:join(JDir, Name)),
+            Seg =
+                case string:split(Name, "-") of
+                    [K, Rest] when K == "seg"; K == "open" ->
+                        {K, list_to_integer(hd(string:split(Rest, ".log")))};
+                    _ -> other
+                end,
+            Kept =
+                case {Mode, Seg} of
+                    {kill, _} -> Bin;
+                    {power, other} -> Bin;
+                    {power, {Kind, N}} ->
+                        case ets:lookup(hb_store_offsite_journal_synced, {JDir, N}) of
+                            [] -> none;
+                            [{_, Size}] ->
+                                Synced = binary:part(Bin, 0, min(Size, byte_size(Bin))),
+                                case Kind of
+                                    "open" -> <<Synced/binary, 0:(8 * 4096)>>;
+                                    "seg" -> Synced
+                                end
+                        end
+                end,
+            case Kept of
+                none -> ok;
+                _ -> ok = file:write_file(filename:join(NewJ, Name), Kept)
+            end
+        end,
+        Names),
+    wal_wrap(Inner).
+
+%% @doc Start a server on the image. Every confirmed `{Msg, Slot}' must be
+%% there, with that message; the assignments run without a gap from the
+%% first slot to the server's current one, with no message twice; and the
+%% next message is assigned the slot after. Returns the server's current
+%% slot before that message.
+wal_check(Image, Opts0, ProcID, Proc, First, Confirmed) ->
+    Opts = Opts0#{ <<"store">> => [Image] },
+    ok = hb_store:start([Image], #{}, Opts),
+    Server = start(ProcID, Proc, Opts),
+    #{ current := Current } = info(Server),
+    Read =
+        fun(S) ->
+            {ok, A} = dev_scheduler_cache:read(ProcID, S, Opts),
+            ids(hb_maps:get(<<"body">>, A, #{}, Opts), Opts)
+        end,
+    [ ?assertEqual({S, ids(M, Opts)}, {S, Read(S)}) || {M, S} <- Confirmed ],
+    ?assert(Current >= lists:max([ S || {_, S} <- Confirmed ])),
+    Slots = lists:sort([ hb_util:int(S) || S <- dev_scheduler_cache:list(ProcID, Opts) ]),
+    ?assertEqual(lists:seq(First, Current), [ S || S <- Slots, S >= First ]),
+    Bodies = [ Read(S) || S <- lists:seq(First, Current) ],
+    ?assertEqual(length(Bodies), length(lists:usort(Bodies))),
+    Next = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => <<"next">> }, Opts),
+    ?assertEqual(Current + 1, slot_of(schedule(Server, Next))),
+    exit(Server, kill),
+    timer:sleep(100),
+    Current.
+
+wal_msgs(Opts, From, To) ->
+    [ hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => I }, Opts)
+    || I <- lists:seq(From, To) ].
+
+wal_confirm(Server, Msgs) -> [ {M, slot_of(schedule(Server, M))} || M <- Msgs ].
+
+%% Confirm four slots, checkpoint (the image's inner store is this one), then
+%% confirm six more, which only the journal holds.
+wal_setup(Tag) ->
+    {Opts, ProcID, Proc, Server, Store} = wal_server(Tag),
+    #{ current := C } = info(Server),
+    Before = wal_confirm(Server, wal_msgs(Opts, 1, 4)),
+    ?assertMatch({_, _}, ?OJ:checkpoint_now(Store)),
+    Snap = wal_snapshot(Store),
+    After = wal_confirm(Server, wal_msgs(Opts, 5, 10)),
+    {Opts, ProcID, Proc, Server, Store, C + 1, Before ++ After, Snap}.
+
+%% Two more requests, whose round is still syncing at the crash.
+wal_in_flight(Server, Opts) ->
+    Abort = scheduler_time() + ?DEFAULT_TIMEOUT,
+    [ Server ! {schedule, M, self(), Abort} || M <- wal_msgs(Opts, 11, 12) ],
+    timer:sleep(300).
+
+%% @doc (1) A power loss: the inner store is back at its checkpoint and the
+%% journal keeps only what was synced. Every confirmed slot is restored, in
+%% order, and nothing of the round in flight: the server goes on at the slot
+%% after the last confirmed one.
+wal_power_loss_keeps_every_confirmed_slot_test_() ->
+    {timeout, 120, fun() ->
+        {Opts, ProcID, Proc, Server, Store, First, Confirmed, Snap} = wal_setup(<<"wal-power">>),
+        Image =
+            with_sync_delay(1500, fun() ->
+                wal_in_flight(Server, Opts),
+                I = wal_crash_image(Store, Snap, power, <<"wal-power-img">>),
+                exit(Server, kill),
+                I
+            end),
+        timer:sleep(100),
+        ?assertEqual(lists:max([ S || {_, S} <- Confirmed ]),
+            wal_check(Image, Opts, ProcID, Proc, First, Confirmed))
+    end}.
+
+%% @doc (2) A `kill -9' of the node mid-round: the journal keeps every byte
+%% written, the round's own included. Every confirmed slot is restored; the
+%% round's may be too (its `flushed' marker was written), never twice.
+wal_kill_mid_round_keeps_every_confirmed_slot_test_() ->
+    {timeout, 120, fun() ->
+        {Opts, ProcID, Proc, Server, Store, First, Confirmed, Snap} = wal_setup(<<"wal-kill">>),
+        Image =
+            with_sync_delay(1500, fun() ->
+                wal_in_flight(Server, Opts),
+                I = wal_crash_image(Store, Snap, kill, <<"wal-kill-img">>),
+                exit(Server, kill),
+                I
+            end),
+        timer:sleep(100),
+        wal_check(Image, Opts, ProcID, Proc, First, Confirmed)
+    end}.
+
+%% @doc (3) A crash in the middle of the replay itself, after part of it was
+%% committed: the start after it replays again and ends the same.
+wal_crash_during_replay_test_() ->
+    {timeout, 120, fun() ->
+        {Opts, ProcID, Proc, Server, Store, First, Confirmed, Snap} = wal_setup(<<"wal-replay">>),
+        Image = wal_crash_image(Store, Snap, power, <<"wal-replay-img">>),
+        exit(Server, kill),
+        timer:sleep(100),
+        persistent_term:put({?OJ, replay_crash_after}, 2),
+        try ok = hb_store:start([Image], #{}, Opts)
+        after persistent_term:erase({?OJ, replay_crash_after})
+        end,
+        % The replay stopped short: the last confirmed slot is not there.
+        LastSlot = lists:max([ S || {_, S} <- Confirmed ]),
+        Path = <<"~scheduler@1.0/assignments/", ProcID/binary, "/",
+                 (integer_to_binary(LastSlot))/binary>>,
+        ?assertMatch({error, _},
+            hb_store:read([maps:get(<<"inner">>, Image)], Path, #{})),
+        Again = wal_crash_image(Image, wal_snapshot(Image), kill, <<"wal-replay-img2">>),
+        wal_check(Again, Opts, ProcID, Proc, First, Confirmed)
+    end}.
+
+%% @doc (4) A crash in the middle of a checkpoint: after its synced commit,
+%% with its record written but not renamed into place. The inner store is
+%% then as of that commit, or, had the crash come before the commit, as of
+%% the last checkpoint; and a record a crash tore is no record. Each start
+%% replays from the last whole record and restores every confirmed slot.
+wal_crash_during_checkpoint_test_() ->
+    {timeout, 180, fun() ->
+        {Opts, ProcID, Proc, Server, Store, First, Confirmed, Snap} = wal_setup(<<"wal-ckpt">>),
+        #{ shipper := #{ durable := Durable } } = ?OJ:status(Store),
+        persistent_term:put({?OJ, checkpoint_crash}, after_tmp),
+        try ?assertEqual(Durable, ?OJ:checkpoint_now(Store))
+        after persistent_term:erase({?OJ, checkpoint_crash})
+        end,
+        exit(Server, kill),
+        timer:sleep(100),
+        JDir = wal_journal(Store),
+        ?assert(filelib:is_regular(filename:join(JDir, "durable.shipper.tmp"))),
+        Committed = wal_snapshot(Store),
+        Before = wal_crash_image(Store, Snap, power, <<"wal-ckpt-before">>),
+        wal_check(Before, Opts, ProcID, Proc, First, Confirmed),
+        After = wal_crash_image(Store, Committed, power, <<"wal-ckpt-after">>),
+        wal_check(After, Opts, ProcID, Proc, First, Confirmed),
+        Torn = wal_crash_image(Store, Snap, power, <<"wal-ckpt-torn">>),
+        ok = file:write_file(filename:join(wal_journal(Torn), "durable"), <<131, 104, 3, 0, 0>>),
+        wal_check(Torn, Opts, ProcID, Proc, First, Confirmed)
+    end}.

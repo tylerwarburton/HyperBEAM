@@ -9,11 +9,11 @@
 %%% <pre>
 %%%   write --> writer: append to local journal, then write the inner store
 %%%   flush --> syncer: one round for every flush waiting (group commit):
-%%%                     cut (writer), fdatasync the journal, flush the inner
-%%%                     store, answer them all
+%%%                     cut (writer), fdatasync the journal, answer them all
 %%%                     |
 %%%                     v sealed segments
-%%%                   shipper --> Path/seg-Token-N.log.gz, Path/manifest.log
+%%%                   shipper --> checkpoint: synced inner commit, `durable'
+%%%                           --> Path/seg-Token-N.log.gz, Path/manifest.log
 %%% </pre>
 %%%
 %%% Write-ahead. The writer appends a write's rows to the journal before it
@@ -21,8 +21,28 @@
 %%% journal holds every write in the order the inner store took them. A
 %%% `kill -9' of the node loses nothing the inner store kept: the append is in
 %%% the OS page cache before the inner write starts. `flush/3', which the
-%%% scheduler calls before it confirms a slot, syncs the journal before it
-%%% flushes the inner store, so a confirmed slot is on disk in both.
+%%% scheduler calls before it confirms a slot, syncs the journal: a confirmed
+%%% slot is on disk in the journal.
+%%%
+%%% The journal is the inner store's write-ahead log (`inner-commit' =
+%%% `checkpoint', the default). A round does not commit the inner store; the
+%%% shipper checkpoints it every `checkpoint-ms': it takes the writer's
+%%% position (every frame before it is in the inner store), commits the inner
+%%% store with a sync, and records the position in `durable' (synced,
+%%% renamed). Every start, clean or not, replays the confirmed frames after
+%%% that position into the inner store, in journal order, before the writer
+%%% answers anything and before `start/3' returns, so nothing is read or
+%%% assigned before it. Replay writes values the journal holds, so a replay
+%%% cut short and run again ends the same. A segment is shipped, and so
+%%% deleted, only once a checkpoint covers it whole: every frame a replay may
+%%% need stays local. The inner store must sync its own commits (LMDB's
+%%% default, `sync' unset or true): every commit is then atomic on disk, and
+%%% a crash leaves the inner store at some commit at or after the last
+%%% checkpoint, which the replay brings up to the journal. A commit LMDB does
+%%% not sync can reach the disk out of order, which a crash turns into a
+%%% corrupt tree rather than an older one, so an inner store with `sync'
+%%% false keeps the inner flush in every round. `inner-commit' = `round' does
+%%% too (the behaviour before the write-ahead log).
 %%%
 %%% Group commit. Durability has its own process, the syncer, so a sync never
 %%% holds up an append and no caller pays for a sync alone. Every flush that
@@ -93,9 +113,13 @@
 %%%   <li>`max-fill-pct' (75): never ship past this fill of the target.</li>
 %%%   <li>`ship-interval-ms' (1 s); failures back off to 5 minutes.</li>
 %%%   <li>`fsync-ms' (200): sync an unsynced journal at least this often.</li>
+%%%   <li>`inner-commit' (`checkpoint'): `checkpoint' confirms a round on the
+%%%       journal alone and makes the inner store durable by checkpoints;
+%%%       `round' also commits the inner store, synced, in every round.</li>
+%%%   <li>`checkpoint-ms' (1 s): checkpoint the inner store this often.</li>
 %%% </ul>
 -module(hb_store_offsite_journal).
--export([wrap/2, status/1, restore/2, restore/3, ship_now/1, clear_poison/1,
+-export([wrap/2, status/1, restore/2, restore/3, ship_now/1, checkpoint_now/1, clear_poison/1,
          clear_ship_poison/1]).
 -export([start/3, stop/3, reset/3, flush/3, scope/0, scope/1]).
 -export([read/3, write/3, list/3, match/3, batch/3, hold/3]).
@@ -108,7 +132,12 @@
 -define(MAX_FILL_PCT, 75).
 -define(SHIP_MS, 1000).
 -define(FSYNC_MS, 200).
+-define(CHECKPOINT_MS, 1000).
 -define(MAX_BACKOFF_MS, 300000).
+% Test hook: when this ETS table exists, every journal sync records how much
+% of its segment it covered, so a test can cut the journal to what a power
+% loss would leave.
+-define(SYNCED, hb_store_offsite_journal_synced).
 -define(CALL_MS, 120000).
 -define(ASSIGNMENTS, <<"~scheduler@1.0/assignments">>).
 %% A content-addressed row at least this large is journaled once per run
@@ -139,9 +168,12 @@ inner_mod(Store) -> maps:get(<<"store-module">>, inner(Store)).
 
 %%% Store callbacks.
 
+%% The writer replays the journal into the inner store before it answers
+%% anything: wait for it, so nothing reads the inner store before the replay.
 start(Store, Req, Opts) ->
     ok = hb_store:start([inner(Store)], Req, Opts),
     _ = writer(Store),
+    _ = call(Store, status, infinity),
     ok.
 
 stop(Store, Req, Opts) ->
@@ -297,12 +329,20 @@ status(Store) ->
         end,
     maps:merge(maps:merge(W, S), Y).
 
-%% @doc Ship every sealed segment now and wait for the round to finish.
+%% @doc Ship every sealed segment now (after a checkpoint, which covers them)
+%% and wait for the round to finish.
 ship_now(Store) ->
     _ = call(Store, seal, ?CALL_MS),
+    shipper_call(Store, ship_now).
+
+%% @doc Checkpoint the inner store now; returns the position it is durable
+%% through, or `none'.
+checkpoint_now(Store) -> shipper_call(Store, checkpoint_now).
+
+shipper_call(Store, Msg) ->
     Pid = shipper(Store),
     Ref = make_ref(),
-    Pid ! {ship_now, self(), Ref},
+    Pid ! {Msg, self(), Ref},
     receive {Ref, R} -> R after ?CALL_MS -> {error, timeout} end.
 
 %%% Calls into the writer.
@@ -404,6 +444,15 @@ journal_dir(Store) ->
 
 target_dir(Store) -> hb_util:list(maps:get(<<"path">>, export(Store))).
 
+%% @doc Whether a round confirms on the journal alone, the inner store made
+%% durable by checkpoints and replayed on start (see the module doc). Only an
+%% inner store that syncs its own commits may be left out of the round.
+wal(Store) ->
+    case hb_util:bin(cfg(<<"inner-commit">>, <<"checkpoint">>, Store)) of
+        <<"round">> -> false;
+        <<"checkpoint">> -> hb_util:atom(maps:get(<<"sync">>, inner(Store), true)) =/= false
+    end.
+
 compress(Store) -> hb_util:atom(cfg(<<"compress">>, true, Store)) =/= false.
 
 %%% The writer.
@@ -432,8 +481,10 @@ writer_init(Store) ->
             {Sealed, Marks0, Token} = read_marks(Dir),
             % Every local file newer than the last seal (or not sealed at
             % all) may hold assignments the marks do not: read them, cut
-            % torn tails, seal. A damaged file refuses the journal.
-            case catch recover_local(Dir, Sealed, Marks0) of
+            % torn tails, seal. Every confirmed frame after the last
+            % checkpoint goes into the inner store again. A damaged file
+            % refuses the journal.
+            case catch recover_local(Dir, Sealed, Marks0, read_durable(Dir), Store) of
                 {'EXIT', {{offsite_journal_corrupt, File, Off}, _}} ->
                     writer_refusing(Store, {journal_corrupt, File, Off});
                 {'EXIT', {{offsite_journal_sync_failed, What, Reason}, _}} ->
@@ -442,6 +493,9 @@ writer_init(Store) ->
                     Why = {sync_failed, {recover, What, Reason}},
                     write_poison(Dir, Why),
                     writer_refusing(Store, {journal_poisoned, Why});
+                {'EXIT', {{offsite_journal_replay_failed, Why}, _}} ->
+                    ?event(error, {offsite_journal_refusing, {replay_failed, Why}}),
+                    writer_refusing(Store, {replay_failed, Why});
                 {'EXIT', Reason} ->
                     % Anything else (a file that cannot be read, cut or
                     % renamed): refuse, rather than crash and have the next
@@ -550,7 +604,8 @@ writer_loop(S = #{ store := Store }) ->
         {call, From, Ref, status} ->
             Status = maps:with([dir, token, seg, sealed, off, appended, poisoned,
                                 started, reconciled, rebased, errors, clean_start], S),
-            From ! {Ref, Status#{ processes => map_size(maps:get(marks, S)) }},
+            From ! {Ref, Status#{ processes => map_size(maps:get(marks, S)),
+                                  wal => wal(Store) }},
             writer_loop(S);
         {call, From, Ref, stop} ->
             _ = stop_writer(S),
@@ -599,6 +654,11 @@ handle(From, Ref, seal, S) ->
     S1 = seal_now(S),
     From ! {Ref, refusal(S1, ok)},
     writer_loop(S1);
+%% Where the next frame goes: every frame before it is in the inner store
+%% (the writer writes a frame's rows before it answers anything else).
+handle(From, Ref, position, S = #{ seg := Seg, off := Off }) ->
+    From ! {Ref, refusal(S, {ok, {Seg, Off}})},
+    writer_loop(S);
 handle(From, Ref, {marks, Sealed}, S = #{ marks := Marks, token := Token }) ->
     From ! {Ref, refusal(S, {ok, {marks, Sealed, Marks, Token}})},
     writer_loop(S);
@@ -999,7 +1059,8 @@ queued_flushes() ->
     after 0 -> []
     end.
 
-%% @doc One round: the cut, one sync of the journal through it, one flush of
+%% @doc One round: the cut, one sync of the journal through it, and (unless
+%% the journal is the inner store's write-ahead log, `wal/1') one flush of
 %% the inner store. Only then is the writer told (`round_done'), and its
 %% answer is every waiter's: a writer poisoned since the cut (its own sync of
 %% the segment failed, though ours passed) refuses, and nobody hears `ok'. A
@@ -1011,7 +1072,7 @@ sync_round(Store, St) ->
             Writer = helper(writer, Store),
             case sync_cut(Cut, St) of
                 {ok, St1} ->
-                    case catch hb_store:flush(inner(Store), #{}) of
+                    case round_inner_flush(Store) of
                         ok ->
                             {call_pid(Writer, round_done, ?CALL_MS), St1,
                                 maps:get(seal, Cut)};
@@ -1023,6 +1084,15 @@ sync_round(Store, St) ->
                     {call_pid(Writer, {round_failed, {sync_failed, Reason}}, ?CALL_MS), St1, []}
             end;
         Refused -> {Refused, St, []}
+    end.
+
+%% The round's inner flush: none when the journal is the inner store's
+%% write-ahead log. A frame the round synced is then replayed into the inner
+%% store by the next start until a checkpoint covers it.
+round_inner_flush(Store) ->
+    case wal(Store) of
+        true -> ok;
+        false -> catch hb_store:flush(inner(Store), #{})
     end.
 
 %% @doc Sync each segment of the cut, on the syncer's own descriptor; then
@@ -1053,9 +1123,9 @@ sync_segs(Dir, [N | Segs], St) ->
             {error, enoent, St1} ->
                 case segment_fd(seg_name(Dir, N), St1) of
                     {error, enoent, St2} -> {ok, St2};
-                    Found -> sync_fd(Found)
+                    Found -> sync_fd(Found, {Dir, N})
                 end;
-            Found -> sync_fd(Found)
+            Found -> sync_fd(Found, {Dir, N})
         end,
     case Synced of
         {ok, St3} -> sync_segs(Dir, Segs, St3);
@@ -1090,12 +1160,12 @@ sealed(Store, ok, Seal) ->
     end;
 sealed(_Store, _Refused, _Seal) -> ok.
 
-sync_fd({ok, St = #{ fd := Fd }}) ->
-    case datasync(Fd) of
+sync_fd({ok, St = #{ fd := Fd }}, Seg) ->
+    case datasync(Fd, Seg) of
         ok -> {ok, St};
         {error, Reason} -> {error, Reason, St}
     end;
-sync_fd(Error) -> Error.
+sync_fd(Error, _Seg) -> Error.
 
 segment_fd(Path, St = #{ path := Path, fd := Fd }) when Fd =/= undefined -> {ok, St};
 segment_fd(Path, St) ->
@@ -1149,7 +1219,7 @@ sync_named(Dir, [N | Segs]) ->
         {error, enoent} -> sync_named(Dir, Segs);
         {error, Reason} -> {error, Reason};
         {ok, Fd} ->
-            R = datasync(Fd),
+            R = datasync(Fd, {Dir, N}),
             _ = file:close(Fd),
             case R of
                 ok -> sync_named(Dir, Segs);
@@ -1168,18 +1238,31 @@ sync_file(File) ->
 
 sync_current(S = #{ dirty := false }) -> S;
 sync_current(S = #{ fd := undefined }) -> S#{ dirty := false };
-sync_current(S = #{ fd := Fd }) ->
-    case datasync(Fd) of
+sync_current(S = #{ fd := Fd, dir := Dir, seg := N }) ->
+    case datasync(Fd, {Dir, N}) of
         ok -> S#{ dirty := false };
         {error, Reason} -> poison(S, {sync_failed, Reason})
     end.
 
-datasync(Fd) ->
+datasync(Fd) -> datasync(Fd, none).
+
+datasync(Fd, Seg) ->
     % Test hooks: a slow disk, then a failing one.
     timer:sleep(persistent_term:get({?MODULE, sync_delay_ms}, 0)),
     case persistent_term:get({?MODULE, fail_sync}, false) of
         true -> {error, eio};
-        false -> file:datasync(Fd)
+        false ->
+            case ets:whereis(?SYNCED) of
+                undefined -> file:datasync(Fd);
+                Tab ->
+                    % Test hook: what this sync covers (what was written
+                    % before it began).
+                    {ok, Size} = file:position(Fd, eof),
+                    R = file:datasync(Fd),
+                    R == ok andalso
+                        ets:insert(Tab, {Seg, max(Size, ets:lookup_element(Tab, Seg, 2, 0))}),
+                    R
+            end
     end.
 
 maybe_roll(S = #{ fd := undefined }) -> S;
@@ -1284,7 +1367,7 @@ seal_current(S = #{ fd := undefined }) -> S;
 seal_current(S = #{ fd := Fd, dir := Dir, seg := N, store := Store }) ->
     case S of
         #{ poisoned := false, dirty := true } ->
-            case datasync(Fd) of
+            case datasync(Fd, {Dir, N}) of
                 ok -> seal_synced(S#{ dirty := false }, Fd, Dir, N, Store);
                 {error, Reason} -> poison(S, {sync_failed, Reason})
             end;
@@ -1378,7 +1461,7 @@ sync_dir_wait(Port, Dir, Out) ->
 
 stop_writer(S = #{ poisoned := P }) when P =/= false -> S;
 stop_writer(S0) ->
-    {_, S} = do_flush(S0),
+    {Flushed, S} = do_flush(S0),
     S1 =
         case append({stop}, S) of
             {ok, SA} -> SA;
@@ -1388,7 +1471,10 @@ stop_writer(S0) ->
     _ = write_marks(S2),
     Dir = maps:get(dir, S2),
     case maps:get(poisoned, S2) of
-        false ->
+        false when Flushed == ok ->
+            % The flush committed the inner store, synced, and nothing with
+            % rows follows it: it is durable through the journal's end.
+            _ = (catch write_durable(Dir, {maps:get(seg, S2), maps:get(off, S2)}, writer)),
             case file:open(filename:join(Dir, "clean"), [write, raw]) of
                 {ok, F} ->
                     _ = file:sync(F),
@@ -1462,16 +1548,20 @@ token_bin(T) -> hb_util:bin(T).
 %% it is cut at its first bad frame, and the `open-' files after it are
 %% dropped. A `seg-' file was synced whole: damage in one, or one after the
 %% end of the log, refuses (raises), before anything is changed. A failed
-%% sync raises too, and is never retried. Returns the highest segment number
-%% seen.
-recover_local(Dir, Sealed, Marks) ->
-    {Max, Replay, Seals, Drop, _End} =
+%% sync raises too, and is never retried. The confirmed frames after
+%% `Durable' (the last checkpoint) are written into the inner store again, in
+%% journal order (`replay_inner/1'), from every file of the log. Returns the
+%% highest segment number seen, and the marks.
+recover_local(Dir, Sealed, Marks) -> recover_local(Dir, Sealed, Marks, none, undefined).
+
+recover_local(Dir, Sealed, Marks, Durable, Store) ->
+    {Max, Replay, Seals, Drop, _End, Inner} =
         lists:foldl(
-            fun({N, open, File}, {Max, R, Seals, Drop, End}) when End =/= false ->
-                    {max(Max, N), R, Seals, [File | Drop], End};
-               ({_N, seg, File}, {_, _, _, _, End}) when End =/= false ->
+            fun({N, open, File}, {Max, R, Seals, Drop, End, I}) when End =/= false ->
+                    {max(Max, N), R, Seals, [File | Drop], End, I};
+               ({_N, seg, File}, {_, _, _, _, End, _}) when End =/= false ->
                     corrupt(File, {after_end_of_log, End});
-               ({N, Kind, File}, {Max, R, Seals, Drop, false}) ->
+               ({N, Kind, File}, {Max, R, Seals, Drop, false, I}) ->
                     {ok, Bin} = hb_file:read_file(File),
                     Valid = valid_prefix(Bin, 0),
                     Whole = Valid == byte_size(Bin),
@@ -1491,9 +1581,11 @@ recover_local(Dir, Sealed, Marks) ->
                      case ends_log(Kind, N, Whole, Recs) of
                          true -> File;
                          false -> false
-                     end}
+                     end,
+                     replay(records(after_durable(N, Bin, Valid, Durable)), I)}
             end,
-            {-1, replay_init(fun(Pairs, M) -> mark(Pairs, M) end, Marks), [], [], false},
+            {-1, replay_init(fun(Pairs, M) -> mark(Pairs, M) end, Marks), [], [], false,
+                 replay_init(replay_inner(Store), 0)},
             local_files(Dir)
         ),
     % What follows the end goes first, durably: a later start must not find
@@ -1507,6 +1599,10 @@ recover_local(Dir, Sealed, Marks) ->
     end,
     lists:foreach(fun(Seal) -> recover_seal(Dir, Seal) end, lists:reverse(Seals)),
     recovery_sync(Dir, sync_dir(Dir)),
+    case replay_finish(Inner) of
+        0 -> ok;
+        Frames -> ?event(warning, {offsite_journal_replayed, {frames, Frames}, {from, Durable}})
+    end,
     {Max, replay_finish(Replay)}.
 
 %% Whether a file ends the local log if anything follows it: an `open-' one
@@ -1546,6 +1642,115 @@ recovery_sync(_What, ok) -> ok;
 recovery_sync(What, {error, Reason}) ->
     ?event(error, {offsite_journal_recovery_sync_failed, What, Reason}),
     erlang:error({offsite_journal_sync_failed, What, Reason}).
+
+%% The frames of a segment after the last checkpoint: none of an earlier
+%% segment, the rest of the checkpoint's own, all of a later one (and all of
+%% every segment when there is no checkpoint). A position that is not a frame
+%% boundary of its file replays all of it: replaying a frame the inner store
+%% holds already changes nothing.
+after_durable(N, Bin, Valid, {N, Off}) when Off >= 0, Off =< Valid ->
+    case valid_prefix(Bin, Off) of
+        Valid -> binary:part(Bin, Off, Valid - Off);
+        _ -> binary:part(Bin, 0, Valid)
+    end;
+after_durable(N, _Bin, _Valid, {S, _}) when S >= N -> <<>>;
+after_durable(_N, Bin, Valid, _Durable) -> binary:part(Bin, 0, Valid).
+
+%% @doc Write a confirmed frame into the inner store again, as the writer did
+%% (`write_inner/3'). A refusal raises: the writer refuses rather than run on
+%% an inner store that lacks a confirmed write.
+replay_inner(undefined) ->
+    fun(_Pairs, C) -> C end;
+replay_inner(Store) ->
+    Inner = inner(Store),
+    Mod = maps:get(<<"store-module">>, Inner),
+    % Test hooks: skip the replay, or crash after this many frames (their
+    % writes committed first, as a crash after a commit would leave them).
+    Skip = persistent_term:get({?MODULE, skip_replay}, false),
+    CrashAfter = persistent_term:get({?MODULE, replay_crash_after}, -1),
+    fun(_Pairs, C) when Skip -> C;
+       (_Pairs, C) when C == CrashAfter ->
+            ok = hb_store:flush(Inner, #{}),
+            exit(replay_crash_test_hook);
+       (Pairs, C) ->
+            case write_inner(Mod, Inner, [Pairs]) of
+                ok -> C + 1;
+                Failure -> erlang:error({offsite_journal_replay_failed, Failure})
+            end
+    end.
+
+%%% Checkpoints: the journal position the inner store is durable through.
+
+read_durable(Dir) ->
+    case hb_file:read_file(filename:join(Dir, "durable")) of
+        {ok, Bin} ->
+            case catch binary_to_term(Bin) of
+                {durable, Seg, Off} when is_integer(Seg), is_integer(Off) -> {Seg, Off};
+                _ -> none
+            end;
+        _ -> none
+    end.
+
+%% Synced, then renamed, then the directory synced: a crash leaves the old
+%% checkpoint or the new one, whole. `Who' keeps the writer's and the
+%% shipper's temporary files apart.
+write_durable(Dir, {Seg, Off}, Who) ->
+    File = filename:join(Dir, "durable"),
+    Tmp = File ++ "." ++ atom_to_list(Who) ++ ".tmp",
+    ok = write_synced(Tmp, term_to_binary({durable, Seg, Off})),
+    test_crash(after_tmp),
+    ok = hb_file:rename(Tmp, File),
+    sync_dir(Dir).
+
+%% Test hook: raise at a named step of a checkpoint.
+test_crash(Step) ->
+    case persistent_term:get({?MODULE, checkpoint_crash}, none) of
+        Step -> erlang:error({checkpoint_crash_test_hook, Step});
+        _ -> ok
+    end.
+
+%% @doc Make the inner store durable through the writer's position: take the
+%% position (every frame before it is in the inner store), commit the inner
+%% store with a sync, then record the position. Nothing to do if the
+%% position has not moved. A failure leaves the last checkpoint standing:
+%% a start replays more, and the shipper ships nothing past it.
+checkpoint(Store, St = #{ durable := Durable }) ->
+    Result =
+        try
+            case call(Store, position, ?CALL_MS) of
+                {ok, Durable} -> unchanged;
+                {ok, Pos} ->
+                    ok = hb_store:flush(inner(Store), #{}),
+                    test_crash(after_commit),
+                    ok = write_durable(journal_dir(Store), Pos, shipper),
+                    {ok, Pos};
+                Refused -> {refused, Refused}
+            end
+        catch C:R -> {failed, {C, R}}
+        end,
+    St1 = St#{ checkpointed => now_ms() },
+    case Result of
+        unchanged -> St1#{ checkpoint_error => none };
+        {ok, P} ->
+            St1#{ durable => P, checkpoints => maps:get(checkpoints, St) + 1,
+                  checkpoint_error => none };
+        Error ->
+            % Logged once, not every `checkpoint-ms' while it lasts.
+            case maps:get(checkpoint_error, St, none) of
+                Error -> ok;
+                _ -> ?event(error, {offsite_journal_checkpoint_failed, Error})
+            end,
+            St1#{ checkpoint_error => Error }
+    end.
+
+now_ms() -> erlang:monotonic_time(millisecond).
+
+%% @doc Whether a local segment is wholly before the last checkpoint: only
+%% then may it be shipped, and so deleted, as no replay can need it.
+covered(_N, _File, none) -> false;
+covered(N, _File, {S, _}) when S > N -> true;
+covered(N, File, {N, Off}) -> hb_file:file_size(File) =< Off;
+covered(_N, _File, _Durable) -> false.
 
 %%% Replay: what a journal confirms. Rows count once a `flushed' marker
 %%% follows them and no `revoke' follows that; rows written before a new run
@@ -1744,7 +1949,10 @@ follow(Store, Value, Acc) ->
 
 shipper_init(Store) ->
     erlang:send_after(0, self(), tick),
-    shipper_loop(Store, #{ shipped => 0, backoff => 0, state => idle, chain => undefined }).
+    erlang:send_after(0, self(), checkpoint_tick),
+    shipper_loop(Store, #{ shipped => 0, backoff => 0, state => idle, chain => undefined,
+                           durable => read_durable(journal_dir(Store)),
+                           checkpoints => 0, checkpointed => undefined }).
 
 shipper_loop(Store, St) ->
     receive
@@ -1753,8 +1961,24 @@ shipper_loop(Store, St) ->
             From ! {Ref, #{ shipper => maps:without([chain], St#{ backlog => backlog(Store) }) }},
             shipper_loop(Store, St);
         {ship_now, From, Ref} ->
-            St1 = ship_round(Store, St),
+            St1 = ship_round(Store, checkpoint(Store, St)),
             From ! {Ref, maps:get(state, St1)},
+            shipper_loop(Store, St1);
+        {checkpoint_now, From, Ref} ->
+            St1 = checkpoint(Store, St),
+            From ! {Ref, maps:get(durable, St1)},
+            shipper_loop(Store, St1);
+        checkpoint_tick ->
+            % The first tick of a run is at once, so a replay is checkpointed
+            % at once; then every `checkpoint-ms'.
+            Every = cfg(<<"checkpoint-ms">>, ?CHECKPOINT_MS, Store),
+            Now = now_ms(),
+            St1 =
+                case maps:get(checkpointed, St) of
+                    T when is_integer(T), Now - T < Every -> St;
+                    _ -> checkpoint(Store, St)
+                end,
+            erlang:send_after(Every, self(), checkpoint_tick),
             shipper_loop(Store, St1);
         wake ->
             shipper_loop(Store, ship_round(Store, St));
@@ -1804,7 +2028,11 @@ ship_round(Store, St) ->
 
 ship_segs([], _Store, St) -> St#{ backoff => 0 };
 ship_segs([{N, File} | Rest], Store, St) ->
-    case ship_one(N, File, Store, maps:get(chain, St)) of
+    case covered(N, File, maps:get(durable, St)) andalso
+            ship_one(N, File, Store, maps:get(chain, St)) of
+        false ->
+            % Not covered by a checkpoint yet: it waits for the next one.
+            St#{ backoff => 0 };
         {ok, Chain} ->
             ship_segs(Rest, Store, St#{ shipped => maps:get(shipped, St) + 1, chain => Chain });
         {ceiling, Info} ->
@@ -2480,7 +2708,9 @@ closure_follows_commitments_path_test() ->
 writer_pid(#{ <<"name">> := Name }) -> hb_name:lookup({?MODULE, writer, Name}).
 
 %% @doc Sixteen callers flushing at once share one round: one sync of the
-%% journal, one flush of the inner store, and every one of them is answered.
+%% journal, and every one of them is answered. The round does not commit the
+%% inner store: the journal is its write-ahead log (64c06ca6c committed it,
+%% synced, in every round).
 concurrent_flushes_share_one_round_test() ->
     {Store, _Inner, Target} = test_setup(<<"oj-group">>, #{ <<"fsync-ms">> => 600000 }),
     ok = write(Store, #{ <<"g/0">> => <<"0">> }, #{}),
@@ -2495,7 +2725,7 @@ concurrent_flushes_share_one_round_test() ->
           Parent ! {flushed, I, flush(Store, #{}, #{})}
       end) || I <- lists:seq(1, N) ],
     ok = wait_until(fun() -> element(2, process_info(Syncer, message_queue_len)) == N end),
-    Pattern = [{?MODULE, datasync, 1}, {hb_store_lmdb, flush, 3}],
+    Pattern = [{?MODULE, datasync, 2}, {hb_store_lmdb, flush, 3}],
     [ erlang:trace_pattern(MFA, true, [local, call_count]) || MFA <- Pattern ],
     erlang:trace(Syncer, true, [call]),
     erlang:trace(writer_pid(Store), true, [call]),
@@ -2507,7 +2737,7 @@ concurrent_flushes_share_one_round_test() ->
     [ erlang:trace_pattern(MFA, false, [local, call_count]) || MFA <- Pattern ],
     ?assertEqual(lists:duplicate(N, ok), Replies),
     ?assertEqual(1, Syncs),
-    ?assertEqual(1, InnerFlushes),
+    ?assertEqual(0, InnerFlushes),
     ?assertMatch(#{ syncer := #{ rounds := R } } when R == R0 + 1, status(Store)),
     % What they wrote is confirmed: it restores.
     idle = ship_now(Store),
@@ -2843,12 +3073,12 @@ roll_does_not_hold_up_appends_test() ->
             || {K, V} <- lists:sort(maps:to_list(Rows)) ],
         ?assert(lists:max(Times) < 100),
         #{ seg := Before } = status(Store),
-        erlang:trace_pattern({?MODULE, datasync, 1}, true, [local, call_count]),
+        erlang:trace_pattern({?MODULE, datasync, 2}, true, [local, call_count]),
         Syncer = hb_name:lookup({?MODULE, syncer, maps:get(<<"name">>, Store)}),
         erlang:trace(if is_pid(Syncer) -> Syncer; true -> all end, true, [call]),
         ok = flush(Store, #{}, #{}),
-        {call_count, Syncs} = erlang:trace_info({?MODULE, datasync, 1}, call_count),
-        erlang:trace_pattern({?MODULE, datasync, 1}, false, [local, call_count]),
+        {call_count, Syncs} = erlang:trace_info({?MODULE, datasync, 2}, call_count),
+        erlang:trace_pattern({?MODULE, datasync, 2}, false, [local, call_count]),
         % Five closed segments, each with an unsynced append.
         ?assert(Syncs >= 5),
         % ...each renamed sealed by the round (a roll since may have closed
@@ -3150,3 +3380,35 @@ not_started_segment_is_synced_test() ->
     _ = seal_closed(S3),
     ?assert(filelib:is_regular(open_name(Dir, N))),
     ?assertNot(filelib:is_regular(seg_name(Dir, N))).
+
+%% @doc A segment is shipped, and so deleted, only once a checkpoint covers
+%% it whole: until then a replay may need it. A sealed segment stays local
+%% through shipping rounds while the checkpoint is behind it, then ships.
+shipping_waits_for_a_checkpoint_test() ->
+    {Store, _Inner, Target} = test_setup(<<"oj-gate">>, #{ <<"checkpoint-ms">> => 600000 }),
+    _ = checkpoint_now(Store),
+    Rows = rows(<<"g/">>, 1, 20),
+    write_rows(Store, Rows),
+    ok = flush(Store, #{}, #{}),
+    ok = call(Store, seal, 5000),
+    Shipper = shipper(Store),
+    [ begin Shipper ! wake, _ = status(Store) end || _ <- [1, 2] ],
+    ?assertMatch(#{ shipper := #{ backlog := #{ segments := 1 } } }, status(Store)),
+    ?assertNot(filelib:is_regular(filename:join(Target, "manifest.log"))),
+    {Seg, _} = checkpoint_now(Store),
+    ?assert(Seg > hd([ N || {N, seg, _} <- local_files(journal_dir(Store)) ])),
+    Shipper ! wake,
+    ?assertMatch(#{ shipper := #{ backlog := #{ segments := 0 } } }, status(Store)),
+    Fresh = fresh_store(<<"oj-gate-r">>),
+    {ok, _} = restore(Target, Fresh),
+    assert_rows(Fresh, Rows).
+
+%% @doc An inner store that does not sync its own commits keeps the inner
+%% flush in every round: a crash can corrupt it rather than set it back.
+unsynced_inner_keeps_the_round_flush_test() ->
+    Inner = (hb_test_utils:test_store(hb_store_lmdb, <<"oj-nosync">>))#{ <<"sync">> => false },
+    Store = wrap(Inner, #{ <<"path">> => <<"x">> }),
+    ?assertNot(wal(Store)),
+    ?assert(wal(Store#{ <<"inner">> => Inner#{ <<"sync">> => true } })),
+    ?assertNot(wal(wrap(Inner#{ <<"sync">> => true },
+                        #{ <<"path">> => <<"x">>, <<"inner-commit">> => <<"round">> }))).
