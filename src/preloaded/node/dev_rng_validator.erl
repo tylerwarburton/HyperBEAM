@@ -341,16 +341,24 @@ plan(Info, Ctx = #{ me := Me, now := Now }, Dir) ->
         XPhase = maps:get(<<"phase">>, X, null),
         Deadline = to_int(maps:get(<<"commitDeadline">>, X, 0), 0),
         Mine0 = maps:get(Me, obj(<<"committed">>, X), undefined),
+        % Reveal once commits are closed: the round's whole active set has
+        % committed, or the beacon clock is past commitDeadline. The beacon
+        % closes the commit phase the moment the set is complete (closeIfDue),
+        % after which nobody can commit, so revealing then cannot be
+        % front-run. The phase and set come from this node itself, so a third
+        % party cannot spoof them. Waiting for the deadline as well held every
+        % round to the full commit window (~0.6 rounds/s, 2026-11-07).
+        Set = list(<<"active">>, X),
+        Done = obj(<<"committed">>, X),
+        Complete = Set =/= [] andalso lists:all(fun(V) -> maps:is_key(V, Done) end, Set),
         % Reveal only once the beacon shows the round revealing. An older beacon
         % is asked to close a round its window has passed; a `ready' beacon
         % closes rounds by itself on every message, and a Close there is only a
         % message in the way of the next commit (three a round, 2026-11-04).
         [ {<<"Close">>, R, #{ <<"round">> => R }}
         || not ReadyMode, XPhase =:= <<"commit">>, Deadline > 0, BNow >= Deadline, Due(<<"Close">>, R, 2000) ] ++
-        % The phase is the node's word: the beacon clock must also show the
-        % commit window over.
         [ {<<"Reveal">>, R, #{ <<"round">> => R, <<"alpha">> => A }}
-        || XPhase =:= <<"reveal">>, BNow >= Deadline, is_binary(Mine0),
+        || XPhase =:= <<"reveal">>, Complete orelse BNow >= Deadline, is_binary(Mine0),
            not lists:member(Me, list(<<"revealed">>, X)),
            Due(<<"Reveal">>, R, 3000),
            A <- [secret_for(Mine0, secrets(Dir, R))], A =/= missing ]
@@ -1028,6 +1036,22 @@ reveal_waits_for_commit_deadline_test() ->
     Info = info(Open, #{ <<"revealing">> => [R] }),
     ?assertEqual([], element(1, plan(Info, (ctx(#{}))#{ beacon_now => 104999 }, Dir))),
     ?assertEqual([<<"Reveal">>], kinds(element(1, plan(Info, (ctx(#{}))#{ beacon_now => 105000 }, Dir)))).
+
+%% A complete set closed the commit phase: reveal before commitDeadline. One
+%% member short: wait for the deadline.
+reveal_early_when_set_complete_test() ->
+    Dir = tmp_dir(),
+    save_secret(Dir, 3, <<"c1">>, <<"a1">>),
+    R = #{ <<"round">> => 3, <<"phase">> => <<"reveal">>, <<"commitDeadline">> => 105000,
+        <<"active">> => [?ME, <<"v2">>, <<"v3">>],
+        <<"committed">> => #{ ?ME => <<"c1">>, <<"v2">> => <<"y">>, <<"v3">> => <<"z">> },
+        <<"revealed">> => [] },
+    Open = #{ <<"round">> => 4, <<"phase">> => <<"commit">>, <<"committed">> => #{ ?ME => <<"x">> } },
+    Plan = fun(X, BNow) -> element(1, plan(info(Open, #{ <<"revealing">> => [X] }), (ctx(#{}))#{ beacon_now => BNow }, Dir)) end,
+    ?assertEqual([<<"Reveal">>], kinds(Plan(R, 100000))),
+    Short = R#{ <<"committed">> => #{ ?ME => <<"c1">>, <<"v2">> => <<"y">> } },
+    ?assertEqual([], Plan(Short, 104999)),
+    ?assertEqual([<<"Reveal">>], kinds(Plan(Short, 105000))).
 
 registry_entry_shapes_test() ->
     E = #{ <<"address">> => ?ME, <<"bond">> => 7 },
