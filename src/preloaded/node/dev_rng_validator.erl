@@ -10,6 +10,8 @@
 %%%      a round can take it, stores the secret, then sends `Commit';
 %%%   2. asks a round to close (`Close') once its commit window has passed;
 %%%   3. reveals its secret (`Reveal') once the beacon shows the round revealing;
+%%%      a reveal due just before its next commit waits for it (<= 500 ms)
+%%%      and goes in the same `Act', so a round costs one message, not two;
 %%%   4. says `Ready' once it is healthy and its stake is full (with `top-up',
 %%%      bonding from the wallet first), and `Pause' when it should stop;
 %%%   5. with `exit' set, sends `Exit', then `Finalize-Exit' until it lands.
@@ -55,6 +57,12 @@
 %% The most RNG an automatic top-up ever covers: a beacon (or a hostile
 %% successor) asking for more gets the `bond' command logged instead.
 -define(MAX_TOP_UP_STAKE, 10000000).
+%% Reveal batching (see `plan'), all on the beacon clock: a due reveal waits
+%% for a commit at most HOLD_MS away, at most HOLD_MAX_MS after its round
+%% closed, and never within REVEAL_MARGIN_MS of its revealDeadline.
+-define(HOLD_MS, 400).
+-define(HOLD_MAX_MS, 500).
+-define(REVEAL_MARGIN_MS, 10000).
 
 device_info(_) ->
     #{ exports => [<<"start">>, <<"status">>] }.
@@ -310,22 +318,23 @@ plan(Info, Ctx = #{ me := Me, now := Now }, Dir) ->
     OpenRound = to_int(maps:get(<<"round">>, Open, 0), 0),
     Phase = maps:get(<<"phase">>, Open, null),
     InSet = lists:member(Me, list(<<"active">>, Open)),
-    MayCommit =
+    % CommitIn: beacon ms until this validator may commit to the open round
+    % (0: now; the atom `infinity' compares above every number).
+    CanOpen = Available andalso not Stopping andalso Active >= MinCommits
+        % Request-driven (reserve spent): only rounds with requests.
+        andalso (to_int(maps:get(<<"pending">>, Open, 0), 0) > 0
+                 orelse (truthy(<<"heartbeat">>, Params)
+                         andalso maps:get(<<"mode">>, Info, null) =/= <<"request-driven">>)),
+    CommitIn =
         case Phase of
-            <<"collecting">> ->
-                Available andalso not Stopping andalso Active >= MinCommits
-                    % Request-driven (reserve spent): only rounds with requests.
-                    andalso (to_int(maps:get(<<"pending">>, Open, 0), 0) > 0
-                             orelse (truthy(<<"heartbeat">>, Params)
-                                     andalso maps:get(<<"mode">>, Info, null) =/= <<"request-driven">>))
-                    andalso BNow >= to_int(maps:get(<<"nextRoundAt">>, Info, 0), 0);
-            <<"commit">> when ReadyMode -> InSet;
-            <<"commit">> -> Available andalso not Stopping;
-            _ -> false
+            <<"collecting">> when CanOpen -> max(0, to_int(maps:get(<<"nextRoundAt">>, Info, 0), 0) - BNow);
+            <<"commit">> when ReadyMode, InSet -> 0;
+            <<"commit">> when not ReadyMode -> case Available andalso not Stopping of true -> 0; false -> infinity end;
+            _ -> infinity
         end,
+    CommitOwed = not maps:is_key(Me, obj(<<"committed">>, Open)) andalso Due(<<"Commit">>, OpenRound, 1000),
     Commit =
-        case MayCommit andalso not maps:is_key(Me, obj(<<"committed">>, Open))
-            andalso Due(<<"Commit">>, OpenRound, 1000) of
+        case CommitIn =:= 0 andalso CommitOwed of
             false -> [];
             true ->
                 % A fresh secret on every send, a resend after a void included.
@@ -334,6 +343,16 @@ plan(Info, Ctx = #{ me := Me, now := Now }, Dir) ->
                 save_secret(Dir, OpenRound, C, A),
                 [{<<"Commit">>, OpenRound, #{ <<"round">> => OpenRound, <<"c">> => C }}]
         end,
+    % A reveal due while our next commit is HOLD_MS or less away waits for it
+    % and goes in the same Act: one message a round instead of two (2026-11-07:
+    % ~6 slots a round at ~21 KB each). `hold_ms' 0 never holds.
+    Hold = lists:member(<<"act">>, list(<<"features">>, Info)) andalso Commit =:= [] andalso CommitOwed
+        andalso CommitIn =< maps:get(hold_ms, Ctx, ?HOLD_MS),
+    RevealWindow = to_int(maps:get(<<"revealWindowMs">>, Params, 30000), 30000),
+    Held = fun(X) ->
+        RD = to_int(maps:get(<<"revealDeadline">>, X, 0), 0),
+        Hold andalso RD - BNow > ?REVEAL_MARGIN_MS andalso BNow - (RD - RevealWindow) < ?HOLD_MAX_MS
+    end,
     % Rounds overlap: the open round takes commits while older ones reveal.
     Rounds = list(<<"revealing">>, Info) ++ [Open],
     PerRound = lists:flatmap(fun(X) ->
@@ -360,7 +379,7 @@ plan(Info, Ctx = #{ me := Me, now := Now }, Dir) ->
         [ {<<"Reveal">>, R, #{ <<"round">> => R, <<"alpha">> => A }}
         || XPhase =:= <<"reveal">>, Complete orelse BNow >= Deadline, is_binary(Mine0),
            not lists:member(Me, list(<<"revealed">>, X)),
-           Due(<<"Reveal">>, R, 3000),
+           Due(<<"Reveal">>, R, 3000), not Held(X),
            A <- [secret_for(Mine0, secrets(Dir, R))], A =/= missing ]
     end, Rounds),
     Oldest = lists:min([to_int(maps:get(<<"round">>, X, 0), 0) || X <- Rounds]),
@@ -1052,6 +1071,37 @@ reveal_early_when_set_complete_test() ->
     Short = R#{ <<"committed">> => #{ ?ME => <<"c1">>, <<"v2">> => <<"y">> } },
     ?assertEqual([], Plan(Short, 104999)),
     ?assertEqual([<<"Reveal">>], kinds(Plan(Short, 105000))).
+
+%% A reveal due within HOLD_MS of the next commit waits for it and goes in the
+%% same Act; never longer than HOLD_MAX_MS after its round closed, nor near
+%% its revealDeadline, nor when the commit is already sent or `act' missing.
+reveal_waits_for_next_commit_test() ->
+    Dir = tmp_dir(),
+    save_secret(Dir, 6, <<"c6">>, <<"a6">>),
+    % Round 6 closed at 99900 (revealDeadline - revealWindowMs).
+    R = #{ <<"round">> => 6, <<"phase">> => <<"reveal">>, <<"active">> => [?ME],
+        <<"committed">> => #{ ?ME => <<"c6">> }, <<"revealed">> => [], <<"revealDeadline">> => 129900 },
+    Open = #{ <<"round">> => 7, <<"phase">> => <<"collecting">> },
+    Info = fun(Extra) ->
+        I = info(Open, maps:merge(#{ <<"revealing">> => [R], <<"nextRoundAt">> => 100300,
+            <<"features">> => [<<"act">>] }, Extra)),
+        I#{ <<"params">> => (maps:get(<<"params">>, I))#{ <<"revealWindowMs">> => 30000 } }
+    end,
+    Plan = fun(I, C) -> kinds(element(1, plan(I, maps:merge(ctx(#{}), C), Dir))) end,
+    ?assertEqual([], Plan(Info(#{}), #{})),
+    {Both, 6} = plan(Info(#{}), (ctx(#{}))#{ now => 100300, beacon_now => 100300 }, Dir),
+    ?assertEqual([<<"Commit">>, <<"Reveal">>], kinds(Both)),
+    ?assertMatch([{<<"Act">>, _, _}], batch(Both, Info(#{}))),
+    Stuck = Info(#{ <<"nextRoundAt">> => 99900 + ?HOLD_MAX_MS + 100 }),
+    ?assertEqual([], Plan(Stuck, #{ beacon_now => 99900 + ?HOLD_MAX_MS - 1 })),
+    ?assertEqual([<<"Reveal">>], Plan(Stuck, #{ beacon_now => 99900 + ?HOLD_MAX_MS })),
+    ?assertEqual([<<"Reveal">>], Plan(Info(#{ <<"nextRoundAt">> => 100000 + ?HOLD_MS + 1 }), #{})),
+    ?assertEqual([<<"Reveal">>], Plan(Info(#{}), #{ sent => #{ {<<"Commit">>, 7} => {100000, 99} } })),
+    ?assertEqual([<<"Reveal">>], Plan(Info(#{ <<"features">> => [] }), #{})),
+    ?assertEqual([<<"Reveal">>], Plan(Info(#{}), #{ hold_ms => 0 })),
+    Short = Info(#{ <<"revealing">> => [R#{ <<"revealDeadline">> => 99900 + ?REVEAL_MARGIN_MS - 1 }] }),
+    ShortW = Short#{ <<"params">> => (maps:get(<<"params">>, Short))#{ <<"revealWindowMs">> => ?REVEAL_MARGIN_MS - 1 } },
+    ?assertEqual([<<"Reveal">>], Plan(ShortW, #{})).
 
 registry_entry_shapes_test() ->
     E = #{ <<"address">> => ?ME, <<"bond">> => 7 },
