@@ -60,7 +60,7 @@
 %% Reveal batching (see `plan'), all on the beacon clock: a due reveal waits
 %% for a commit at most HOLD_MS away, at most HOLD_MAX_MS after its round
 %% closed, and never within REVEAL_MARGIN_MS of its revealDeadline.
--define(HOLD_MS, 400).
+-define(HOLD_MS, 500).
 -define(HOLD_MAX_MS, 500).
 -define(REVEAL_MARGIN_MS, 10000).
 
