@@ -28,6 +28,8 @@
 %%% read or does not match the store means starting over from slot 0.
 -module(lib_bridge_replica).
 -export([view/3]).
+%% For `dev_scheduler_follower', which follows any process this way.
+-export([load/4, forward/1, slot_path/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
