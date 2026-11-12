@@ -373,7 +373,7 @@ arweave_assignment(_, _, _, _) -> false.
 %% verified at that height (dev_arweave_scheduler_sync: recomputed
 %% indep_hash and tx_root, confirmed by its descendants).
 validated_block(Height, Hash, Opts) ->
-    case dev_arweave_scheduler_cache:read_block(Height, Opts) of
+    case lib_arweave_scheduler_blocks:read_block(Height, Opts) of
         {ok, Block} ->
             hb_util:encode(hb_util:decode(
                 hb_maps:get(<<"indep-hash">>, Block, <<>>, Opts))) =:= Hash;
@@ -393,7 +393,7 @@ arweave_assignment_names_a_validated_block_test() ->
     try
         % No block this node verified at that height.
         ?assertEqual(false, arweave_assignment(A, Pusd, 1, Opts)),
-        {ok, _} = dev_arweave_scheduler_cache:write_block(100,
+        {ok, _} = lib_arweave_scheduler_blocks:write_block(100,
             #{ <<"height">> => 100, <<"indep-hash">> => Hash }, Opts),
         ?assertEqual(A, arweave_assignment(A, Pusd, 1, Opts)),
         % A block hash this node did not verify at that height.
@@ -422,7 +422,7 @@ replica_failure_is_scrubbed_test() ->
     Secret = <<"https://rpc.example/v2/KEY">>,
     Opts = #{<<"store">> => [Store], <<"rpc">> => Secret},
     Hash = hb_util:encode(crypto:strong_rand_bytes(48)),
-    {ok, _} = dev_arweave_scheduler_cache:write_block(100,
+    {ok, _} = lib_arweave_scheduler_blocks:write_block(100,
         #{<<"height">> => 100, <<"indep-hash">> => Hash}, Opts),
     % A verified block, and an assignment with no message to load.
     A = #{<<"process">> => Pusd, <<"slot">> => 1,
@@ -449,10 +449,9 @@ canonical_schedule_is_read_locally() ->
     end,
     Node = hb_http_server:start_node(#{<<"port">> => 0,
         <<"on">> => #{<<"response">> => #{<<"device">> => #{<<"response">> => Hook}}}}),
+    % The scheduler reads Arweave only from the node's `gateway'.
     Opts = (execution_opts(#{}, Store))#{<<"arweave-scheduler-from">> => 10,
-        <<"arweave-index-blocks">> => false,
-        <<"routes">> => [#{<<"template">> => <<"^/arweave">>,
-            <<"node">> => #{<<"match">> => <<"^/arweave">>, <<"with">> => hb_util:bin(Node)}}]},
+        <<"gateway">> => hb_util:bin(Node)},
     Pusd = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Put = fun(Path, Value) ->
         {ok, ID} = hb_cache:write(Value, Opts),

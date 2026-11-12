@@ -21,7 +21,6 @@
 -export([post_tx_header/2, post_tx/3, post_tx/4, post_chunk/2]).
 %%% Helper functions
 -export([get_chunk/2]).
--export([block_message/2]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -1148,50 +1147,6 @@ block_proofs(Block, Req, Opts) ->
                 [<<"poa">>, <<"poa2">>], hb_message:uncommitted(Block, Opts), Opts)
     end.
 
-%% @doc A block's JSON as the message this device returns for it.
-block_message(Body, Opts) ->
-    block_keys(
-        hb_message:convert(
-            Body,
-            <<"structured@1.0">>,
-            % `convert/4' asks the source codec to produce TABM first; put
-            % `bundle' on json@1.0 so that step does not linkify block fields.
-            #{
-                <<"device">> => <<"json@1.0">>,
-                <<"bundle">> => true
-            },
-            Opts
-        )
-    ).
-
-%% @doc Name the fields of a block as message keys: `-' in place of `_', as in
-%% `indep-hash', in the block and in the messages nested in it, and
-%% `block-signature' and `block-nonce' for the block's `signature' and `nonce'.
-%% In `httpsig@1.0', `signature' is the header that carries the signatures
-%% of a message and `nonce' one of their parameters.
-block_keys(Block) ->
-    maps:from_list(
-        lists:map(
-            fun({<<"signature">>, Value}) -> {<<"block-signature">>, Value};
-               ({<<"nonce">>, Value}) -> {<<"block-nonce">>, Value};
-               ({Key, Value}) ->
-                    {hb_util_string:dash_chars(Key), dash_keys(Value)}
-            end,
-            maps:to_list(Block)
-        )
-    ).
-
-%% @doc Put `-' in place of `_' in the keys of a message nested in a block.
-dash_keys(Msg) when is_map(Msg) ->
-    maps:from_list(
-        [
-            {hb_util_string:dash_chars(Key), dash_keys(Value)}
-        ||
-            {Key, Value} <- maps:to_list(Msg)
-        ]
-    );
-dash_keys(Value) -> Value.
-
 %% @doc Whether a peer's block is the block its path asked for, or an error:
 %% `/block/height/<n>' asks for `height' `n', `/block/hash/<id>' for
 %% `indep-hash' `id', and `/block/current' for any block.
@@ -1424,7 +1379,7 @@ to_message(Path = <<"/raw/", _/binary>>, <<"GET">>, {ok, Response}, LogExtra, _R
     {ok, hb_maps:get(<<"body">>, Response, <<>>, Opts)};
 to_message(Path = <<"/block/", Ref/binary>>, <<"GET">>, {ok, #{ <<"body">> := Body }}, LogExtra, Req, Opts) ->
     event_request(Path, <<"GET">>, 200, LogExtra),
-    Block = block_proofs(block_message(Body, Opts), Req, Opts),
+    Block = block_proofs(ar_block:block_message(Body, Opts), Req, Opts),
     maybe
         true ?= requested_block(Ref, Block, Opts),
         CacheRes =

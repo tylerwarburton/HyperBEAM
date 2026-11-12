@@ -1659,7 +1659,7 @@ fixture(Name) ->
     Body.
 
 fixture_block(Height) ->
-    dev_arweave:block_message(fixture(integer_to_binary(Height)), #{}).
+    ar_block:block_message(fixture(integer_to_binary(Height)), #{}).
 
 fixture_headers() -> hb_json:decode(fixture(<<"2002970-txs">>)).
 
@@ -1670,7 +1670,7 @@ rehashed(Block) ->
 
 rehashed_json(Body, Changes) ->
     JSON = maps:merge(hb_json:decode(Body), Changes),
-    Hash = ar_block:indep_hash(dev_arweave:block_message(hb_json:encode(JSON), #{})),
+    Hash = ar_block:indep_hash(ar_block:block_message(hb_json:encode(JSON), #{})),
     hb_json:encode(JSON#{ <<"indep_hash">> => hb_util:encode(Hash) }).
 
 real_block_indep_hash_test() ->

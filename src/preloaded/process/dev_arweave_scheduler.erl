@@ -5,7 +5,7 @@
 %%% own routed entries as contiguous AO slots.
 -module(dev_arweave_scheduler).
 -implements(<<"arweave-scheduler@1.0">>).
--device_libraries([lib_process]).
+-device_libraries([lib_process, lib_arweave_scheduler_blocks]).
 -export([device_info/0, router/4]).
 -export([schedule/3, next/3, slot/3, status/3, sync/3, diagnose/3, checkpoint/1]).
 -include("include/hb.hrl").

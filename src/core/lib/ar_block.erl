@@ -3,7 +3,7 @@
 -module(ar_block).
 
 -export([strict_data_split_threshold/0, get_chunk_padded_offset/1, generate_size_tagged_list_from_txs/2]).
--export([indep_hash/1, tx_root/2]).
+-export([indep_hash/1, tx_root/2, block_message/2]).
 
 -include("include/ar.hrl").
 
@@ -58,6 +58,52 @@ get_tx_data_root(#tx{ format = 2, data_root = DataRoot }) ->
     DataRoot;
 get_tx_data_root(TX) ->
     (ar_tx:generate_chunk_tree(TX))#tx.data_root.
+
+%% @doc A block's JSON as the message `~arweave@2.9/block' returns for it. In
+%% core, not in that device, so every package that verifies blocks reads them
+%% the same way.
+block_message(Body, Opts) ->
+    block_keys(
+        hb_message:convert(
+            Body,
+            <<"structured@1.0">>,
+            % `convert/4' asks the source codec to produce TABM first; put
+            % `bundle' on json@1.0 so that step does not linkify block fields.
+            #{
+                <<"device">> => <<"json@1.0">>,
+                <<"bundle">> => true
+            },
+            Opts
+        )
+    ).
+
+%% @doc Name the fields of a block as message keys: `-' in place of `_', as in
+%% `indep-hash', in the block and in the messages nested in it, and
+%% `block-signature' and `block-nonce' for the block's `signature' and `nonce'.
+%% In `httpsig@1.0', `signature' is the header that carries the signatures
+%% of a message and `nonce' one of their parameters.
+block_keys(Block) ->
+    maps:from_list(
+        lists:map(
+            fun({<<"signature">>, Value}) -> {<<"block-signature">>, Value};
+               ({<<"nonce">>, Value}) -> {<<"block-nonce">>, Value};
+               ({Key, Value}) ->
+                    {hb_util_string:dash_chars(Key), dash_keys(Value)}
+            end,
+            maps:to_list(Block)
+        )
+    ).
+
+%% @doc Put `-' in place of `_' in the keys of a message nested in a block.
+dash_keys(Msg) when is_map(Msg) ->
+    maps:from_list(
+        [
+            {hb_util_string:dash_chars(Key), dash_keys(Value)}
+        ||
+            {Key, Value} <- maps:to_list(Msg)
+        ]
+    );
+dash_keys(Value) -> Value.
 
 %% @doc A block's independent hash, recomputed from its fields: Arweave's
 %% `indep_hash/1' and `generate_signed_hash/1' for a block from fork 2.9 on.

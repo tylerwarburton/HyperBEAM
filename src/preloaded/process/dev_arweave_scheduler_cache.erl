@@ -18,22 +18,8 @@
 
 -define(CACHE_PREFIX, <<"~arweave-scheduler@1.0">>).
 
-%% @doc Use the Arweave scheduler's dedicated store when configured, then the
-%% generic scheduler store for compatibility. Otherwise use the local-scoped
-%% stores from the node's main `store' list. Keeping the L1 index separate
-%% allows a coordinated rollout boundary without disturbing local schedules.
-opts(Opts) ->
-    Opts#{
-        <<"store">> => hb_opts:get(
-            arweave_scheduler_store,
-            hb_opts:get(
-                scheduler_store,
-                hb_opts:get(store, no_viable_store, hb_store:scope(Opts, local)),
-                Opts
-            ),
-            Opts
-        )
-    }.
+%% @doc The scheduler's store, and its verified blocks: lib_arweave_scheduler_blocks.
+opts(Opts) -> lib_arweave_scheduler_blocks:opts(Opts).
 
 %% @doc Read and write the linked global synchronization record.
 read_global(Opts) -> read_state(global_path(), Opts).
@@ -75,30 +61,11 @@ write_execution_header(Header, RawOpts) ->
 read_header(TXID, RawOpts) ->
     hb_cache:read(TXID, opts(RawOpts)).
 
-%% @doc Cache and read canonical block messages under scheduler-owned height
-%% paths. This avoids coupling the scheduler package to the Arweave device's
-%% private block-cache module.
-write_block(Height, Block, RawOpts) ->
-    Opts = opts(RawOpts),
-    case hb_cache:write(Block, Opts) of
-        {ok, BlockID} ->
-            case hb_cache:link(BlockID, block_path(Height), Opts) of
-                ok -> {ok, BlockID};
-                Error -> Error
-            end;
-        Error -> Error
-    end.
+write_block(Height, Block, Opts) ->
+    lib_arweave_scheduler_blocks:write_block(Height, Block, Opts).
 
-read_block(Height, RawOpts) ->
-    Opts = opts(RawOpts),
-    try hb_cache:read(block_path(Height), Opts) of
-        {ok, Block} -> {ok, hb_cache:ensure_all_loaded(Block, Opts)};
-        {error, not_found} -> not_found;
-        Error -> Error
-    catch
-        throw:{necessary_message_not_found, _, _} -> not_found;
-        throw:{could_not_read_lazy_link, _, _, _} -> not_found
-    end.
+read_block(Height, Opts) ->
+    lib_arweave_scheduler_blocks:read_block(Height, Opts).
 
 %% @doc Link an address and ordinate to the cached transaction header's TXID.
 write_target(Address, Ordinate, TXID, RawOpts) ->
@@ -277,9 +244,6 @@ assignment_path(ProcessID, Slot) ->
             hb_ao:normalize_key(Slot)
         ]
     ).
-
-block_path(Height) ->
-    hb_path:to_binary([?CACHE_PREFIX, <<"blocks">>, hb_util:bin(Height)]).
 
 %%% Tests
 

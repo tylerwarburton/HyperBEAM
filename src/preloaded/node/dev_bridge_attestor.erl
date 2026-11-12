@@ -71,7 +71,7 @@
 -export([device_info/1, start/3, status/3, keys/3, nudge/3, root_endorse/3]).
 -export([proposals_to_vote/2, successor_ok/3]).
 -export([withdrawal_signature/5, minted/3]).
--device_libraries([lib_bridge_replica]).
+-device_libraries([lib_bridge_replica, lib_arweave_scheduler_blocks]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
