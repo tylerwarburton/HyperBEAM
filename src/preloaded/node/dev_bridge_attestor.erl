@@ -48,7 +48,7 @@
 %%%
 %%% One rule: the node acts (attests a deposit, signs a release, acknowledges,
 %%% votes, follows a successor) only on PUSD state it computed itself from
-%%% assignments it verified (`dev_bridge_attestor_replica'). It trusts nothing
+%%% assignments it verified (`lib_bridge_replica'). It trusts nothing
 %%% another node publishes, its own scheduler's included: every attestor,
 %%% wherever PUSD runs, reads PUSD the same way. Until a slot verifies there is
 %%% nothing to act on; a slot that does not verify is where the replica stays.
@@ -71,6 +71,7 @@
 -export([device_info/1, start/3, status/3, keys/3, nudge/3, root_endorse/3]).
 -export([proposals_to_vote/2, successor_ok/3]).
 -export([withdrawal_signature/5, minted/3]).
+-device_libraries([lib_bridge_replica]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -1826,7 +1827,7 @@ l1_unsigned(Process, Tags) ->
 %% did; `{not_yet, Why}' while no slot has verified.
 view(Pusd, #{ cfg := Cfg, opts := Opts }) ->
     Dir = hb_util:bin(maps:get(<<"replica-dir">>, Cfg, <<"bridge-replica">>)),
-    case dev_bridge_attestor_replica:view(Pusd, maps:get(<<"scheduler-url">>, Cfg),
+    case lib_bridge_replica:view(Pusd, maps:get(<<"scheduler-url">>, Cfg),
             #{ opts => Opts, dir => Dir }) of
         {ok, State, ROpts, Replica} -> {ok, {State, ROpts}, Replica};
         {not_yet, Why} -> {not_yet, Why}
@@ -1835,7 +1836,7 @@ view(Pusd, #{ cfg := Cfg, opts := Opts }) ->
 lane_view(Ledger, Node, #{ cfg := Cfg, opts := Opts }) ->
     BaseDir = hb_util:bin(maps:get(<<"replica-dir">>, Cfg, <<"bridge-replica">>)),
     Dir = <<BaseDir/binary, "/lane-", Ledger/binary>>,
-    case dev_bridge_attestor_replica:view(Ledger, Node, #{ opts => Opts, dir => Dir }) of
+    case lib_bridge_replica:view(Ledger, Node, #{ opts => Opts, dir => Dir }) of
         {ok, State, ROpts, Replica} -> {ok, {State, ROpts}, Replica};
         {not_yet, Why} -> {not_yet, Why}
     end.

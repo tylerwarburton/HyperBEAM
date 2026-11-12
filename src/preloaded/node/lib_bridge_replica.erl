@@ -26,7 +26,7 @@
 %%% result-affecting options pinned to what our nodes run. The cursor (slot,
 %%% chain, last assignment) is kept beside the store; a cursor that cannot be
 %%% read or does not match the store means starting over from slot 0.
--module(dev_bridge_attestor_replica).
+-module(lib_bridge_replica).
 -export([view/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
