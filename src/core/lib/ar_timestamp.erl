@@ -1,6 +1,8 @@
 -module(ar_timestamp).
 -export([start/0, get/0]).
+-include_lib("eunit/include/eunit.hrl").
 -define(TIMEOUT, 1000 * 15).
+-define(MAX_BACKOFF, 1000 * 120).
 -include_lib("include/hb.hrl").
 
 %%% A simple Erlang server that caches the current Arweave timestamp and
@@ -26,7 +28,7 @@ spawn_server() ->
             cache(
                 case hb_client_remote:arweave_timestamp() of
                     {ok, Current} -> Current;
-                    error -> {0, 0, hb_util:human_id(<<0:256>>)}
+                    {error, _} -> {0, 0, hb_util:human_id(<<0:256>>)}
                 end
             )
         end),
@@ -75,11 +77,29 @@ cache(Current) ->
 
 %% @doc Refresh the timestamp cache periodically. A failed read keeps the last
 %% block: an assignment is stamped with a block a few seconds old, and with
-%% block 0 only until the first read succeeds.
-refresher(TSServer) ->
-    timer:sleep(?TIMEOUT),
+%% block 0 only until the first read succeeds. A gateway that refuses is not
+%% asked again before it says to, and each refusal in a row doubles the wait,
+%% up to `?MAX_BACKOFF': asking every 15 s through a rate limit kept the node's
+%% address limited.
+refresher(TSServer) -> refresher(TSServer, ?TIMEOUT).
+refresher(TSServer, Wait) ->
+    timer:sleep(Wait),
     case hb_client_remote:arweave_timestamp() of
-        {ok, New} -> TSServer ! {refresh, New};
-        error -> ok
-    end,
-    refresher(TSServer).
+        {ok, New} ->
+            TSServer ! {refresh, New},
+            refresher(TSServer, ?TIMEOUT);
+        {error, RetryAfter} ->
+            refresher(TSServer, backoff(Wait, RetryAfter))
+    end.
+
+backoff(Wait, RetryAfter) when is_integer(RetryAfter) ->
+    min(?MAX_BACKOFF, max(2 * Wait, RetryAfter * 1000));
+backoff(Wait, _) ->
+    min(?MAX_BACKOFF, 2 * Wait).
+
+backoff_test() ->
+    ?assertEqual(30000, backoff(?TIMEOUT, undefined)),
+    ?assertEqual(60000, backoff(?TIMEOUT, 60)),
+    ?assertEqual(30000, backoff(?TIMEOUT, 30)),
+    ?assertEqual(?MAX_BACKOFF, backoff(90000, 30)),
+    ?assertEqual(?MAX_BACKOFF, backoff(?TIMEOUT, 3600)).

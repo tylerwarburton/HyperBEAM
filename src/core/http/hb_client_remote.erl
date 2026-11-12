@@ -69,9 +69,10 @@ add_route(Node, Route, Opts) ->
 %%% Arweave node API
 
 %% @doc Grab the latest block information from the Arweave gateway node, as
-%% `{ok, {Timestamp, Height, Hash}}', or `error' if the gateway cannot be
-%% read. Every node asks, whatever its `mode': a node in the default `debug'
-%% mode used to stamp every assignment with block 0.
+%% `{ok, {Timestamp, Height, Hash}}', or `{error, RetryAfter}' if the gateway
+%% cannot be read: the seconds a refusing gateway asked for, else `undefined'.
+%% Every node asks, whatever its `mode': a node in the default `debug' mode
+%% used to stamp every assignment with block 0.
 arweave_timestamp() ->
     URL = binary_to_list(<<(hb_opts:get(gateway))/binary, "/block/current">>),
     try httpc:request(get, {URL, []}, [{timeout, 5000}], [{body_format, binary}]) of
@@ -84,12 +85,27 @@ arweave_timestamp() ->
                     hb_maps:get(<<"indep_hash">>, Fields)
                 }
             };
+        {ok, {{_, Status, _}, Headers, _}} ->
+            RetryAfter =
+                case catch list_to_integer(
+                        proplists:get_value("retry-after", Headers, "")) of
+                    Secs when is_integer(Secs), Secs >= 0 -> Secs;
+                    _ -> undefined
+                end,
+            ?event(warning,
+                {arweave_timestamp_unavailable,
+                    {status, Status},
+                    {reason, proplists:get_value("reason", Headers)},
+                    {retry_after, RetryAfter}
+                }
+            ),
+            {error, RetryAfter};
         Other ->
             ?event(warning, {arweave_timestamp_unavailable, Other}),
-            error
+            {error, undefined}
     catch Class:Reason ->
         ?event(warning, {arweave_timestamp_unavailable, {Class, Reason}}),
-        error
+        {error, undefined}
     end.
 
 %%% Bundling and data access API
