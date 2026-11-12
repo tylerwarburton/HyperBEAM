@@ -415,7 +415,7 @@ escape_format(Str) when is_list(Str) ->
         _ ->
             re:replace(
                 Bin,
-                "~([a-z\\-_]+@[0-9]+\\.[0-9]+)", "~~\\1",
+                device_name_regex(), "~~\\1",
                 [global, {return, list}]
             )
     end;
@@ -1177,6 +1177,14 @@ private_trace_test() ->
             {hb_ao, resolve, 3, [{file, "test.erl"}, {line, 9}]}
         ]))
     ).
+
+%% @doc A device name after a `~' is escaped with the compiled pattern, and
+%% a string with no `@' is passed through.
+escape_format_test() ->
+    ?assertEqual("~~scheduler@1.0 and ~~lua-patch@1.0 ~p",
+        escape_format("~scheduler@1.0 and ~lua-patch@1.0 ~p")),
+    ?assertEqual("plain ~p", escape_format("plain ~p")),
+    ?assertEqual(<<"bin">>, escape_format(<<"bin">>)).
 
 short_format_test() ->
     lists:foreach(
