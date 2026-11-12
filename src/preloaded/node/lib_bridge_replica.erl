@@ -349,10 +349,9 @@ step(A, #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers,
         Class:Reason:Stacktrace ->
             ?event(bridge, {replica_malformed_assignment,
                 {class, Class}, {reason, Reason}, {trace, Stacktrace}}),
-            {refused, <<"malformed assignment: ",
-                (hb_util:bin(io_lib:format("~p:~p ~p", [
-                    Class, Reason, lists:sublist(Stacktrace, 2)
-                ])))/binary>>}
+            % The public status serves this: a fixed reason, never the call's
+            % arguments (node options, keys, RPC URLs). The detail is logged.
+            {refused, <<"malformed assignment: ", (atom_to_binary(Class))/binary>>}
     end.
 
 arweave_assignment(A, Pusd, Slot, Opts) when is_map(A) ->
@@ -379,6 +378,22 @@ peer_arweave_metadata_is_not_authority_test() ->
         <<"block-hash">> => hb_util:encode(crypto:strong_rand_bytes(48))},
     ?assertMatch({refused, _}, step(Claimed,
         #{scheduler_device => <<"arweave-scheduler@1.0">>})).
+
+%% A slot that crashes a check is refused with the same scrubbed text as a
+%% failed pass: the public status never shows a call's arguments.
+replica_failure_is_scrubbed_test() ->
+    Pusd = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Secret = <<"https://rpc.example/v2/KEY">>,
+    A = #{<<"process">> => Pusd, <<"slot">> => 1,
+        <<"type">> => <<"Assignment">>, <<"block-height">> => 100,
+        <<"block-index">> => 0, <<"timestamp">> => 1700000000,
+        <<"block-hash">> => crypto:strong_rand_bytes(64)},
+    {refused, Why} = step({canonical_arweave, A}, #{pusd => Pusd, slot => 0,
+        chain => none, schedulers => [], http => #{},
+        scheduler_device => <<"arweave-scheduler@1.0">>,
+        opts => #{<<"rpc">> => Secret}}),
+    ?assertMatch(<<"malformed assignment: ", _/binary>>, Why),
+    ?assertEqual(nomatch, binary:match(Why, <<"KEY">>)).
 
 canonical_schedule_is_read_locally_test_() ->
     {timeout, 60, fun canonical_schedule_is_read_locally/0}.
