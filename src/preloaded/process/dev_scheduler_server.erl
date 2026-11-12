@@ -648,7 +648,7 @@ write_assignment(State, Message, First, Pending) ->
     Opts = maps:get(opts, State),
     ProcID = maps:get(id, State),
     {ok, OnlyAttested} = hb_message:with_only_committed(Message, Opts),
-    IDs = message_ids(Message, OnlyAttested, Opts),
+    IDs = dev_scheduler_cache:signature_ids(OnlyAttested, Opts),
     case assigned(ProcID, IDs, First, Pending, Opts) of
         {ok, Slot, ID} -> {refused, refusal(State, Slot, ID)};
         not_found ->
@@ -659,13 +659,6 @@ write_assignment(State, Message, First, Pending) ->
             {Next, Assignment,
                 maps:merge(Pending, maps:from_keys(IDs, NextSlot))}
     end.
-
-%% @doc The IDs a message is assigned at most once under: its signatures,
-%% and the outbox entry its admission names (`dev_scheduler_admission'), so
-%% the same entry signed again is refused with its first slot.
-message_ids(Message, OnlyAttested, Opts) ->
-    dev_scheduler_cache:signature_ids(OnlyAttested, Opts) ++
-        dev_scheduler_admission:ids(dev_scheduler_admission:keys(Message, Opts), Opts).
 
 %% The slot of this batch, or (at or below `First') of the store, that
 %% already carries one of the IDs.
@@ -722,7 +715,7 @@ do_assign(State, Message, ReplyPID) ->
     Opts = maps:get(opts, State),
     ProcID = maps:get(id, State),
     {ok, OnlyAttested} = hb_message:with_only_committed(Message, Opts),
-    IDs = message_ids(Message, OnlyAttested, Opts),
+    IDs = dev_scheduler_cache:signature_ids(OnlyAttested, Opts),
     case dev_scheduler_cache:find_assigned(
             ProcID, IDs, maps:get(current, State), Opts) of
         {ok, Slot, ID} ->
@@ -756,9 +749,7 @@ build_assignment(State, Message, OnlyAttested) ->
     {Timestamp, Height, Hash} = ar_timestamp:get(),
     Assignment =
         commit_assignment(
-            % The door's admission (`admit-*'), if any: signed with the rest,
-            % so the process reads it as its own scheduler's word.
-            (dev_scheduler_admission:keys(Message, Opts))#{
+            #{
                 % A slot computes the assignment on the process's state; the
                 % path of the message in its `body' is the execution device's.
                 <<"path">> => <<"compute">>,
@@ -1089,36 +1080,6 @@ same_content_new_signature_assigned_test_() ->
         S1 = slot_of(schedule(Server, A)),
         S2 = slot_of(schedule(Server, B)),
         ?assertEqual(S1 + 1, S2)
-    end}.
-
-%% @doc An admitted outbox entry is assigned once however often it is signed
-%% again, and its assignment carries the admission (`dev_scheduler_admission'),
-%% read back the same from the store.
-admitted_entry_assigned_once_test_() ->
-    {timeout, 60, fun() ->
-        {Opts, ProcID, _Proc, Server} = dedupe_setup(<<"dedupe-admitted">>),
-        Push =
-            fun() ->
-                Msg = hb_message:commit(#{
-                    <<"type">> => <<"Message">>, <<"target">> => ProcID,
-                    <<"from-process">> => ProcID, <<"from-slot">> => 4,
-                    <<"from-outbox-key">> => <<"1">>, <<"from-entry">> => ProcID,
-                    <<"from-scheduler">> =>
-                        hb_util:human_id(ar_wallet:to_address(hb:wallet())) },
-                    Opts, <<"httpsig@1.0">>),
-                {ok, Admitted} = dev_scheduler_admission:admit(ProcID, Msg, Opts),
-                Admitted
-            end,
-        A = schedule(Server, Push()),
-        Slot = slot_of(A),
-        ?assertEqual(<<"local">>, hb_ao:get(<<"admit-policy">>, A, #{})),
-        ?assertEqual(4, hb_util:int(hb_ao:get(<<"admit-slot">>, A, #{}))),
-        ?assertMatch({error, #{ <<"status">> := 409, <<"slot">> := Slot }},
-            schedule(Server, Push())),
-        {ok, Stored} = dev_scheduler_cache:read(ProcID, Slot, Opts),
-        ?assertMatch([_], dev_scheduler_admission:ids(Stored, Opts)),
-        ?assertEqual(dev_scheduler_admission:ids(A, Opts),
-            dev_scheduler_admission:ids(Stored, Opts))
     end}.
 
 %% @doc Concurrent posts of one message take exactly one slot.

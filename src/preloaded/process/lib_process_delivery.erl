@@ -67,7 +67,7 @@
 -export([pending/1, pending/2, pending_keys/3]).
 -export([delivers/2, delivers/3, metrics/0]).
 -export([read_target/2, recently_missing/2, remember_missing/2]).
--export([augment_message/3, apply_security/4, normalize_message/2, origin/3]).
+-export([augment_message/3, apply_security/4, normalize_message/2]).
 -export([remote_schedule_result/3, find_type/2, parse_redirect/2]).
 -export([classify/3]).
 -include("include/hb.hrl").

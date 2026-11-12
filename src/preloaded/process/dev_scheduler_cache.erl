@@ -238,8 +238,7 @@ find_assigned(ProcID, [ID | IDs], Current, Store, Opts) ->
                             lists:member(ID,
                                 signature_ids(
                                     hb_maps:get(<<"body">>, Assignment, #{}, Opts),
-                                    Opts)
-                                ++ dev_scheduler_admission:ids(Assignment, Opts));
+                                    Opts));
                         not_found -> false
                     end,
             case Carries of

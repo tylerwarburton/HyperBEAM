@@ -500,9 +500,7 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
             false -> true
         end,
     ?event({verified, Verified}),
-    % Handle scheduling of the message if the message is valid. A message
-    % that claims a process origin (`from-process') is admitted or refused
-    % here, never assigned bare (`dev_scheduler_admission').
+    % Handle scheduling of the message if the message is valid.
     case {Verified, hb_ao:get(<<"type">>, Req, Opts)} of
         {false, _} ->
             {error,
@@ -512,17 +510,7 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
                     <<"reason">> => <<"Given message is invalid.">>
                 }
             };
-        {true, Type} ->
-            case dev_scheduler_admission:admit(ProcID, Req, Opts) of
-                {ok, Admitted} -> schedule_valid(ProcID, PID, Type, Admitted, Opts);
-                {error, Refusal} -> {error, Refusal}
-            end
-    end.
-
-%% @doc Schedule a message that verified and was admitted.
-schedule_valid(ProcID, PID, Type, Req, Opts) ->
-    case Type of
-        <<"Process">> ->
+        {true, <<"Process">>} ->
             % A definition belongs with its assignments, in the scheduler's
             % store (the node's store when none is set).
             {ok, _} = dev_scheduler_cache:write_spawn(Req, Opts),
@@ -550,7 +538,7 @@ schedule_valid(ProcID, PID, Type, Req, Opts) ->
                 }
             ),
             scheduled(dev_scheduler_server:schedule(PID, Req));
-        _ ->
+        {true, _} ->
             ?event(
                 {scheduling_message,
                     {proc_id, ProcID},
