@@ -385,35 +385,42 @@ compute(Key, RawBase, RawReq, Opts) ->
     OldPriv = #{ <<"state">> := State } = hb_private:from_message(Base),
     % TODO: looks like the script is injected in multiple places, does the 
     % script need to be passed?
-    % Get the Lua function to call from the base message.
+    % Get the Lua function to call. Inside a process slot (`dev_process'
+    % marks the state privately) the request is a scheduled message: input
+    % to the contract, never the choice of entry point or its arguments.
+    ReqSources =
+        case is_map_key(<<"initialized">>, OldPriv) of
+            true -> fun(_Keys) -> [] end;
+            false -> fun(Keys) -> [{Req, K} || K <- Keys] end
+        end,
     Function =
         hb_ao:get_first(
-            [
-                {Req, <<"body/function">>},
-                {Req, <<"function">>},
-                {{as, <<"message@1.0">>, Base}, <<"function">>}
-            ],
+            ReqSources([<<"body/function">>, <<"function">>]) ++
+                [{{as, <<"message@1.0">>, Base}, <<"function">>}],
             Key,
             Opts#{ <<"hashpath">> => ignore }
         ),
     ?event(debug_lua, function_found),
     case luerl:get_table_keys_dec([Function], State) of
         {ok, nil, _} -> {error, not_found};
-        _ -> call_function(Function, Base, Req, OldPriv, State, Opts)
+        _ ->
+            call_function(
+                Function,
+                ReqSources([<<"parameters">>]),
+                Base, Req, OldPriv, State, Opts
+            )
     end.
 
 %% @doc Call a function of the Lua state with the parameters that the request
-%% or the base gives, or else with the base and the request.
-call_function(Function, Base, Req, OldPriv, State, Opts) ->
+%% (outside a slot) or the base gives, or else with the base and the request.
+call_function(Function, ReqParams, Base, Req, OldPriv, State, Opts) ->
     % The default arguments carry no private keys from the base or the request.
     % A message in the request's `body', as a process's assignment carries,
     % gives no arguments: they would replace the base, the process's state.
     Params =
         hb_ao:get_first(
-            [
-                {Req, <<"parameters">>},
-                {{as, <<"message@1.0">>, Base}, <<"parameters">>}
-            ],
+            ReqParams ++
+                [{{as, <<"message@1.0">>, Base}, <<"parameters">>}],
             [
                 hb_private:reset(Base),
                 hb_private:reset(Req),
@@ -1567,6 +1574,62 @@ aos_authority_not_trusted_test() ->
     {ok, _} = hb_ao:resolve(Process, Message, Opts#{ <<"hashpath">> => ignore }),
     {ok, Results} = hb_ao:resolve(Process, <<"now/results/output/data">>, Opts),
     ?assertEqual(<<"Message is not trusted.">>, Results).
+
+%% @doc A scheduled message is input to the contract: it cannot choose which
+%% Lua global a slot runs, nor replace the arguments it runs with.
+scheduled_messages_cannot_select_lua_invocation_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Wallet = ar_wallet:new(),
+        Opts = #{<<"store">> => hb_test_utils:test_store(),
+            <<"priv-wallet">> => Wallet, <<"hashpath">> => ignore,
+            <<"scheduler-publish-remote">> => false,
+            <<"scheduling-mode">> => local_confirmation,
+            <<"spawn-worker">> => false, <<"process-workers">> => false},
+        Script = <<
+            "function compute(base, req)\n"
+            "  base.seen = req.body and req.body.action or 'spawn'\n"
+            "  return base\n"
+            "end\n"
+            "function bypass(base, req) base.seen = 'bypassed' return base end\n"
+        >>,
+        Process = hb_message:commit(
+            #{
+                <<"device">> => <<"process@1.0">>,
+                <<"type">> => <<"Process">>,
+                <<"scheduler-device">> => <<"scheduler@1.0">>,
+                <<"execution-device">> => <<"lua@5.3a">>,
+                <<"module">> => #{
+                    <<"content-type">> => <<"application/lua">>,
+                    <<"body">> => Script
+                },
+                <<"scheduler-location">> =>
+                    hb_util:human_id(ar_wallet:to_address(Wallet))
+            },
+            Opts
+        ),
+        ProcessID = hb_message:id(Process, all, Opts),
+        {ok, _} = hb_cache:write(Process, Opts),
+        {ok, _} = hb_ao:resolve(#{<<"device">> => <<"scheduler@1.0">>},
+            #{<<"path">> => <<"schedule">>, <<"method">> => <<"POST">>,
+                <<"body">> => Process}, Opts),
+        Sender = ar_wallet:new(),
+        Attack = fun(Fields, Slot) ->
+            Body = hb_message:commit(Fields#{<<"target">> => ProcessID,
+                <<"type">> => <<"Message">>,
+                <<"action">> => <<"expected">>}, #{<<"priv-wallet">> => Sender}),
+            {ok, _} = hb_cache:write(Body, Opts),
+            {ok, _} = hb_ao:resolve(Process,
+                #{<<"path">> => <<"schedule">>, <<"method">> => <<"POST">>,
+                    <<"body">> => Body}, Opts),
+            {ok, Result} = hb_ao:resolve(Process,
+                #{<<"path">> => <<"compute">>, <<"slot">> => Slot}, Opts),
+            ?assertEqual(<<"expected">>, hb_ao:get(<<"seen">>, Result, Opts))
+        end,
+        Attack(#{<<"function">> => <<"bypass">>}, 1),
+        Attack(#{<<"parameters">> => [#{<<"body">> =>
+            #{<<"action">> => <<"injected-context">>}}]}, 2)
+    end}.
 
 %% @doc Benchmark the performance of Lua executions.
 aos_process_benchmark_test_() ->
