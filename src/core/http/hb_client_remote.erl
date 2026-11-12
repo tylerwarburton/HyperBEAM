@@ -68,20 +68,28 @@ add_route(Node, Route, Opts) ->
 
 %%% Arweave node API
 
-%% @doc Grab the latest block information from the Arweave gateway node.
+%% @doc Grab the latest block information from the Arweave gateway node, as
+%% `{ok, {Timestamp, Height, Hash}}', or `error' if the gateway cannot be
+%% read. Every node asks, whatever its `mode': a node in the default `debug'
+%% mode used to stamp every assignment with block 0.
 arweave_timestamp() ->
-    case hb_opts:get(mode) of
-        debug -> {0, 0, hb_util:human_id(<<0:256>>)};
-        prod ->
-            {ok, {{_, 200, _}, _, Body}} =
-                httpc:request(
-                    <<(hb_opts:get(gateway))/binary, "/block/current">>
-                ),
-            Fields = hb_json:decode(hb_util:bin(Body)),
-            Timestamp = hb_maps:get(<<"timestamp">>, Fields),
-            Hash = hb_maps:get(<<"indep_hash">>, Fields),
-            Height = hb_maps:get(<<"height">>, Fields),
-            {Timestamp, Height, Hash}
+    URL = binary_to_list(<<(hb_opts:get(gateway))/binary, "/block/current">>),
+    try httpc:request(get, {URL, []}, [{timeout, 5000}], [{body_format, binary}]) of
+        {ok, {{_, 200, _}, _, Body}} ->
+            Fields = hb_json:decode(Body),
+            {ok,
+                {
+                    hb_maps:get(<<"timestamp">>, Fields),
+                    hb_maps:get(<<"height">>, Fields),
+                    hb_maps:get(<<"indep_hash">>, Fields)
+                }
+            };
+        Other ->
+            ?event(warning, {arweave_timestamp_unavailable, Other}),
+            error
+    catch Class:Reason ->
+        ?event(warning, {arweave_timestamp_unavailable, {Class, Reason}}),
+        error
     end.
 
 %%% Bundling and data access API

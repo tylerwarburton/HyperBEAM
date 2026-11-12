@@ -474,6 +474,10 @@ resolve_stage(3, Func, Base, Req, Original, Opts) ->
     ),
     resolve_stage(4, Func, Base, Req, Original, Opts);
 resolve_stage(4, Func, Base, Req, Original, Opts) ->
+    persistent_lookup(Func, Base, Req, Original, Opts, 0).
+
+%% @doc Stage 4, carrying how many times a leader we waited on has died.
+persistent_lookup(Func, Base, Req, Original, Opts, LeaderDeaths) ->
     ?event_debug(debug_ao_core, {stage, 4, persistent_resolver_lookup}, Opts),
     % Persistent-resolver lookup: Search for local (or Distributed
     % Erlang cluster) processes that are already performing the execution.
@@ -501,24 +505,38 @@ resolve_stage(4, Func, Base, Req, Original, Opts) ->
                 {continue, NewBase, NewReq} ->
                     resolve_stage(5, Func, NewBase, NewReq, Original, ExecName, Opts)
             end;
-        {wait, Leader} ->
+        {wait, Leader, GroupName} ->
             % There is another executor of this resolution in-flight.
             % Bail execution, register to receive the response, then
-            % wait.
-            case hb_persistent:await(Leader, Base, Req, maps:without(?TEMP_OPTS, Opts)) of
+            % wait, under the name the leader is registered as.
+            case
+                hb_persistent:await(
+                    Leader, GroupName, Base, Req, maps:without(?TEMP_OPTS, Opts)
+                )
+            of
                 {error, leader_died} ->
                     ?event(
                         ao_core,
                         {leader_died_during_wait,
                             {leader, Leader},
+                            {deaths, LeaderDeaths + 1},
                             {base, Base},
                             {req, Req},
                             {opts, Opts}
                         },
                         Opts
                     ),
-                    % Re-try again if the group leader has died.
-                    resolve_stage(4, Func, Base, Req, Original, Opts);
+                    % Re-elect, a bounded number of times. A request that
+                    % crashes its leader every time would otherwise spawn,
+                    % crash and re-send forever while its caller waited.
+                    case LeaderDeaths < hb_opts:get(leader_died_retries, 2, Opts) of
+                        true ->
+                            persistent_lookup(
+                                Func, Base, Req, Original, Opts, LeaderDeaths + 1
+                            );
+                        false ->
+                            error_leader_died(GroupName, LeaderDeaths + 1, Opts)
+                    end;
                 Res ->
                     % Apply this caller's overlay and generate its hashpath.
                     resolve_stage(10, Base, Req, Res, Original, undefined, Opts)
@@ -758,23 +776,47 @@ resolve_stage(10, Base, Req, Res, Original, ExecName, Opts) ->
 resolve_stage(11, _Base, _Req, Res, _Original, undefined, _Opts) ->
     % Cached and awaited results do not start a worker.
     Res;
-resolve_stage(11, _Base, _Req, {ok, Res} = Res, _Original, ExecName, Opts) ->
+resolve_stage(11, _Base, _Req, {ok, Res} = FullRes, _Original, ExecName, Opts) ->
     ?event_debug(debug_ao_core, {stage, 11, ExecName, maybe_spawn_worker}, Opts),
-    % Check if we should fork out a new worker process for the current execution
+    % Check if we should fork out a new worker process for the current execution.
+    % The head used to be `{ok, Res} = Res', which no term matches, so no
+    % worker was ever spawned. `ungrouped_exec' is the sentinel for a
+    % resolution that was never registered under a name: there is nothing for
+    % a worker to be found under, and spawning one would leak a process per
+    % request, all under that one name.
     case
-        {is_map(Res), hb_opts:get(spawn_worker, false, Opts#{ <<"prefer">> => local })}
+        {
+            is_map(Res),
+            ExecName =/= ungrouped_exec,
+            hb_opts:get(spawn_worker, false, Opts#{ <<"prefer">> => local })
+        }
     of
-        {A, B} when (A == false) or (B == false) ->
-            Res;
-        {_, _} ->
-            % Spawn a worker for the current execution
+        {true, true, SpawnWorker} when SpawnWorker =/= false ->
             WorkerPID = hb_persistent:start_worker(ExecName, Res, Opts),
-            hb_persistent:forward_work(WorkerPID, Opts),
-            Res
+            hb_persistent:forward_work(WorkerPID, ExecName, Opts),
+            FullRes;
+        _ ->
+            FullRes
     end;
 resolve_stage(11, _Base, _Req, OtherRes, _Original, _ExecName, _Opts) ->
     ?event_debug(debug_ao_core, {stage, 11, _ExecName, abnormal_status_skip_spawning}, _Opts),
     OtherRes.
+
+%% @doc The executor of a request kept dying: answer with an error rather than
+%% re-electing again.
+error_leader_died(GroupName, Deaths, Opts) ->
+    ?event(
+        ao_core,
+        {error, {type, leader_died}, {group, GroupName}, {deaths, Deaths}},
+        Opts
+    ),
+    {
+        error,
+        #{
+            <<"status">> => 500,
+            <<"body">> => <<"The executor for this request died repeatedly.">>
+        }
+    }.
 
 %% @doc Execute a sub-resolution.
 subresolve(RawBase, DevID, ReqPath, Opts) when is_binary(ReqPath) ->

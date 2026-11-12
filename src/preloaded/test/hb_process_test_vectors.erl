@@ -5,6 +5,8 @@
 %%% Helpers used by other devices that utilize `~process@1.0'.
 -export([init/0, aos_process/0, aos_process/1, test_process/0, wasm_process/1]).
 -export([schedule_aos_call/2, schedule_aos_call/3]).
+-export([lua_process/2, lua_patch_process/2, schedule_test_message/4]).
+-export([pstate_slots/3]).
 
 init() -> application:ensure_all_started(hb).
 
@@ -111,6 +113,42 @@ lua_process(Script, Opts) ->
         ),
         Opts#{ <<"priv-wallet">> => Wallet }
     ).
+
+%% @doc Generate a process whose execution device is `lua-patch@1.0' (a
+%% delta process: `lib_process_cache' stores its slots as patches), running
+%% the given Lua script.
+lua_patch_process(Script, Opts) ->
+    Wallet = hb_opts:get(priv_wallet, hb:wallet(), Opts),
+    hb_message:commit(
+        hb_maps:merge(
+            hb_message:uncommitted(base_process(Opts), Opts),
+            #{
+                <<"execution-device">> => <<"lua-patch@1.0">>,
+                <<"module">> => #{
+                    <<"content-type">> => <<"application/lua">>,
+                    <<"body">> => Script
+                }
+            },
+            Opts
+        ),
+        Opts#{ <<"priv-wallet">> => Wallet }
+    ).
+
+%% @doc The slots of one kind of `pstate/' row (`d', `f', `s', `o', `x') a
+%% process holds in the first store of `Opts', ascending.
+pstate_slots(ProcID, Kind, Opts) ->
+    [Store | _] =
+        case hb_opts:get(<<"store">>, [], Opts) of
+            M when is_map(M) -> [M];
+            L -> L
+        end,
+    Prefix = <<"pstate/", (hb_util:human_id(ProcID))/binary, "/", Kind/binary>>,
+    case hb_store:list([Store], Prefix, #{}) of
+        {ok, Names} ->
+            lists:sort([ binary_to_integer(N) || N <- Names,
+                         is_integer(catch binary_to_integer(N)) ]);
+        _ -> []
+    end.
 
 %% @doc Generate a device that has a stack of two `dev_test's for 
 %% execution. This should generate a message state has doubled 
@@ -620,6 +658,130 @@ now_results_test_parallel_() ->
         schedule_aos_call(Base, <<"return 1+1">>, Opts),
         schedule_aos_call(Base, <<"return 2+2">>, Opts),
         ?assertEqual({ok, <<"4">>}, hb_ao:resolve(Base, <<"now/results/data">>, Opts))
+    end}.
+
+%% @doc A lua@5.3a process publishes a mixed-case key (`balance-<address>',
+%% as PUSD does) on every slot. Its value stays the value: on prod e50c10a0d
+%% it became `[new, [old, ...]]' from the second write on.
+%% @doc Prod PUSD, 2026-10-29: the attestors' mints were scheduled and never
+%% computed, as nobody pushed or computed the process, and `/now' served from
+%% the cache stayed at the last computed slot for 15 minutes. A slot this
+%% node assigns is computed by itself: `/now' reaches it with no reader.
+compute_on_schedule_test_() ->
+    {timeout, 60, fun() ->
+        Opts = test_opts(#{
+            <<"process-now-from-cache">> => true,
+            <<"spawn-worker">> => true,
+            <<"process-workers">> => true,
+            <<"process-worker-spawn">> => true
+        }),
+        Base =
+            lua_process(
+                <<"function inc(base) base.count = (base.count or 0) + 1 return base end">>,
+                Opts
+            ),
+        Count = fun() ->
+            {ok, C} = hb_ao:resolve(Base, <<"now/count">>, Opts),
+            C
+        end,
+        schedule_test_message(Base, <<"inc">>, #{ <<"path">> => <<"inc">> }, Opts),
+        {ok, _} =
+            hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 0 }, Opts),
+        [ schedule_test_message(Base, <<"inc">>, #{ <<"path">> => <<"inc">> }, Opts)
+        || _ <- lists:seq(1, 3) ],
+        Deadline = erlang:monotonic_time(millisecond) + 10000,
+        Wait =
+            fun Loop() ->
+                case Count() of
+                    4 -> ok;
+                    Other ->
+                        case erlang:monotonic_time(millisecond) > Deadline of
+                            true -> {stale, Other};
+                            false -> timer:sleep(100), Loop()
+                        end
+                end
+            end,
+        ?assertEqual(ok, Wait())
+    end}.
+
+mixed_case_key_stays_a_value_test_() ->
+    {timeout, 60, fun() ->
+        Opts = test_opts(#{
+            <<"process-state-blobs">> => true,
+            <<"process-delta-cache">> => true,
+            <<"process-hot-cache-slots">> => 0
+        }),
+        Base =
+            lua_process(
+                <<"function inc(base) "
+                  "N = (N or 0) + 1 "
+                  "base['balance-UEzu0jQBQIgGJnQ'] = tostring(N) "
+                  "return base end">>,
+                Opts
+            ),
+        [ schedule_test_message(Base, <<"inc">>, #{ <<"path">> => <<"inc">> }, Opts)
+        || _ <- lists:seq(1, 4) ],
+        {ok, S1} =
+            hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 1 }, Opts),
+        ?assertEqual(<<"2">>, hb_ao:get(<<"balance-UEzu0jQBQIgGJnQ">>, S1, Opts)),
+        % Computed onward from the state read back from the cache.
+        {ok, S3} =
+            hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 3 }, Opts),
+        ?assertEqual(<<"4">>, hb_ao:get(<<"balance-UEzu0jQBQIgGJnQ">>, S3, Opts)),
+        {ok, Now} = hb_ao:resolve(Base, <<"now/balance-uezu0jqbqiggjnq">>, Opts),
+        ?assertEqual(<<"4">>, Now)
+    end}.
+
+%% @doc Run-9 soak: retention deletes a computed slot's row while the worker
+%% holds a later state. A process's state only moves forward, so a read of
+%% that slot is a 410 -- not a replay from the nearest kept checkpoint or the
+%% start, and not `already calculated' (an empty 400) -- whether it is asked
+%% of the live state or of the definition, and nothing below the head is
+%% written back.
+read_below_retention_floor_test_() ->
+    {timeout, 60, fun() ->
+        Opts = test_opts(#{
+            <<"process-state-blobs">> => true,
+            <<"process-hot-cache-slots">> => 0,
+            <<"process-snapshot-slots">> => 3,
+            <<"process-snapshot-target">> => false,
+            <<"store-retention-checkpoints">> => 1,
+            <<"store-retention-recent-slots">> => 1
+        }),
+        Base =
+            lua_process(
+                <<"function inc(base) base.count = (base.count or 0) + 1 return base end">>,
+                Opts
+            ),
+        [ schedule_test_message(Base, <<"inc">>, #{ <<"path">> => <<"inc">> }, Opts)
+        || _ <- lists:seq(1, 8) ],
+        {ok, Head} =
+            hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 7 }, Opts),
+        ?assertEqual(8, hb_ao:get(<<"count">>, Head, Opts)),
+        % No age floor: only the newest checkpoints are kept, as the test needs.
+        #{ deleted := Deleted } =
+            hb_store_retention:retain(Opts#{ <<"store-retention-keep-seconds">> => 0 }),
+        ?assert(Deleted > 0),
+        ProcID = hb_message:id(Base, all, Opts),
+        Kept = pstate_slots(ProcID, <<"f">>, Opts),
+        ?assertNot(lists:member(4, Kept)),
+        ?assertNot(lists:member(1, Kept)),
+        % Read from the live state at slot 7, as the process worker does.
+        ?assertMatch(
+            {error, #{ <<"status">> := 410 }},
+            hb_ao:resolve(Head, #{ <<"path">> => <<"compute">>, <<"slot">> => 4 }, Opts)
+        ),
+        % And from the definition, below every kept checkpoint.
+        ?assertMatch(
+            {error, #{ <<"status">> := 410 }},
+            hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 1 }, Opts)
+        ),
+        % Nothing was recomputed into the gap.
+        ?assertEqual(Kept, pstate_slots(ProcID, <<"f">>, Opts)),
+        % The kept head still reads back.
+        {ok, Again} =
+            hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 7 }, Opts),
+        ?assertEqual(8, hb_ao:get(<<"count">>, Again, Opts))
     end}.
 
 %% @doc A slot whose execution returns an error is skipped: the error

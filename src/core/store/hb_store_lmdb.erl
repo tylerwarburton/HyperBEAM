@@ -63,9 +63,15 @@ start(Opts = #{ <<"name">> := DataDir }, _Req, _NodeOpts) ->
             },
             no_mem_init
         ] ++
-        case maps:get(<<"sync">>, Opts, false) of
-            true -> [];
-            false -> [no_sync]
+        % Every commit is synced unless `sync' is `false'. Without the sync a
+        % host crash can leave LMDB's meta page ahead of its data pages, and
+        % the tree is corrupt (the old fork's main node, 2026-10-20: 13.3M
+        % entries, ~7k readable, an `mdb_page_dirty' assertion on every
+        % start). Commits are grouped, so the sync is paid per commit, not
+        % per write.
+        case hb_util:atom(maps:get(<<"sync">>, Opts, true)) of
+            false -> [no_sync];
+            _ -> []
         end ++
         case maps:get(<<"read-ahead">>, Opts, true) of
             true -> [];
@@ -168,6 +174,15 @@ write(Opts, Req, _NodeOpts) ->
 %% @param PathReq Request of the form `#{<<"read">> => Path}`.
 %% @returns `{ok, Value}` on success, `{composite, Children}` for a key with
 %%          keys below it, or `{error, not_found}` on failure
+%% A request with `exact => true' reads the key's own value only: one
+%% `elmdb:get' (pending writes included), never the prefix scan, which
+%% commits the pending writes before it reads.
+read(Opts, #{ <<"read">> := Path, <<"exact">> := true }, _NodeOpts) ->
+    case read_direct(ensure_env(Opts), hb_path:to_binary(Path)) of
+        not_found -> {error, not_found};
+        {error, Type, _} -> {error, Type};
+        Read -> Read
+    end;
 read(Opts, #{ <<"read">> := Path }, _NodeOpts) when is_binary(Path) ->
     read_result(Opts, Path);
 read(Opts, #{ <<"read">> := Path }, _NodeOpts) ->
@@ -388,16 +403,18 @@ stop_flusher(DataDir) ->
 %% @doc Commit the writes that `elmdb' holds in memory, and sync them to disk.
 %% `elmdb:put_batch/2' returns before its writes are committed: writes are
 %% committed in batches of `batch-size', and a halt of the node before then
-%% loses them. A store with `sync' set to `true' syncs every commit to disk.
-%% Any other store commits to the OS page cache only, and a loss of power can
-%% lose its commits since the last flush.
-flush(Opts = #{ <<"sync">> := true }, _Req, _NodeOpts) ->
-    commit(find_env(Opts));
+%% loses them. A store syncs every commit to disk unless `sync' is `false';
+%% such a store commits to the OS page cache only, so the flush syncs it, and
+%% a loss of power can lose (or corrupt) its commits since the last flush.
 flush(Opts, _Req, _NodeOpts) ->
-    Instance = #{ <<"env">> := Env } = find_env(Opts),
-    maybe
-        ok ?= commit(Instance),
-        lmdb_result(elmdb:env_sync(Env))
+    case hb_util:atom(maps:get(<<"sync">>, Opts, true)) of
+        false ->
+            Instance = #{ <<"env">> := Env } = find_env(Opts),
+            maybe
+                ok ?= commit(Instance),
+                lmdb_result(elmdb:env_sync(Env))
+            end;
+        _ -> commit(find_env(Opts))
     end.
 
 %% @doc Commit the writes that `elmdb' holds in memory.
@@ -619,22 +636,41 @@ read_prefix_composite_test() ->
         read(StoreOpts, #{ <<"read">> => <<"root">> }, #{})
     ),
     ?assertEqual({ok, [<<"a">>, <<"b">>]}, test_list(StoreOpts, <<"root">>)),
-    % If writes are pending, a read of a key with no value waits for their
-    % commit on a dirty IO scheduler: with one normal scheduler online, this
-    % process runs before the read returns.
+    % Pending writes are part of a composite read and a listing without being
+    % committed first (patches/elmdb-prefix-overlay.patch): a new child
+    % appears, a rewritten value reads as the new one, and a prefix that only
+    % pending rows have is found.
+    ok = flush(StoreOpts, #{}, #{}),
     test_write(StoreOpts, <<"root/d">>, <<"3">>),
-    Online = erlang:system_flag(schedulers_online, 1),
-    Self = self(),
-    spawn(
-        fun() ->
-            Self ! reading,
-            read(StoreOpts, #{ <<"read">> => <<"missing">> }, #{}),
-            Self ! read
-        end
+    test_write(StoreOpts, <<"root/a">>, <<"9">>),
+    test_write(StoreOpts, <<"fresh/x">>, <<"4">>),
+    Expected = {composite, [{<<"a">>, <<"9">>}, <<"b">>, {<<"d">>, <<"3">>}]},
+    ?assertEqual(Expected, read(StoreOpts, #{ <<"read">> => <<"root">> }, #{})),
+    ?assertEqual({ok, [<<"a">>, <<"b">>, <<"d">>]}, test_list(StoreOpts, <<"root">>)),
+    ?assertEqual(
+        {composite, [{<<"x">>, <<"4">>}]},
+        read(StoreOpts, #{ <<"read">> => <<"fresh">> }, #{})
     ),
-    receive reading -> Self ! ran end,
-    First = receive Msg when Msg == ran; Msg == read -> Msg end,
-    erlang:system_flag(schedulers_online, Online),
-    receive Next when Next == ran; Next == read -> ok end,
-    ?assertEqual(ran, First),
+    ?assertEqual({ok, [<<"x">>]}, test_list(StoreOpts, <<"fresh">>)),
+    % A bounded listing places pending children inside its window: `c' is
+    % pending, `a', `b', `d' committed or pending around it.
+    test_write(StoreOpts, <<"root/c/z">>, <<"5">>),
+    Bounded = fun(Req) -> list_children(StoreOpts, <<"root">>, Req) end,
+    ?assertEqual({ok, [<<"a">>, <<"b">>]}, Bounded(#{ <<"limit">> => 2 })),
+    ?assertEqual({ok, [<<"b">>, <<"c">>]}, Bounded(#{ <<"from">> => <<"b">>, <<"limit">> => 2 })),
+    ?assertEqual(
+        {ok, [<<"c">>, <<"b">>]},
+        Bounded(#{ <<"from">> => <<"c">>, <<"limit">> => 2, <<"direction">> => desc })
+    ),
+    ?assertEqual(
+        {ok, [<<"d">>, <<"c">>, <<"b">>, <<"a">>]},
+        Bounded(#{ <<"direction">> => desc })
+    ),
+    % The same rows once committed.
+    ok = flush(StoreOpts, #{}, #{}),
+    ?assertEqual(
+        {composite, [{<<"a">>, <<"9">>}, <<"b">>, <<"c">>, {<<"d">>, <<"3">>}]},
+        read(StoreOpts, #{ <<"read">> => <<"root">> }, #{})
+    ),
+    ?assertEqual({ok, [<<"b">>, <<"c">>]}, Bounded(#{ <<"from">> => <<"b">>, <<"limit">> => 2 })),
     test_stop(StoreOpts).

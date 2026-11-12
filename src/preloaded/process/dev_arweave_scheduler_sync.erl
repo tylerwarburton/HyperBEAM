@@ -296,6 +296,8 @@ initialize_process(
         {ok, Header, #tx{}} ?= fetch_header(ProcessID, Opts),
         {ok, _} ?=
             dev_arweave_scheduler_cache:write_header(Header, Opts),
+        {ok, _} ?=
+            dev_arweave_scheduler_cache:write_execution_header(Header, Opts),
         ok ?=
             write_assignment(
                 ProcessID,
@@ -396,6 +398,7 @@ write_process_assignments(
     ) ->
     case write_process_assignments(ProcessID, Targets, NextSlot, Opts) of
         {ok, NewNextSlot} ->
+            compute_on_schedule(ProcessID, NextSlot, NewNextSlot, Opts),
             NewState =
                 State#{
                     <<"synced-to">> =>
@@ -411,6 +414,42 @@ write_process_assignments(
                 Error -> Error
             end;
         Error -> Error
+    end.
+
+%% @doc A slot this node learns is computed promptly, as `scheduler@1.0'
+%% computes the slots it assigns (`dev_scheduler_server:compute_on_schedule').
+%% An Arweave schedule is pulled, not pushed: a sync writes new slots when
+%% somebody asks, and nothing then computed them, so `/now' stayed at the old
+%% slot. The PUSD bridge waited on exactly that: every attestor had signed a
+%% deposit, PUSD held the three messages at slots 17-19, and the credit never
+%% appeared until a compute was forced by hand (2026-11-04). One compute to
+%% the newest slot, through the process's worker; it discards the state, so
+%% it neither names nor stores it. `process-compute-on-schedule' false turns
+%% it off, as for `scheduler@1.0'.
+compute_on_schedule(_ProcessID, From, To, _Opts) when To =< From -> ok;
+compute_on_schedule(ProcessID, _From, To, Opts) ->
+    case hb_util:atom(hb_opts:get(<<"process-compute-on-schedule">>, true, Opts)) of
+        false -> ok;
+        _ ->
+            spawn(fun() ->
+                try
+                    {ok, Process} = hb_cache:read(ProcessID, Opts),
+                    hb_ao:resolve(
+                        Process,
+                        #{ <<"path">> => <<"compute">>, <<"slot">> => To - 1 },
+                        Opts#{
+                            <<"spawn-worker">> => true,
+                            <<"hashpath">> => ignore,
+                            <<"cache-control">> => [<<"no-store">>]
+                        }
+                    )
+                catch Class:Reason ->
+                    ?event(warning, {arweave_compute_on_schedule_failed,
+                        {process, ProcessID}, {slot, To - 1},
+                        {class, Class}, {reason, Reason}})
+                end
+            end),
+            ok
     end.
 
 write_process_assignments(_ProcessID, [], Slot, _Opts) -> {ok, Slot};
@@ -443,34 +482,106 @@ write_process_assignments(
     end.
 
 write_assignment(ProcessID, Slot, Height, Index, TXID, Opts) ->
-    Body = {link, <<"ao:", TXID/binary>>, #{}},
-    Assignment =
+    maybe
+        {ok, BlockHash, Timestamp} ?= assignment_provenance(Height, Opts),
+        Body = {link, <<"ao:", TXID/binary>>, #{}},
+        Assignment =
+            #{
+                <<"path">> => <<"compute">>,
+                <<"data-protocol">> => <<"ao">>,
+                <<"variant">> => <<"ao.N.1">>,
+                <<"process">> => ProcessID,
+                <<"epoch">> => <<"0">>,
+                <<"slot">> => Slot,
+                <<"block-height">> => Height,
+                <<"block-index">> => Index,
+                <<"block-hash">> => BlockHash,
+                <<"timestamp">> => Timestamp,
+                <<"body">> => Body,
+                <<"type">> => <<"Assignment">>
+            },
+        dev_arweave_scheduler_cache:write_assignment(Assignment, Opts)
+    end.
+
+%% @doc Bind every assignment to the exact cached canonical block used to
+%% order it. Missing or malformed provenance fails closed rather than
+%% materializing a slot that independent nodes cannot later audit.
+assignment_provenance(Height, Opts) ->
+    case dev_arweave_scheduler_cache:read_block(Height, Opts) of
+        {ok, Block} ->
+            try
+                NativeHash = hb_maps:get(<<"indep-hash">>, Block, not_found, Opts),
+                Timestamp = hb_util:int(
+                    hb_maps:get(<<"timestamp">>, Block, not_found, Opts)
+                ),
+                true = is_binary(NativeHash),
+                true = Timestamp >= 0,
+                {ok, canonical_block_hash(NativeHash), Timestamp}
+            catch
+                _:_ -> assignment_provenance_error(Height)
+            end;
+        _ -> assignment_provenance_error(Height)
+    end.
+
+assignment_provenance_error(Height) ->
+    {error,
         #{
-            <<"path">> => <<"compute">>,
-            <<"data-protocol">> => <<"ao">>,
-            <<"variant">> => <<"ao.N.1">>,
-            <<"process">> => ProcessID,
-            <<"epoch">> => <<"0">>,
-            <<"slot">> => Slot,
-            <<"block-height">> => Height,
-            <<"block-index">> => Index,
-            <<"body">> => Body,
-            <<"type">> => <<"Assignment">>
-        },
-    dev_arweave_scheduler_cache:write_assignment(Assignment, Opts).
+            <<"status">> => 500,
+            <<"reason">> =>
+                <<"Canonical block provenance is unavailable for assignment.">>,
+            <<"block-height">> => Height
+        }
+    }.
+
+canonical_block_hash(NativeHash) when byte_size(NativeHash) =:= 48 ->
+    hb_util:encode(NativeHash);
+canonical_block_hash(EncodedHash) when byte_size(EncodedHash) =:= 64 ->
+    NativeHash = hb_util:decode(EncodedHash),
+    48 = byte_size(NativeHash),
+    EncodedHash = hb_util:encode(NativeHash),
+    EncodedHash.
+
+assignment_provenance_missing_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"ar-sched-provenance">>),
+    ok = hb_store:start(Store),
+    Opts = #{ <<"store">> => [Store], <<"priv-wallet">> => ar_wallet:new() },
+    ?assertMatch(
+        {error, #{ <<"block-height">> := 42 }},
+        assignment_provenance(42, Opts)
+    ),
+    {ok, _} = dev_arweave_scheduler_cache:write_block(
+        42,
+        #{ <<"indep-hash">> => crypto:strong_rand_bytes(48) },
+        Opts
+    ),
+    ?assertMatch(
+        {error, #{ <<"block-height">> := 42 }},
+        assignment_provenance(42, Opts)
+    ),
+    ok = hb_store:stop(Store).
 
 %% @doc Fetch and route one transaction at its canonical block ordinate.
 index_transaction(Height, Index, TXID, Opts) ->
     case fetch_header(TXID, Opts) of
-        {ok, _Header, TX} ->
+        {ok, Header, TX} ->
             Ordinate = ordinate(Height, Index),
-            {ok,
-                [
-                    {Address, Ordinate, TXID}
-                ||
-                    Address <- transaction_targets(TX)
-                ]
-            };
+            Targets = transaction_targets(TX),
+            case Targets of
+                [] -> {ok, []};
+                _ ->
+                    case dev_arweave_scheduler_cache:write_execution_header(
+                            Header, Opts) of
+                        {ok, _} ->
+                            {ok,
+                                [
+                                    {Address, Ordinate, TXID}
+                                ||
+                                    Address <- Targets
+                                ]
+                            };
+                        Error -> Error
+                    end
+            end;
         {error, #{ <<"status">> := 422 }} -> {ok, []};
         Error -> Error
     end.
@@ -1351,6 +1462,20 @@ sparse_materialization_test() ->
     TXIDB = hb_util:human_id(hb_message:id(HeaderB, signed, Opts)),
     {ok, _} = dev_arweave_scheduler_cache:write_header(HeaderA, Opts),
     {ok, _} = dev_arweave_scheduler_cache:write_header(HeaderB, Opts),
+    Hash100 = crypto:strong_rand_bytes(48),
+    Hash101 = hb_util:encode(crypto:strong_rand_bytes(48)),
+    {ok, _} = dev_arweave_scheduler_cache:write_block(
+        100,
+        #{ <<"height">> => 100, <<"indep-hash">> => Hash100,
+            <<"timestamp">> => 1700000000 },
+        Opts
+    ),
+    {ok, _} = dev_arweave_scheduler_cache:write_block(
+        101,
+        #{ <<"height">> => 101, <<"indep-hash">> => Hash101,
+            <<"timestamp">> => 1700000120 },
+        Opts
+    ),
     ok =
         dev_arweave_scheduler_cache:write_target(
             ProcessID,
@@ -1399,10 +1524,25 @@ sparse_materialization_test() ->
         dev_arweave_scheduler_cache:read_assignment(ProcessID, 3, Opts),
     ?assertEqual(100, hb_maps:get(<<"block-height">>, Assignment1, Opts)),
     ?assertEqual(2, hb_maps:get(<<"block-index">>, Assignment1, Opts)),
+    ?assertEqual(
+        hb_util:encode(Hash100),
+        hb_maps:get(<<"block-hash">>, Assignment1, Opts)
+    ),
+    ?assertEqual(1700000000, hb_maps:get(<<"timestamp">>, Assignment1, Opts)),
     ?assertEqual(100, hb_maps:get(<<"block-height">>, Assignment2, Opts)),
     ?assertEqual(10, hb_maps:get(<<"block-index">>, Assignment2, Opts)),
+    ?assertEqual(
+        hb_util:encode(Hash100),
+        hb_maps:get(<<"block-hash">>, Assignment2, Opts)
+    ),
+    ?assertEqual(1700000000, hb_maps:get(<<"timestamp">>, Assignment2, Opts)),
     ?assertEqual(101, hb_maps:get(<<"block-height">>, Assignment3, Opts)),
     ?assertEqual(0, hb_maps:get(<<"block-index">>, Assignment3, Opts)),
+    ?assertEqual(
+        Hash101,
+        hb_maps:get(<<"block-hash">>, Assignment3, Opts)
+    ),
+    ?assertEqual(1700000120, hb_maps:get(<<"timestamp">>, Assignment3, Opts)),
     AssignmentIDs =
         [
             hb_message:id(Assignment1, signed, Opts),

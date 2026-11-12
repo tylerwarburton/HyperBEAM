@@ -103,7 +103,7 @@
     start/1, start/2, start/3,
     stop/1, stop/2, stop/3,
     reset/1, reset/2, reset/3,
-    flush/2
+    flush/2, batch/3, hold/3
 ]).
 -export([filter/2, scope/2, sort/2]).
 -export([
@@ -112,7 +112,7 @@
     list/2, list/3,
     match/2, match/3
 ]).
--export([find/1]).
+-export([find/1, normalize_store/1, normalize_stores/1, normalize_opts/1]).
 -export([generate_test_suite/1, generate_test_suite/2, test_stores/0]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -173,13 +173,13 @@ set(StoreMod, Name, InstanceTerm) ->
 %% @doc Find or spawn a store instance by its store opts.
 -ifdef(STORE_EVENTS).
 find(StoreOpts) ->
-    {Time, Result} = timer:tc(fun() -> do_find(StoreOpts) end),
+    {Time, Result} = timer:tc(fun() -> do_find(normalize_store(StoreOpts)) end),
     hb_event:record(<<"store_duration">>, <<"find">>, #{}, Time),
     hb_event:record(<<"store">>, <<"find">>, #{}, 1),
     Result.
 -else.
 find(StoreOpts) ->
-    do_find(StoreOpts).
+    do_find(normalize_store(StoreOpts)).
 -endif.
 
 do_find(StoreOpts = #{ <<"store-module">> := Mod }) ->
@@ -231,6 +231,44 @@ live(InstanceMessage = #{ <<"pid">> := Pid }) ->
 live(InstanceMessage) ->
     {ok, InstanceMessage}.
 
+%%% Store modules as atoms.
+%%%
+%%% A config read from JSON without `ao-types' (or one passed through a
+%%% message codec) gives `store-module' as a binary, and every
+%%% `erlang:function_exported/3' or `apply/3' on it raises `badarg'. Every
+%%% entry point of this module normalises its stores first.
+
+%% @doc A store message with `store-module' as an atom. A name that is not a
+%% module the node has is left as it is (the store then fails as before),
+%% so a request cannot make the node create atoms.
+normalize_store(Store = #{ <<"store-module">> := Mod }) when is_binary(Mod) ->
+    Store#{ <<"store-module">> => module_atom(Mod) };
+normalize_store(Store) -> Store.
+
+normalize_stores(Stores) when is_list(Stores) -> [ normalize_store(S) || S <- Stores ];
+normalize_stores(Store) -> normalize_store(Store).
+
+module_atom(Mod) ->
+    try binary_to_existing_atom(Mod, utf8)
+    catch error:badarg ->
+        case code:where_is_file(binary_to_list(Mod) ++ ".beam") of
+            non_existing -> Mod;
+            _ -> binary_to_atom(Mod, utf8)
+        end
+    end.
+
+%% @doc Normalise every store list of a node message (`store',
+%% `scheduler-store', `process-store', `irreplaceable-store').
+normalize_opts(Opts) ->
+    maps:map(
+        fun(K, V) when K == <<"store">>; K == <<"scheduler-store">>;
+                       K == <<"process-store">>; K == <<"irreplaceable-store">>;
+                       K == store; K == scheduler_store; K == process_store ->
+                normalize_stores(V);
+           (_, V) -> V
+        end,
+        Opts).
+
 %%% Library wrapper implementations.
 
 %% @doc Ensure that a store, or list of stores, have all been started.
@@ -272,14 +310,56 @@ flush(Stores, Opts) ->
     admin_call(
         lists:filter(
             fun(#{ <<"store-module">> := Mod }) ->
+                _ = code:ensure_loaded(Mod),
                 erlang:function_exported(Mod, flush, 3)
             end,
-            Stores
+            normalize_stores(Stores)
         ),
         flush,
         #{},
         Opts
     ).
+
+%% @doc Run `Fun' with the writes it makes through each store whose module
+%% implements `hold/3' held by that store, and made together when `Fun'
+%% returns (`hb_store_offsite_journal:batch/3'). Returns what `Fun' returns;
+%% a store that refuses the batch raises. Inside `Fun' a held write cannot be
+%% read back. Stores without `hold/3' take each write as it is made.
+batch(Stores, Fun, Opts) ->
+    {Result, Commit} = hold(Stores, Fun, Opts),
+    case Commit() of
+        ok -> Result;
+        Failure -> throw(Failure)
+    end.
+
+%% @doc `batch/3' without making the held writes: returns `{Result, Commit}',
+%% and `Commit()' makes them (`ok', or the first store's refusal), from any
+%% process (`hb_store_offsite_journal:hold/3').
+hold(Stores, Fun, Opts) ->
+    Held =
+        lists:foldr(
+            fun(Store = #{ <<"store-module">> := Mod }, Inner) ->
+                _ = code:ensure_loaded(Mod),
+                case erlang:function_exported(Mod, hold, 3) of
+                    true ->
+                        fun() ->
+                            {{Result, InnerCommit}, Commit} = Mod:hold(Store, Inner, Opts),
+                            {Result,
+                                fun() ->
+                                    case Commit() of
+                                        ok -> InnerCommit();
+                                        Failure -> Failure
+                                    end
+                                end}
+                        end;
+                    false -> Inner
+                end;
+               (_NotAStore, Inner) -> Inner
+            end,
+            fun() -> {Fun(), fun() -> ok end} end,
+            lists:flatten([normalize_stores(Stores)])
+        ),
+    Held().
 
 %% @doc Takes a store object and a filter function or match spec, returning a
 %% new store object with only the modules that match the filter. The filter
@@ -414,7 +494,8 @@ match(Modules, Match, Opts) ->
 %% this function will also time the call and record the appropriate event
 %% counter.
 -ifdef(STORE_EVENTS).
-call_function(X, Function, Args) ->
+call_function(X0, Function, Args) ->
+    X = normalize_stores(X0),
     {Time, Result} =
         timer:tc(fun() -> do_call_function(X, Function, Args, undefined, undefined) end),
     ?event(store_events,
@@ -436,7 +517,7 @@ call_function(X, Function, Args) ->
     Result.
 -else.
 call_function(X, Function, Args) ->
-    do_call_function(X, Function, Args, undefined, undefined).
+    do_call_function(normalize_stores(X), Function, Args, undefined, undefined).
 -endif.
 do_call_function(X, Function, Args, Failure, Error) when not is_list(X) ->
     do_call_function([X], Function, Args, Failure, Error);
@@ -719,6 +800,7 @@ apply_store_function(Mod, Store, Function, Args, AttemptsRemaining) ->
                 {stacktrace, {trace, Stacktrace}}
             }
         ),
+        _ = code:ensure_loaded(Mod),
         case erlang:function_exported(Mod, Function, length(Args) + 1) of
             true ->
                 retry(
@@ -744,7 +826,8 @@ admin_call(Stores, Function, Req, Opts) when not is_list(Stores) ->
     admin_call([Stores], Function, Req, Opts);
 admin_call([], _Function, _Req, _Opts) ->
     ok;
-admin_call([Store | Rest], Function, Req, Opts) ->
+admin_call([Store0 | Rest], Function, Req, Opts) ->
+    Store = normalize_store(Store0),
     case call_function([Store], Function, [Req, Opts]) of
         ok ->
             admin_post_process(Function, Store),
@@ -765,7 +848,8 @@ admin_post_process(stop, Store) ->
 admin_post_process(_, _Store) ->
     ok.
 
-start_one(Store = #{ <<"store-module">> := Mod }, Req, Opts) ->
+start_one(Store0 = #{ <<"store-module">> := _ }, Req, Opts) ->
+    Store = #{ <<"store-module">> := Mod } = normalize_store(Store0),
     case is_admissible(Store, start) of
         false ->
             {error, not_found};
@@ -802,6 +886,8 @@ call_store_start(Mod, Store, Req, Opts) ->
     end.
 
 call_store_stop(Mod, Store) ->
+    % `function_exported' is false for a module not loaded yet.
+    _ = code:ensure_loaded(Mod),
     case erlang:function_exported(Mod, stop, 3) of
         true -> Mod:stop(Store, #{}, Store);
         false -> Mod:stop(Store)
@@ -827,7 +913,8 @@ is_admissible(_, _) ->
 
 get_store_scope_result(Store = #{ <<"scope">> := Scope }) ->
     normalize_scope(Scope);
-get_store_scope_result(Store = #{ <<"store-module">> := Mod }) ->
+get_store_scope_result(Store0 = #{ <<"store-module">> := _ }) ->
+    Store = #{ <<"store-module">> := Mod } = normalize_store(Store0),
     try
         code:ensure_loaded(Mod),
         case erlang:function_exported(Mod, scope, 3) of
@@ -1832,3 +1919,30 @@ get_store_scope_access_test() ->
     ?assertEqual(remote, get_store_scope(WriteStore)),
     AdminStore = #{<<"store-module">> => hb_store_remote_node, <<"access">> => [<<"admin">>]},
     ?assertEqual(remote, get_store_scope(AdminStore)).
+
+%% @doc A flush reaches a store whose module is not loaded yet: on a fresh
+%% node `erlang:function_exported/3' is false for it until something loads
+%% it, and the flush was skipped.
+flush_reaches_unloaded_module_test() ->
+    N = integer_to_list(erlang:unique_integer([positive])),
+    Mod = list_to_atom("hb_store_flush_probe_" ++ N),
+    Name = list_to_atom("hb_store_flush_probe_listener_" ++ N),
+    Dir = "cache-TEST/flush-probe-" ++ N,
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    File = filename:join(Dir, atom_to_list(Mod) ++ ".erl"),
+    ok = file:write_file(File, io_lib:format(
+        "-module(~s).~n-export([flush/3, scope/0]).~n"
+        "scope() -> local.~n"
+        "flush(_, _, _) -> ~s ! {flushed, ?MODULE}, ok.~n", [Mod, Name])),
+    {ok, Mod} = compile:file(File, [{outdir, Dir}]),
+    true = code:add_patha(Dir),
+    true = register(Name, self()),
+    try
+        ?assertEqual(false, code:is_loaded(Mod)),
+        ok = flush(#{ <<"store-module">> => Mod, <<"name">> => <<"probe">> }, #{}),
+        ?assertEqual(flushed,
+            receive {flushed, Mod} -> flushed after 2000 -> skipped end)
+    after
+        unregister(Name),
+        code:del_path(Dir)
+    end.

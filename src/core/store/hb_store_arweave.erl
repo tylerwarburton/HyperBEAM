@@ -120,14 +120,24 @@ read_remote_offset(
         Opts
     ) ->
     Res =
-        hb_http:request(
-            #{
-                <<"method">> => <<"HEAD">>,
-                <<"path">> => <<"/~arweave@2.9/raw=", ID/binary>>
-            },
-            Opts
-        ),
+        try
+            hb_http:request(
+                #{
+                    <<"method">> => <<"HEAD">>,
+                    <<"path">> => <<"/~arweave@2.9/raw=", ID/binary>>
+                },
+                Opts
+            )
+        catch _:_ -> {error, remote_offset_unavailable}
+        end,
     ?event(arweave_offsets, {remote_index, {id, {explicit, ID}}, {result, Res}}),
+    case remote_offset_result(Res) of
+        not_found -> read_direct_tx_offset(ID, Opts);
+        Offset -> Offset
+    end;
+read_remote_offset(_, _, _) -> not_found.
+
+remote_offset_result(Res) ->
     case Res of
         {ok,
             #{
@@ -157,8 +167,75 @@ read_remote_offset(
             }};
         _ ->
             not_found
+    end.
+
+%% A core Arweave node exposes a confirmed L1 transaction's data-tree end
+%% offset and size without requiring a gateway or a second HyperBEAM node.
+%% This fallback is deliberately L1-only: an ANS-104 item has no `/tx' offset
+%% of its own and continues through the normal remote index/gateway stores.
+read_direct_tx_offset(ID, Opts) ->
+    Res = hb_http:request(
+        #{
+            <<"method">> => <<"GET">>,
+            <<"path">> => <<"/arweave/tx/", ID/binary, "/offset">>
+        },
+        Opts
+    ),
+    ?event(arweave_offsets, {direct_tx_offset, {id, {explicit, ID}}, {result, Res}}),
+    direct_tx_offset_result(Res, Opts).
+
+direct_tx_offset_result({ok, Res}, _Opts) when is_map(Res) ->
+    Body = case maps:get(<<"body">>, Res, Res) of
+        Bin when is_binary(Bin) ->
+            try hb_json:decode(Bin) catch _:_ -> #{} end;
+        Map when is_map(Map) -> Map;
+        _ -> #{}
+    end,
+    case Body of
+        #{ <<"offset">> := End0, <<"size">> := Size0 } ->
+            try
+                EndOffset = hb_util:int(End0),
+                Size = hb_util:int(Size0),
+                StartOffset = EndOffset - Size + 1,
+                true = Size >= 0 andalso StartOffset >= 0,
+                {Version, CodecName, StartOffset, Length} =
+                    hb_store_arweave_offset:decode(
+                        hb_store_arweave_offset:encode(
+                            <<"tx@1.0">>, StartOffset, Size
+                        )
+                    ),
+                {ok, #{
+                    <<"version">> => Version,
+                    <<"codec">> => CodecName,
+                    <<"start">> => StartOffset,
+                    <<"length">> => Length
+                }}
+            catch _:_ -> not_found
+            end;
+        _ -> not_found
     end;
-read_remote_offset(_, _, _) -> not_found.
+direct_tx_offset_result(_, _) -> not_found.
+
+direct_tx_offset_result_test() ->
+    ?assertEqual(
+        {ok, #{
+            <<"version">> => 1,
+            <<"codec">> => <<"tx@1.0">>,
+            <<"start">> => 8766,
+            <<"length">> => 1235
+        }},
+        direct_tx_offset_result(
+            {ok, #{ <<"body">> => <<"{\"offset\":\"10000\",\"size\":\"1235\"}">> }},
+            #{}
+        )
+    ),
+    ?assertEqual(
+        not_found,
+        direct_tx_offset_result(
+            {ok, #{ <<"body">> => <<"{\"offset\":\"2\",\"size\":\"4\"}">> }},
+            #{}
+        )
+    ).
 
 %% @doc Read the data at the given key, reading the `local-store' first if
 %% available. The reads use the node's options, overridden by the options in
@@ -166,6 +243,21 @@ read_remote_offset(_, _, _) -> not_found.
 %% `~arweave@2.9' reads return messages, not data, and `store-module', as in
 %% `hb_store_remote_node:read/3'.
 read(StoreOpts, #{ <<"read">> := ID }, NodeOpts) when ?IS_ID(ID) ->
+    case canonical_id(ID) of
+        true -> read_id(StoreOpts, ID, NodeOpts);
+        % 43 characters that are not the form `hb_util:human_id/1' gives name
+        % no item, and `hb_util:native_id/1' raises on them.
+        false -> {error, not_found}
+    end;
+read(_StoreOpts, #{ <<"read">> := _ID }, _NodeOpts) ->
+    {error, not_found}.
+
+canonical_id(ID) ->
+    try hb_util:native_id(ID) of _ -> true
+    catch _:_ -> false
+    end.
+
+read_id(StoreOpts, ID, NodeOpts) ->
     Opts =
         maps:without(
             [<<"store-module">>, <<"force-message">>],
@@ -183,9 +275,7 @@ read(StoreOpts, #{ <<"read">> := ID }, NodeOpts) when ?IS_ID(ID) ->
                 not_found -> {error, not_found};
                 Result -> Result
             end
-    end;
-read(_StoreOpts, #{ <<"read">> := _ID }, _NodeOpts) ->
-    {error, not_found}.
+    end.
 
 %% @doc Read the data at the given key, reading the provided Arweave index store
 %% as a source of offsets. After offsets have been found, the data is loaded
@@ -238,11 +328,15 @@ do_read(StoreOpts, ID, Opts) ->
                     end
             end;
         not_found ->
-            ?event(
-                arweave_offsets,
-                {miss, {id, {explicit, ID}}}
-            ),
-            not_found
+            case read_tx_data_from_local(ID, 0, Opts) of
+                {ok, Data} -> load_tx_from_data(ID, Data, Opts);
+                _ ->
+                    ?event(
+                        arweave_offsets,
+                        {miss, {id, {explicit, ID}}}
+                    ),
+                    not_found
+            end
     end.
 
 %% @doc Add the offset that a read succeeded at to the local index, unless the
@@ -292,18 +386,22 @@ load_item(ExpectedID, StartOffset, Length, Opts) ->
 %% the start of the first chunk of the data and runs for the length of the data
 %% segment, ignoring header size.
 %% Pending TX offsets are fetched by ID.
-load_tx(ID, relative, _Length, Opts) ->
+load_tx(ID, relative, Length, Opts) ->
     hb_prometheus:measure_and_report(
         fun() ->
-            hb_ao:resolve(
-                #{ <<"device">> => <<"arweave@2.9">> },
-                #{
-                    <<"path">> => <<"pending">>,
-                    <<"pending">> => ID,
-                    <<"exclude-data">> => false
-                },
-                Opts
-            )
+            case read_tx_data_from_local(ID, Length, Opts) of
+                {ok, Data} -> load_tx_from_data(ID, Data, Opts);
+                _ ->
+                    hb_ao:resolve(
+                        #{ <<"device">> => <<"arweave@2.9">> },
+                        #{
+                            <<"path">> => <<"pending">>,
+                            <<"pending">> => ID,
+                            <<"exclude-data">> => false
+                        },
+                        Opts
+                    )
+            end
         end,
         hb_store_arweave_chunk_fetch_duration_seconds,
         [load_tx]
@@ -336,7 +434,7 @@ load_tx(ID, StartOffset, Length, Opts) ->
                         Opts)};
                 _ ->
                     maybe
-                        {ok, Data} ?= read_chunks(StartOffset, Length, Opts),
+                        {ok, Data} ?= read_tx_data(ID, StartOffset, Length, Opts),
                         TX = TXHeader#tx{data = Data},
                         % The data must be the data that the signature covers.
                         true ?= ar_tx:verify(TX) orelse {error, data_mismatch},
@@ -351,6 +449,158 @@ load_tx(ID, StartOffset, Length, Opts) ->
         end,
         hb_store_arweave_chunk_fetch_duration_seconds,
         [load_tx]
+    ).
+
+load_tx_from_data(ID, Data, Opts) ->
+    {ok, StructuredTXHeader} = hb_ao:resolve(
+        #{ <<"device">> => <<"arweave@2.9">> },
+        #{ <<"path">> => <<"tx">>, <<"tx">> => ID, <<"exclude-data">> => true },
+        Opts
+    ),
+    TXHeader = hb_message:convert(
+        StructuredTXHeader, <<"tx@1.0">>, <<"structured@1.0">>, Opts),
+    TX = TXHeader#tx{data = Data},
+    case ar_tx:verify(TX) of
+        true -> {ok, hb_message:convert(
+            TX, <<"structured@1.0">>, <<"tx@1.0">>, Opts)};
+        false -> {error, data_mismatch}
+    end.
+
+%% Prefer verified weave chunks. A newly mined transaction's partition may
+%% not have reached the selected data nodes yet, while its accepting core peer
+%% or a gateway already has the payload. Every returned byte remains untrusted
+%% here: `load_tx/4' verifies it against the signed transaction immediately.
+read_tx_data(ID, StartOffset, Length, Opts) ->
+    case read_chunks(StartOffset, Length, Opts) of
+        {ok, Data} -> {ok, Data};
+        _ ->
+            case read_tx_data_from_local(ID, Length, Opts) of
+                Found = {ok, _} -> Found;
+                _ -> read_tx_data_from_core(ID, StartOffset, Length, Opts)
+            end
+    end.
+
+%% An operator may seed public L1 payload bytes while Arweave data chunks are
+%% still propagating. This is not a trust path: load_tx/4 verifies the complete
+%% signed transaction and data root immediately after these bytes return.
+read_tx_data_from_local(ID, _Length, Opts) ->
+    Dir = hb_util:bin(hb_opts:get(
+        <<"arweave-bootstrap-dir">>, <<"/app/cache-arweave/bootstrap">>, Opts)),
+    File = filename:join(binary_to_list(Dir), binary_to_list(ID)),
+    case file:read_file(File) of
+        {ok, Data} -> {ok, Data};
+        _ -> {error, not_found}
+    end.
+
+%% A chain peer that accepted the transaction normally has its fresh chunks
+%% before the partition-selected archival nodes do. Restrict only this retry's
+%% route; all ordinary chunk reads retain the range-aware default router.
+read_tx_data_from_core(ID, StartOffset, Length, Opts) ->
+    Core = hb_util:bin(hb_opts:get(
+        <<"arweave-node">>, hb_opts:get(gateway, not_found, Opts), Opts)),
+    CoreRoutes = [#{
+        <<"template">> => #{
+            <<"path">> => <<"^/arweave/chunk">>,
+            <<"method">> => <<"GET">>
+        },
+        <<"node">> => #{ <<"match">> => <<"^/arweave">>, <<"with">> => Core }
+    }],
+    case read_chunks(StartOffset, Length, Opts#{ <<"routes">> => CoreRoutes }) of
+        {ok, Data} -> {ok, Data};
+        _ -> read_tx_data_from_gateway(ID, Length, Opts)
+    end.
+
+read_tx_data_from_gateway(ID, Length, Opts) ->
+    Gateway = hb_util:bin(hb_opts:get(
+        <<"arweave-raw-gateway">>, <<"https://arweave.net">>, Opts)),
+    Res = hb_http:request(
+        #{
+            <<"method">> => <<"GET">>,
+            <<"path">> => <<Gateway/binary, "/raw/", ID/binary>>
+        },
+        Opts
+    ),
+    case gateway_tx_data_result(Res, Length) of
+        Found = {ok, _} -> Found;
+        _ -> read_tx_data_from_json(Gateway, ID, Length, Opts)
+    end.
+
+%% Modern Arweave gateways no longer consistently serve the legacy `/raw'
+%% route. The signed L1 transaction JSON still carries the same base64url data.
+%% `load_tx/4' verifies these bytes against the signed header immediately after
+%% this fallback returns, so the gateway remains an untrusted transport.
+read_tx_data_from_json(Gateway, ID, Length, Opts) ->
+    Res = hb_http:request(
+        #{
+            <<"method">> => <<"GET">>,
+            <<"path">> => <<Gateway/binary, "/tx/", ID/binary>>
+        },
+        Opts
+    ),
+    case gateway_tx_json_data_result(Res, Length) of
+        Found = {ok, _} -> Found;
+        _ -> read_tx_data_from_content_gateway(ID, Length, Opts)
+    end.
+
+%% Gateway routing can intentionally replace `/tx/<id>' with a core peer,
+%% whose header response omits data. Arweave's immutable content hostname is
+%% derived from the native transaction id and returns the payload directly,
+%% without the redirect used by `https://arweave.net/<id>'.
+read_tx_data_from_content_gateway(ID, Length, Opts) ->
+    Host = base32:encode(hb_util:native_id(ID), [lower, nopad]),
+    Peer = <<"https://", Host/binary, ".arweave.net:443">>,
+    % Use request/4 intentionally: request/2 invokes the node router, whose
+    % Arweave rule sends transaction paths to the data-less core peer.
+    Res = hb_http:request(<<"GET">>, Peer, <<"/", ID/binary>>, Opts),
+    gateway_tx_data_result(Res, Length).
+
+gateway_tx_data_result({ok, #{ <<"body">> := Data }}, Length)
+        when is_binary(Data), byte_size(Data) =:= Length ->
+    {ok, Data};
+gateway_tx_data_result(_, _) -> {error, not_found}.
+
+gateway_tx_json_data_result({ok, #{ <<"body">> := Body }}, Length)
+        when is_binary(Body) ->
+    try hb_json:decode(Body) of
+        #{ <<"data">> := Encoded } when is_binary(Encoded) ->
+            gateway_tx_json_decoded(hb_util:decode(Encoded), Length);
+        _ -> {error, not_found}
+    catch _:_ -> {error, not_found}
+    end;
+gateway_tx_json_data_result(_, _) -> {error, not_found}.
+
+gateway_tx_json_decoded(Data, Length)
+        when is_binary(Data), byte_size(Data) =:= Length -> {ok, Data};
+gateway_tx_json_decoded(_, _) -> {error, not_found}.
+
+gateway_tx_data_result_test() ->
+    ?assertEqual(
+        {ok, <<1, 2, 3>>},
+        gateway_tx_data_result({ok, #{ <<"body">> => <<1, 2, 3>> }}, 3)
+    ),
+    ?assertEqual(
+        {error, not_found},
+        gateway_tx_data_result({ok, #{ <<"body">> => <<1, 2>> }}, 3)
+    ),
+    Encoded = hb_util:encode(<<1, 2, 3>>),
+    ?assertEqual(
+        {ok, <<1, 2, 3>>},
+        gateway_tx_json_data_result(
+            {ok, #{ <<"body">> => hb_json:encode(#{ <<"data">> => Encoded }) }},
+            3
+        )
+    ),
+    ?assertEqual(
+        {error, not_found},
+        gateway_tx_json_data_result(
+            {ok, #{ <<"body">> => hb_json:encode(#{ <<"data">> => Encoded }) }},
+            2
+        )
+    ),
+    ID = <<"V9LX-yfznypDu0QnIZKpFIRKcii-XVOXcKRe0WGWScY">>,
+    ?assertEqual(
+        <<"k7jnp6zh6opsuq53iqtsdevjcsceu4rixzovhf3qurpncymwjhda">>,
+        base32:encode(hb_util:native_id(ID), [lower, nopad])
     ).
 
 %% @doc Read the chunks from the given start offset and length using the 
@@ -565,10 +815,10 @@ write_read_fake_bundle_tx_test() ->
     ok = write_offset(Opts, ID, <<"tx@1.0">>, StartOffset, Size),
     {ok, TX} = read(Opts, #{ <<"read">> => ID }, Opts),
     ?assert(hb_message:verify(TX, all, #{})),
-    % A form of the ID with other spare bits in its last character raises.
+    % A noncanonical spelling must not resolve through the canonical index.
     OtherForm = <<"cGNURX2IUt98VKVIeXSfYe6eulNwPEqijaQfvatzd_p">>,
-    ?assertError(
-        {badmatch, ID},
+    ?assertEqual(
+        {error, not_found},
         read(Opts, #{ <<"read">> => OtherForm }, Opts)
     ),
     ok.

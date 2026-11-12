@@ -21,14 +21,32 @@ start() ->
 %% @doc Spawn a new server and its refresher.
 spawn_server() ->
     TSServer =
-        spawn(fun() -> cache(hb_client_remote:arweave_timestamp()) end),
+        spawn(fun() ->
+            ets:new(?MODULE, [named_table, protected, {read_concurrency, true}]),
+            cache(
+                case hb_client_remote:arweave_timestamp() of
+                    {ok, Current} -> Current;
+                    error -> {0, 0, hb_util:human_id(<<0:256>>)}
+                end
+            )
+        end),
     spawn(fun() -> link(TSServer), refresher(TSServer) end),
     register(?MODULE, TSServer),
     TSServer.
 
-%% @doc Get the current timestamp from the server, starting the server if it
-%% isn't already running.
+%% @doc Get the current timestamp: read from the server's table, so that no
+%% caller waits on the server. Every assignment the scheduler builds reads it,
+%% and a request to the one server process queued the scheduler behind every
+%% other caller's request. Until the table holds a value, ask the server,
+%% starting it if it isn't already running.
 get() ->
+    try ets:lookup(?MODULE, current) of
+        [{current, Timestamp}] -> Timestamp;
+        [] -> get_from_server()
+    catch error:badarg -> get_from_server()
+    end.
+
+get_from_server() ->
     ?event(getting_ar_timestamp),
     PID = start(),
     ?event({got_ar_timestamp_pid, PID}),
@@ -42,6 +60,7 @@ get() ->
 
 %% @doc Cache the current timestamp from Arweave.
 cache(Current) ->
+    ets:insert(?MODULE, {current, Current}),
     ?event(cache_waiting),
     receive
         {get, Pid} ->
@@ -54,17 +73,13 @@ cache(Current) ->
             cache(New)
     end.
 
-%% @doc Refresh the timestamp cache periodically.
+%% @doc Refresh the timestamp cache periodically. A failed read keeps the last
+%% block: an assignment is stamped with a block a few seconds old, and with
+%% block 0 only until the first read succeeds.
 refresher(TSServer) ->
     timer:sleep(?TIMEOUT),
-    try TSServer ! {refresh, hb_client_remote:arweave_timestamp()}
-    catch
-        Class:Reason ->
-            ?event(warning,
-                {ar_timestamp_refresh_failed,
-                    {class, Class},
-                    {reason, Reason}
-                }
-            )
+    case hb_client_remote:arweave_timestamp() of
+        {ok, New} -> TSServer ! {refresh, New};
+        error -> ok
     end,
     refresher(TSServer).

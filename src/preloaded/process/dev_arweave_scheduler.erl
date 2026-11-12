@@ -7,7 +7,7 @@
 -implements(<<"arweave-scheduler@1.0">>).
 -device_libraries([lib_process]).
 -export([device_info/0, router/4]).
--export([schedule/3, next/3, slot/3, status/3, sync/3, checkpoint/1]).
+-export([schedule/3, next/3, slot/3, status/3, sync/3, diagnose/3, checkpoint/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -18,6 +18,7 @@ device_info() ->
         exports =>
             [
                 <<"status">>,
+                <<"diagnose">>,
                 <<"sync">>,
                 <<"next">>,
                 <<"schedule">>,
@@ -178,6 +179,29 @@ status(_Base, _Req, Opts) ->
                     <<"cache-control">> => <<"no-store">>
                 }
             }
+    end.
+
+%% @doc Return process-materialization failures as data for operators. Normal
+%% schedule/slot paths keep their existing status semantics; this key is
+%% read-only and never changes the scheduler algorithm.
+diagnose(Base, Req, Opts) ->
+    try
+        ProcessID = find_process_id(Base, Req, Opts),
+        dev_arweave_scheduler_sync:process(ProcessID, Opts)
+    of
+        {ok, State} ->
+            {ok, #{ <<"status">> => <<"ok">>, <<"state">> => State }};
+        {error, Reason} ->
+            {ok, #{ <<"status">> => <<"error">>, <<"error">> => Reason }};
+        Other ->
+            {ok, #{ <<"status">> => <<"unexpected">>,
+                <<"detail">> => hb_util:bin(Other) }}
+    catch
+        Class:Reason:Stack ->
+            Detail = iolist_to_binary(io_lib:format("~0p:~0p", [Class, Reason])),
+            Frames = iolist_to_binary(io_lib:format("~0p", [lists:sublist(Stack, 5)])),
+            {ok, #{ <<"status">> => <<"exception">>,
+                <<"detail">> => Detail, <<"stack">> => Frames }}
     end.
 
 checkpoint(State) -> {ok, State}.

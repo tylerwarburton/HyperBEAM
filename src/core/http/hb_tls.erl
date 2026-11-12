@@ -119,7 +119,7 @@ csr(Wallet = #{ <<"type">> := Type = ?RSA_SIGN_TYPE }, Domains) ->
     )}],
     {Info, EncodedInfo} = csr_info(Wallet, Names, Extensions,
         'CertificationRequestInfo_attributes_SETOF'),
-    {ok, Encoded} = 'PKCS-10':encode(
+    Encoded = public_key:der_encode(
         'CertificationRequest',
         #'CertificationRequest'{
             certificationRequestInfo = Info,
@@ -140,14 +140,15 @@ csr_info(Wallet, Names, Extensions, AttributeRecord) ->
         version = 0,
         subject = {rdnSequence, [[#'AttributeTypeAndValue'{
             type = ?'id-at-commonName',
-            value = {utf8String, hd(Names)}
+            value = public_key:der_encode('DirectoryString',
+                {utf8String, unicode:characters_to_binary(hd(Names))})
         }]]},
         subjectPKInfo = csr_public_key_info(Wallet),
         attributes = [{AttributeRecord,
             {1, 2, 840, 113549, 1, 9, 14}, Extensions}]
     },
     try
-        {ok, Encoded} = 'PKCS-10':encode('CertificationRequestInfo', Info),
+        Encoded = public_key:der_encode('CertificationRequestInfo', Info),
         {Info, Encoded}
     catch error:_ when AttributeRecord =/=
             'AttributePKCS-10' ->
@@ -260,7 +261,7 @@ csr_key_test() ->
     Encoded = csr(Wallet, [<<"localhost">>, <<"node.example">>]),
     CSR = public_key:der_decode('CertificationRequest', Encoded),
     Info = CSR#'CertificationRequest'.certificationRequestInfo,
-    {ok, EncodedInfo} = 'PKCS-10':encode('CertificationRequestInfo', Info),
+    EncodedInfo = public_key:der_encode('CertificationRequestInfo', Info),
     ?assert(public_key:verify(
         EncodedInfo,
         sha256,

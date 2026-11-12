@@ -7,7 +7,7 @@
 -export([opts/1]).
 -export([read_global/1, write_global/2]).
 -export([read_process/2, write_process/3, list_processes/1]).
--export([write_header/2, read_header/2]).
+-export([write_header/2, write_execution_header/2, read_header/2]).
 -export([write_block/3, read_block/2]).
 -export([ensure_target_root/2]).
 -export([write_target/4, write_targets/2, read_target/3, list_targets/2]).
@@ -18,20 +18,21 @@
 
 -define(CACHE_PREFIX, <<"~arweave-scheduler@1.0">>).
 
-%% @doc Use the scheduler store when one is configured. Otherwise, use the
-%% stores of the node's `store' list whose scope is `local'.
+%% @doc Use the Arweave scheduler's dedicated store when configured, then the
+%% generic scheduler store for compatibility. Otherwise use the local-scoped
+%% stores from the node's main `store' list. Keeping the L1 index separate
+%% allows a coordinated rollout boundary without disturbing local schedules.
 opts(Opts) ->
     Opts#{
-        <<"store">> =>
+        <<"store">> => hb_opts:get(
+            arweave_scheduler_store,
             hb_opts:get(
                 scheduler_store,
-                hb_opts:get(
-                    store,
-                    no_viable_store,
-                    hb_store:scope(Opts, local)
-                ),
+                hb_opts:get(store, no_viable_store, hb_store:scope(Opts, local)),
                 Opts
-            )
+            ),
+            Opts
+        )
     }.
 
 %% @doc Read and write the linked global synchronization record.
@@ -56,6 +57,19 @@ list_processes(RawOpts) ->
 %% @doc Cache a signed transaction header under its TXID.
 write_header(Header, RawOpts) ->
     hb_cache:write(Header, opts(RawOpts)).
+
+%% @doc Publish a verified L1 process/message header to the ordinary local
+%% store chain so process execution can resolve an assignment's body. Scheduler
+%% indexes and assignments remain isolated in `arweave-scheduler-store'.
+write_execution_header(Header, RawOpts) ->
+    ExecutionOpts = RawOpts#{
+        <<"store">> => hb_opts:get(
+            store,
+            no_viable_store,
+            hb_store:scope(RawOpts, local)
+        )
+    },
+    hb_cache:write(Header, ExecutionOpts).
 
 %% @doc Read a cached signed transaction header by TXID.
 read_header(TXID, RawOpts) ->
@@ -264,6 +278,20 @@ block_path(Height) ->
     hb_path:to_binary([?CACHE_PREFIX, <<"blocks">>, hb_util:bin(Height)]).
 
 %%% Tests
+
+opts_prefer_arweave_scheduler_store_test() ->
+    Main = hb_test_utils:test_store(hb_store_volatile, <<"main">>),
+    Generic = hb_test_utils:test_store(hb_store_volatile, <<"generic">>),
+    Arweave = hb_test_utils:test_store(hb_store_volatile, <<"arweave">>),
+    Selected = opts(#{
+        <<"store">> => [Main],
+        <<"scheduler-store">> => [Generic],
+        <<"arweave-scheduler-store">> => [Arweave]
+    }),
+    ?assertEqual([Arweave], maps:get(<<"store">>, Selected)),
+    ?assertEqual([Generic], maps:get(<<"store">>, opts(#{
+        <<"store">> => [Main], <<"scheduler-store">> => [Generic]
+    }))).
 
 linked_spawn_uses_process_store_test() ->
     Source = hb_test_utils:test_store(hb_store_volatile, <<"linked-source">>),

@@ -282,7 +282,7 @@ spawn_lookahead_worker(ProcID, Slot, Opts) ->
                     {caller, Caller}
                 }
             ),
-            case dev_scheduler_cache:read(ProcID, Slot, Opts) of
+            case dev_scheduler_cache:read_durable(ProcID, Slot, Opts) of
                 {ok, Assignment} ->
                     LoadedAssignment = hb_cache:ensure_all_loaded(Assignment, Opts),
                     Caller ! {assignment, ProcID, Slot, LoadedAssignment};
@@ -335,7 +335,7 @@ check_lookahead_and_local_cache(undefined, ProcID, TargetSlot, Opts) ->
     % The lookahead worker has not found an assignment for the target
     % slot yet, so we check our local cache.
     ?event(next_lookahead, {reading_local_cache, {slot, TargetSlot}}),
-    case dev_scheduler_cache:read(ProcID, TargetSlot, Opts) of
+    case dev_scheduler_cache:read_durable(ProcID, TargetSlot, Opts) of
         not_found -> not_found;
         {ok, Assignment} ->
             % We have an assignment in our local cache, so we return it.
@@ -511,15 +511,25 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
                 }
             };
         {true, <<"Process">>} ->
-            {ok, _} = hb_cache:write(Req, Opts),
-            spawn(
-                fun() ->
-                    {ok, Results} = hb_client_remote:upload(Req, Opts),
-                    ?event(
-                        {uploaded_process, {proc_id, ProcID}, {results, Results}}
+            % A definition belongs with its assignments, in the scheduler's
+            % store (the node's store when none is set).
+            {ok, _} = dev_scheduler_cache:write_spawn(Req, Opts),
+            ok = dev_scheduler_cache:flush(Opts),
+            case hb_opts:get(scheduler_publish_remote, true, Opts) of
+                false -> ok;
+                _ ->
+                    spawn(
+                        fun() ->
+                            {ok, Results} = hb_client_remote:upload(Req, Opts),
+                            ?event(
+                                {uploaded_process,
+                                    {proc_id, ProcID},
+                                    {results, Results}
+                                }
+                            )
+                        end
                     )
-                end
-            ),
+            end,
             ?event(
                 {registering_new_process,
                     {proc_id, ProcID},
@@ -527,7 +537,7 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
                     {is_alive, is_process_alive(PID)}
                 }
             ),
-            {ok, dev_scheduler_server:schedule(PID, Req)};
+            scheduled(dev_scheduler_server:schedule(PID, Req));
         {true, _} ->
             ?event(
                 {scheduling_message,
@@ -537,8 +547,13 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
                 }
             ),
             % If Request is not a process, use the ID of Base as the PID
-            {ok, dev_scheduler_server:schedule(PID, Req)}
+            scheduled(dev_scheduler_server:schedule(PID, Req))
     end.
+
+%% @doc A refusal from the scheduling server (a message it has already
+%% assigned) is the request's error; anything else is the assignment.
+scheduled({error, Error}) -> {error, Error};
+scheduled(Assignment) -> {ok, Assignment}.
 
 %% @doc Locate the correct scheduling server for a given process.
 find_server(ProcID, Base, Opts) ->
@@ -783,8 +798,10 @@ slot(M1, M2, Opts) ->
         {local, PID} ->
             ?event({getting_current_slot, {proc_id, ProcID}}),
             {Timestamp, Height, Hash} = ar_timestamp:get(),
-            #{ current := CurrentSlot, wallets := Wallets } =
+            #{ current := Assigned, wallets := Wallets } =
                 dev_scheduler_server:info(PID),
+            % The newest slot that is durable, not the newest assigned.
+            CurrentSlot = min(Assigned, dev_scheduler_cache:durable(ProcID)),
             {ok, #{
                 <<"process">> => ProcID,
                 <<"current">> => CurrentSlot,
@@ -1168,7 +1185,13 @@ cache_remote_schedule(_, ProcID, Schedule, Opts) ->
                             {assignment, hb_maps:get(<<"slot">>, Assignment, undefined, Opts)}
                         }
                     ),
-                    dev_scheduler_cache:write(ProcID, Assignment, Opts)
+                    case dev_scheduler_cache:write(ProcID, Assignment, Opts) of
+                        ok -> ok;
+                        Error ->
+                            ?event(error,
+                                {remote_schedule_cache_write_failed,
+                                    {proc_id, ProcID}, {error, Error}})
+                    end
                 end,
                 AssignmentList =
                     hb_util:message_to_ordered_list(
@@ -1579,7 +1602,8 @@ get_local_assignments(ProcID, From, undefined, Opts) ->
             % No assignments in cache.
             {[], false};
         {Slot, _} ->
-            get_local_assignments(ProcID, From, Slot, Opts)
+            get_local_assignments(
+                ProcID, From, min(Slot, dev_scheduler_cache:durable(ProcID)), Opts)
     end;
 get_local_assignments(ProcID, From, RequestedTo, Opts) ->
     ?event({handling_req_to_get_assignments, ProcID, {from, From}, {to, RequestedTo}}),
@@ -1597,7 +1621,7 @@ get_local_assignments(ProcID, From, RequestedTo, Opts) ->
 read_local_assignments(_ProcID, From, To, _Opts) when From > To ->
     [];
 read_local_assignments(ProcID, CurrentSlot, To, Opts) ->
-    case dev_scheduler_cache:read(ProcID, CurrentSlot, Opts) of
+    case dev_scheduler_cache:read_durable(ProcID, CurrentSlot, Opts) of
         not_found ->
             % No assignment found in cache.
             [];
@@ -1713,17 +1737,26 @@ schedule_does_not_borrow_another_process_test_parallel() ->
 schedule_message_and_get_slot_test_parallel() ->
     start(),
     Base = hb_message:commit(test_process(), #{ <<"priv-wallet">> => hb:wallet() }),
-    Req = #{
-        <<"path">> => <<"schedule">>,
-        <<"method">> => <<"POST">>,
-        <<"body">> =>
-            hb_message:commit(#{
-                <<"type">> => <<"Message">>,
-                <<"test-key">> => <<"true">>
-            }, #{ <<"priv-wallet">> => hb:wallet() })
-    },
-    ?assertMatch({ok, _}, hb_ao:resolve(Base, Req, #{})),
-    ?assertMatch({ok, _}, hb_ao:resolve(Base, Req, #{})),
+    MkReq =
+        fun() ->
+            #{
+                <<"path">> => <<"schedule">>,
+                <<"method">> => <<"POST">>,
+                <<"body">> =>
+                    hb_message:commit(#{
+                        <<"type">> => <<"Message">>,
+                        <<"test-key">> => <<"true">>
+                    }, #{ <<"priv-wallet">> => hb:wallet() })
+            }
+        end,
+    Req = MkReq(),
+    {ok, First} = hb_ao:resolve(Base, Req, #{}),
+    ?assertMatch({ok, _}, hb_ao:resolve(Base, MkReq(), #{})),
+    % The same signed message again is refused, naming its slot.
+    FirstSlot = hb_ao:get(<<"slot">>, First, #{}),
+    ?assertMatch(
+        {error, #{ <<"status">> := 409, <<"slot">> := FirstSlot }},
+        hb_ao:resolve(Base, Req, #{})),
     Res = #{
         <<"path">> => <<"slot">>,
         <<"method">> => <<"GET">>,
@@ -1745,6 +1778,39 @@ schedule_message_and_get_slot_test_parallel() ->
     ?assertError(
         function_clause,
         hb_ao:resolve(Base, Req, #{ <<"store">> => Raising })
+    ).
+
+%% @doc A scheduling mode given as a binary, which is how a JSON config file
+%% delivers it, still confirms every message. Before, a binary matched none of
+%% the confirmation branches and every request waited out the 10 s timeout.
+schedule_with_binary_mode_test_parallel() ->
+    start(),
+    lists:foreach(
+        fun(Mode) ->
+            Opts = #{
+                <<"priv-wallet">> => hb:wallet(),
+                <<"scheduling-mode">> => Mode,
+                <<"scheduler-publish-remote">> => false
+            },
+            Base = hb_message:commit(test_process(), Opts),
+            MkReq =
+                fun() ->
+                    #{
+                        <<"path">> => <<"schedule">>,
+                        <<"method">> => <<"POST">>,
+                        <<"body">> =>
+                            hb_message:commit(
+                                #{ <<"type">> => <<"Message">>, <<"test-key">> => Mode },
+                                Opts
+                            )
+                    }
+                end,
+            Start = erlang:monotonic_time(millisecond),
+            ?assertMatch({ok, _}, hb_ao:resolve(Base, MkReq(), Opts)),
+            ?assertMatch({ok, _}, hb_ao:resolve(Base, MkReq(), Opts)),
+            ?assert(erlang:monotonic_time(millisecond) - Start < 5000)
+        end,
+        [<<"aggressive">>, <<"local_confirmation">>, <<"remote_confirmation">>]
     ).
 
 redirect_to_hint_test_parallel() ->
@@ -1971,7 +2037,7 @@ http_get_schedule_test_parallel_() ->
 			<<"method">> => <<"POST">>,
 			<<"body">> => PMsg
 		}, Opts),
-		Req = hb_message:commit(#{
+		MkReq = fun() -> hb_message:commit(#{
 			<<"path">> => <<"/~scheduler@1.0/schedule">>,
 			<<"method">> => <<"POST">>,
 			<<"body">> =>
@@ -1986,11 +2052,11 @@ http_get_schedule_test_parallel_() ->
                     },
                     Opts
                 )
-		}, Opts),
+		}, Opts) end,
 		{ok, _} = hb_http:post(Node, Base, Opts),
 			lists:foreach(
 				fun(_) ->
-	                {ok, Res} = hb_http:post(Node, Req, Opts),
+	                {ok, Res} = hb_http:post(Node, MkReq(), Opts),
 	                ?event(debug_scheduler_test, {res, Res})
 	            end,
 					lists:seq(1, 3)
@@ -2095,7 +2161,7 @@ http_get_json_schedule_test_parallel_() ->
 			<<"body">> => PMsg
 		}, Opts),
 		{ok, _} = hb_http:post(Node, Base, Opts),
-		Req = hb_message:commit(#{
+		MkReq = fun() -> hb_message:commit(#{
 			<<"path">> => <<"/~scheduler@1.0/schedule">>,
 			<<"method">> => <<"POST">>,
 			<<"body">> =>
@@ -2108,9 +2174,9 @@ http_get_json_schedule_test_parallel_() ->
 				)
 			},
 			Opts
-		),
+		) end,
 			lists:foreach(
-				fun(_) -> {ok, _} = hb_http:post(Node, Req, Opts) end,
+				fun(_) -> {ok, _} = hb_http:post(Node, MkReq(), Opts) end,
 					lists:seq(1, 3)
 				),
 				?assertMatch({ok, #{ <<"current">> := 3 }}, http_get_slot(Node, PMsg)),
@@ -2165,6 +2231,8 @@ http_cache_remote_schedule() ->
             #{ <<"priv-wallet">> => ar_wallet:new() }
         ),
     ok = dev_scheduler_cache:write(ProcID, Forged, SchedOpts),
+    % Served as if it were durable, as a dishonest scheduler would serve it.
+    ok = dev_scheduler_cache:set_durable(ProcID, 1),
     Location =
         hb_message:commit(
             #{
@@ -2225,13 +2293,13 @@ single_resolution(Opts) ->
         end,
     Base = hb_message:commit(test_process(SignedOpts), SignedOpts),
     ?event({benchmark_start, ?MODULE}),
-    MsgToSchedule = hb_message:commit(#{
-        <<"type">> => <<"Message">>,
-        <<"test-key">> => <<"test-val">>
-    }, SignedOpts),
-    {ok, _} = hb_cache:write(MsgToSchedule, SignedOpts),
     Iterations = hb_test_utils:benchmark(
         fun(_) ->
+            % Each a new signed message: one is assigned at most once.
+            MsgToSchedule = hb_message:commit(#{
+                <<"type">> => <<"Message">>,
+                <<"test-key">> => <<"test-val">>
+            }, SignedOpts),
             MsgX = #{
                 <<"path">> => <<"schedule">>,
                 <<"method">> => <<"POST">>,
@@ -2266,18 +2334,22 @@ single_resolution(Opts) ->
 many_clients(Opts) ->
     BenchTime = 0.25,
     Processes = hb_opts:get(workers, 25, Opts),
-    {Node, HTTPOpts} = http_init(Opts),
+    % Every worker's write must be accepted: this measures scheduling, not the
+    % node's write bound.
+    {Node, HTTPOpts} =
+        http_init(Opts#{ <<"max-writes-in-flight">> => Processes }),
     PMsg = hb_message:commit(test_process(HTTPOpts), HTTPOpts),
-    Base = hb_message:commit(#{
+    % Each a new signed message: one is assigned at most once.
+    MkBase = fun() -> hb_message:commit(#{
         <<"path">> => <<"/~scheduler@1.0/schedule">>,
         <<"method">> => <<"POST">>,
         <<"process">> => PMsg,
         <<"body">> => hb_message:commit(#{ <<"inner">> => <<"test">> }, HTTPOpts)
-    }, HTTPOpts),
-    {ok, _} = hb_http:post(Node, Base, HTTPOpts),
+    }, HTTPOpts) end,
+    {ok, _} = hb_http:post(Node, MkBase(), HTTPOpts),
     Iterations = hb_test_utils:benchmark(
         fun(X) ->
-            {ok, _} = hb_http:post(Node, Base, HTTPOpts),
+            {ok, _} = hb_http:post(Node, MkBase(), HTTPOpts),
             ?event(bench, {iteration, X, self()})
         end,
         BenchTime,
@@ -2366,3 +2438,101 @@ benchmark_suite() ->
             desc => <<"100xRocksDB store, aggressive conf, http/3.">>
         }
     ].
+
+%% @doc A process definition POSTed to the scheduler is committed to the
+%% scheduler's store before the POST is answered.
+spawn_is_flushed_before_answer_test() ->
+    start(),
+    Wallet = hb:wallet(),
+    Sched = (hb_test_utils:test_store(hb_store_lmdb, <<"spawn-flush">>))#{
+        <<"flush-every">> => 0, <<"batch-size">> => 1000000 },
+    Main = hb_test_utils:test_store(hb_store_lmdb, <<"spawn-flush-main">>),
+    Opts = #{ <<"priv-wallet">> => Wallet, <<"store">> => [Main],
+              <<"scheduler-store">> => [Sched] },
+    ok = hb_store:start([Sched, Main], #{}, Opts),
+    Base = hb_message:commit(test_process(Opts), Opts),
+    {ok, _} = hb_ao:resolve(Base, #{ <<"method">> => <<"POST">>,
+        <<"path">> => <<"schedule">>, <<"body">> => Base }, Opts),
+    #{ <<"db">> := DB } = hb_store:find(Sched),
+    ?assertEqual(0, elmdb:overlay_count(DB)).
+
+%% @doc A node whose store list came from a JSON config (store modules as
+%% binaries, no `ao-types') spawns a process and schedules to it, answering
+%% each request instead of crashing the scheduler and leaving the client
+%% waiting.
+spawn_with_json_store_config_test_() ->
+    {timeout, 60, fun() ->
+        start(),
+        Wallet = hb:wallet(),
+        Dir = fun(T) -> maps:get(<<"name">>, hb_test_utils:test_store(hb_store_lmdb, T)) end,
+        Json = iolist_to_binary([
+            <<"{\"store\":[{\"store-module\":\"hb_store_lmdb\",\"name\":\"">>,
+            Dir(<<"json-main">>),
+            <<"\"}],\"scheduler-store\":[{\"store-module\":\"hb_store_lmdb\",\"name\":\"">>,
+            Dir(<<"json-sched">>), <<"\"}]}">>]),
+        Config = hb_json:decode(Json),
+        ?assertMatch([#{ <<"store-module">> := <<"hb_store_lmdb">> }],
+                     maps:get(<<"store">>, Config)),
+        Opts = Config#{ <<"priv-wallet">> => Wallet },
+        Base = hb_message:commit(test_process(Opts), Opts),
+        Self = self(),
+        Run =
+            fun(Tag, F) ->
+                spawn(fun() -> Self ! {Tag, catch F()} end),
+                receive {Tag, R} -> R after 20000 -> {Tag, timeout} end
+            end,
+        ?assertMatch({ok, _},
+            Run(spawn_post, fun() ->
+                hb_ao:resolve(Base, #{ <<"method">> => <<"POST">>,
+                    <<"path">> => <<"schedule">>, <<"body">> => Base }, Opts)
+            end)),
+        Msg = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"test-key">> => <<"v">> }, Opts),
+        ?assertMatch({ok, _},
+            Run(schedule, fun() ->
+                hb_ao:resolve(Base, #{ <<"method">> => <<"POST">>,
+                    <<"path">> => <<"schedule">>, <<"body">> => Msg }, Opts)
+            end))
+    end}.
+
+%% @doc Nothing is computed from, or served for, a slot whose assignment is
+%% written but not durable. Here the batch's flush fails, as a crash between
+%% the write and the flush would leave it: slot 1 is in the store, readable,
+%% but only slot 0 is given to compute or served as the schedule.
+undurable_slot_not_computed_or_served_test_() ->
+    {timeout, 90, fun() ->
+        start(),
+        Wallet = hb:wallet(),
+        Inner = (hb_test_utils:test_store(hb_store_lmdb, <<"durable-slots">>))#{
+            <<"capacity">> => 1 bsl 30 },
+        Store = hb_store_offsite_journal:wrap(Inner,
+            #{ <<"path">> => <<(maps:get(<<"name">>, Inner))/binary, "-export">> }),
+        Opts = #{ <<"priv-wallet">> => Wallet, <<"store">> => [Store],
+                  <<"scheduling-mode">> => local_confirmation,
+                  <<"scheduler-lookahead">> => false },
+        ok = hb_store:start([Store], #{}, Opts),
+        Proc = hb_message:commit(test_process(Opts), Opts),
+        ProcID = hb_util:human_id(hb_message:id(Proc, all, Opts)),
+        Server = dev_scheduler_server:start(ProcID, Proc, Opts),
+        M1 = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 1 }, Opts),
+        M2 = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => 2 }, Opts),
+        _ = dev_scheduler_server:schedule(Server, M1),
+        Ref = monitor(process, Server),
+        erlang:suspend_process(Server),
+        Server ! {schedule, M2, self(), erlang:system_time(millisecond) + 10000},
+        persistent_term:put({hb_store_offsite_journal, fail_sync}, true),
+        try
+            erlang:resume_process(Server),
+            receive {'DOWN', Ref, _, _, _} -> ok after 10000 -> error(server_alive) end
+        after
+            persistent_term:erase({hb_store_offsite_journal, fail_sync})
+        end,
+        % The assignment of slot 1 was written: the window is real.
+        ?assertMatch({ok, _}, dev_scheduler_cache:read(ProcID, 1, Opts)),
+        ?assertMatch({ok, _, _},
+            check_lookahead_and_local_cache(undefined, ProcID, 0, Opts)),
+        ?assertEqual(not_found,
+            check_lookahead_and_local_cache(undefined, ProcID, 1, Opts)),
+        {Served, _} = get_local_assignments(ProcID, 0, undefined, Opts),
+        ?assertEqual([0],
+            [ hb_util:int(hb_ao:get(<<"slot">>, A, Opts)) || A <- Served ])
+    end}.

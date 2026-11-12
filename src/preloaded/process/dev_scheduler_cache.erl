@@ -1,7 +1,10 @@
 %%% @doc A module that provides a cache for scheduler assignments and locations.
 -module(dev_scheduler_cache).
--export([write/3, write_spawn/2, read/3, flush/1]).
+-export([write/3, write_spawn/2, read/3, flush/1, flush_async/1, flush_async/3,
+         batch/2, hold/2]).
 -export([list/2, latest/2]).
+-export([signature_ids/2, write_message_slot/4, find_assigned/4]).
+-export([set_durable/2, clear_durable/1, durable/1, read_durable/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -53,16 +56,81 @@ write(ProcID, RawAssignment, RawOpts) ->
             {error, Reason}
     end.
 
+%% @doc Run `Fun' with its writes to the scheduler store held and made as one
+%% (`hb_store:batch/3'): a journaled store takes them in one writer call. A
+%% held write cannot be read back inside `Fun'. A refused batch raises.
+batch(Fun, RawOpts) ->
+    Opts = opts(RawOpts),
+    hb_store:batch(hb_opts:get(store, no_viable_store, Opts), Fun, Opts).
+
+%% @doc `batch/2' without making the writes: `{Result, Commit}', where
+%% `Commit()' makes them, from any process (`hb_store:hold/3').
+hold(Fun, RawOpts) ->
+    Opts = opts(RawOpts),
+    hb_store:hold(hb_opts:get(store, no_viable_store, Opts), Fun, Opts).
+
 %% @doc Commit the writes that the scheduler store holds in memory, such that
 %% they survive a halt of the node.
 flush(RawOpts) ->
     Opts = opts(RawOpts),
     hb_store:flush(hb_opts:get(store, no_viable_store, Opts), Opts).
 
+%% @doc Flush without waiting: the caller is sent `{flushed, Ref, Result}',
+%% `Result' being `ok' or `{error, Reason}'. Flushes asked for by many
+%% callers at once share the store's commits (see `hb_store_offsite_journal').
+flush_async(Opts) ->
+    Ref = make_ref(),
+    _ = flush_async(self(), Ref, Opts),
+    Ref.
+
+%% @doc Flush in the background, then send `{flushed, Ref, Result}' to
+%% `Caller'.
+flush_async(Caller, Ref, Opts) ->
+    spawn(
+        fun() ->
+            Result =
+                try flush(Opts) of
+                    ok -> ok;
+                    Other -> {error, Other}
+                catch Class:Reason -> {error, {Class, Reason}}
+                end,
+            Caller ! {flushed, Ref, Result}
+        end
+    ),
+    Ref.
+
 %% @doc Write the initial assignment message to the cache.
 write_spawn(RawInitMessage, Opts) ->
     InitMessage = hb_cache:ensure_all_loaded(RawInitMessage, Opts),
-    hb_cache:write(InitMessage, opts(Opts)).
+    case hb_cache:write(InitMessage, opts(Opts)) of
+        {ok, _} = Res ->
+            ok = write_referenced(InitMessage, Opts),
+            Res;
+        Error -> Error
+    end.
+
+%% @doc A definition that names its code by ID (a WASM `image', an aos
+%% `module') cannot be recomputed without it: copy that message into the
+%% scheduler's store too. A reference the node cannot read (a remote module
+%% not cached here) is logged; the spawn goes on.
+write_referenced(InitMessage, Opts) ->
+    lists:foreach(
+        fun(Key) ->
+            case hb_maps:get(Key, InitMessage, undefined, Opts) of
+                ID when ?IS_ID(ID) ->
+                    case hb_cache:read(ID, Opts) of
+                        {ok, Msg} ->
+                            {ok, _} =
+                                hb_cache:write(hb_cache:ensure_all_loaded(Msg, Opts), opts(Opts));
+                        Other ->
+                            ?event(warning,
+                                {spawn_reference_not_kept, {key, Key}, {id, ID}, {read, Other}})
+                    end;
+                _ -> ok
+            end
+        end,
+        [<<"image">>, <<"module">>]
+    ).
 
 %% @doc Get an assignment message from the cache.
 read(ProcID, Slot, Opts) when is_integer(Slot) ->
@@ -118,6 +186,125 @@ list(ProcID, RawOpts) ->
         ]),
         Opts#{ <<"store-failure">> => throw }
     ).
+
+%% @doc The IDs of a message's signature commitments: those with a committer.
+%% Each is derived from its signature and checked against it when the message
+%% verifies (`sha256' of the signature for both `ans104@1.0' and `httpsig@1.0'),
+%% so the same signature has the same ID in either encoding, and a signature
+%% cannot be relabelled. A message signed twice has two, and neither may be
+%% assigned again, so adding a signature to a message does not make it new.
+signature_ids(Msg, Opts) ->
+    Commitments = hb_cache:ensure_all_loaded(
+        hb_maps:get(<<"commitments">>, Msg, #{}, Opts), Opts),
+    lists:sort(
+        [ hb_util:human_id(ID)
+        || {ID, Comm} <- maps:to_list(Commitments),
+           is_map(Comm), is_map_key(<<"committer">>, Comm) ]).
+
+%% @doc Index the slot under each of the message's signature IDs, in the
+%% scheduler's store. The scheduler writes the rows right after the
+%% assignment, and the store's commits keep write order, so what is on disk
+%% after a crash is a prefix: an assignment without its rows can only be one
+%% of the last written.
+write_message_slot(_ProcID, [], _Slot, _RawOpts) -> ok;
+write_message_slot(ProcID, IDs, Slot, RawOpts) ->
+    Opts = opts(RawOpts),
+    ok = hb_store:write(
+        hb_opts:get(store, no_viable_store, Opts),
+        maps:from_list(
+            [ {message_slot_path(ProcID, ID), hb_util:bin(Slot)} || ID <- IDs ]),
+        Opts#{ <<"store-failure">> => throw }).
+
+%% @doc The slot at or below `Current' that already carries one of the
+%% signature IDs: `{ok, Slot, ID}', or `not_found'. A row is read by its exact
+%% key (one `get', which sees the writes not yet flushed too; never a prefix
+%% scan, which commits pending writes first). A row is trusted only if that
+%% slot's assignment carries the ID, so a row whose assignment never landed
+%% (or a slot reused after a failed flush) refuses nothing.
+find_assigned(ProcID, IDs, Current, RawOpts) ->
+    Opts = opts(RawOpts),
+    Store = hb_opts:get(store, no_viable_store, Opts),
+    find_assigned(ProcID, IDs, Current, Store, Opts#{ <<"store-failure">> => throw }).
+find_assigned(_ProcID, [], _Current, _Store, _Opts) -> not_found;
+find_assigned(ProcID, [ID | IDs], Current, Store, Opts) ->
+    Req = #{ <<"read">> => message_slot_path(ProcID, ID), <<"exact">> => true },
+    case hb_store:read(Store, Req, Opts) of
+        {ok, SlotBin} ->
+            Slot = hb_util:int(SlotBin),
+            Carries =
+                Slot =< Current andalso
+                    case read(ProcID, Slot, Opts) of
+                        {ok, Assignment} ->
+                            lists:member(ID,
+                                signature_ids(
+                                    hb_maps:get(<<"body">>, Assignment, #{}, Opts),
+                                    Opts));
+                        not_found -> false
+                    end,
+            case Carries of
+                true -> {ok, Slot, ID};
+                false -> find_assigned(ProcID, IDs, Current, Store, Opts)
+            end;
+        _ -> find_assigned(ProcID, IDs, Current, Store, Opts)
+    end.
+
+message_slot_path(ProcID, ID) ->
+    hb_path:to_binary([
+        ?SCHEDULER_CACHE_PREFIX,
+        <<"message-slots">>,
+        hb_util:human_id(ProcID),
+        ID
+    ]).
+
+%% @doc The newest slot of a process scheduled here that is known durable
+%% (flushed to the scheduler's store), as the process's scheduling server
+%% last set it; `infinity' if none has (the process is not scheduled here).
+%% An assignment above it may be written but not yet flushed: a crash can
+%% lose it and the slot number be given to another message, so nothing may
+%% be computed from it, pushed or served before it is durable.
+durable(ProcID) ->
+    case ets:lookup(durable_table(), hb_util:human_id(ProcID)) of
+        [{_, Slot}] -> Slot;
+        [] -> infinity
+    end.
+
+set_durable(ProcID, Slot) ->
+    true = ets:insert(durable_table(), {hb_util:human_id(ProcID), Slot}),
+    ok.
+
+clear_durable(ProcID) ->
+    true = ets:delete(durable_table(), hb_util:human_id(ProcID)),
+    ok.
+
+%% @doc Read an assignment only if its slot is durable: what compute and the
+%% schedule served to others read.
+read_durable(ProcID, Slot, Opts) ->
+    case hb_util:int(Slot) =< durable(ProcID) of
+        true -> read(ProcID, Slot, Opts);
+        false -> not_found
+    end.
+
+%% @doc The node-wide table of durable slots. Its owner is a process of its
+%% own that never exits, so the table outlives any scheduler or caller.
+durable_table() ->
+    case ets:whereis(dev_scheduler_durable) of
+        undefined ->
+            Self = self(),
+            spawn(
+                fun() ->
+                    try ets:new(dev_scheduler_durable,
+                            [named_table, public, {read_concurrency, true}]) of
+                        _ ->
+                            Self ! durable_table,
+                            receive never -> ok end
+                    catch error:badarg -> Self ! durable_table
+                    end
+                end
+            ),
+            receive durable_table -> ok end,
+            ets:whereis(dev_scheduler_durable);
+        Tab -> Tab
+    end.
 
 %% @doc Get the latest assignment from the cache.
 latest(ProcID, RawOpts) ->
@@ -474,3 +661,109 @@ volatile_store_corruption_test() ->
             { list, length(SlotsAfterCorruption) }, 
             { latest, LatestAfterCorruption }
     }).
+
+%% @doc An assignment written by the scheduler cache lands in the
+%% irreplaceable store with its whole message, readable from that store
+%% alone, and reads back through the node's store list.
+assignment_lands_in_irreplaceable_store_test() ->
+    Main = hb_test_utils:test_store(hb_store_lmdb, <<"irr-main2">>),
+    Irr = hb_test_utils:test_store(hb_store_lmdb, <<"irr-irr2">>),
+    hb_store:start(Main),
+    Node = hb_store_irreplaceable:node_message(#{ <<"store">> => [Main], <<"irreplaceable-store">> => Irr,
+                           <<"priv-wallet">> => ar_wallet:new() }),
+    Body = hb_message:commit(#{ <<"type">> => <<"Message">>,
+                                <<"data">> => crypto:strong_rand_bytes(200) }, Node),
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Assignment = hb_message:commit(#{ <<"variant">> => <<"ao.N.1">>, <<"process">> => ProcID,
+                                      <<"slot">> => 0, <<"body">> => Body }, Node),
+    ok = write(ProcID, Assignment, Node),
+    ok = flush(Node),
+    Path = <<"~scheduler@1.0/assignments/", ProcID/binary, "/0">>,
+    ?assertMatch({ok, _}, hb_store:read([Irr], Path, #{})),
+    ?assertMatch({error, _}, hb_store:read([Main], Path, #{})),
+    % The irreplaceable store alone holds the whole assignment. (Signing may
+    % also leave a copy of the body in the main store; that copy is derived.)
+    IrrOnly = #{ <<"store">> => [Irr] },
+    {ok, Read} = read(ProcID, 0, IrrOnly),
+    Loaded = hb_cache:ensure_all_loaded(Read, IrrOnly),
+    ?assertEqual(hb_message:id(Assignment, signed, Node),
+                 hb_message:id(Loaded, signed, Node)),
+    ?assert(hb_message:verify(Loaded, all, IrrOnly)),
+    BodyID = hb_message:id(Body, signed, Node),
+    % A message read by ID through the node's own store list finds it.
+    ?assertMatch({ok, _}, hb_cache:read(BodyID, Node)).
+
+%% @doc With an offsite journal, an assignment shipped and restored into an
+%% empty store reads back whole from that store alone.
+assignment_restores_from_offsite_journal_test() ->
+    Main = hb_test_utils:test_store(hb_store_lmdb, <<"irr-main3">>),
+    Irr = hb_test_utils:test_store(hb_store_lmdb, <<"irr-irr3">>),
+    Target = <<(maps:get(<<"name">>, Irr))/binary, "-export">>,
+    hb_store:start(Main),
+    Node =
+        hb_store_irreplaceable:node_message(#{
+            <<"store">> => [Main],
+            <<"irreplaceable-store">> => Irr,
+            <<"irreplaceable-export">> => #{ <<"path">> => Target },
+            <<"priv-wallet">> => ar_wallet:new()
+        }),
+    [Wrapped] = hb_opts:get(<<"scheduler-store">>, undefined, Node),
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Assignments =
+        [
+            hb_message:commit(#{
+                <<"variant">> => <<"ao.N.1">>,
+                <<"process">> => ProcID,
+                <<"slot">> => Slot,
+                <<"body">> =>
+                    hb_message:commit(#{
+                        <<"type">> => <<"Message">>,
+                        <<"data">> => crypto:strong_rand_bytes(300)
+                    }, Node)
+            }, Node)
+        ||
+            Slot <- [0, 1, 2]
+        ],
+    lists:foreach(
+        fun(A) -> ok = write(ProcID, A, Node), ok = flush(Node) end,
+        Assignments
+    ),
+    idle = hb_store_offsite_journal:ship_now(Wrapped),
+    Fresh = hb_test_utils:test_store(hb_store_lmdb, <<"irr-fresh3">>),
+    hb_store:start(Fresh),
+    {ok, _} = hb_store_offsite_journal:restore(Target, Fresh),
+    FreshOpts = #{ <<"store">> => [Fresh] },
+    ?assertEqual([0, 1, 2], lists:sort(list(ProcID, FreshOpts))),
+    lists:foreach(
+        fun(A) ->
+            Slot = hb_ao:get(<<"slot">>, A, Node),
+            {ok, R} = read(ProcID, Slot, FreshOpts),
+            ?assertEqual(hb_message:id(A, signed, Node), hb_message:id(R, signed, Node)),
+            Loaded = hb_cache:ensure_all_loaded(R, FreshOpts),
+            ?assertEqual(
+                hb_ao:get(<<"body/data">>, A, Node),
+                hb_ao:get(<<"body/data">>, Loaded, FreshOpts)
+            ),
+            ?assert(hb_message:verify(Loaded, all, FreshOpts))
+        end,
+        Assignments
+    ).
+
+%% @doc A definition whose code is named by ID carries that code into the
+%% scheduler's store: readable from it alone.
+spawn_carries_referenced_image_test() ->
+    Main = hb_test_utils:test_store(hb_store_lmdb, <<"img-main">>),
+    Irr = hb_test_utils:test_store(hb_store_lmdb, <<"img-irr">>),
+    ok = hb_store:start([Main, Irr], #{}, #{}),
+    Opts = #{ <<"store">> => [Main], <<"scheduler-store">> => [Irr],
+              <<"priv-wallet">> => ar_wallet:new() },
+    Image = hb_message:commit(#{ <<"data">> => crypto:strong_rand_bytes(500),
+                                 <<"content-type">> => <<"application/wasm">> }, Opts),
+    {ok, _} = hb_cache:write(Image, Opts),
+    ImageID = hb_message:id(Image, signed, Opts),
+    Proc = hb_message:commit(#{ <<"type">> => <<"Process">>, <<"image">> => ImageID,
+                                <<"device">> => <<"process@1.0">> }, Opts),
+    {ok, _} = write_spawn(Proc, Opts),
+    {ok, Read} = hb_cache:read(ImageID, #{ <<"store">> => [Irr] }),
+    ?assertEqual(hb_maps:get(<<"data">>, Image, Opts),
+                 hb_maps:get(<<"data">>, hb_cache:ensure_all_loaded(Read, #{ <<"store">> => [Irr] }), Opts)).

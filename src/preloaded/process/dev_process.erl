@@ -40,11 +40,12 @@
 %%%     Cache-Keys:      A list of the keys that should be cached for all 
 %%%                      assignments, in addition to `/Results'.
 -module(dev_process).
--device_libraries([lib_process, lib_process_cache]).
+-device_libraries([lib_process, lib_process_cache, lib_process_delivery]).
 %%% Public API
 -export([device_info/1]).
 -export([as/3, compute/3, schedule/3, slot/3, now/3, push/3, snapshot/3]).
--export([target_slot/2]).
+-export([deliveries/3]).
+-export([target_slot/2, request_slot/2, is_cached_state/1]).
 -export([default_device/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("include/hb.hrl").
@@ -66,6 +67,10 @@ device_info(_Base) ->
         worker => fun dev_process_worker:server/3,
         grouper => fun dev_process_worker:group/3,
         await => fun dev_process_worker:await/5,
+        % The await function sends its own request: a `compute' waiter
+        % registers itself and sends the worker a two-tuple, never a copy of
+        % its request and options (`dev_process_worker').
+        await_sends => true,
         exports =>
             [
                 <<"as">>,
@@ -74,7 +79,8 @@ device_info(_Base) ->
                 <<"schedule">>,
                 <<"slot">>,
                 <<"snapshot">>,
-                <<"push">>
+                <<"push">>,
+                <<"deliveries">>
             ]
     }.
 
@@ -144,7 +150,9 @@ default_device(Base, Key, Opts) ->
 -spec schedule(#{ scheduler => _, _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
     {ok, _} | {error, _}.
 schedule(Base, Req, Opts) ->
-    lib_process:run_as(<<"scheduler">>, Base, Req, Opts).
+    hb_phase_timer:time(schedule, fun() ->
+        lib_process:run_as(<<"scheduler">>, Base, Req, Opts)
+    end).
 
 -spec slot(#{ scheduler => _, _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
     {ok, _} | {error, _}.
@@ -223,8 +231,11 @@ init(Base, Req, Opts) ->
 compute(Base, Req, Opts) ->
     ProcBase = lib_process:ensure_process_key(Base, Opts),
     ProcID = lib_process:process_id(ProcBase, #{}, Opts),
-    TargetSlot = target_slot(Req, Opts),
+    TargetSlot = request_slot(Req, Opts),
     case TargetSlot of
+        {invalid, RawSlot} ->
+            ?event(compute, {invalid_slot_requested, {slot, RawSlot}}, Opts),
+            {error, invalid_slot_error()};
         not_found ->
             % The slot is not set, so we need to serve the latest known state
             % unless the `init' key is set to a value aside from `now'.
@@ -235,9 +246,12 @@ compute(Base, Req, Opts) ->
                 _ ->
                     {error, not_found}
             end;
-        RawSlot ->
-            Slot = hb_util:int(RawSlot),
-            case lib_process_cache:read(ProcID, Slot, Opts) of
+        Slot ->
+            CacheRead =
+                hb_phase_timer:time(compute_cache_read, fun() ->
+                    lib_process_cache:read(ProcID, Slot, Opts)
+                end),
+            case CacheRead of
                 {ok, Result} ->
                     % The result is already cached, so we can return it.
                     ?event(
@@ -247,23 +261,112 @@ compute(Base, Req, Opts) ->
                             {result, Result}
                         }
                     ),
-                    {ok, without_snapshot(Result, Opts)};
+                    {ok, mark_cached_state(without_snapshot(Result, Opts), Opts)};
                 {error, not_found} ->
-                    {ok, Loaded} = ensure_loaded(ProcBase, Req, Opts),
-                    ?event(compute,
-                        {computing, {process_id, ProcID},
-                        {to_slot, Slot}},
-                        Opts
-                    ),
-                    compute_to_slot(
-                        ProcID,
-                        Loaded,
-                        Req,
-                        Slot,
-                        Opts
-                    )
+                    compute_uncached(ProcID, ProcBase, Req, Slot, Opts)
             end
     end.
+
+%% @doc Compute a slot that is not stored. A process's state only moves
+%% forward: a slot at or below the newest stored slot (the head) that is not
+%% stored -- retention deleted it -- is refused with a 410, never recomputed.
+%% A recompute replays the process from its nearest kept checkpoint, or from
+%% the start, in whoever asked, with no deadline and no way to cancel it: on
+%% prod (2026-11-05) ~30 detached pushes of the order-book vault, each ~85k
+%% slots behind its head, replayed it at once, the node fell from 27 to 9
+%% slots/s, every process's slot took 3-7x as long, and the vault fell further
+%% behind. Every route to a slot's state ends here or in the worker's
+%% `compute_to_slot/5', which refuses the same slots. A slot's outbox
+%% outlives its state in its `o' row (`lib_process_cache:read_results/3'),
+%% which is what a push reads.
+%%
+%% Slot -1 is the initialized process before its first assignment: it is
+%% always `init/3', never a replay, so it is not refused.
+compute_uncached(ProcID, ProcBase, Req, Slot, Opts) ->
+    case Slot >= 0 andalso
+            lib_process_cache:latest_slot(ProcID, lib_process:scoped_opts(Opts)) of
+        {ok, Head} when is_integer(Head), Slot =< Head ->
+            ?event(compute, {refused_pruned_slot, ProcID, Slot, Head}, Opts),
+            {error, pruned_slot_error(ProcID, Slot, Head)};
+        _ when Slot >= 0 ->
+            % The worker said the slot is behind its live state, so it was
+            % stored; it is not now, so it is gone (`dev_process_worker').
+            case hb_opts:get(<<"process-stored-only">>, false, Opts) of
+                true -> {error, pruned_slot_error(ProcID, Slot, Slot)};
+                false -> compute_ahead(ProcID, ProcBase, Req, Slot, Opts)
+            end;
+        _ -> compute_here(ProcID, ProcBase, Req, Slot, Opts)
+    end.
+
+%% A slot beyond the head is the worker's to compute, even when its request
+%% reached here ungrouped (a nested call runs with `await-inprogress' off):
+%% it waits for the worker. Only with no worker is it computed here.
+compute_ahead(ProcID, ProcBase, Req, Slot, Opts) ->
+    case live_worker(ProcID, Opts) of
+        {ok, Worker} ->
+            case dev_process_worker:delegate(Worker, ProcID, ProcBase, Req, Slot, Opts) of
+                {error, leader_died} ->
+                    compute_here(ProcID, ProcBase, Req, Slot, Opts);
+                Res -> Res
+            end;
+        none -> compute_here(ProcID, ProcBase, Req, Slot, Opts)
+    end.
+
+%% @doc The process's worker, when one runs and this is not it.
+live_worker(ProcID, Opts) ->
+    case hb_opts:get(<<"is-worker">>, false, Opts) =/= true andalso
+            hb_opts:get(process_workers, false, Opts) == true andalso
+            hb_name:lookup({process_worker, hb_util:human_id(ProcID)}) of
+        Pid when is_pid(Pid), Pid =/= self() -> {ok, Pid};
+        _ -> none
+    end.
+
+compute_here(ProcID, ProcBase, Req, Slot, Opts) ->
+    SlotOpts = slot_opts(Opts),
+    case hb_phase_timer:time(ensure_loaded, fun() ->
+            ensure_loaded(ProcBase, Req, SlotOpts)
+        end) of
+        {ok, Loaded} ->
+            ?event(compute,
+                {computing, {process_id, ProcID},
+                {to_slot, Slot}},
+                Opts
+            ),
+            Res = compute_to_slot(ProcID, Loaded, Req, Slot, SlotOpts),
+            % A compute outside the worker (the leader of a group
+            % before a worker exists) answers the waiters registered
+            % for its own slot, whatever its result: a failure stores
+            % nothing, so no slot notification would reach them.
+            case hb_opts:get(<<"is-worker">>, false, Opts) of
+                true -> ok;
+                _ -> dev_process_worker:notify_result(ProcID, Slot, Res)
+            end,
+            Res;
+        {error, _} = Error -> Error
+    end.
+
+%% @doc The options every slot is computed under, whoever computes it: the
+%% process worker, or the first caller after a restart (an HTTP request, a
+%% push, the compute-on-schedule follower) computing inline before a worker
+%% exists. A computed slot is stored and read by slot number
+%% (`lib_process_cache'), never by ID or hashpath, so the nested resolutions
+%% (`set', `next', `execution', `at-slot') must not content-address the
+%% process state: with `hashpath => update' each commits the whole state with
+%% httpsig. That was fixed for the worker alone (2026-10-27), so a process
+%% that came back behind after a restart caught up at the slow rate and never
+%% reached its worker: the prod vault (1.2 MB state) computed 1.8 slots/s for
+%% hours with 13,731 requests queued behind it, 2026-11-04.
+%% Nor does any nested resolution group: the worker already computes with
+%% `await-inprogress => false', but an inline leader inherited its caller's
+%% (a push's schedule asks for `true'), and `hb_persistent:default_grouper'
+%% then named every `hb_ao:get' of the slot by a SHA-256 of the whole state's
+%% `term_to_binary': 55% of the node's samples, prod 2026-11-04.
+slot_opts(Opts) ->
+    Opts#{
+        <<"hashpath">> => ignore,
+        <<"result-cache-lookup">> => false,
+        <<"await-inprogress">> => false
+    }.
 
 %% @doc Return the slot requested by a `compute' request, or `not_found'.
 target_slot(Req, Opts) ->
@@ -274,6 +377,92 @@ target_slot(Req, Opts) ->
         ],
         Opts
     ).
+
+%% @doc Return the slot a `compute' request asks for as an integer of at least
+%% -1, `not_found' when it names none, or `{invalid, Raw}'.
+%%
+%% This is the one reading of a request's slot: `compute/3', the process
+%% worker, its grouper and its waiters all use it, so they cannot disagree on
+%% which slot a request means -- `compute' takes precedence over `slot', as in
+%% `target_slot/2'. A slot that is not an integer, or is below -1, can never
+%% name a state; it is reported here instead of crashing `hb_util:int/1' or
+%% reaching `compute_to_slot/6', where such a target rewinds to nothing and
+%% throws.
+%%
+%% -1 is a real state: the initialized process before its first assignment
+%% (`init/3' sets `at-slot' to -1), and the `current' slot the scheduler
+%% reports for a process with no assignments yet. `now/3' asks for exactly
+%% that slot, so rejecting it answered every `now' on a fresh process with a
+%% 400 instead of its initial state.
+%%
+%% A request that carries its slot as a plain literal -- every HTTP `compute'
+%% does -- is read directly: resolving the keys through `message@1.0' costs
+%% ~125us, and this runs in the grouper, the worker and each waiter on every
+%% request. Any other shape (a link, a typed or wrapped value, no literal at
+%% all) takes the full `target_slot/2' path.
+request_slot(Req, Opts) when is_map(Req) ->
+    case literal_slot(Req) of
+        {ok, Raw} -> parse_slot(Raw);
+        not_literal -> request_slot_resolved(Req, Opts)
+    end;
+request_slot(Req, Opts) ->
+    request_slot_resolved(Req, Opts).
+
+request_slot_resolved(Req, Opts) ->
+    case target_slot(Req, Opts) of
+        not_found -> not_found;
+        Raw -> parse_slot(unwrap_slot(Raw))
+    end.
+
+%% @doc The slot a request carries as a literal value, in `target_slot/2''s
+%% precedence order, if it carries one that way.
+literal_slot(#{ <<"compute">> := Slot }) when is_integer(Slot); is_binary(Slot) ->
+    {ok, Slot};
+literal_slot(Req = #{ <<"slot">> := Slot })
+        when is_integer(Slot) orelse is_binary(Slot),
+            not is_map_key(<<"compute">>, Req),
+            not is_map_key(<<"compute+link">>, Req) ->
+    {ok, Slot};
+literal_slot(_) ->
+    not_literal.
+
+parse_slot(Slot) when is_integer(Slot), Slot >= -1 -> Slot;
+parse_slot(Slot) when is_binary(Slot); is_list(Slot) ->
+    try hb_util:int(Slot) of
+        Int when Int >= -1 -> Int;
+        _ -> {invalid, Slot}
+    catch error:badarg -> {invalid, Slot}
+    end;
+parse_slot(Slot) -> {invalid, Slot}.
+
+%% @doc The error returned for a request whose slot cannot name an assignment.
+invalid_slot_error() ->
+    #{
+        <<"status">> => 400,
+        <<"body">> => <<"Invalid slot: expected an integer of at least -1.">>
+    }.
+
+%% @doc The error returned for a slot at or below the head that is no longer
+%% stored. It is gone, not missing: no later request will find it either.
+pruned_slot_error(ProcID, Slot, Head) ->
+    #{
+        <<"status">> => 410,
+        <<"body">> =>
+            <<
+                "Slot ", (hb_util:bin(Slot))/binary,
+                " of ", (hb_util:bin(ProcID))/binary,
+                " is below retained history (head ", (hb_util:bin(Head))/binary,
+                ")."
+            >>
+    }.
+
+%% @doc Unwrap an HTTP typed-result map to the scalar it carries. Any other
+%% term -- including `not_found', which both callers depend on -- is returned
+%% untouched.
+unwrap_slot(Slot) when is_map(Slot) ->
+    maps:get(maps:get(<<"ao-result">>, Slot, <<"body">>), Slot, Slot);
+unwrap_slot(Slot) ->
+    Slot.
 
 %% @doc Continually get and apply the next assignment from the scheduler until
 %% we reach the target slot that the user has requested.
@@ -299,7 +488,7 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
             % Compute the next state transition.
             NextSlot = CurrentSlot + 1,
             % Get the next input message from the scheduler device.
-            case next(Base, Req, Opts) of
+            case hb_phase_timer:time(slot_next, fun() -> next(Base, Req, Opts) end) of
                 {error, Res} ->
                     % If the scheduler device cannot provide a next message,
                     % we return its error details, along with the current slot.
@@ -339,26 +528,15 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
                     end
             end;
         CurrentSlot when CurrentSlot > TargetSlot ->
-            % The cache should already have the result, so we should never end up
-            % here. Depending on the type of process, 'rewinding' may require
-            % re-computing from a significantly earlier checkpoint, so for now
-            % we throw an error.
+            % The slot is behind the state held here and not in the cache:
+            % retention deleted its row. A state never moves backwards, so it
+            % is refused, not replayed (`compute_uncached/5').
             ?event(
                 compute,
-                {error_already_calculated_slot,
-                    {target, TargetSlot},
-                    {current, CurrentSlot}
-                },
+                {refused_pruned_slot, ProcID, TargetSlot, CurrentSlot},
                 Opts
             ),
-            throw(
-                {error,
-                    {already_calculated_slot,
-                        {target, TargetSlot},
-                        {current, CurrentSlot}
-                    }
-                }
-            )
+            {error, pruned_slot_error(ProcID, TargetSlot, CurrentSlot)}
     end.
 
 %% @doc Compute a single slot for a process, given an initialized state.
@@ -409,19 +587,23 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                 ),
             % Force a snapshot of the target slot so the terminal state is
             % restorable; intermediate slots snapshot per the configured interval.
+            % See `snapshot_target/3' for turning the forced snapshot off.
             {StoreTimeMicroSecs, ProcStateWithSnapshot} =
                 timer:tc(
                     fun() ->
                         store_result(
-                            Slot == TargetSlot,
+                            snapshot_target(Slot, TargetSlot, Opts),
                             ProcID,
                             Slot,
                             NewProcStateMsgWithSlot,
                             InitReq,
-                            Opts
+                            with_assignment_time(Req, Opts)
                         )
                     end
                 ),
+            hb_phase_timer:record(slot_prep, PrepTimeMicroSecs),
+            hb_phase_timer:record(slot_execution, RuntimeMicroSecs),
+            hb_phase_timer:record(slot_store, StoreTimeMicroSecs),
             ?event(compute_short,
                 {computed_slot,
                     {proc_id, ProcID},
@@ -430,7 +612,6 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                     {prep_ms, PrepTimeMicroSecs div 1000},
                     {execution_ms, RuntimeMicroSecs div 1000},
                     {store_ms, StoreTimeMicroSecs div 1000},
-                    {computed_slot_size, erlang:external_size(NewProcStateMsgWithSlot)},
                     {action,
                         hb_maps:get(
                             <<"action">>,
@@ -450,12 +631,14 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                 {ok, ProcStateWithSnapshot},
                 Opts
             ),
-            % Optionally fire an async `/push' for the slot we just cached.
-            % Only fresh computes reach this branch; cache hits in `compute/3'
-            % short-circuit before we get here, so each slot is push-triggered
-            % at most once per node lifetime regardless of how many times the
-            % caller polls `/now' or `/compute'.
-            maybe_trigger_push(State, Slot, InitReq, Opts),
+            % A slot with an outbox is delivered by the process's deliverer,
+            % whoever computed it and whether or not anybody asked for a push:
+            % its `o' row is already written, before its state row
+            % (`lib_process_delivery'). A cast; it never waits.
+            case lib_process_cache:has_outbox(ProcID, NewProcStateMsgWithSlot, Opts) of
+                true -> lib_process_delivery:notify(ProcID, Slot, Opts);
+                false -> ok
+            end,
             {ok, ProcStateWithSnapshot};
         {Status, Error} when Status == ok; Status == error ->
             % An error occurred while computing the slot, or its result is
@@ -481,20 +664,38 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                     {error, ErrMsg}
                 }
             ),
+            % The inbound state's results, and the delta it carries, are
+            % slot N-1's. Neither may survive into this slot: its outbox
+            % would be stored and delivered a second time as this slot's,
+            % and its patches stored again as this slot's change. This
+            % slot changes nothing; its results are its error.
+            ErrResults = #{ <<"type">> => <<"error">>, <<"error">> => ErrMsg },
+            Inbound = maps:without([<<"results">>, <<"results+link">>], State),
+            Unchanged =
+                case hb_private:get(<<"process-cache-delta">>, Inbound, not_found, Opts) of
+                    not_found -> Inbound;
+                    _ ->
+                        hb_private:set(Inbound, <<"process-cache-delta">>,
+                            #{ <<"patches">> => [], <<"results">> => ErrResults }, Opts)
+                end,
             ErrState =
                 hb_ao:set(
-                    State,
+                    Unchanged,
                     #{
                         <<"device">> => <<"process@1.0">>,
                         <<"at-slot">> => Slot,
-                        <<"results">> => #{
-                            <<"type">> => <<"error">>,
-                            <<"error">> => ErrMsg
-                        }
+                        <<"results">> => ErrResults
                     },
                     Opts
                 ),
-            store_result(Slot == TargetSlot, ProcID, Slot, ErrState, InitReq, Opts),
+            store_result(
+                snapshot_target(Slot, TargetSlot, Opts),
+                ProcID,
+                Slot,
+                ErrState,
+                InitReq,
+                with_assignment_time(Req, Opts)
+            ),
             {ok, ErrState};
         {failure, Failure} ->
             % A failure of this node -- a failed read or fetch -- is not a
@@ -513,6 +714,19 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
             {failure, Failure}
     end.
 
+%% @doc Options for a compute this device issues itself, such as the one in
+%% `now/3'. `spawn-worker' is a temporary option that `hb_ao' strips from
+%% every nested execution, and a process compute is always nested (inside
+%% `now', a push, the scheduler), so without this a process worker never
+%% starts and every request rebuilds the process state from the cache.
+%% `process-worker-spawn => true' asks for a worker on these computes only;
+%% it is off by default, keeping v0.11's behaviour.
+worker_spawn_opts(Opts) ->
+    case hb_opts:get(<<"process-worker-spawn">>, false, Opts) of
+        true -> Opts#{ <<"spawn-worker">> => true };
+        _ -> Opts
+    end.
+
 %% @doc Prepare the process state message for computing the next slot.
 prepare_next_slot(ProcID, State, RawReq, Opts) ->
     Slot = hb_util:int(hb_ao:get(<<"slot">>, RawReq, Opts)),
@@ -523,77 +737,40 @@ prepare_next_slot(ProcID, State, RawReq, Opts) ->
     Req = RawReq#{ <<"path">> => <<"compute">> },
     ?event(compute, {input_msg, Req}),
     ?event(compute, {executing, {proc_id, ProcID}, {slot, Slot}}, Opts),
-    % Unset the previous results.
-    PreparedState = hb_ao:set(State, #{ <<"results">> => unset }, Opts),
+    % Unset the previous results, and the previous slot's delta: a device
+    % that returns the state without a delta of its own must not hand slot
+    % N-1's on as this slot's (its outbox would be stored and delivered again).
+    Unset = hb_ao:set(State, #{ <<"results">> => unset }, Opts),
+    PreparedState =
+        hb_private:set_priv(Unset,
+            maps:remove(<<"process-cache-delta">>, hb_private:from_message(Unset))),
     {ok, Slot, PreparedState, Req}.
-
-%% @doc Fire a `~push@1.0/push' for the slot we just computed, iff the
-%% originating request carries a truthy `push' key. The push is invoked
-%% from a freshly-spawned process so a slow downstream chain cannot stall
-%% the compute path that produced this slot.
-%%
-%% `push' values:
-%%   `true' / `<<"true">>'  - push with no `max-depth' set, so the node's
-%%                            `push_max_depth' option bounds the recursion.
-%%   non-negative integer N - push with `max-depth = N', so the fan-out
-%%                            unwinds at most N levels deep. See `dev_push'
-%%                            for `max-depth = 0' semantics: each outbox
-%%                            entry is still scheduled on its target, but
-%%                            the recursive `/push' is skipped.
-%%   anything else (or absent) - silent no-op.
-maybe_trigger_push(Process, Slot, Req, Opts) ->
-    case hb_maps:get(<<"push">>, Req, undefined, Opts) of
-        true        -> dispatch_push(Process, Slot, undefined, Req, Opts);
-        <<"true">>  -> dispatch_push(Process, Slot, undefined, Req, Opts);
-        N when is_integer(N), N >= 0 ->
-            dispatch_push(Process, Slot, N, Req, Opts);
-        Bin when is_binary(Bin) ->
-            try hb_util:int(Bin) of
-                N when is_integer(N), N >= 0 ->
-                    dispatch_push(Process, Slot, N, Req, Opts);
-                _ -> ok
-            catch _:_ -> ok
-            end;
-        _ -> ok
-    end.
-
-%% @doc Build the inner `~push@1.0/push' request for `Slot' and invoke it from
-%% a freshly-spawned process. Inherits the
-%% originating request's payload keys (e.g. `result-depth', `async')
-%% so the caller's preference flows through, replaces `path'/`slot',
-%% and -- when bounded -- sets `max-depth'. The default sync mode
-%% propagates back-pressure to the compute path: a slow downstream
-%% chain throttles further hook fires rather than queueing unbounded
-%% spawns under load.
-dispatch_push(Process, Slot, MaxDepth, Req, Opts) ->
-    BaseReq =
-        (hb_maps:without([<<"push">>, <<"path">>, <<"slot">>], Req, Opts))#{
-            <<"path">> => <<"push">>,
-            <<"slot">> => Slot
-        },
-    PushReq =
-        case MaxDepth of
-            undefined -> BaseReq;
-            N -> BaseReq#{ <<"max-depth">> => N }
-        end,
-    % Extract the canonical process spec from the live state so push ID
-    % computation lands on the same cache key that `store_result' just
-    %% wrote under -- passing the live state directly hashes to a different
-    %% key and sends the downstream read into a re-compute loop.
-    Spec = hb_maps:get(<<"process">>, Process, Process, Opts),
-    ?event(push,
-        {triggered_by_compute,
-            {slot, Slot},
-            {max_depth, MaxDepth}
-        },
-        Opts
-    ),
-    spawn(fun() -> hb_ao:raw(<<"push@1.0">>, Spec, PushReq, Opts) end),
-    ok.
 
 %% @doc Store the resulting state in the cache, potentially with the snapshot
 %% key. The write is synchronous: callers may notify waiters or run push hooks
 %% as soon as this returns, so the slot must already be cache-visible.
+%% @doc Whether the target slot of a computation is snapshotted whatever the
+%% configured interval. A request computes one new slot at a time under live
+%% traffic, so the forced snapshot is a whole Lua VM image written for every
+%% message. `process-snapshot-target => false' leaves snapshots to
+%% `process-snapshot-slots' and `process-snapshot-time': less storage and a
+%% cheaper slot, against a cold start that replays the slots since the last
+%% interval snapshot.
+snapshot_target(Slot, TargetSlot, Opts) ->
+    Slot == TargetSlot
+        andalso hb_opts:get(<<"process-snapshot-target">>, true, Opts) =/= false.
+
+%% @doc The options to store a slot with: its assignment's timestamp in
+%% milliseconds, which a checkpoint's `s' marker keeps so that retention can
+%% date it (`lib_process_cache', `hb_store_retention'). An Arweave-scheduled
+%% assignment's timestamp is in seconds; `assignment_ms/2' normalises it, and
+%% a time that is not plausible is left out (the checkpoint is then kept).
+with_assignment_time(Assignment, Opts) ->
+    case hb_store_retention:assignment_ms(Assignment, Opts) of
+        {ok, Ms} -> Opts#{ <<"process-assignment-timestamp">> => Ms };
+        _ -> maps:remove(<<"process-assignment-timestamp">>, Opts)
+    end.
+
 store_result(ForceSnapshot, ProcID, Slot, Res, Req, RawOpts) ->
     Opts = lib_process:execution_opts(RawOpts),
     % Cache the `Snapshot' key as frequently as the node is configured to.
@@ -710,37 +887,56 @@ now(RawBase, Req, Opts) ->
         false ->
             maybe
                 {ok, CurrentSlot} ?=
+                    hb_phase_timer:time(now_slot_current, fun() ->
+                        hb_ao:resolve(
+                            Base,
+                            #{ <<"path">> => <<"slot/current">> },
+                            Opts
+                        )
+                    end),
+                ?event({now_called, {process, ProcessID}, {slot, CurrentSlot}}),
+                {ok, _} = Computed ?=
                     hb_ao:resolve(
                         Base,
-                        #{ <<"path">> => <<"slot/current">> },
-                        Opts
+                        #{
+                            <<"path">> => <<"compute">>,
+                            <<"slot">> => CurrentSlot
+                        },
+                        worker_spawn_opts(Opts)
                     ),
-                ?event({now_called, {process, ProcessID}, {slot, CurrentSlot}}),
+                % Refreshed only once the slot is stored: the refreshed slot
+                % is the head, and a slot the scheduler has assigned but
+                % nobody has computed must never be named as one -- every
+                % slot up to the head is refused as pruned.
                 lib_process_cache:refresh(
                     ProcessID,
                     hb_util:int(CurrentSlot),
                     Opts
                 ),
-                hb_ao:resolve(
-                    Base,
-                    (hb_maps:with([<<"push">>], Req, Opts))#{
-                        <<"path">> => <<"compute">>,
-                        <<"slot">> => CurrentSlot
-                    },
-                    Opts
-                )
+                Computed
             end;
         CacheParam ->
             % We are serving the latest known state from the cache, rather
             % than computing it.
-            LatestKnown = lib_process_cache:latest(ProcessID, [], Opts),
+            LatestKnown =
+                hb_phase_timer:time(now_cache_latest, fun() ->
+                    lib_process_cache:latest(ProcessID, [], Opts)
+                end),
             case LatestKnown of
                 {ok, LatestSlot, RawLatestMsg} ->
                     case lib_process_cache:fresh(ProcessID, LatestSlot, Req, Opts) of
                         {error, _} = Error ->
                             Error;
                         true ->
-                            LatestMsg = without_snapshot(RawLatestMsg, Opts),
+                            % Marked as a cache hit: it is public state only
+                            % (never a base to compute from), and the store
+                            % already holds it, so result caching must not
+                            % write it back on every read.
+                            LatestMsg =
+                                mark_cached_state(
+                                    without_snapshot(RawLatestMsg, Opts),
+                                    Opts
+                                ),
                             ?event(compute_cache,
                                 {serving_latest_cached_state,
                                     {proc_id, ProcessID},
@@ -788,17 +984,44 @@ uncached_now(_CacheParam, Base, Req, Opts, _Failure) ->
     % computation is also admissible.
     now(Base, Req, Opts#{ <<"process-now-from-cache">> => false }).
 
+%% @doc The slots of a process whose outbox is not delivered yet, after making
+%% sure its deliverer runs (`lib_process_delivery'). At boot the node calls it
+%% with `process-delivery-sweep' set, and then it starts a deliverer for
+%% every process this node schedules that is owed a delivery: a slot stored
+%% before a restart is still delivered, whether or not its process is ever
+%% computed again. With `process-delivery-metrics' set (the metrics endpoint
+%% does), it gives the node's delivery backlog instead
+%% (`lib_process_delivery:metrics/0').
+deliveries(Base, _Req, Opts) ->
+    case {hb_opts:get(<<"process-delivery-metrics">>, false, Opts),
+            hb_opts:get(<<"process-delivery-sweep">>, false, Opts)} of
+        {true, _} -> {ok, lib_process_delivery:metrics()};
+        {_, true} ->
+            {ok, #{ <<"started">> => lib_process_delivery:sweep(Opts) }};
+        _ ->
+            ProcBase = lib_process:ensure_process_key(Base, Opts),
+            ProcID = lib_process:process_id(ProcBase, #{}, Opts),
+            Pending = lib_process_delivery:pending(ProcID, Opts),
+            case Pending of
+                [] -> ok;
+                _ -> _ = lib_process_delivery:ensure(ProcID, Opts)
+            end,
+            {ok, #{ <<"pending">> => Pending }}
+    end.
+
 %% @doc Recursively push messages to the scheduler until we find a message
 %% that does not lead to any further messages being scheduled.
 -spec push(#{ push => _, _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
     {ok, _} | {error, _}.
 push(Base, Req, Opts) ->
-    lib_process:run_as(
-        <<"push">>,
-        lib_process:ensure_process_key(Base, Opts),
-        Req,
-        Opts
-    ).
+    hb_phase_timer:time(push, fun() ->
+        lib_process:run_as(
+            <<"push">>,
+            lib_process:ensure_process_key(Base, Opts),
+            Req,
+            Opts
+        )
+    end).
 
 %% @doc Set the private `initialized' key of a state that the process device
 %% returns.
@@ -822,6 +1045,53 @@ is_initialized(State, Opts) ->
 %% @doc Ensure that the process message we have in memory is live and
 %% up-to-date.
 ensure_loaded(Base, Req, Opts) ->
+    case is_cached_state(Base) of
+        true ->
+            % A state read back from the cache (or sent to a listener) is
+            % public only: it has no execution-device state, so it must never
+            % be computed onward. Restore from the process definition instead.
+            ensure_loaded_state(
+                hb_maps:get(<<"process">>, Base, Base, Opts),
+                Req,
+                Opts
+            );
+        false ->
+            ensure_loaded_state(Base, Req, Opts)
+    end.
+
+ensure_loaded_state(Base, Req, Opts) ->
+    ensure_loaded_state_inner(Base, Req, Opts).
+
+%% @doc `ok' when a process may be initialized from its definition: retention
+%% never deleted any of its state, and nothing of it is stored or its lowest
+%% stored slot is slot 0. Retention keeps every snapshot, slot 0's among
+%% them, so a lowest slot of 0 alone does not say nothing was pruned: the
+%% marker does (`lib_process_cache:pruned/2').
+restorable_from_start(ProcID, Opts) ->
+    case {lib_process_cache:pruned(ProcID, Opts), lib_process_cache:stored_floor(ProcID, Opts)} of
+        {false, none} -> ok;
+        {false, {ok, 0}} -> ok;
+        {_, Lowest} ->
+            Floor = case Lowest of {ok, F} -> F; none -> 0 end,
+            ?event(compute, {refused_restore_from_start, ProcID, {lowest_stored, Floor}}, Opts),
+            Failure =
+                #{
+                    <<"status">> => 500,
+                    <<"body">> =>
+                        <<"No checkpoint of ", (hb_util:bin(ProcID))/binary,
+                          " to restore from, and slots of it are pruned (lowest stored ",
+                          (hb_util:bin(Floor))/binary,
+                          "): it is never replayed from the start.">>
+                },
+            hb_hook:on(
+                <<"process-failure">>,
+                #{ <<"process-id">> => ProcID, <<"slot">> => Floor, <<"body">> => Failure },
+                Opts
+            ),
+            {error, Failure}
+    end.
+
+ensure_loaded_state_inner(Base, Req, Opts) ->
     % Get the nonce we are currently on and the inbound nonce.
     TargetSlot = hb_ao:get(<<"slot">>, Req, undefined, Opts),
     ProcID = lib_process:process_id(Base, #{}, Opts),
@@ -893,30 +1163,349 @@ ensure_loaded(Base, Req, Opts) ->
                     {ok, set_initialized(NormalizedWithoutSnapshot, Opts)};
                 {error, not_found} ->
                     % If we do not have a checkpoint, initialize the
-                    % process from scratch.
+                    % process from scratch -- but only when nothing of it was
+                    % ever pruned. A process whose lowest stored slot is above
+                    % 0 replayed from its definition would recompute (and
+                    % re-emit) every slot retention deleted: on prod a replay
+                    % from slot 0 of the vault ran for seven hours
+                    % (2026-11-05). It fails closed instead.
                     ?event(
                         {no_checkpoint_found,
                             {process, ProcID},
                             {slot, TargetSlot}
                         }
                     ),
-                    % A process runs from its committed keys only, whether the
-                    % request gives the process itself or carries it.
-                    {ok, Process} =
-                        hb_message:with_only_committed(
-                            hb_maps:get(<<"process">>, Base, Base, Opts),
-                            Opts
-                        ),
-                    {ok, _} =
-                        hb_cache:write(Process, lib_process:cache_opts(Opts)),
-                    init(
-                        lib_process:ensure_process_key(Process, Opts),
-                        Req,
-                        Opts
-                    )
+                    case restorable_from_start(ProcID, Opts) of
+                        {error, _} = Refused -> Refused;
+                        ok ->
+                            % A process runs from its committed keys only,
+                            % whether the request gives the process itself or
+                            % carries it.
+                            {ok, Process} =
+                                hb_message:with_only_committed(
+                                    hb_maps:get(<<"process">>, Base, Base, Opts),
+                                    Opts
+                                ),
+                            {ok, _} =
+                                hb_cache:write(Process, lib_process:cache_opts(Opts)),
+                            init(
+                                lib_process:ensure_process_key(Process, Opts),
+                                Req,
+                                Opts
+                            )
+                    end
             end
     end.
+
+%% @doc Mark a state that was read back from the process cache. Cached states
+%% are public only: they carry no execution-device state (for Lua, no VM), so
+%% they are answers, never a base to compute the next slot from.
+mark_cached_state(Msg, Opts) ->
+    hb_private:set(Msg, #{ <<"process-cached-state">> => true }, Opts).
+
+%% @doc Return `true' if a state came from the process cache rather than from
+%% executing the process.
+is_cached_state(Msg) ->
+    maps:get(<<"process-cached-state">>, hb_private:from_message(Msg), false)
+        =:= true.
 
 %% @doc Remove the `snapshot' key from a message and return it.
 without_snapshot(Msg, Opts) ->
     hb_ao:set(Msg, <<"snapshot">>, unset, Opts).
+
+%% @doc A process definition is verified once, not on every request; a
+%% different (tampered) definition is still verified and rejected.
+process_id_verifies_once_test() ->
+    application:ensure_all_started(hb),
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+        <<"priv-wallet">> => ar_wallet:new()
+    },
+    Process = hb_process_test_vectors:aos_process(Opts),
+    Base = #{ <<"process">> => Process },
+    Verifies =
+        fun(Fun) ->
+            erlang:trace_pattern({hb_message, verify, 3}, true, [call_count]),
+            Res = Fun(),
+            {call_count, N} = erlang:trace_info({hb_message, verify, 3}, call_count),
+            erlang:trace_pattern({hb_message, verify, 3}, false, [call_count]),
+            {Res, N}
+        end,
+    {ID, _} = Verifies(fun() -> lib_process:process_id(Base, #{}, Opts) end),
+    ?assertEqual(hb_message:id(Process, signed, Opts), ID),
+    ?assertEqual(
+        {ID, 0},
+        Verifies(fun() -> lib_process:process_id(Base, #{}, Opts) end)
+    ),
+    Tampered = Process#{ <<"scheduler-location">> => <<"someone-else">> },
+    ?assertThrow(
+        {process_not_verified, _},
+        lib_process:process_id(#{ <<"process">> => Tampered }, #{}, Opts)
+    ).
+
+
+%% @doc The target slot is snapshotted by default; with
+%% `process-snapshot-target => false' only the configured interval snapshots.
+snapshot_target_option_test() ->
+    application:ensure_all_started(hb),
+    lists:foreach(
+        fun({Setting, Expected}) ->
+            Opts = #{
+                <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+                <<"priv-wallet">> => ar_wallet:new(),
+                <<"process-snapshot-slots">> => 1000,
+                <<"process-snapshot-time">> => false,
+                <<"process-snapshot-target">> => Setting
+            },
+            Base = hb_process_test_vectors:aos_process(Opts),
+            ProcID = hb_message:id(Base, all),
+            hb_process_test_vectors:schedule_aos_call(Base, <<"return 1">>, Opts),
+            hb_process_test_vectors:schedule_aos_call(Base, <<"return 2">>, Opts),
+            {ok, _} =
+                hb_ao:resolve(
+                    Base,
+                    #{ <<"path">> => <<"compute">>, <<"slot">> => 1 },
+                    Opts
+                ),
+            {ok, Stored} = lib_process_cache:read(ProcID, 1, Opts),
+            ?assertEqual(
+                {Setting, Expected},
+                {Setting, hb_maps:is_key(<<"snapshot">>, Stored, Opts)}
+            )
+        end,
+        [{true, true}, {false, false}]
+    ).
+
+%% @doc A device that returns the state without a delta of its own (here the
+%% test device) never carries the previous slot's delta, with its outbox, into
+%% the next slot: `prepare_next_slot/4' drops it.
+prepare_drops_previous_delta_test() ->
+    application:ensure_all_started(hb),
+    Opts = #{ <<"store">> => hb_test_utils:test_store(hb_store_lmdb) },
+    Base = hb_process_test_vectors:test_process(),
+    ProcID = hb_message:id(Base, all, Opts),
+    hb_process_test_vectors:schedule_test_message(Base, <<"one">>, #{}, Opts),
+    hb_process_test_vectors:schedule_test_message(Base, <<"two">>, #{}, Opts),
+    {ok, State1} = hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 1 }, Opts),
+    Outbox = #{ <<"1">> => #{ <<"target">> => ProcID, <<"data">> => <<"again">> } },
+    Stale = hb_private:set(State1, <<"process-cache-delta">>,
+        #{ <<"patches">> => [], <<"results">> => #{ <<"outbox">> => Outbox } }, Opts),
+    {ok, 2, Prepared, Req} = prepare_next_slot(ProcID, Stale, #{ <<"slot">> => 2 }, Opts),
+    {ok, State2} = lib_process:run_as(<<"execution">>, Prepared, Req,
+        lib_process:execution_opts(Opts)),
+    ?assertEqual(2, hb_ao:get(<<"results/assignment-slot">>, State2, Opts)),
+    ?assertEqual(not_found, hb_private:get(<<"process-cache-delta">>, State2, not_found, Opts)).
+
+%%% A process's state only moves forward.
+
+%% @doc A Lua counter run by `lua-patch@1.0' (a delta process): slot N leaves
+%% `count' at N + 1.
+pruned_counter_script() ->
+    <<
+        "Count = Count or 0\n"
+        "function compute(req)\n"
+        "  Count = Count + 1\n"
+        "  local value = tostring(Count)\n"
+        "  return {\n"
+        "    patches = { { path = '/count', value = value } },\n"
+        "    results = { output = { data = value } }\n"
+        "  }\n"
+        "end\n"
+    >>.
+
+%% @doc A delta process stored as `pstate/' rows, `Slots' messages scheduled
+%% and computed, a VM snapshot every 5 slots, and retention run over it: with
+%% the newest two snapshot checkpoints kept, its floor is `Slots - 1 - 5'.
+pruned_setup(Slots) ->
+    application:ensure_all_started(hb),
+    Opts =
+        #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"process-state-blobs">> => true,
+            <<"process-delta-cache">> => true,
+            <<"process-hot-cache-slots">> => 0,
+            <<"process-snapshot-slots">> => 5,
+            <<"process-snapshot-time">> => false,
+            <<"process-snapshot-target">> => false,
+            <<"process-compute-on-schedule">> => false,
+            <<"spawn-worker">> => true,
+            <<"process-workers">> => true,
+            <<"process-worker-spawn">> => true,
+            <<"await-inprogress">> => named
+        },
+    Process = hb_process_test_vectors:lua_patch_process(pruned_counter_script(), Opts),
+    {ok, _} = hb_cache:write(Process, Opts),
+    ProcID = hb_message:id(Process, all, Opts),
+    [ hb_process_test_vectors:schedule_test_message(
+          Process, <<"inc">>, #{ <<"n">> => N }, Opts)
+    || N <- lists:seq(1, Slots) ],
+    Head = Slots - 1,
+    {ok, HeadState} =
+        hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => Head }, Opts),
+    ?assertEqual(integer_to_binary(Slots), hb_ao:get(<<"count">>, HeadState, Opts)),
+    % No age floor: only the newest checkpoints are kept, as the test needs.
+    #{ deleted := Deleted } =
+        hb_store_retention:retain(Opts#{ <<"store-retention-keep-seconds">> => 0 }),
+    ?assert(Deleted > 0),
+    {Process, ProcID, Head, Opts}.
+
+slot_executions() ->
+    lists:sum([ N || {slot_execution, _, N, _} <- hb_phase_timer:read() ]).
+
+stored_slots(ProcID, Opts) ->
+    lists:usort(
+        lists:append(
+            [ hb_process_test_vectors:pstate_slots(ProcID, K, Opts)
+            || K <- [<<"d">>, <<"f">>, <<"s">>] ])).
+
+%% @doc Each checkpoint a computed slot writes is dated by its assignment in
+%% its `s' marker, and with the default age floor (three days) retention
+%% deletes nothing of a process computed just now.
+snapshot_markers_dated_by_assignment_test_() ->
+    {timeout, 180, fun() ->
+        T0 = erlang:system_time(millisecond),
+        {_Process, ProcID, _Head, Opts} = pruned_setup(16),
+        Store = hb_opts:get(<<"store">>, undefined, Opts),
+        Snapshots = hb_process_test_vectors:pstate_slots(ProcID, <<"s">>, Opts),
+        ?assertNotEqual([], Snapshots),
+        lists:foreach(
+            fun(S) ->
+                {ok, Marker} =
+                    hb_store:read(Store, lib_process_cache:blob_key(ProcID, <<"s">>, S), Opts),
+                {ok, Ms} = hb_store_retention:marker_time(Marker),
+                ?assert(Ms >= T0 - 1000 andalso Ms =< erlang:system_time(millisecond)),
+                % The stored assignment's own time, which retention reads
+                % for an empty marker.
+                ?assertEqual({ok, Ms}, hb_store_retention:assignment_time(ProcID, S, Opts))
+            end,
+            Snapshots),
+        Kept = stored_slots(ProcID, Opts),
+        ?assertMatch(#{ deleted := 0 }, hb_store_retention:retain(Opts)),
+        ?assertEqual(Kept, stored_slots(ProcID, Opts))
+    end}.
+
+%% @doc Prod, 2026-11-05: detached pushes of the order-book vault asked for
+%% slots ~85k below its head after retention had deleted them, and each one
+%% replayed the vault from the start in the requester -- ~30 at once, for
+%% hours, with no way to cancel them. A slot at or below the head that is not
+%% stored is a 410: nothing is executed, nothing is written below the floor,
+%% and the process carries on forward.
+pruned_slot_is_410_not_replay_test_() ->
+    {timeout, 180, fun() ->
+        {Process, ProcID, Head, Opts} = pruned_setup(31),
+        Kept = stored_slots(ProcID, Opts),
+        % Every snapshot checkpoint (every fifth slot) is kept; the slots
+        % between them below the floor are not.
+        ?assert(lists:member(5, Kept)),
+        Pruned = [ S || S <- lists:seq(0, Head), not lists:member(S, Kept) ],
+        ?assert(lists:member(1, Pruned)),
+        ?assertEqual({ok, Head}, lib_process_cache:latest_slot(ProcID, Opts)),
+        Before = slot_executions(),
+        lists:foreach(
+            fun(Slot) ->
+                ?assertMatch(
+                    {error, #{ <<"status">> := 410 }},
+                    hb_ao:resolve(
+                        Process,
+                        #{ <<"path">> => <<"compute">>, <<"slot">> => Slot },
+                        Opts
+                    )
+                )
+            end,
+            [1, 6, lists:last(Pruned)]
+        ),
+        ?assertEqual(Before, slot_executions()),
+        ?assertEqual(Kept, stored_slots(ProcID, Opts)),
+        % A kept slot still reads back, and the next one computes forward.
+        {ok, Floor} =
+            hb_ao:resolve(
+                Process,
+                #{ <<"path">> => <<"compute">>, <<"slot">> => lists:min(Kept) },
+                Opts
+            ),
+        ?assertEqual(
+            integer_to_binary(lists:min(Kept) + 1),
+            hb_ao:get(<<"count">>, Floor, Opts)
+        ),
+        hb_process_test_vectors:schedule_test_message(
+            Process, <<"inc">>, #{ <<"n">> => Head + 2 }, Opts),
+        {ok, Next} =
+            hb_ao:resolve(
+                Process,
+                #{ <<"path">> => <<"compute">>, <<"slot">> => Head + 1 },
+                Opts
+            ),
+        ?assertEqual(integer_to_binary(Head + 2), hb_ao:get(<<"count">>, Next, Opts)),
+        ?assertEqual(Before + 1, slot_executions())
+    end}.
+
+%% @doc `now' names the scheduler's current slot as the head only once that
+%% slot is stored. It used to refresh the head before computing it, so a
+%% compute that failed left an uncomputed slot named as the head -- and every
+%% slot up to the head is refused as pruned.
+now_refreshes_only_stored_head_test_() ->
+    {timeout, 60, fun() ->
+        application:ensure_all_started(hb),
+        Opts = #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"process-compute-on-schedule">> => false
+        },
+        Base =
+            hb_process_test_vectors:lua_process(
+                <<"function inc(base) base.count = (base.count or 0) + 1 return base end\n"
+                  "function throw(base) error('The process failed.') end">>,
+                Opts
+            ),
+        ProcID = hb_message:id(Base, all, Opts),
+        hb_process_test_vectors:schedule_test_message(
+            Base, <<"inc">>, #{ <<"path">> => <<"inc">> }, Opts),
+        hb_process_test_vectors:schedule_test_message(
+            Base, <<"throw">>, #{ <<"path">> => <<"throw">> }, Opts),
+        {ok, _} =
+            hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => 0 }, Opts),
+        ?assertEqual({ok, 0}, lib_process_cache:latest_slot(ProcID, Opts)),
+        ?assertMatch({failure, _}, now(Base, #{ <<"max-age">> => 0 }, Opts)),
+        ?assertEqual({ok, 0}, lib_process_cache:latest_slot(ProcID, Opts))
+    end}.
+
+%% @doc A process with no checkpoint left to restore from, whose low slots
+%% retention deleted, is never initialized from its definition and replayed:
+%% that replay re-runs (and re-emits) every pruned slot. It fails closed with
+%% a 500, executing nothing (prod, 2026-11-05: a replay of the vault from
+%% slot 0 ran for seven hours).
+restore_from_zero_refused_when_pruned_test_() ->
+    {timeout, 180, fun() ->
+        {Process, ProcID, Head, Opts} = pruned_setup(31),
+        Store = hb_opts:get(<<"store">>, undefined, Opts),
+        #{ <<"db">> := DB } = hb_store:find(Store),
+        Snapshots = hb_process_test_vectors:pstate_slots(ProcID, <<"s">>, Opts),
+        ?assertNotEqual([], Snapshots),
+        {ok, _} =
+            elmdb:delete_batch(
+                DB,
+                [ <<"pstate/", ProcID/binary, "/s/",
+                    (iolist_to_binary(io_lib:format("~12..0B", [S])))/binary>>
+                || S <- Snapshots ]
+            ),
+        % Retention kept the snapshot checkpoints' states, slot 0's among
+        % them, so only the marker says the process was pruned.
+        ?assert(lib_process_cache:pruned(ProcID, Opts)),
+        Before = slot_executions(),
+        Inline =
+            Opts#{
+                <<"process-workers">> => false,
+                <<"spawn-worker">> => false,
+                <<"process-worker-spawn">> => false
+            },
+        ?assertMatch(
+            {error, #{ <<"status">> := 500 }},
+            hb_ao:resolve(
+                Process,
+                #{ <<"path">> => <<"compute">>, <<"slot">> => Head + 1 },
+                Inline
+            )
+        ),
+        ?assertEqual(Before, slot_executions())
+    end}.
