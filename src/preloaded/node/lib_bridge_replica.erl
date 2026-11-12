@@ -12,13 +12,16 @@
 %%%   - An assignment: what PUSD's scheduler's signature vouches for, if it is
 %%%     the next slot of PUSD and its `base-hashpath' continues the chain.
 %%%   - Its message: what a real signature on it vouches for, if it names no
-%%%     other process as its `target'.
+%%%     other process as its `target'. A message with no signature at all is
+%%%     an unsigned input, exactly as PUSD receives it: the assignment, not
+%%%     the message, is what put it in the schedule.
 %%%
-%%% A real signature is a commitment whose algorithm (`type' or `alg') is a
-%%% signature algorithm and that verifies; an hmac names whoever it claims to
-%%% and vouches for nothing. This is PUSD's own `provenSigner' rule.
+%%% A real signature is a commitment with a committer (`hb_message:signers/2':
+%%% any signature type HB verifies) that verifies; an hmac names nobody and
+%%% vouches for nothing. Which of those PUSD believes is PUSD's own rule.
 %%%
-%%% The first assignment that fails is where the replica stays; the attestor
+%%% Only the assignment's provenance, or a signature that fails to verify,
+%%% stops the replica: the first such slot is where the replica stays; the attestor
 %%% acts on the verified state before it. Accepted slots go to a store of the
 %%% replica's own, and PUSD is computed there with options that read nothing
 %%% computed elsewhere on the node (no workers, no shared hot cache, no
@@ -36,8 +39,6 @@
 %% Assignments verified per call, at most: a replica far behind catches up
 %% over several passes, acting meanwhile on the verified state it has.
 -define(MAX_SLOTS, 5000).
-%% Commitment algorithms that are signatures (pusd.lua SIGNATURE_ALGS).
--define(SIGNATURE_ALGS, [<<"rsa-pss-sha512">>, <<"rsa-pss-sha256">>]).
 
 %% @doc `{ok, State, Opts, Info}' with PUSD's state after the last verified
 %% slot, the options to read it with, and `#{slot, stopped}'; or
@@ -66,9 +67,9 @@ view(Pusd, Url, #{ opts := NodeOpts, dir := Dir }) ->
 %%% Vouching ------------------------------------------------------------------
 
 %% @doc `Msg' as far as real signatures vouch for it: only its commitments that
-%% are a signature algorithm, by one of `Committers' (`any': by anyone), and
-%% only the keys they commit; `false' when there is no such commitment or any
-%% of them fails to verify.
+%% have a committer, by one of `Committers' (`any': by anyone), and only the
+%% keys they commit; `false' when there is no such commitment or any of them
+%% fails to verify.
 vouched(Msg, Committers, Opts) when is_map(Msg) ->
     Commitments = hb_maps:get(<<"commitments">>, Msg, #{}, Opts),
     Real = maps:filter(fun(_, C) -> real(C, Committers) end,
@@ -82,10 +83,22 @@ vouched(Msg, Committers, Opts) when is_map(Msg) ->
     end;
 vouched(_, _, _) -> false.
 
-real(C = #{ <<"committer">> := Committer }, Committers) ->
-    lists:member(maps:get(<<"type">>, C, maps:get(<<"alg">>, C, none)), ?SIGNATURE_ALGS)
-        andalso (Committers =:= any orelse lists:member(hb_committer:uri(Committer), Committers));
+real(#{ <<"committer">> := Committer }, Committers) ->
+    Committers =:= any orelse lists:member(hb_committer:uri(Committer), Committers);
 real(_, _) -> false.
+
+%% A scheduled message as PUSD receives it: vouched when it carries a
+%% signature, unsigned when it carries none; `false' when a signature on it
+%% does not verify.
+body(Msg, Opts) when is_map(Msg) ->
+    Comms = hb_maps:get(<<"commitments">>, Msg, #{}, Opts),
+    Signed = is_map(Comms) andalso
+        maps:size(maps:filter(fun(_, C) -> real(C, any) end, Comms)) > 0,
+    case Signed of
+        true -> vouched(Msg, any, Opts);
+        false -> hb_message:uncommitted(Msg)
+    end;
+body(_, _) -> false.
 
 %%% The replica -----------------------------------------------------------------
 
@@ -332,8 +345,7 @@ step(A, #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers,
                 hb_cache:ensure_loaded(Get(<<"body">>), Opts), Opts);
             signed_scheduler -> hb_cache:ensure_all_loaded(Get(<<"body">>), Opts)
         end,
-        Body = need(vouched(RawBody, any, Opts),
-            <<"message signature does not verify">>),
+        Body = need(body(RawBody, Opts), <<"message signature does not verify">>),
         % The vouched assignment says whose slot this is; a message that names
         % a process at all must name PUSD.
         need(message_for_process(Body, Pusd, Slot + 1, Opts),
@@ -381,6 +393,22 @@ validated_block(Height, Hash, Opts) ->
                 hb_maps:get(<<"indep-hash">>, Block, <<>>, Opts))) =:= Hash;
         _ -> false
     end.
+
+%% Any signature type HB verifies vouches for a body (an ECDSA L1 tx is one);
+%% a body with none is unsigned input; only a signature that fails to verify
+%% stops the replica.
+body_is_what_pusd_receives_test() ->
+    W = ar_wallet:new_ecdsa(),
+    TX = ar_tx:sign(#tx{ format = 2, target = crypto:strong_rand_bytes(32),
+        tags = [{<<"Action">>, <<"Transfer">>}] }, W),
+    Ecdsa = hb_message:convert(TX, <<"structured@1.0">>, <<"tx@1.0">>, #{}),
+    ?assert(hb_message:verify(Ecdsa, all, #{})),
+    ?assertMatch(#{ <<"action">> := <<"Transfer">> }, body(Ecdsa, #{})),
+    Unsigned = #{ <<"action">> => <<"Transfer">>, <<"quantity">> => <<"1">> },
+    ?assertEqual(Unsigned, body(Unsigned, #{})),
+    Rsa = hb_message:commit(Unsigned, #{ <<"priv-wallet">> => ar_wallet:new() }),
+    ?assertMatch(#{ <<"quantity">> := <<"1">> }, body(Rsa, #{})),
+    ?assertEqual(false, body(Rsa#{ <<"quantity">> => <<"2">> }, #{})).
 
 arweave_assignment_names_a_validated_block_test() ->
     Store = hb_test_utils:test_store(hb_store_volatile, <<"replica-validated">>),
