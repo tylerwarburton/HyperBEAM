@@ -320,7 +320,7 @@ root_certificate_approval(Message, View, St = #{cfg := Cfg, opts := Opts, me := 
         Action = maps:get(<<"action">>, Payload),
         true = lists:member(Action, [<<"Transfer">>, <<"Ledger-Enter">>,
             <<"Bridge-Redeem">>, <<"Ledger-Release">>]),
-        Amount = root_positive_integer(maps:get(<<"quantity">>, Payload)),
+        Amount = root_amount(Action, Payload),
         Sequence = root_positive_integer(maps:get(<<"root-sequence">>, Payload)),
         Account = root_certificate_actor(Action, Author, Payload, Info, View),
         Intents = key(<<"rootintents">>, View),
@@ -378,6 +378,22 @@ root_positive_integer(Value) when is_binary(Value) ->
     true = Number > 0 andalso Number < 9007199254740992,
     Value = integer_to_binary(Number),
     Number.
+
+%% @doc A release carries no quantity of its own: its amount is the sum of its
+%% moves, in the contract's one spelling (`id:recipient:quantity' joined by
+%% `,', ids strictly ascending). Escrow is the contract's check, not ours: an
+%% over-escrow batch must still land so every move gets its rejected receipt.
+root_amount(<<"Ledger-Release">>, Payload) ->
+    release_total(binary:split(maps:get(<<"moves">>, Payload), <<",">>, [global]), 0, 0);
+root_amount(_Action, Payload) ->
+    root_positive_integer(maps:get(<<"quantity">>, Payload)).
+
+release_total([], _Last, Total) -> Total;
+release_total([Entry | Rest], Last, Total) ->
+    [Id, Recipient, Quantity] = binary:split(Entry, <<":">>, [global]),
+    Sequence = root_positive_integer(Id),
+    true = Sequence > Last andalso valid_root_address(Recipient),
+    release_total(Rest, Sequence, Total + root_positive_integer(Quantity)).
 
 valid_root_address(Address) when is_binary(Address), byte_size(Address) =:= 43 ->
     re:run(Address, <<"^[A-Za-z0-9_-]+$">>, [{capture, none}]) =:= match;
@@ -466,9 +482,17 @@ root_certificate_approval_test() ->
     Foreign = {State#{<<"bridgeinfo">> => hb_json:encode(
         Info#{<<"attestors">> => [#{<<"ao">> => Author}]})}, Opts},
     ?assertMatch({error, _}, root_certificate_approval(Signed, Foreign, St)),
-    Release = Payload#{<<"action">> => <<"Ledger-Release">>,
-        <<"author">> => LaneAuthority, <<"ledger">> => Lane},
+    Release = (maps:without([<<"quantity">>, <<"recipient">>], Payload))#{
+        <<"action">> => <<"Ledger-Release">>, <<"author">> => LaneAuthority,
+        <<"ledger">> => Lane, <<"moves">> => <<"3:", Me/binary, ":500,9:", Author/binary, ":1">>},
     ?assertMatch({ok, _}, root_certificate_approval(Sign(Release, LaneWallet), View, St)),
+    lists:foreach(fun(Moves) ->
+        ?assertMatch({error, _}, root_certificate_approval(
+            Sign(Release#{<<"moves">> => Moves}, LaneWallet), View, St))
+    end, [<<>>, <<"3:", Me/binary, ":5,3:", Author/binary, ":1">>,
+        <<"9:", Me/binary, ":5,3:", Author/binary, ":1">>,
+        <<"3:", Me/binary, ":05">>, <<"3:", Me/binary, ":0">>, <<"03:", Me/binary, ":5">>,
+        <<"3:short:5">>, <<"3:", Me/binary, ":5,">>, <<"3:", Me/binary>>]),
     ?assertMatch({error, _}, root_certificate_approval(
         Sign(Release#{<<"author">> => Author}, AuthorWallet), View, St)),
     Seed = <<42:256>>,
@@ -631,8 +655,12 @@ root_publisher_retry_check(Root, St, Info, Opts) ->
                 <<"endorsements">> => maps:get(<<"Root-Endorsements">>, WireTags)}, Opts)),
         ?assertEqual(1, length(hb_mock_server:get_requests(Gateway, price))),
         ?assertEqual(1, length(hb_mock_server:get_requests(Gateway, tx_anchor))),
-        ?assertException(error, {badmatch, _}, publish_root_certificate(<<"retry-check">>,
-            Tags#{<<"quantity">> => <<"51">>}, Fresh))
+        % The key names the root sequence: a later plan for it reposts the
+        % journalled carrier rather than signing a competing one.
+        ?assertMatch({ok, _}, publish_root_certificate(<<"retry-check">>,
+            Tags#{<<"quantity">> => <<"51">>}, Fresh)),
+        [_, _, Third] = hb_mock_server:get_requests(tx, 3, Gateway),
+        ?assertEqual(maps:get(<<"body">>, First), maps:get(<<"body">>, Third))
     after hb_mock_server:stop(Gateway)
     end.
 
@@ -1178,8 +1206,12 @@ move_receipt_plan(Root, R, Allowed) ->
 
 %% @doc Only a lane's registered authority signs its relinquishment. Other
 %% committee members approve the resulting canonical-root intent, not a claim
-%% read from an untrusted lane's HTTP state.
-root_release_plans(Root, Ledger, Registry, Moves, Receipts, Epoch, Rows, Me) ->
+%% read from an untrusted lane's HTTP state. One certificate releases as many
+%% pending exits, lowest id first, as its carrier holds. The key names the
+%% sequence, not the batch: the first batch journalled for a sequence is the
+%% one published, so exits arriving meanwhile wait for the next sequence
+%% instead of minting a competing carrier.
+root_release_plans(Root, Ledger, Registry, Moves, Receipts, Epoch, Committee, Rows, Me) ->
     Row = case Rows of RowsMap when is_map(RowsMap) -> maps:get(Ledger, RowsMap, #{}); _ -> #{} end,
     Busy = maps:get(<<"status">>, Row, <<>>) =:= <<"pending">>
         andalso maps:get(<<"epoch">>, Row, -1) =:= Epoch,
@@ -1198,17 +1230,40 @@ root_release_plans(Root, Ledger, Registry, Moves, Receipts, Epoch, Rows, Me) ->
                     hb_util:int(maps:get(<<"id">>, A)) =< hb_util:int(maps:get(<<"id">>, B))
                 end, Pending) of
                 [] -> [];
-                [Move | _] ->
+                Sorted ->
                     Sequence = integer_to_binary(hb_util:int(maps:get(<<"sequence">>, Row, 0)) + 1),
-                    MoveId = maps:get(<<"id">>, Move),
-                    [{root, <<"root-release:", Ledger/binary, ":", MoveId/binary,
-                        ":", (integer_to_binary(Epoch))/binary, ":", Sequence/binary>>, #{
+                    EpochText = integer_to_binary(Epoch),
+                    Operation = #{<<"action">> => <<"Ledger-Release">>, <<"ledger">> => Ledger,
+                        <<"attestor-epoch">> => EpochText, <<"root-sequence">> => Sequence},
+                    Batch = release_batch(Sorted, Operation, root_operation_budget(Committee), []),
+                    [{root, <<"root-release:", Ledger/binary, ":", EpochText/binary, ":",
+                            Sequence/binary>>, #{
                         <<"action">> => <<"Ledger-Release">>, <<"ledger">> => Ledger,
-                        <<"recipient">> => maps:get(<<"account">>, Move),
-                        <<"quantity">> => maps:get(<<"quantity">>, Move),
-                        <<"rootsequence">> => Sequence, <<"x-move-id">> => MoveId}}]
+                        <<"moves">> => Batch, <<"rootsequence">> => Sequence}}]
             end
     end.
+
+%% @doc Bytes left for `Root-Operation' in a carrier. Arweave allows 2,048
+%% bytes of tag names and values; the rest of a carrier is 1,234 fixed bytes
+%% (protocol tags, intent id, the 1,024-byte RSA authorization) plus one
+%% 66-byte endorsement per member of a strict majority.
+root_operation_budget(Committee) ->
+    2048 - 1234 - 66 * (Committee div 2 + 1).
+
+%% @doc The longest prefix of the pending exits whose operation fits the
+%% budget. The first exit always goes, so an oversized one fails visibly at
+%% assembly instead of silently never being released.
+release_batch([Move | Rest], Operation, Budget, Entries) ->
+    Next = [<<(maps:get(<<"id">>, Move))/binary, ":", (maps:get(<<"account">>, Move))/binary,
+        ":", (maps:get(<<"quantity">>, Move))/binary>> | Entries],
+    Fits = byte_size(hb_json:encode(Operation#{<<"moves">> => join_moves(Next)})) =< Budget,
+    case Fits orelse Entries =:= [] of
+        true -> release_batch(Rest, Operation, Budget, Next);
+        false -> join_moves(Entries)
+    end;
+release_batch([], _Operation, _Budget, Entries) -> join_moves(Entries).
+
+join_moves(Reversed) -> iolist_to_binary(lists:join(<<",">>, lists:reverse(Reversed))).
 
 %% @doc One publisher per loop leaves the loop free to endorse requests from
 %% its own worker and from peers. Only a successful POST starts the resend
@@ -1255,10 +1310,10 @@ publish_root_certificate(Key, Tags, St = #{cfg := Cfg, opts := Opts, me := Me,
         <<"attestor-epoch">> => integer_to_binary(Epoch)},
     StateFile = hb_util:bin(maps:get(<<"state-file">>, Cfg, <<"bridge-state.json">>)),
     File = <<StateFile/binary, ".root-", (hb_util:human_id(crypto:hash(sha256, <<Root/binary, Key/binary>>)))/binary>>,
+    % The key names the root sequence, not the batch: what was journalled
+    % first for it is what this sequence publishes, whatever a later pass plans.
     Saved = case file:read_file(File) of
-        {ok, Bin} ->
-            #{payload := Payload} = Existing = binary_to_term(Bin, [safe]),
-            Existing;
+        {ok, Bin} -> binary_to_term(Bin, [safe]);
         {error, enoent} ->
             Intent = hb_message:commit(Payload, Opts, <<"ans104@1.0">>),
             Initial = #{payload => Payload, intent => Intent},
@@ -1398,6 +1453,7 @@ relay_fast_ledgers(Info, Deposits, Receipts, MoveReceipts, Epoch,
                                     ++ root_release_plans(Root, Ledger,
                                         maps:get(Ledger, maps:get(<<"ledgers">>, Info, #{}), #{}),
                                         LaneMoves, MoveReceipts, Epoch,
+                                        length(maps:get(<<"attestors">>, Info)),
                                         maps:get(root_intents, St, #{}), maps:get(me, St)), S2
                                 );
                             {not_yet, Why} ->
@@ -2210,9 +2266,10 @@ fast_ledger_move_plans_test() ->
     ?assertEqual([], move_receipt_plans(Root, [Receipt], maps:remove(Source, Allowed))),
     ?assertEqual([], move_receipt_plans(<<"other-root">>, [Receipt], Allowed)).
 
-%% @doc A timeout keeps the same signed operation. Only an advanced verified
-%% root sequence creates a new publication journal, retaining the move ID that
-%% prevents duplicate settlement even if both carriers eventually arrive.
+%% @doc The plan for a root sequence is keyed by that sequence alone, so a
+%% retry reuses its journal whatever arrived since. Only an advanced verified
+%% root sequence creates a new publication journal; move IDs keep a batch that
+%% somehow lands twice from settling twice.
 root_release_retry_sequence_test() ->
     Root = <<"root">>, Ledger = <<"lane">>, Me = <<"authority">>,
     Registry = #{<<"scheduler">> => Me},
@@ -2221,19 +2278,48 @@ root_release_retry_sequence_test() ->
         <<"account">> => <<"holder">>, <<"quantity">> => <<"50">>},
     Rows = #{Ledger => #{<<"sequence">> => <<"4">>, <<"epoch">> => 7,
         <<"status">> => <<"executed">>}},
-    Plan = root_release_plans(Root, Ledger, Registry, [Move], [], 7, Rows, Me),
+    Plan = root_release_plans(Root, Ledger, Registry, [Move], [], 7, 3, Rows, Me),
     [{root, Key, Tags}] = Plan,
-    ?assertEqual(Plan, root_release_plans(Root, Ledger, Registry, [Move], [], 7, Rows, Me)),
+    ?assertEqual(Plan, root_release_plans(Root, Ledger, Registry, [Move], [], 7, 3, Rows, Me)),
     ?assertEqual(<<"5">>, maps:get(<<"rootsequence">>, Tags)),
+    ?assertEqual(<<"8:holder:50">>, maps:get(<<"moves">>, Tags)),
+    Later = Move#{<<"id">> => <<"9">>},
+    [{root, Key, Grown}] = root_release_plans(Root, Ledger, Registry, [Later, Move], [], 7, 3, Rows, Me),
+    ?assertEqual(<<"8:holder:50,9:holder:50">>, maps:get(<<"moves">>, Grown)),
     Advanced = Rows#{Ledger := (maps:get(Ledger, Rows))#{<<"sequence">> => <<"5">>}},
-    [{root, NewKey, NewTags}] = root_release_plans(Root, Ledger, Registry, [Move], [], 7, Advanced, Me),
+    [{root, NewKey, NewTags}] = root_release_plans(Root, Ledger, Registry, [Move], [], 7, 3, Advanced, Me),
     ?assertNotEqual(Key, NewKey),
     ?assertEqual(Tags#{<<"rootsequence">> := <<"6">>}, NewTags),
-    ?assertEqual([], root_release_plans(Root, Ledger, Registry, [Move], [], 7, Rows, <<"stranger">>)),
+    ?assertEqual([], root_release_plans(Root, Ledger, Registry, [Move], [], 7, 3, Rows, <<"stranger">>)),
     lists:foreach(fun(Status) ->
         Receipt = #{<<"key">> => <<"lane|8">>, <<"status">> => Status},
-        ?assertEqual([], root_release_plans(Root, Ledger, Registry, [Move], [Receipt], 7, Rows, Me))
+        ?assertEqual([], root_release_plans(Root, Ledger, Registry, [Move], [Receipt], 7, 3, Rows, Me))
     end, [<<"accepted">>, <<"rejected">>]).
+
+%% @doc A batch is the longest run of pending exits, lowest id first, whose
+%% carrier fits Arweave's 2,048 tag bytes for the current committee.
+root_release_batch_fits_carrier_test() ->
+    Id = fun() -> hb_util:human_id(crypto:strong_rand_bytes(32)) end,
+    Root = Id(), Ledger = Id(), Me = Id(),
+    Moves = [#{<<"id">> => integer_to_binary(N), <<"root">> => Root, <<"source">> => Ledger,
+        <<"destination">> => Root, <<"status">> => <<"pending">>,
+        <<"account">> => Id(), <<"quantity">> => <<"123456789">>} || N <- lists:seq(1001, 1040)],
+    Rows = #{Ledger => #{<<"sequence">> => <<"99999">>}},
+    Batch = fun(Committee) ->
+        [{root, _, Tags}] = root_release_plans(Root, Ledger, #{<<"scheduler">> => Me},
+            lists:reverse(Moves), [], 2, Committee, Rows, Me),
+        Entries = binary:split(maps:get(<<"moves">>, Tags), <<",">>, [global]),
+        Operation = #{<<"action">> => <<"Ledger-Release">>, <<"ledger">> => Ledger,
+            <<"moves">> => maps:get(<<"moves">>, Tags), <<"attestor-epoch">> => <<"2">>,
+            <<"root-sequence">> => <<"100000">>},
+        Carrier = 1234 + 66 * (Committee div 2 + 1) + byte_size(hb_json:encode(Operation)),
+        ?assert(Carrier =< 2048),
+        ?assert(Carrier + 1 + byte_size(hd(Entries)) > 2048),
+        ?assertEqual(<<"1001">>, hd(binary:split(hd(Entries), <<":">>))),
+        length(Entries)
+    end,
+    ?assertEqual(9, Batch(3)),
+    ?assertEqual(4, Batch(11)).
 
 relay_failure_isolation_test() ->
     St = #{ skipped => #{} },
