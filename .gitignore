@@ -23,6 +23,8 @@ rebar3.crashdump
 /venv
 
 *.json
+!test/metadata/signed-process.json
+!test/metadata/signed-process-header-authority.json
 !.vscode/*
 
 *.bin
