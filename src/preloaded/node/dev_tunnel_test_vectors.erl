@@ -107,6 +107,9 @@ opts() ->
     Store = [hb_test_utils:test_store()],
     #{
         <<"port">> => 0,
+        % This fixture tests 96 concurrent transport calls, not the node's
+        % overload policy. Allow those calls plus worker registration/replies.
+        <<"max-writes-in-flight">> => 256,
         <<"priv-wallet">> => ar_wallet:new(),
         <<"store">> => Store,
         <<"match-index">> => Store,

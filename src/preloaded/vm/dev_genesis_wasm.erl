@@ -3,7 +3,7 @@
 %%% AO process definitions to be used in HyperBEAM.
 -module(dev_genesis_wasm).
 -specification("../../../specs/genesis-wasm@1.0.md").
--device_libraries([lib_process, lib_process_cache]).
+-device_libraries([lib_process, lib_process_cache, lib_process_delivery]).
 -export([init/3, compute/3, normalize/3, snapshot/3, import/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("include/hb.hrl").

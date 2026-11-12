@@ -27,7 +27,13 @@
     #{ read := binary(), accept => binary(), _ => _ },
     #{ _ => _ }
 ) -> {ok, _} | {error, _} | {failure, _}.
-read(_M1, M2, Opts) ->
+read(_M1, M2, RawOpts) ->
+    % Peer lookups can restrict the receiver to local data, preventing a
+    % cycle when both nodes configure one another as fallback stores.
+    Opts = case hb_util:bin(hb_maps:get(<<"local-only">>, M2, false, RawOpts)) of
+        <<"true">> -> hb_store:scope(RawOpts, local);
+        _ -> RawOpts
+    end,
     Location = hb_ao:get(<<"read">>, M2, Opts),
     ?event({read, {key_extracted, Location}}),
     ?event(debug_gateway, cache_read),

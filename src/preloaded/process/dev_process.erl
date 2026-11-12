@@ -1455,7 +1455,10 @@ now_refreshes_only_stored_head_test_() ->
         Base =
             hb_process_test_vectors:lua_process(
                 <<"function inc(base) base.count = (base.count or 0) + 1 return base end\n"
-                  "function throw(base) error('The process failed.') end">>,
+                  "function throw(base) error('The process failed.') end\n"
+                  "function compute(base, req) "
+                  "if req.body.path == 'throw' then return throw(base) end "
+                  "return inc(base) end">>,
                 Opts
             ),
         ProcID = hb_message:id(Base, all, Opts),

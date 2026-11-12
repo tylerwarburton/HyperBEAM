@@ -28,12 +28,14 @@
 %%% whoever claims a withdrawal submits the collected signatures.
 %%%
 %%% Proposals and approvals are made on PUSD by the node's operator, from any
-%%% AO wallet; the node only ever signs. Endpoints, all read-only:
+%%% AO wallet; the node only ever signs. Endpoints:
 %%%   GET  /~bridge-attestor@1.0/keys    this node's four public keys, to join a set
 %%%   GET  /~bridge-attestor@1.0/status  cursors, last pass, last error, RPC hosts
 %%%   GET  /~bridge-attestor@1.0/nudge   a bridge transaction was just sent: pass
 %%%                                      now, then every `fast-interval' for
 %%%                                      `fast-window'
+%%%   POST /~bridge-attestor@1.0/root-endorse signs an author-signed root
+%%%                                      certificate after local verification
 %%%
 %%% Passes run every `interval' while idle. A nudge only changes WHEN the next
 %%% pass happens, never what it does, so anyone may send one; passes are still
@@ -63,7 +65,7 @@
 %%%   solana => #{ rpc, program, commitment }, sui => #{ rpc, package, bridge }
 -module(dev_bridge_attestor).
 -implements(<<"bridge-attestor@1.0">>).
--export([device_info/1, start/3, status/3, keys/3, nudge/3]).
+-export([device_info/1, start/3, status/3, keys/3, nudge/3, root_endorse/3]).
 -export([proposals_to_vote/2, successor_ok/3]).
 -export([withdrawal_signature/5, minted/3]).
 -include("include/hb.hrl").
@@ -78,7 +80,8 @@
 -define(COOL_MS, 15000).
 
 device_info(_) ->
-    #{ exports => [<<"start">>, <<"status">>, <<"keys">>, <<"nudge">>] }.
+    #{ exports => [<<"start">>, <<"status">>, <<"keys">>, <<"nudge">>,
+        <<"root-endorse">>] }.
 
 %%% Endpoints -----------------------------------------------------------------
 
@@ -126,6 +129,38 @@ nudge(_Base, _Req, _Opts) ->
         Pid when is_pid(Pid) -> Pid ! nudge, {ok, json(#{ <<"ok">> => true })};
         _ -> {error, <<"The bridge loop is not running on this node">>}
     end.
+
+%% @doc Endorse an independently signed root operation. The loop chooses its
+%% configured root and verified replica; the requester supplies no state or
+%% committee. This creates a signature, not an on-chain vote or publication.
+root_endorse(_Base, Req, Opts) ->
+    Candidate = hb_maps:get(<<"certificate">>, Req,
+        hb_maps:get(<<"body">>, Req, Req, Opts), Opts),
+    Message = case Candidate of
+        M when is_map(M) -> M;
+        _ -> Req
+    end,
+    case hb_message:with_only_committed(Message, Opts) of
+        {ok, Signed} ->
+            case call({root_endorse, Signed}) of
+                {ok, Endorsement = #{<<"certificate">> := Certificate}} ->
+                    {ok, json(Endorsement#{<<"certificate">> => portable_certificate(Certificate)})};
+                Error -> Error
+            end;
+        _ -> {error, <<"A signed root operation is required">>}
+    end.
+
+%% @doc JSON certificates use wallet addresses, as Lua's commitment tables do.
+%% Keep the signature's original keyid/public key and every signed field.
+portable_certificate(Message) ->
+    Public = hb_private:reset(Message),
+    Public#{<<"commitments">> => maps:filtermap(fun(_, Commitment) ->
+        case maps:find(<<"committer">>, Commitment) of
+            {ok, Signer} -> {true, Commitment#{<<"committer">> =>
+                hb_util:committer_address(Signer)}};
+            error -> false
+        end
+    end, maps:get(<<"commitments">>, Public))}.
 
 call(Msg) ->
     case hb_name:lookup(?NAME) of
@@ -202,7 +237,443 @@ loop(St) ->
             loop(St);
         {keys, From, Ref} ->
             From ! {Ref, {ok, public_keys(St)}},
-            loop(St)
+            loop(St);
+        {{root_endorse, Message}, From, Ref} ->
+            Reply = try
+                Root = maps:get(<<"pusd">>, maps:get(cfg, St)),
+                case view(Root, St) of
+                    {ok, View, #{stopped := null}} -> root_certificate_approval(Message, View, St);
+                    {ok, _View, _Replica} -> {error, <<"Verified root state is still catching up">>};
+                    {not_yet, _} -> {error, <<"Verified root state is not available">>}
+                end
+            catch _:_ -> {error, <<"Root certificate endorsement failed">>}
+            end,
+            From ! {Ref, Reply},
+            loop(St);
+        {root_publication_done, Pid, Result} ->
+            case maps:get(root_publication, St, undefined) of
+                {Pid, Monitor, Key} ->
+                    erlang:demonitor(Monitor, [flush]),
+                    Cleared = maps:remove(root_publication, St),
+                    Next = case Result of
+                        {ok, _} -> Cleared#{sent := (maps:get(sent, St))#{Key => os:system_time(millisecond)},
+                            root_publication_error => null};
+                        _ -> Cleared#{root_publication_error => <<"Root certificate publication failed; retained for retry">>}
+                    end,
+                    loop(Next);
+                _ -> loop(St)
+            end;
+        {'DOWN', Monitor, process, _Pid, _Reason} ->
+            case maps:get(root_publication, St, undefined) of
+                {_, Monitor, _} -> loop((maps:remove(root_publication, St))#{
+                    root_publication_error => <<"Root certificate publisher stopped; retained for retry">>});
+                _ -> loop(St)
+            end
+    end.
+
+%% @doc Check the author, committee epoch, actor and next sequence against
+%% locally verified state before adding this node's signature. Execution at
+%% the root rechecks balances and all action-specific constraints in canonical
+%% order. A lane release may certify a rejection receipt when escrow is empty.
+root_certificate_approval(Message, View, St = #{cfg := Cfg, opts := Opts, me := Me}) ->
+    try
+        Root = maps:get(<<"pusd">>, Cfg),
+        Root = maps:get(<<"target">>, Message),
+        <<"pusd-root/v1">> = maps:get(<<"certificate-version">>, Message),
+        Author = maps:get(<<"author">>, Message),
+        true = valid_root_address(Author),
+        Info = key(<<"bridgeinfo">>, View),
+        Members = maps:get(<<"attestors">>, Info),
+        Addresses = [maps:get(<<"ao">>, M) || M <- Members],
+        true = length(Addresses) =:= length(lists:usort(Addresses)),
+        true = lists:member(Me, Addresses),
+        Epoch = integer_to_binary(hb_util:int(maps:get(<<"epoch">>, Info))),
+        Epoch = maps:get(<<"attestor-epoch">>, Message),
+        Payload = hb_private:reset(hb_message:uncommitted(Message)),
+        true = maps:fold(fun(K, V, Acc) ->
+            Acc andalso is_binary(K) andalso is_binary(V) andalso
+                re:run(K, <<"^[a-z][a-z0-9-]*$">>, [{capture, none}]) =:= match
+        end, true, Payload),
+        AuthorURI = hb_committer:uri(Author, Opts),
+        Commitments = hb_maps:get(<<"commitments">>, Message, #{}, Opts),
+        Codecs = [<<"httpsig@1.0">>, <<"ans104@1.0">>, <<"tx@1.0">>],
+        true = lists:all(fun(C) ->
+            lists:member(maps:get(<<"commitment-device">>, C, undefined), Codecs)
+        end, maps:values(Commitments)),
+        AuthorIDs = [ID || {ID, Commitment} <- maps:to_list(Commitments),
+            maps:get(<<"committer">>, Commitment, undefined) =:= AuthorURI,
+            lists:member(maps:get(<<"type">>, Commitment, undefined),
+                [<<"rsa-pss-sha256">>, <<"rsa-pss-sha512">>]),
+            lists:member(maps:get(<<"commitment-device">>, Commitment, undefined),
+                [<<"httpsig@1.0">>, <<"ans104@1.0">>, <<"tx@1.0">>])],
+        true = AuthorIDs =/= [],
+        true = hb_message:verify(Message, all, Opts),
+        true = hb_message:verify(Message, #{<<"ids">> => AuthorIDs}, Opts),
+        Covered = hb_message:committed(Message,
+            #{<<"ids">> => AuthorIDs}, Opts),
+        true = lists:all(fun(K) -> lists:member(K, Covered) end, maps:keys(Payload)),
+        Action = maps:get(<<"action">>, Payload),
+        true = lists:member(Action, [<<"Transfer">>, <<"Ledger-Enter">>,
+            <<"Bridge-Redeem">>, <<"Ledger-Release">>]),
+        Amount = root_positive_integer(maps:get(<<"quantity">>, Payload)),
+        Sequence = root_positive_integer(maps:get(<<"root-sequence">>, Payload)),
+        Account = root_certificate_actor(Action, Author, Payload, Info, View),
+        Intents = key(<<"rootintents">>, View),
+        Previous = maps:get(Account, Intents, #{}),
+        Sequence = hb_util:int(maps:get(<<"sequence">>, Previous, 0)) + 1,
+        true = maps:get(<<"status">>, Previous, <<>>) =/= <<"pending">>
+            orelse hb_util:int(maps:get(<<"epoch">>, Previous, -1)) =/=
+                binary_to_integer(Epoch),
+        true = Action =:= <<"Ledger-Release">> orelse
+            Amount =< root_balance(Account, View),
+        Signed = hb_message:commit(Message, Opts),
+        Result = #{<<"certificate">> => Signed},
+        case root_inline_proof(Message, AuthorIDs, Members, St) of
+            none -> {ok, Result};
+            Proof -> {ok, Result#{<<"inline-proof">> => Proof}}
+        end
+    catch _:_ -> {error, <<"Root operation is not eligible for endorsement">>}
+    end.
+
+%% @doc The aggregate balances map is a checkpoint in patch-mode PUSD. A
+%% touched account's scalar is the current value, including an explicit zero.
+root_balance(Account, View = {State, ROpts}) ->
+    case hb_ao:get(<<"balance-", Account/binary>>, State, not_found, ROpts) of
+        not_found -> hb_util:int(maps:get(Account, key(<<"balances">>, View), 0));
+        Current -> hb_util:int(Current)
+    end.
+
+%% @doc Compact proofs use the current set's registered Sui public key, with
+%% the root certificate domain. A changed key must be installed locally before
+%% this node can endorse that epoch. Non-ANS requests have no inline encoding.
+root_inline_proof(Message, AuthorIDs, Members, #{keys := Keys, me := Me, opts := Opts}) ->
+    Commitments = maps:get(<<"commitments">>, Message),
+    ANS = [ID || ID <- AuthorIDs,
+        maps:get(<<"commitment-device">>, maps:get(ID, Commitments)) =:= <<"ans104@1.0">>],
+    [Member] = [M || M <- Members, maps:get(<<"ao">>, M) =:= Me],
+    case {ANS, maps:find(<<"sui">>, Member)} of
+        {[], _} -> none;
+        {_, error} -> none;
+        {[IntentID], {ok, Registered}} ->
+            Seed = maps:get(sui, Keys),
+            PublicKey = dev_bridge_attestor_sign:ed25519_public(Seed),
+            PublicKey = unhex(Registered),
+            {ok, Bytes} = hb_ao:resolve(#{<<"device">> => <<"bridge-root@1.0">>},
+                #{<<"path">> => <<"domain">>, <<"root">> => maps:get(<<"target">>, Message),
+                    <<"epoch">> => maps:get(<<"attestor-epoch">>, Message),
+                    <<"intent-id">> => IntentID}, Opts),
+            #{<<"signer">> => Me, <<"intent-id">> => IntentID,
+                <<"signature">> => hb_util:encode(dev_bridge_attestor_sign:ed25519_sign(Bytes, Seed))}
+    end;
+root_inline_proof(_Message, _AuthorIDs, _Members, _State) -> none.
+
+%% @doc A root amount or sequence uses the same canonical exact range as Lua.
+root_positive_integer(Value) when is_binary(Value) ->
+    Number = binary_to_integer(Value),
+    true = Number > 0 andalso Number < 9007199254740992,
+    Value = integer_to_binary(Number),
+    Number.
+
+valid_root_address(Address) when is_binary(Address), byte_size(Address) =:= 43 ->
+    re:run(Address, <<"^[A-Za-z0-9_-]+$">>, [{capture, none}]) =:= match;
+valid_root_address(_) -> false.
+
+%% @doc Match the contract's wallet/process actor and registered lane owner.
+root_certificate_actor(<<"Ledger-Release">>, Author, Payload, Info, _View) ->
+    [] = root_delivery_stamps(Payload),
+    Lane = maps:get(<<"ledger">>, Payload),
+    Ledger = maps:get(Lane, maps:get(<<"ledgers">>, Info)),
+    Author = maps:get(<<"scheduler">>, Ledger),
+    true = maps:get(<<"status">>, Ledger) =/= <<"disabled">>,
+    Lane;
+root_certificate_actor(_Action, Author, Payload, _Info, {State, ROpts}) ->
+    case root_delivery_stamps(Payload) of
+        [] -> Author;
+        Stamps ->
+            Scheduler = case hb_ao:get(<<"scheduler-location">>, State, not_found, ROpts) of
+                not_found -> hb_ao:get(<<"process/scheduler-location">>, State, not_found, ROpts);
+                Address -> Address
+            end,
+            Author = Scheduler,
+            Normalized = lists:foldl(fun({K, V}, Acc) ->
+                case maps:find(K, Acc) of
+                    {ok, V} -> Acc;
+                    error -> Acc#{K => V}
+                end
+            end, #{}, Stamps),
+            Process = maps:get(<<"fromprocess">>, Normalized),
+            true = valid_root_address(Process),
+            Process
+    end.
+
+root_delivery_stamps(Payload) ->
+    [{N, V} || {K, V} <- maps:to_list(Payload),
+        N <- [binary:replace(binary:replace(K, <<"-">>, <<>>, [global]),
+            <<"_">>, <<>>, [global])],
+        N =/= <<"from">>, byte_size(N) >= 4,
+        binary:part(N, 0, 4) =:= <<"from">>].
+
+%% @doc Real author signatures are checked against the local committee and
+%% balances. Neither a caller's claimed committee nor another wallet's lane
+%% signature can elicit an endorsement.
+root_certificate_approval_test() ->
+    [AuthorWallet, MemberWallet, LaneWallet] = [ar_wallet:new() || _ <- lists:seq(1, 3)],
+    Address = fun(W) -> hb_util:human_id(ar_wallet:to_address(W)) end,
+    Author = Address(AuthorWallet),
+    Me = Address(MemberWallet),
+    LaneAuthority = Address(LaneWallet),
+    Root = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Lane = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Opts = #{<<"priv-wallet">> => MemberWallet, <<"store">> => hb_test_utils:test_store()},
+    St = #{cfg => #{<<"pusd">> => Root}, opts => Opts, me => Me},
+    Info = #{<<"epoch">> => 7, <<"attestors">> => [#{<<"ao">> => Me}],
+        <<"ledgers">> => #{Lane => #{<<"scheduler">> => LaneAuthority,
+            <<"status">> => <<"active">>}}},
+    State = #{<<"bridgeinfo">> => hb_json:encode(Info),
+        <<"balances">> => hb_json:encode(#{Author => <<"100">>, Lane => <<"0">>}),
+        <<"rootintents">> => <<"{}">>},
+    View = {State, Opts},
+    Payload = #{<<"certificate-version">> => <<"pusd-root/v1">>,
+        <<"target">> => Root, <<"author">> => Author,
+        <<"attestor-epoch">> => <<"7">>, <<"action">> => <<"Transfer">>,
+        <<"root-sequence">> => <<"1">>, <<"recipient">> => Me,
+        <<"quantity">> => <<"50">>},
+    Sign = fun(P, W) -> hb_message:commit(P, #{<<"priv-wallet">> => W}) end,
+    Signed = Sign(Payload, AuthorWallet),
+    {ok, #{<<"certificate">> := Endorsed}} = root_certificate_approval(Signed, View, St),
+    ?assert(hb_message:verify(Endorsed, all, Opts)),
+    ?assert(hb_message:verify(Endorsed, [Author, Me], Opts)),
+    BalanceKey = hb_util:lowercase_key(<<"balance-", Author/binary>>),
+    ?assertMatch({error, _}, root_certificate_approval(Signed,
+        {State#{BalanceKey => <<"0">>}, Opts}, St)),
+    FreshCredit = State#{<<"balances">> => <<"{}">>, BalanceKey => <<"100">>},
+    ?assertMatch({ok, _}, root_certificate_approval(Signed, {FreshCredit, Opts}, St)),
+    ?assertMatch({error, _}, root_certificate_approval(
+        Signed#{<<"quantity">> => <<"90">>}, View, St)),
+    ?assertMatch({error, _}, root_certificate_approval(
+        Sign(Payload#{<<"quantity">> => <<"101">>}, AuthorWallet), View, St)),
+    ?assertMatch({error, _}, root_certificate_approval(
+        Sign(Payload#{<<"attestor-epoch">> => <<"6">>}, AuthorWallet), View, St)),
+    ?assertMatch({error, _}, root_certificate_approval(
+        Sign(Payload#{<<"root-sequence">> => <<"2">>}, AuthorWallet), View, St)),
+    ?assertMatch({error, _}, root_certificate_approval(
+        Sign(Payload, LaneWallet), View, St)),
+    Foreign = {State#{<<"bridgeinfo">> => hb_json:encode(
+        Info#{<<"attestors">> => [#{<<"ao">> => Author}]})}, Opts},
+    ?assertMatch({error, _}, root_certificate_approval(Signed, Foreign, St)),
+    Release = Payload#{<<"action">> => <<"Ledger-Release">>,
+        <<"author">> => LaneAuthority, <<"ledger">> => Lane},
+    ?assertMatch({ok, _}, root_certificate_approval(Sign(Release, LaneWallet), View, St)),
+    ?assertMatch({error, _}, root_certificate_approval(
+        Sign(Release#{<<"author">> => Author}, AuthorWallet), View, St)),
+    Seed = <<42:256>>,
+    PublicKey = dev_bridge_attestor_sign:ed25519_public(Seed),
+    Registered = <<"0x", (binary:encode_hex(PublicKey))/binary>>,
+    InlineInfo = Info#{<<"attestors">> => [#{<<"ao">> => Me, <<"sui">> => Registered}]},
+    InlineView = {State#{<<"bridgeinfo">> => hb_json:encode(InlineInfo)}, Opts},
+    InlineSt = St#{keys => #{sui => Seed}},
+    WalletItem = hb_message:commit(Payload, #{<<"priv-wallet">> => AuthorWallet}, <<"ans104@1.0">>),
+    {ok, #{<<"inline-proof">> := #{<<"signature">> := Proof, <<"intent-id">> := IntentID}}} =
+        root_certificate_approval(WalletItem, InlineView, InlineSt),
+    {ok, ProofBytes} = hb_ao:resolve(#{<<"device">> => <<"bridge-root@1.0">>},
+        #{<<"path">> => <<"domain">>, <<"root">> => Root, <<"epoch">> => 7,
+            <<"intent-id">> => IntentID}, Opts),
+    ?assert(crypto:verify(eddsa, none, ProofBytes, hb_util:decode(Proof), [PublicKey, ed25519])),
+    ?assertMatch({error, _}, root_certificate_approval(WalletItem, InlineView,
+        InlineSt#{keys => #{sui => <<43:256>>}})).
+
+root_endorse_endpoint_test_() ->
+    {timeout, 120, fun root_endorse_endpoint/0}.
+
+%% @doc The public device endpoint obtains state from a real independently
+%% replayed process. A claimed balance supplied in the request is irrelevant.
+root_endorse_endpoint() ->
+    hb:init(),
+    Opts = (ao_test_opts())#{<<"scheduler-publish-remote">> => false,
+        <<"scheduling-mode">> => local_confirmation},
+    Me = hb_util:human_id(ar_wallet:to_address(maps:get(<<"priv-wallet">>, Opts))),
+    AuthorWallet = ar_wallet:new(),
+    Author = hb_util:human_id(ar_wallet:to_address(AuthorWallet)),
+    Dir = <<"/tmp/root-endorsement-", (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary>>,
+    ok = file:make_dir(Dir),
+    NodeKeys = load_keys(<<Dir/binary, "/keys.json">>),
+    SuiPublic = dev_bridge_attestor_sign:ed25519_public(maps:get(sui, NodeKeys)),
+    Info = hb_json:encode(#{<<"epoch">> => 7,
+        <<"attestors">> => [#{<<"ao">> => Me,
+            <<"sui">> => <<"0x", (binary:encode_hex(SuiPublic))/binary>>}], <<"ledgers">> => #{}}),
+    Balances = hb_json:encode(#{Author => <<"100">>, Me => <<"100">>}),
+    Script = <<"function compute(base, req) base.bridgeinfo = '", Info/binary,
+        "'; base.balances = '", Balances/binary,
+        "'; base.rootintents = '{}'; return base end">>,
+    Process = hb_message:commit(#{<<"device">> => <<"process@1.0">>,
+        <<"execution-device">> => <<"lua@5.3a">>,
+        <<"scheduler-device">> => <<"scheduler@1.0">>,
+        <<"scheduler-location">> => Me, <<"authority">> => [Me],
+        <<"module">> => #{<<"content-type">> => <<"application/lua">>,
+            <<"body">> => Script}}, Opts),
+    {ok, _} = hb_cache:write(Process, Opts),
+    Root = hb_message:id(Process, all, Opts),
+    Node = hb_http_server:start_node(Opts),
+    Cfg = (ao_test_cfg(Root, Dir))#{<<"scheduler-url">> => url(Node),
+        <<"replica-dir">> => <<Dir/binary, "/replica">>},
+    St = initial_state(Cfg, Opts),
+    schedule_as(AuthorWallet, #{<<"action">> => <<"Ping">>}, Root, Opts),
+    Loop = spawn(fun() -> loop(St) end),
+    hb_name:register(?NAME, Loop),
+    try
+        Payload = #{<<"certificate-version">> => <<"pusd-root/v1">>,
+            <<"target">> => Root, <<"author">> => Author,
+            <<"attestor-epoch">> => <<"7">>, <<"action">> => <<"Transfer">>,
+            <<"root-sequence">> => <<"1">>, <<"recipient">> => Me,
+            <<"quantity">> => <<"50">>},
+        Run = fun(P) ->
+            Signed = hb_message:commit(P, #{<<"priv-wallet">> => AuthorWallet}),
+            hb_ao:resolve(#{<<"device">> => <<"bridge-attestor@1.0">>},
+                #{<<"path">> => <<"root-endorse">>, <<"certificate">> => Signed,
+                    <<"balances">> => #{Author => <<"1000000">>}}, Opts)
+        end,
+        {ok, #{<<"body">> := JSON}} = Run(Payload),
+        #{<<"certificate">> := Portable} = hb_json:decode(JSON),
+        Approved = Portable#{<<"commitments">> => maps:map(fun(_, C) ->
+            C#{<<"committer">> => hb_committer:uri(maps:get(<<"committer">>, C))}
+        end, maps:get(<<"commitments">>, Portable))},
+        ?assert(hb_message:verify(Approved, [Author, Me], Opts)),
+        ?assertMatch({error, _}, Run(Payload#{<<"quantity">> => <<"101">>})),
+        WalletItem = hb_message:commit(Payload,
+            #{<<"priv-wallet">> => AuthorWallet}, <<"ans104@1.0">>),
+        Item = hb_message:convert(WalletItem, <<"ans104@1.0">>, Opts),
+        Bytes = ar_bundles:serialize(Item),
+        Endpoint = binary_to_list(<<(url(Node))/binary, "/~bridge-attestor@1.0/root-endorse">>),
+        {ok, {{_, 200, _}, _, ResponseBody}} = httpc:request(post,
+            {Endpoint, [{"accept", "application/json"}], "application/ans104", Bytes},
+            [{timeout, 60000}], [{body_format, binary}]),
+        #{<<"certificate">> := HTTPApproved, <<"inline-proof">> := HTTPProof} = hb_json:decode(ResponseBody),
+        ?assertEqual(Author, maps:get(<<"author">>, HTTPApproved)),
+        ?assertEqual(<<"50">>, maps:get(<<"quantity">>, HTTPApproved)),
+        IntentID = hb_util:human_id(Item#tx.id),
+        ?assertEqual(IntentID, maps:get(<<"intent-id">>, HTTPProof)),
+        {ok, Domain} = hb_ao:resolve(#{<<"device">> => <<"bridge-root@1.0">>},
+            #{<<"path">> => <<"domain">>, <<"root">> => Root, <<"epoch">> => 7,
+                <<"intent-id">> => IntentID}, Opts),
+        ?assert(crypto:verify(eddsa, none, Domain,
+            hb_util:decode(maps:get(<<"signature">>, HTTPProof)), [SuiPublic, ed25519])),
+        CodecProof = fetch_root_proof(url(Node), WalletItem, Opts),
+        ?assertEqual(HTTPProof, CodecProof),
+        Committee = [#{<<"ao">> => Me,
+            <<"sui">> => <<"0x", (binary:encode_hex(SuiPublic))/binary>>}],
+        ?assertMatch({ok, #{<<"tags">> := _}},
+            collect_root_carrier(Root, 7, Committee, WalletItem, St)),
+        JournalFile = <<Dir/binary, "/public-root-journal">>,
+        PublicState = #{intent => WalletItem},
+        save_root_publication(JournalFile, PublicState),
+        {ok, JournalBytes} = file:read_file(JournalFile),
+        ?assertEqual(PublicState, binary_to_term(JournalBytes, [safe])),
+        root_publisher_retry_check(Root, St, hb_json:decode(Info), Opts),
+        root_publisher_lifecycle_check(St)
+    after
+        exit(Loop, shutdown),
+        hb_name:unregister(?NAME)
+    end.
+
+%% @doc Exercise the actual signed carrier and HTTP submission without paying
+%% for an L1 transaction. The gateway fixture rejects its first POST; a fresh
+%% worker state must reuse the durable carrier without requesting a new price,
+%% anchor, or endorsement after that uncertain/failed broadcast.
+root_publisher_retry_check(Root, St, Info, Opts) ->
+    Counter = atomics:new(1, []),
+    StateFile = maps:get(<<"state-file">>, maps:get(cfg, St)),
+    Journal = <<StateFile/binary, ".root-", (hb_util:human_id(crypto:hash(sha256,
+        <<Root/binary, "retry-check">>)))/binary>>,
+    {Gateway, GatewayOpts} = hb_mock_server:start_arweave_gateway(#{
+        price => {200, <<"1">>},
+        tx_anchor => {200, hb_util:human_id(<<7:256>>)},
+        tx => fun(Req) ->
+            {ok, SavedBytes} = file:read_file(Journal),
+            #{carrier := SavedCarrier} = binary_to_term(SavedBytes, [safe]),
+            Posted = ar_tx:json_struct_to_tx(hb_json:decode(maps:get(<<"body">>, Req))),
+            ?assertEqual(SavedCarrier#tx.id, Posted#tx.id),
+            ?assertEqual(SavedCarrier#tx.signature, Posted#tx.signature),
+            ?assert(ar_tx:verify(Posted)),
+            case atomics:add_get(Counter, 1, 1) of
+                1 -> {429, <<"Retry later">>};
+                _ -> {200, <<"OK">>}
+            end
+        end}),
+    PublisherOpts = maps:merge(Opts, GatewayOpts),
+    Publisher = St#{opts := PublisherOpts, root_certificate_info => Info},
+    Tags = #{<<"action">> => <<"Transfer">>, <<"recipient">> => Root,
+        <<"quantity">> => <<"50">>, <<"rootsequence">> => <<"1">>},
+    try
+        ?assertMatch({error, _}, publish_root_certificate(<<"retry-check">>, Tags, Publisher)),
+        [First] = hb_mock_server:get_requests(tx, 1, Gateway),
+        Fresh = (initial_state(maps:get(cfg, St), PublisherOpts))#{root_certificate_info => Info},
+        ?assertMatch({ok, _}, publish_root_certificate(<<"retry-check">>, Tags, Fresh)),
+        [First, Second] = hb_mock_server:get_requests(tx, 2, Gateway),
+        ?assertEqual(maps:get(<<"body">>, First), maps:get(<<"body">>, Second)),
+        WireTX = ar_tx:json_struct_to_tx(hb_json:decode(maps:get(<<"body">>, Second))),
+        WireTags = maps:from_list(WireTX#tx.tags),
+        ?assertMatch({ok, _}, hb_ao:resolve(#{<<"device">> => <<"bridge-root@1.0">>},
+            #{<<"path">> => <<"verify">>, <<"root">> => Root, <<"epoch">> => 7,
+                <<"committee">> => maps:get(<<"attestors">>, Info),
+                <<"intent-id">> => maps:get(<<"Intent-Id">>, WireTags),
+                <<"operation">> => maps:get(<<"Root-Operation">>, WireTags),
+                <<"authorization">> => maps:get(<<"Root-Authorization">>, WireTags),
+                <<"endorsements">> => maps:get(<<"Root-Endorsements">>, WireTags)}, Opts)),
+        ?assertEqual(1, length(hb_mock_server:get_requests(Gateway, price))),
+        ?assertEqual(1, length(hb_mock_server:get_requests(Gateway, tx_anchor))),
+        ?assertException(error, {badmatch, _}, publish_root_certificate(<<"retry-check">>,
+            Tags#{<<"quantity">> => <<"51">>}, Fresh))
+    after hb_mock_server:stop(Gateway)
+    end.
+
+%% @doc A failed worker leaves a responsive attestor and a visible error; a
+%% successful worker clears that error. Stopping the attestor stops its worker.
+root_publisher_lifecycle_check(St) ->
+    Parent = self(),
+    Start = fun() ->
+        Loop = spawn(fun() ->
+            LoopPid = self(),
+            {Worker, Monitor} = spawn_monitor(fun() ->
+                watch_root_publisher_parent(LoopPid),
+                receive
+                    crash -> exit(test_worker_failure);
+                    finish -> LoopPid ! {root_publication_done, self(), {ok, posted}}
+                end
+            end),
+            Parent ! {publisher_ready, LoopPid, Worker},
+            loop(St#{root_publication => {Worker, Monitor, <<"test-job">>},
+                root_publication_error => <<"prior failure">>})
+        end),
+        receive {publisher_ready, Loop, Worker} -> {Loop, Worker}
+        after 1000 -> error(publisher_start_timeout)
+        end
+    end,
+    Status = fun(Pid) ->
+        Ref = make_ref(),
+        Pid ! {status, self(), Ref},
+        receive {Ref, {ok, Result}} -> Result after 1000 -> error(attestor_unresponsive) end
+    end,
+    lists:foreach(fun(Outcome) ->
+        {Loop, Worker} = Start(),
+        try
+            Worker ! Outcome,
+            hb_util:wait_until(fun() ->
+                maps:get(<<"root-publication-running">>, Status(Loop)) =:= false
+            end, 2000),
+            Result = Status(Loop),
+            ?assertEqual(false, maps:get(<<"root-publication-running">>, Result)),
+            case Outcome of
+                finish -> ?assertEqual(null, maps:get(<<"root-publication-error">>, Result));
+                crash -> ?assertNotEqual(null, maps:get(<<"root-publication-error">>, Result))
+            end
+        after exit(Loop, shutdown)
+        end
+    end, [crash, finish]),
+    {Loop, Worker} = Start(),
+    Monitor = erlang:monitor(process, Worker),
+    exit(Loop, shutdown),
+    receive {'DOWN', Monitor, process, Worker, _} -> ok
+    after 2000 -> error(publisher_outlived_attestor)
     end.
 
 %% A failed pass: what `status' shows, and what is logged. Neither carries a
@@ -294,17 +765,100 @@ attest(Info, View, St = #{ cfg := Cfg, me := Me }) ->
             St3 = sign_withdrawals(Withdrawals, Epoch, St2),
             St4 = acknowledge(Withdrawals, St3),
             St5 = relay_fast_ledgers(Info, LedgerDeposits, LedgerReceipts,
-                MoveReceipts, Epoch, St4),
+                MoveReceipts, Epoch, St4#{root_intents => key(<<"rootintents">>, View),
+                    root_certificate_info => Info}),
+            StRoots = case maps:get(<<"rootCertificateVersion">>, Info, 0) of
+                0 -> approve_root_intents(View, Epoch, St5);
+                _ -> St5
+            end,
             St6 = lists:foldl(
                 fun(P, S) ->
                     guard(<<"proposal:", (item_id(P))/binary>>, S, fun() ->
                         Id = hb_util:int(maps:get(<<"id">>, P)),
                         once(<<"vote:", (integer_to_binary(Id))/binary>>, S, fun() -> vote(P, S) end)
                     end)
-                end, St5, proposals_to_vote(Info, Me)),
+                end, StRoots, proposals_to_vote(Info, Me)),
             save_state(Cfg, St6),
             St6#{ last_pass => os:system_time(millisecond), last_error => null }
     end.
+
+%% @doc Vote only from this node's independently computed canonical root view.
+%% Pending holder and lane-authority intents were authenticated by the root;
+%% neither a remote /now response nor a caller-supplied intent is used here.
+approve_root_intents(View, Epoch, St = #{cfg := Cfg, me := Me}) ->
+    Rows = case key(<<"rootintents">>, View) of M when is_map(M) -> M; _ -> #{} end,
+    lists:foldl(fun({Account, Row}, State) ->
+        guard(<<"root-intent:", Account/binary>>, State, fun() ->
+            case root_intent_vote(maps:get(<<"pusd">>, Cfg), Account, Row, Epoch, Me) of
+                false -> State;
+                {ok, Tags} ->
+                    Seq = maps:get(<<"rootsequence">>, Tags),
+                    Id = <<"root-intent:", (integer_to_binary(Epoch))/binary,
+                        ":", Account/binary, ":", Seq/binary>>,
+                    once(Id, State, fun() -> send(Tags, State) end)
+            end
+        end)
+    end, St, maps:to_list(Rows)).
+
+root_intent_vote(Root, Account, Row, Epoch, Me) ->
+    try
+        true = is_binary(Account) andalso byte_size(Account) == 43,
+        <<"pending">> = maps:get(<<"status">>, Row),
+        Account = maps:get(<<"account">>, Row),
+        Epoch = hb_util:int(maps:get(<<"epoch">>, Row)),
+        false = maps:get(Me, maps:get(<<"votes">>, Row, #{}), false),
+        Seq = maps:get(<<"sequence">>, Row),
+        true = is_binary(Seq) andalso binary_to_integer(Seq) > 0,
+        Seq = integer_to_binary(binary_to_integer(Seq)),
+        Action = maps:get(<<"action">>, Row),
+        true = lists:member(Action, [<<"Transfer">>, <<"Ledger-Enter">>,
+            <<"Bridge-Redeem">>, <<"Ledger-Release">>]),
+        Intent = maps:get(<<"intent">>, Row),
+        Action = maps:get(<<"Action">>, Intent),
+        Fields = [<<"Recipient">>, <<"Quantity">>, <<"Ledger">>, <<"Chain">>,
+            <<"Token">>, <<"EntrySequence">>, <<"X-Reference">>, <<"X-Transfer-Sequence">>],
+        ExtraKeys = lists:sort([K || K <- maps:keys(Intent),
+            case hb_util:to_lower(K) of
+                <<"from", _/binary>> -> true;
+                <<"x-", _/binary>> -> true;
+                _ -> false
+            end]),
+        Parts = [<<"pusd-certificate/v2">>, <<"Root-Intent">>, Root,
+            integer_to_binary(Epoch), Action, Account, Seq]
+            ++ [maps:get(K, Intent, <<>>) || K <- Fields]
+            ++ lists:flatmap(fun(K) -> [K, maps:get(K, Intent)] end, ExtraKeys),
+        Digest = iolist_to_binary(lists:join(<<"|">>,
+            [[integer_to_binary(byte_size(P)), <<":">>, P] || P <- Parts])),
+        Digest = maps:get(<<"digest">>, Row),
+        {ok, #{<<"action">> => <<"Root-Approve">>, <<"account">> => Account,
+            <<"rootsequence">> => Seq, <<"requestdigest">> => Digest,
+            <<"attestorepoch">> => integer_to_binary(Epoch)}}
+    catch _:_ -> false
+    end.
+
+root_intent_vote_test() ->
+    Root = binary:copy(<<"R">>, 43),
+    Account = binary:copy(<<"A">>, 43),
+    Recipient = binary:copy(<<"B">>, 43),
+    Me = binary:copy(<<"M">>, 43),
+    Memo = <<16#C3, 16#A9, $|, $:>>,
+    Digest = <<"19:pusd-certificate/v2|11:Root-Intent|43:", Root/binary,
+        "|1:3|8:Transfer|43:", Account/binary, "|1:1|43:", Recipient/binary,
+        "|2:10|0:|0:|0:|0:|0:|0:|6:X-Memo|4:", Memo/binary>>,
+    Intent = #{<<"Action">> => <<"Transfer">>, <<"Recipient">> => Recipient,
+        <<"Quantity">> => <<"10">>, <<"X-Memo">> => Memo},
+    Row = #{<<"status">> => <<"pending">>, <<"account">> => Account,
+        <<"epoch">> => 3, <<"sequence">> => <<"1">>,
+        <<"action">> => <<"Transfer">>, <<"intent">> => Intent,
+        <<"digest">> => Digest, <<"votes">> => #{}},
+    ?assertMatch({ok, #{<<"requestdigest">> := Digest}},
+        root_intent_vote(Root, Account, Row, 3, Me)),
+    ?assertEqual(false, root_intent_vote(Root, Account, Row, 4, Me)),
+    ?assertEqual(false, root_intent_vote(Recipient, Account, Row, 3, Me)),
+    ?assertEqual(false, root_intent_vote(Root, Account,
+        Row#{<<"votes">> => #{Me => true}}, 3, Me)),
+    ?assertEqual(false, root_intent_vote(Root, Account,
+        Row#{<<"intent">> => Intent#{<<"Quantity">> => <<"11">>}}, 3, Me)).
 
 %% Every chain that is configured, each failing on its own.
 scan(Cfg, Cursors, Opts) ->
@@ -574,7 +1128,7 @@ move_receipt_plan(Root, R, Allowed) ->
         andalso is_binary(MoveId) andalso MoveId =/= <<>>
         andalso is_binary(Account) andalso is_binary(Quantity)
         andalso maps:is_key(Source, Allowed)
-        andalso maps:is_key(Destination, Allowed)
+        andalso (Destination =:= Root orelse maps:is_key(Destination, Allowed))
         andalso (Status =:= <<"accepted">> orelse Status =:= <<"rejected">>)
         andalso is_binary(EpochText)
         andalso (Status =/= <<"rejected">> orelse
@@ -597,6 +1151,7 @@ move_receipt_plan(Root, R, Allowed) ->
                 maps:merge(Common#{ <<"action">> => <<"Ledger-Move-Result">> },
                     ResultExtra)},
             case Status of
+                _ when Destination =:= Root -> [Result];
                 <<"rejected">> -> [Result];
                 <<"accepted">> ->
                     case maps:get(<<"creditId">>, R, undefined) of
@@ -611,6 +1166,177 @@ move_receipt_plan(Root, R, Allowed) ->
                     end
             end
     end.
+
+%% @doc Only a lane's registered authority signs its relinquishment. Other
+%% committee members approve the resulting canonical-root intent, not a claim
+%% read from an untrusted lane's HTTP state.
+root_release_plans(Root, Ledger, Registry, Moves, Receipts, Epoch, Rows, Me) ->
+    Row = case Rows of RowsMap when is_map(RowsMap) -> maps:get(Ledger, RowsMap, #{}); _ -> #{} end,
+    Busy = maps:get(<<"status">>, Row, <<>>) =:= <<"pending">>
+        andalso maps:get(<<"epoch">>, Row, -1) =:= Epoch,
+    case maps:get(<<"scheduler">>, Registry, undefined) =:= Me andalso not Busy of
+        false -> [];
+        true ->
+            Settled = move_receipts(Receipts),
+            Pending = [M || M <- Moves, is_map(M),
+                maps:get(<<"status">>, M, <<>>) =:= <<"pending">>,
+                maps:get(<<"root">>, M, <<>>) =:= Root,
+                maps:get(<<"source">>, M, <<>>) =:= Ledger,
+                maps:get(<<"destination">>, M, <<>>) =:= Root,
+                is_binary(maps:get(<<"id">>, M, undefined)),
+                not maps:is_key(<<Ledger/binary, "|", (maps:get(<<"id">>, M))/binary>>, Settled)],
+            case lists:sort(fun(A, B) ->
+                    hb_util:int(maps:get(<<"id">>, A)) =< hb_util:int(maps:get(<<"id">>, B))
+                end, Pending) of
+                [] -> [];
+                [Move | _] ->
+                    Sequence = integer_to_binary(hb_util:int(maps:get(<<"sequence">>, Row, 0)) + 1),
+                    MoveId = maps:get(<<"id">>, Move),
+                    [{root, <<"root-release:", Ledger/binary, ":", MoveId/binary,
+                        ":", (integer_to_binary(Epoch))/binary, ":", Sequence/binary>>, #{
+                        <<"action">> => <<"Ledger-Release">>, <<"ledger">> => Ledger,
+                        <<"recipient">> => maps:get(<<"account">>, Move),
+                        <<"quantity">> => maps:get(<<"quantity">>, Move),
+                        <<"rootsequence">> => Sequence, <<"x-move-id">> => MoveId}}]
+            end
+    end.
+
+%% @doc One publisher per loop leaves the loop free to endorse requests from
+%% its own worker and from peers. Only a successful POST starts the resend
+%% delay; the canonical root receipt, not that POST, settles the source move.
+start_root_publication(Key, Tags, St = #{cfg := Cfg, sent := Sent}) ->
+    case maps:is_key(root_publication, St) orelse
+            os:system_time(millisecond) - maps:get(Key, Sent, 0) < resend_ms(Cfg) of
+        true -> St;
+        false ->
+            Parent = self(),
+            {Pid, Ref} = spawn_monitor(fun() ->
+                watch_root_publisher_parent(Parent),
+                Result = try publish_root_certificate(Key, Tags, St)
+                    catch _:_ -> {error, root_publication_failed}
+                end,
+                Parent ! {root_publication_done, self(), Result}
+            end),
+            St#{root_publication => {Pid, Ref, Key}}
+    end.
+
+%% @doc Stop the worker when its attestor stops without linking worker failures
+%% back into the attestor. The watcher exits when the worker exits, including a
+%% normal completion, so it retains no process or monitor after the job ends.
+watch_root_publisher_parent(Parent) ->
+    Worker = self(),
+    spawn_link(fun() ->
+        ParentRef = erlang:monitor(process, Parent),
+        WorkerRef = erlang:monitor(process, Worker),
+        receive
+            {'DOWN', ParentRef, process, Parent, _} -> exit(shutdown);
+            {'DOWN', WorkerRef, process, Worker, _} -> ok
+        end
+    end).
+
+%% @doc Persist public signed artifacts before collection and publication.
+%% Each retry reads the same carrier, including its fee, anchor and signature.
+publish_root_certificate(Key, Tags, St = #{cfg := Cfg, opts := Opts, me := Me,
+        root_certificate_info := Info}) ->
+    Root = maps:get(<<"pusd">>, Cfg),
+    Epoch = hb_util:int(maps:get(<<"epoch">>, Info)),
+    Payload = (maps:remove(<<"rootsequence">>, Tags))#{<<"target">> => Root,
+        <<"root-sequence">> => maps:get(<<"rootsequence">>, Tags),
+        <<"author">> => Me, <<"certificate-version">> => <<"pusd-root/v1">>,
+        <<"attestor-epoch">> => integer_to_binary(Epoch)},
+    StateFile = hb_util:bin(maps:get(<<"state-file">>, Cfg, <<"bridge-state.json">>)),
+    File = <<StateFile/binary, ".root-", (hb_util:human_id(crypto:hash(sha256, <<Root/binary, Key/binary>>)))/binary>>,
+    Saved = case file:read_file(File) of
+        {ok, Bin} ->
+            #{payload := Payload} = Existing = binary_to_term(Bin, [safe]),
+            Existing;
+        {error, enoent} ->
+            Intent = hb_message:commit(Payload, Opts, <<"ans104@1.0">>),
+            Initial = #{payload => Payload, intent => Intent},
+            save_root_publication(File, Initial),
+            Initial;
+        {error, Reason} -> error({root_journal_unreadable, Reason})
+    end,
+    Carrier = case maps:find(carrier, Saved) of
+        {ok, Transaction} -> Transaction;
+        error ->
+            Members = maps:get(<<"attestors">>, Info),
+            Intent0 = maps:get(intent, Saved),
+            {ok, #{<<"tags">> := TagRows}} = collect_root_carrier(Root, Epoch, Members, Intent0, St),
+            {ok, Price} = hb_ao:resolve(#{<<"device">> => <<"arweave@2.9">>},
+                #{<<"path">> => <<"/price">>, <<"size">> => 0}, Opts),
+            {ok, Anchor} = hb_ao:resolve(#{<<"device">> => <<"arweave@2.9">>},
+                #{<<"path">> => <<"/tx_anchor">>}, Opts),
+            Unsigned = ar_tx:normalize(#tx{format = 2, data = <<>>, data_size = 0,
+                anchor = Anchor, reward = hb_util:int(Price),
+                tags = [{maps:get(<<"name">>, T), maps:get(<<"value">>, T)}
+                    || T <- hb_util:message_to_ordered_list(TagRows)]}),
+            Signed = ar_tx:normalize(ar_tx:sign(Unsigned,
+                hb_opts:get(priv_wallet, no_viable_wallet, Opts))),
+            save_root_publication(File, Saved#{carrier => Signed}),
+            Signed
+    end,
+    Message = hb_message:convert(Carrier, <<"structured@1.0">>, <<"tx@1.0">>, Opts),
+    hb_ao:resolve(#{<<"device">> => <<"arweave@2.9">>},
+        Message#{<<"path">> => <<"tx">>, <<"method">> => <<"POST">>}, Opts).
+
+%% @doc Flush the signed bytes before atomically replacing the public journal.
+save_root_publication(File, State) ->
+    ok = filelib:ensure_dir(File),
+    Tmp = <<File/binary, ".tmp">>,
+    ok = file:write_file(Tmp, term_to_binary(State), [raw, binary, sync]),
+    ok = file:rename(Tmp, File).
+
+%% @doc Request proofs concurrently. Location records are routing hints only:
+%% the assembler checks every proof against the verified membership snapshot.
+collect_root_carrier(Root, Epoch, Members, Intent, St = #{opts := Opts}) ->
+    Parent = self(),
+    Ref = make_ref(),
+    Workers = [spawn(fun() ->
+        Proof = try request_root_proof(Member, Intent, St) catch _:_ -> #{} end,
+        Parent ! {Ref, Proof}
+    end) || Member <- Members],
+    Request = #{<<"path">> => <<"assemble">>, <<"root">> => Root, <<"epoch">> => Epoch,
+        <<"committee">> => Members, <<"intent">> => Intent},
+    try collect_root_proofs(Ref, length(Workers), [], Request,
+            erlang:monotonic_time(millisecond) + 65000, Opts)
+    after lists:foreach(fun(Pid) -> exit(Pid, kill) end, Workers)
+    end.
+
+%% @doc Stop as soon as the same root verifier accepts a majority certificate.
+collect_root_proofs(_Ref, 0, _Proofs, _Request, _Deadline, _Opts) -> {error, no_majority};
+collect_root_proofs(Ref, Pending, Proofs, Request, Deadline, Opts) ->
+    receive
+        {Ref, Proof} ->
+            Next = [Proof | Proofs],
+            case hb_ao:resolve(#{<<"device">> => <<"bridge-root@1.0">>},
+                    Request#{<<"proofs">> => Next}, Opts) of
+                {ok, _} = Ready -> Ready;
+                _ -> collect_root_proofs(Ref, Pending - 1, Next, Request, Deadline, Opts)
+            end
+    after max(0, Deadline - erlang:monotonic_time(millisecond)) -> {error, endorsement_timeout}
+    end.
+
+%% @doc Local requests traverse the same verified-state policy as remote ones.
+request_root_proof(#{<<"ao">> := Me}, Intent, #{me := Me}) ->
+    {ok, Result} = call({root_endorse, Intent}),
+    maps:get(<<"inline-proof">>, Result);
+request_root_proof(#{<<"ao">> := Address}, Intent, #{opts := Opts}) ->
+    {ok, Location} = hb_ao:resolve(#{<<"device">> => <<"location@1.0">>},
+        #{<<"path">> => Address, <<"variant">> => <<"ao.N.1">>}, Opts),
+    Node = hb_ao:get(<<"url">>, Location, Opts),
+    fetch_root_proof(Node, Intent, Opts).
+
+%% @doc Send the exact signed intent using HyperBEAM's ANS-104 HTTP codec.
+fetch_root_proof(Node, Intent, Opts) ->
+    {ok, Response} = hb_http:post(Node, <<"/~bridge-attestor@1.0/root-endorse">>,
+        Intent#{<<"accept">> => <<"application/json">>},
+        Opts#{<<"http-codec">> => <<"ans104@1.0">>}),
+    Result = case maps:get(<<"body">>, Response, Response) of
+        Bin when is_binary(Bin) -> hb_json:decode(Bin);
+        Map -> Map
+    end,
+    maps:get(<<"inline-proof">>, Result).
 
 fast_ledger_node(Spec, Cfg) when is_binary(Spec) -> Spec;
 fast_ledger_node(Spec, Cfg) when is_map(Spec) ->
@@ -659,7 +1385,11 @@ relay_fast_ledgers(Info, Deposits, Receipts, MoveReceipts, Epoch,
                                 ),
                                 dispatch_move_plans(
                                     move_root_plans(Epoch, Ledger, LaneMoves,
-                                        MoveReceipts, Allowed), S2
+                                        MoveReceipts, Allowed)
+                                    ++ root_release_plans(Root, Ledger,
+                                        maps:get(Ledger, maps:get(<<"ledgers">>, Info, #{}), #{}),
+                                        LaneMoves, MoveReceipts, Epoch,
+                                        maps:get(root_intents, St, #{}), maps:get(me, St)), S2
                                 );
                             {not_yet, Why} ->
                                 S#{ skipped := (maps:get(skipped, S))#{
@@ -696,7 +1426,9 @@ fast_ledgers(Registered, Configured) ->
 dispatch_move_plans(Plans, St = #{ cfg := Cfg }) ->
     Configured = maps:get(fast_ledgers, St, #{}),
     lists:foldl(
-        fun({Target, RetryKey, Tags}, Acc) ->
+        fun({root, RetryKey, Tags = #{<<"action">> := <<"Ledger-Release">>}}, Acc) ->
+            start_root_publication(RetryKey, Tags, Acc);
+        ({Target, RetryKey, Tags}, Acc) ->
             guard(RetryKey, Acc, fun() ->
                 once(RetryKey, Acc, fun() ->
                     case Target of
@@ -1212,6 +1944,8 @@ status_view(St) ->
         <<"waiting-acks">> => maps:size(maps:get(releases, St)),
         <<"last-pass">> => maps:get(last_pass, St),
         <<"last-error">> => maps:get(last_error, St),
+        <<"root-publication-running">> => maps:is_key(root_publication, St),
+        <<"root-publication-error">> => maps:get(root_publication_error, St, null),
         <<"replica">> => maps:get(replica, St, null),
         <<"skipped">> => [#{ <<"item">> => K, <<"reason">> => V }
             || {K, V} <- lists:sort(maps:to_list(maps:get(skipped, St, #{})))],
@@ -1442,6 +2176,31 @@ fast_ledger_move_plans_test() ->
     ?assertEqual(<<"cap">>, maps:get(<<"error">>, Rejection)),
     ?assertEqual([], move_receipt_plans(Root, [Receipt], maps:remove(Source, Allowed))),
     ?assertEqual([], move_receipt_plans(<<"other-root">>, [Receipt], Allowed)).
+
+%% @doc A timeout keeps the same signed operation. Only an advanced verified
+%% root sequence creates a new publication journal, retaining the move ID that
+%% prevents duplicate settlement even if both carriers eventually arrive.
+root_release_retry_sequence_test() ->
+    Root = <<"root">>, Ledger = <<"lane">>, Me = <<"authority">>,
+    Registry = #{<<"scheduler">> => Me},
+    Move = #{<<"id">> => <<"8">>, <<"root">> => Root, <<"source">> => Ledger,
+        <<"destination">> => Root, <<"status">> => <<"pending">>,
+        <<"account">> => <<"holder">>, <<"quantity">> => <<"50">>},
+    Rows = #{Ledger => #{<<"sequence">> => <<"4">>, <<"epoch">> => 7,
+        <<"status">> => <<"executed">>}},
+    Plan = root_release_plans(Root, Ledger, Registry, [Move], [], 7, Rows, Me),
+    [{root, Key, Tags}] = Plan,
+    ?assertEqual(Plan, root_release_plans(Root, Ledger, Registry, [Move], [], 7, Rows, Me)),
+    ?assertEqual(<<"5">>, maps:get(<<"rootsequence">>, Tags)),
+    Advanced = Rows#{Ledger := (maps:get(Ledger, Rows))#{<<"sequence">> => <<"5">>}},
+    [{root, NewKey, NewTags}] = root_release_plans(Root, Ledger, Registry, [Move], [], 7, Advanced, Me),
+    ?assertNotEqual(Key, NewKey),
+    ?assertEqual(Tags#{<<"rootsequence">> := <<"6">>}, NewTags),
+    ?assertEqual([], root_release_plans(Root, Ledger, Registry, [Move], [], 7, Rows, <<"stranger">>)),
+    lists:foreach(fun(Status) ->
+        Receipt = #{<<"key">> => <<"lane|8">>, <<"status">> => Status},
+        ?assertEqual([], root_release_plans(Root, Ledger, Registry, [Move], [Receipt], 7, Rows, Me))
+    end, [<<"accepted">>, <<"rejected">>]).
 
 relay_failure_isolation_test() ->
     St = #{ skipped => #{} },
@@ -1988,11 +2747,8 @@ message_for_another_process_is_not_used_test_() ->
             maps:get(replica, St1))
     end}.
 
-%% A signed message without a `target', scheduled on PUSD: the honest
-%% scheduler takes the process from the path, so any wallet can send one. The
-%% assignment says the slot is PUSD's; the replica goes on past it, and the
-%% Redeem it carries is signed.
-message_without_target_is_pusds_test_() ->
+%% A scheduler cannot supply the missing destination authority of a signature.
+message_without_destination_is_refused_test_() ->
     {timeout, 120, fun() ->
         Make = fun(_Orig) ->
             hb_message:commit(#{ <<"action">> => <<"Redeem">>, <<"to">> => ?TEST_TO,
@@ -2000,6 +2756,22 @@ message_without_target_is_pusds_test_() ->
                 #{ <<"priv-wallet">> => ar_wallet:new() }, <<"httpsig@1.0">>)
         end,
         St = replica_setup(<<"no-target">>, fun(W) -> replace_redeem(W, Make) end),
+        St1 = pass(St),
+        ?assertEqual(<<>>, raw(<<"signs">>, St1)),
+        ?assertMatch(#{stopped := <<"message is for another process", _/binary>>},
+            maps:get(replica, St1))
+    end}.
+
+%% A signed Assign-To authorizes the root even without a native TX target.
+message_with_assign_to_is_pusds_test_() ->
+    {timeout, 120, fun() ->
+        Make = fun(Orig) ->
+            hb_message:commit(#{<<"action">> => <<"Redeem">>, <<"to">> => ?TEST_TO,
+                <<"amount">> => <<"5">>,
+                <<"assign-to">> => hb_maps:get(<<"target">>, Orig, #{})},
+                #{<<"priv-wallet">> => ar_wallet:new()}, <<"httpsig@1.0">>)
+        end,
+        St = replica_setup(<<"assign-to">>, fun(W) -> replace_redeem(W, Make) end),
         St1 = pass(St),
         ?assertEqual(<<"1=", (true_signature(St1))/binary, ";">>, raw(<<"signs">>, St1))
     end}.

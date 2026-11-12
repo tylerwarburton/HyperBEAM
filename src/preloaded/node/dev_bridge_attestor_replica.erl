@@ -29,6 +29,7 @@
 -module(dev_bridge_attestor_replica).
 -export([view/3]).
 -include("include/hb.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 %% Assignments verified per call, at most: a replica far behind catches up
 %% over several passes, acting meanwhile on the verified state it has.
@@ -91,10 +92,23 @@ load(Pusd, Url, NodeOpts, Dir) ->
     Store = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => Base },
     ok = filelib:ensure_dir(binary_to_list(<<Base/binary, "/">>)),
     ok = hb_store:start([Store]),
-    ROpts = (maps:without([<<"hashpath">>, <<"lua-device-preload">>], NodeOpts))#{
+    ROpts = execution_opts(NodeOpts, Store),
+    R = #{ pusd => Pusd, url => Url, opts => ROpts, http => NodeOpts,
+        cursor => <<Base/binary, ".cursor.json">>,
+        proc => undefined, schedulers => [], scheduler_device => <<"scheduler@1.0">>,
+        slot => -1, chain => Pusd, last => none,
+        stopped => null },
+    resume(process(R)).
+
+%% @doc Replayed code gets the same key isolation as public HTTP execution.
+%% The attestor retains its signing keys outside the foreign Lua environment.
+execution_opts(NodeOpts, Store) ->
+    (maps:without(?NODE_KEY_OPTS ++ [<<"hashpath">>, <<"lua-device-preload">>], NodeOpts))#{
         <<"store">> => [Store],
         <<"scheduler-store">> => [Store],
         <<"arweave-scheduler-store">> => [Store],
+        <<"arweave-scheduler-confirmation-depth">> => max(2,
+            hb_util:int(hb_opts:get(arweave_scheduler_confirmation_depth, 2, NodeOpts))),
         <<"process-store">> => [Store],
         <<"process-workers">> => false,
         <<"spawn-worker">> => false,
@@ -108,19 +122,50 @@ load(Pusd, Url, NodeOpts, Dir) ->
         % (paralith-mono infra/nodes/node-config.v011.json).
         <<"lua-patch-invalid-patches">> => <<"drop">>,
         <<"lua-device-sandbox">> => []
-    },
-    R = #{ pusd => Pusd, url => Url, opts => ROpts, http => NodeOpts,
-        cursor => <<Base/binary, ".cursor.json">>,
-        proc => undefined, schedulers => [], scheduler_device => <<"scheduler@1.0">>,
-        slot => -1, chain => Pusd, last => none,
-        stopped => null },
-    resume(process(R)).
+    }.
+
+replica_does_not_lend_its_validator_key_test() ->
+    hb:init(),
+    Store = hb_test_utils:test_store(),
+    Privileged = #{<<"priv-wallet">> => ar_wallet:new(), <<"store">> => [Store],
+        <<"cache-control">> => [<<"no-cache">>, <<"no-store">>],
+        <<"identities">> => #{<<"validator">> => ar_wallet:new()}},
+    Restricted = execution_opts(Privileged, Store),
+    ?assertNot(maps:is_key(<<"priv-wallet">>, Restricted)),
+    ?assertNot(maps:is_key(<<"identities">>, Restricted)),
+    Script = <<
+        "function attempt()\n",
+        " local ok, count = pcall(function()\n",
+        "  local status, signed = ao.resolve({device='message@1.0'},\n",
+        "   {path='commit', ['message-subject']='payload',\n",
+        "    payload={action='Root-Approve'}, ['commitment-device']='httpsig@1.0', type='signed'})\n",
+        "  if status == 'ok' then return #ao.signers(signed) end\n",
+        "  return 0\n",
+        " end)\n",
+        " return ok and count or 0\n",
+        "end\n",
+        "function read_value() return ao.get('value', {value='available'}) end"
+    >>,
+    Base = #{<<"device">> => <<"lua@5.3a">>, <<"module">> =>
+        #{<<"content-type">> => <<"application/lua">>, <<"body">> => Script}},
+    ?assertEqual({ok, 1}, hb_ao:resolve(Base, <<"attempt">>, Privileged)),
+    Denied = hb_ao:resolve(Base, <<"attempt">>, Restricted),
+    case Denied of
+        {ok, 0} -> ok;
+        {failure, #{<<"status">> := 500, <<"body">> := Error}} ->
+            % A denied commit may fail while the Lua boundary encodes the
+            % host's error tuple. It must specifically be a commit refusal.
+            ?assertNotEqual(nomatch, binary:match(Error, <<"cannot_commit">>));
+        _ -> ?assertEqual({ok, 0}, Denied)
+    end,
+    ?assertEqual({ok, <<"available">>}, hb_ao:resolve(Base, <<"read_value">>, Restricted)).
 
 %% The process, stored or fetched, as far as a real signature vouches for it,
 %% and only if that is PUSD.
 process(R = #{ pusd := Pusd, url := Url, opts := ROpts, http := Opts }) ->
     Candidates = [
         fun() -> {ok, P} = hb_cache:read(Pusd, ROpts), hb_cache:ensure_all_loaded(P, ROpts) end,
+        fun() -> {ok, P} = hb_cache:read(Pusd, Opts), hb_cache:ensure_all_loaded(P, Opts) end,
         fun() ->
             {ok, P} = hb_http:get(Url, <<"/", Pusd/binary>>, Opts),
             hb_cache:ensure_all_loaded(P, Opts)
@@ -198,15 +243,18 @@ resume(R = #{ cursor := File, pusd := Pusd, opts := ROpts,
 forward(R = #{ proc := undefined }) -> R;
 forward(R) -> forward(R, ?MAX_SLOTS).
 
+forward(R = #{scheduler_device := <<"arweave-scheduler@1.0">>}, 0) ->
+    R#{stopped := <<"catching up to the canonical Arweave schedule">>};
 forward(R, 0) -> R;
 forward(R = #{ slot := Slot }, Left) ->
     case fetch(R, Slot + 1) of
+        {error, Why} -> R#{stopped := Why};
         [] -> R;
         As -> forward_each(As, R, Left)
     end.
 
 forward_each([], R, Left) -> forward(R, Left);
-forward_each(_, R, 0) -> R;
+forward_each(_, R, 0) -> forward(R, 0);
 forward_each([A | Rest], R = #{ slot := Slot }, Left) ->
     case step(A, R) of
         {ok, Kept, Id} -> forward_each(Rest, accept(Kept, Id, R), Left - 1);
@@ -215,8 +263,22 @@ forward_each([A | Rest], R = #{ slot := Slot }, Left) ->
             R#{ stopped := <<Why/binary, " at slot ", (integer_to_binary(Slot + 1))/binary>> }
     end.
 
-%% The assignments the scheduler serves from `From' on, in slot order; none
-%% when it cannot be read.
+%% @doc Arweave ordering is constructed locally from confirmed blocks. A peer's
+%% unsigned assignment metadata is never proof of inclusion, finality or order.
+fetch(#{pusd := Pusd, scheduler_device := <<"arweave-scheduler@1.0">>, opts := Opts}, From) ->
+    case catch hb_ao:resolve(#{<<"device">> => <<"arweave-scheduler@1.0">>},
+            #{<<"path">> => <<"schedule">>, <<"target">> => Pusd,
+                <<"from">> => From}, Opts) of
+        {ok, Res} ->
+            try
+                As = hb_maps:get(<<"assignments">>, Res, #{}, Opts),
+                Ordered = lists:keysort(1, [{hb_util:int(K), V} || {K, V} <- hb_maps:to_list(As, Opts)]),
+                [{canonical_arweave, hb_cache:ensure_loaded(A, Opts)} || {N, A} <- Ordered, N >= From]
+            catch _:_ -> {error, <<"Canonical Arweave assignments are unavailable">>}
+            end;
+        _ -> {error, <<"Canonical Arweave synchronization is unavailable">>}
+    end;
+%% The signed assignments a conventional scheduler serves from `From' on.
 fetch(#{ pusd := Pusd, url := Url, http := Opts }, From) ->
     Path = <<"/", Pusd/binary, "~process@1.0/schedule?from=", (integer_to_binary(From))/binary>>,
     case catch hb_http:get(Url, Path, Opts#{ <<"http-client">> => httpc, <<"protocol">> => http2 }) of
@@ -233,8 +295,18 @@ fetch(#{ pusd := Pusd, url := Url, http := Opts }, From) ->
 
 %% `A' as the next slot: what PUSD's scheduler vouches for, carrying what the
 %% message's signer vouches for, and the ID the chain continues with.
+step({canonical_arweave, A}, R = #{scheduler_device := <<"arweave-scheduler@1.0">>}) ->
+    step(A, R, canonical_arweave);
+step(_A, #{scheduler_device := <<"arweave-scheduler@1.0">>}) ->
+    {refused, <<"Arweave assignments must come from local canonical synchronization">>};
+step(A, R) -> step(A, R, signed_scheduler).
+
 step(A, #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers,
-        scheduler_device := SchedulerDevice, http := Opts }) ->
+        scheduler_device := SchedulerDevice, http := HTTPOpts, opts := ReplicaOpts }, Origin) ->
+    Opts = case Origin of
+        canonical_arweave -> ReplicaOpts;
+        signed_scheduler -> maps:without(?NODE_KEY_OPTS, HTTPOpts)
+    end,
     try
         Kept =
             case SchedulerDevice of
@@ -245,7 +317,7 @@ step(A, #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers,
                     need(vouched(A, Schedulers, Opts),
                         <<"assignment not signed by the scheduler">>)
             end,
-        Get = fun(K) -> hb_ao:get(K, Kept, not_found, Opts#{ <<"hashpath">> => ignore }) end,
+        Get = fun(K) -> hb_maps:get(K, Kept, not_found, Opts) end,
         need(hb_util:int(Get(<<"slot">>)) =:= Slot + 1, <<"slot out of order">>),
         need(hb_util:human_id(Get(<<"process">>)) =:= Pusd, <<"assignment for another process">>),
         need(
@@ -253,7 +325,12 @@ step(A, #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers,
                 orelse Get(<<"base-hashpath">>) =:= Chain,
             <<"assignment breaks the hash chain">>
         ),
-        Body = need(vouched(hb_cache:ensure_all_loaded(Get(<<"body">>), Opts), any, Opts),
+        RawBody = case Origin of
+            canonical_arweave -> hb_cache:read_all_commitments(
+                hb_cache:ensure_loaded(Get(<<"body">>), Opts), Opts);
+            signed_scheduler -> hb_cache:ensure_all_loaded(Get(<<"body">>), Opts)
+        end,
+        Body = need(vouched(RawBody, any, Opts),
             <<"message signature does not verify">>),
         % The vouched assignment says whose slot this is; a message that names
         % a process at all must name PUSD.
@@ -277,7 +354,7 @@ step(A, #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers,
     end.
 
 arweave_assignment(A, Pusd, Slot, Opts) when is_map(A) ->
-    Get = fun(K) -> hb_ao:get(K, A, not_found, Opts#{ <<"hashpath">> => ignore }) end,
+    Get = fun(K) -> hb_maps:get(K, A, not_found, Opts) end,
     Hash = Get(<<"block-hash">>),
     try
         Valid = hb_util:int(Get(<<"slot">>)) =:= Slot
@@ -291,6 +368,49 @@ arweave_assignment(A, Pusd, Slot, Opts) when is_map(A) ->
     catch _:_ -> false
     end;
 arweave_assignment(_, _, _, _) -> false.
+
+peer_arweave_metadata_is_not_authority_test() ->
+    Pusd = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Claimed = #{<<"process">> => Pusd, <<"slot">> => 1,
+        <<"type">> => <<"Assignment">>, <<"block-height">> => 100,
+        <<"block-index">> => 0, <<"timestamp">> => 1700000000,
+        <<"block-hash">> => hb_util:encode(crypto:strong_rand_bytes(48))},
+    ?assertMatch({refused, _}, step(Claimed,
+        #{scheduler_device => <<"arweave-scheduler@1.0">>})).
+
+canonical_schedule_is_read_locally_test_() ->
+    {timeout, 60, fun canonical_schedule_is_read_locally/0}.
+
+canonical_schedule_is_read_locally() ->
+    hb:init(),
+    Store = hb_test_utils:test_store(),
+    Hook = fun(_, Request, _) ->
+        {ok, Request#{<<"body">> => #{<<"status">> => 200,
+            <<"content-type">> => <<"application/json">>, <<"body">> => <<"{\"height\":20}">>}}}
+    end,
+    Node = hb_http_server:start_node(#{<<"port">> => 0,
+        <<"on">> => #{<<"response">> => #{<<"device">> => #{<<"response">> => Hook}}}}),
+    Opts = (execution_opts(#{}, Store))#{<<"arweave-scheduler-from">> => 10,
+        <<"arweave-index-blocks">> => false,
+        <<"routes">> => [#{<<"template">> => <<"^/arweave">>,
+            <<"node">> => #{<<"match">> => <<"^/arweave">>, <<"with">> => hb_util:bin(Node)}}]},
+    Pusd = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Put = fun(Path, Value) ->
+        {ok, ID} = hb_cache:write(Value, Opts),
+        ok = hb_cache:link(ID, Path, Opts)
+    end,
+    Put(<<"~arweave-scheduler@1.0/sync/global">>, #{<<"from">> => 10, <<"to">> => 18}),
+    Put(<<"~arweave-scheduler@1.0/sync/process/", Pusd/binary>>,
+        #{<<"process">> => Pusd, <<"spawn-ordinate">> => <<"10-0">>,
+            <<"synced-to">> => 18, <<"next-slot">> => 2}),
+    Canonical = #{<<"process">> => Pusd, <<"slot">> => 1,
+        <<"type">> => <<"Assignment">>, <<"body">> => #{<<"source">> => <<"local-index">>}},
+    Put(<<"~arweave-scheduler@1.0/assignments/", Pusd/binary, "/1">>, Canonical),
+    [{canonical_arweave, Read}] = fetch(#{pusd => Pusd,
+        scheduler_device => <<"arweave-scheduler@1.0">>, opts => Opts,
+        url => <<"http://127.0.0.1:1">>, http => Opts}, 1),
+    Body = hb_cache:ensure_loaded(hb_maps:get(<<"body">>, Read, Opts), Opts),
+    ?assertEqual(<<"local-index">>, hb_maps:get(<<"source">>, Body, Opts)).
 
 message_for_process(Body, Pusd, Slot, Opts) ->
     Target = hb_maps:get(<<"target">>, Body, none, Opts),

@@ -91,27 +91,39 @@ compute(Key, RawBase, RawReq, Opts) ->
     Req = hb_cache:read_all_commitments(RawReq, Opts),
     {ok, Base} = init(RawBase, Req, Opts),
     OldPriv = #{ <<"state">> := State } = hb_private:from_message(Base),
+    InSlot = in_slot(OldPriv),
+    FunctionSources = case InSlot of
+        true -> [{{as, <<"message@1.0">>, Base}, <<"function">>}];
+        false -> [
+            {Req, <<"body/function">>},
+            {Req, <<"function">>},
+            {{as, <<"message@1.0">>, Base}, <<"function">>}
+        ]
+    end,
     Function =
         hb_ao:get_first(
-            [
-                {Req, <<"body/function">>},
-                {Req, <<"function">>},
-                {{as, <<"message@1.0">>, Base}, <<"function">>}
-            ],
+            FunctionSources,
             Key,
             Opts#{ <<"hashpath">> => ignore }
         ),
-    Params =
-        hb_ao:get_first(
+    % Scheduled messages are input to the contract, never instructions for
+    % choosing another Lua entry point or replacing its execution context.
+    Params = case InSlot of
+        true -> [Req];
+        false -> hb_ao:get_first(
             [
                 {Req, <<"body/parameters">>},
                 {Req, <<"parameters">>}
             ],
             [Req],
             Opts#{ <<"hashpath">> => ignore }
-        ),
+        )
+    end,
+    InputParams = case InSlot andalso literal_input_links(Base, Opts) of
+        true -> [literal_request(Req, Opts)];
+        false -> Params
+    end,
     T1 = erlang:monotonic_time(microsecond),
-    InSlot = in_slot(OldPriv),
     % RC7's `ao' library reads the node message from here, as in `dev_lua';
     % `snapshot/3' keeps it out of the snapshot. Outside a process slot, a
     % library call that crashes is a Lua error the contract can catch
@@ -123,7 +135,7 @@ compute(Key, RawBase, RawReq, Opts) ->
             luerl:put_private(<<"node-message">>, Opts, State)
         ),
     Response =
-        try call_lua(Function, encode(Params, Opts), CallState, deadline(InSlot, Opts))
+        try call_lua(Function, encode(InputParams, Opts), CallState, deadline(InSlot, Opts))
         catch
             _:Reason:Stacktrace -> {error, Reason, Stacktrace}
         end,
@@ -137,6 +149,29 @@ compute(Key, RawBase, RawReq, Opts) ->
     hb_phase_timer:record(lua_patch_prep, T1 - T0),
     hb_phase_timer:record(lua_patch_lua, T2 - T1),
     process_response(collect(InSlot, Base, Req, Response, Opts), Base, OldPriv, Opts).
+
+%% @doc A process can consume tag values as literal URIs. This policy comes
+%% from its signed definition, not the incoming message or node defaults.
+literal_input_links(Base, Opts) ->
+    hb_ao:get_first([
+        {{as, <<"message@1.0">>, Base}, <<"process/lua-input-links">>},
+        {{as, <<"message@1.0">>, Base}, <<"lua-input-links">>}
+    ], <<"resolve">>, Opts) =:= <<"literal">>.
+
+%% @doc Load the scheduled header and its signature metadata, then preserve
+%% payload links as strings. An unknown tag must not make execution depend on
+%% retrieval of an arbitrary remote object before the contract can reject it.
+literal_request(Req, Opts) ->
+    Body = hb_cache:ensure_loaded(hb_maps:get(<<"body">>, Req, #{}, Opts), Opts),
+    Loaded = hb_cache:read_all_commitments(Body, Opts),
+    Commitments = hb_cache:ensure_all_loaded(
+        hb_maps:get(<<"commitments">>, Loaded, #{}, Opts), Opts),
+    literal_links(Req#{<<"body">> => Loaded#{<<"commitments">> => Commitments}}).
+
+literal_links({link, URI, _}) -> URI;
+literal_links(Map) when is_map(Map) -> maps:map(fun(_, V) -> literal_links(V) end, Map);
+literal_links(List) when is_list(List) -> [literal_links(V) || V <- List];
+literal_links(Value) -> Value.
 
 %% @doc Collect the VM's garbage after every `lua-gc-interval-slots'th slot.
 %% Contracts on this device collect in full only on checkpoint slots
@@ -1697,7 +1732,7 @@ count_state_hashes(Fun) ->
     MatchSpec =
         [{['$1', '_', '_'],
             [{is_map, '$1'}, {is_map_key, <<"last-action">>, '$1'}],
-            []}],
+            [{message, {caller}}]}],
     Patterns = [{hb_message, id, 3}, {hb_message, commit, 3}],
     [ erlang:trace_pattern(P, MatchSpec, [local]) || P <- Patterns ],
     erlang:trace(all, true, [call, {tracer, self()}]),
@@ -1711,6 +1746,9 @@ count_state_hashes(Fun) ->
 
 count_hash_messages(N) ->
     receive
+        {trace, _, call, {hb_message, _, _}, Caller} ->
+            ?debugFmt("computed-state hash caller: ~p", [Caller]),
+            count_hash_messages(N + 1);
         {trace, _, call, {hb_message, _, _}} -> count_hash_messages(N + 1)
     after 100 -> N
     end.
@@ -1803,6 +1841,60 @@ finish_gc_cycle(State, Number, Limit) ->
 
 delta_process(Opts) ->
     delta_process(Opts, equivalent_script()).
+
+scheduled_messages_cannot_select_lua_invocation_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Opts = #{<<"store">> => hb_test_utils:test_store(),
+            <<"priv-wallet">> => ar_wallet:new(), <<"hashpath">> => ignore,
+            <<"scheduler-publish-remote">> => false,
+            <<"scheduling-mode">> => local_confirmation,
+            <<"spawn-worker">> => false, <<"process-workers">> => false},
+        Script = <<
+            "function compute(req) return {patches={{path='/seen', value=req.body.action or 'spawn'}}, results={}} end\n",
+            "function bypass(req) return {patches={{path='/seen', value='bypassed'}}, results={}} end"
+        >>,
+        Process = delta_process(Opts, Script, #{<<"lua-input-links">> => <<"literal">>}),
+        ProcessID = hb_message:id(Process, all, Opts),
+        {ok, _} = hb_cache:write(Process, Opts),
+        {ok, _} = hb_ao:resolve(#{<<"device">> => <<"scheduler@1.0">>},
+            #{<<"path">> => <<"schedule">>, <<"method">> => <<"POST">>,
+                <<"body">> => Process}, Opts),
+        Wallet = ar_wallet:new(),
+        Attack = fun(Fields, Slot) ->
+            Body = hb_message:commit(Fields#{<<"target">> => ProcessID,
+                <<"type">> => <<"Message">>,
+                <<"action">> => <<"expected">>}, #{<<"priv-wallet">> => Wallet}),
+            {ok, _} = hb_cache:write(Body, Opts),
+            {ok, _} = hb_ao:resolve(Process,
+                #{<<"path">> => <<"schedule">>, <<"method">> => <<"POST">>,
+                    <<"body">> => Body}, Opts),
+            {ok, Result} = hb_ao:resolve(Process,
+                #{<<"path">> => <<"compute">>, <<"slot">> => Slot}, Opts),
+            ?assertEqual(<<"expected">>, hb_ao:get(<<"seen">>, Result, Opts))
+        end,
+        Attack(#{<<"function">> => <<"bypass">>}, 1),
+        Attack(#{<<"parameters">> => [#{<<"body">> =>
+            #{<<"action">> => <<"injected-context">>}}]}, 2)
+    end}.
+
+%% @doc Local scheduler admission refuses dangling links. Arweave headers can
+%% contain arbitrary tag URIs, so test their VM boundary after initialization,
+%% with the private marker that process@1.0 puts on an execution state.
+literal_process_input_does_not_fetch_unknown_links_test() ->
+    hb:init(),
+    Opts = #{<<"store">> => hb_test_utils:test_store(), <<"hashpath">> => ignore},
+    Missing = <<"ao:", (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary>>,
+    Script = <<"function compute(req) return {patches={{path='/seen', value=req.body.unused == '",
+        Missing/binary, "' and 'literal' or 'wrong'}}, results={}} end">>,
+    Base = (base(<<"lua-patch@1.0">>, Script))#{<<"lua-input-links">> => <<"literal">>},
+    {ok, Initialized} = hb_ao:resolve(Base, <<"init">>, Opts),
+    ProcessState = hb_private:set(Initialized, <<"initialized">>, true, Opts),
+    {ok, Result} = hb_ao:resolve(ProcessState,
+        #{<<"path">> => <<"compute">>, <<"slot">> => 1,
+            <<"body">> => #{<<"unused">> => {link, Missing, #{}}}}, Opts),
+    ?assertEqual(<<"literal">>, hb_ao:get(<<"seen">>, Result, Opts)).
+
 delta_process(Opts, Script) ->
     delta_process(Opts, Script, #{}).
 delta_process(Opts, Script, Extra) ->

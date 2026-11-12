@@ -178,23 +178,27 @@ read_assignment(ProcessID, Slot, RawOpts) ->
         {ok, RawAssignment} ->
             Assignment =
                 hb_message:normalize_commitments(RawAssignment, Opts),
-            {ok,
-                case Slot of
-                    0 ->
-                        Assignment#{
-                            <<"body">> =>
-                                hb_maps:get(
-                                    <<"body">>,
-                                    Assignment,
-                                    not_found,
-                                    lib_process:execution_opts(Opts)
-                                )
-                        };
-                    _ -> hb_cache:ensure_all_loaded(Assignment, Opts)
-                end
-            };
+            % The signed header is available locally. Its tag values may
+            % name unavailable objects; loading them is an execution policy,
+            % not a prerequisite for reading the canonical assignment.
+            {ok, Assignment#{<<"body">> => hb_maps:get(
+                <<"body">>, Assignment, not_found,
+                lib_process:execution_opts(Opts))}};
         {error, not_found} -> not_found
     end.
+
+assignment_read_does_not_fetch_payload_links_test() ->
+    Opts = #{<<"store">> => [hb_test_utils:test_store()], <<"priv-wallet">> => ar_wallet:new()},
+    ProcessID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Missing = <<"ao:", (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary>>,
+    Header = hb_message:commit(#{<<"target">> => ProcessID,
+        <<"unused">> => {link, Missing, #{}}}, Opts, <<"tx@1.0">>),
+    {ok, _} = hb_cache:write(Header, Opts),
+    ok = write_assignment(#{<<"process">> => ProcessID, <<"slot">> => 1,
+        <<"type">> => <<"Assignment">>, <<"body">> => Header}, Opts),
+    {ok, Assignment} = read_assignment(ProcessID, 1, Opts),
+    Body = hb_cache:ensure_loaded(maps:get(<<"body">>, Assignment), Opts),
+    ?assertMatch({link, Missing, _}, maps:get(<<"unused">>, Body)).
 
 %% @doc Format a schedule response without claiming that one tip hash or
 %% timestamp sequenced every historical assignment in the response.

@@ -81,8 +81,7 @@ base_admin_action(Action) -> error({bad_admin_action, Action}).
 %% @doc Personal-sign `Inner` with a 32-byte private key: what `ECDSA.recover`
 %% on the EIP-191 hash accepts.
 base_sign(Inner, Priv) ->
-    <<RS:64/binary, V:8>> = secp256k1_nif:sign(Inner, Priv, ethereum),
-    <<RS/binary, (V + 27):8>>.
+    secp256k1_nif:sign(Inner, Priv, ethereum).
 
 %% @doc The 0x address of a 32-byte private key, lowercase.
 base_address(Priv) ->
@@ -334,20 +333,21 @@ solana_release_test() ->
 admin_messages_test() ->
     B58 = fun(Byte) -> base58_encode(binary:copy(<<Byte>>, 32)) end,
     ?assertEqual(
-        <<"504152414c4954485f41444d494e5f563101010101010101010101010101010101",
-          "01010101010101010101010101010101aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0400000000000000010202020202020202",
-          "020202020202020202020202020202020202020202020202020202020202020201">>,
+        <<"504152414c4954485f41444d494e5f5631010101010101010101010101010101"
+          "0101010101010101010101010101010101aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa040000000000000001020202020202"
+          "020202020202020202020202020202020202020202020202020201">>,
         hex(solana_admin(B58(1), ?ROOT_ID, 4, 1, B58(2), true))),
     Bridge = <<"0x034401905bebdf8c04f3cd5f04f442a39372c8dc321c29edfb4f9cb30b23ab96">>,
     Coin = <<"0x0000000000000000000000000000000000000000000000000000000000000000::test_usdc::TEST_USDC">>,
+    % Byte layout from para_bridge.move admin_message, including the coin type.
     ?assertEqual(
-        <<"504152414c4954485f41444d494e5f5631034401905bebdf8c04f3cd5f04f442a",
-          "39372c8dc321c29edfb4f9cb30b23ab96aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0400000000000000013078303030303030",
+        <<"504152414c4954485f41444d494e5f5631034401905bebdf8c04f3cd5f04f442",
+          "a39372c8dc321c29edfb4f9cb30b23ab96aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa040000000000000001307830303030",
           "3030303030303030303030303030303030303030303030303030303030303030",
-          "3030303030303030303030303030303030303030303030303030303030303030",
-          "3030303030303030303a3a746573745f757364633a3a544553545f5553444301">>,
+          "303030303030303030303030303030303030303030303030303030303a3a7465",
+          "73745f757364633a3a544553545f5553444301">>,
         hex(sui_admin(Bridge, ?ROOT_ID, 4, 1, Coin, true))),
     ?assertEqual(
         <<"504152414c4954485f41444d494e5f5631034401905bebdf8c04f3cd5f04f442a",

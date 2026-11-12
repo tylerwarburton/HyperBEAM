@@ -677,7 +677,7 @@ compute_on_schedule_test_() ->
         }),
         Base =
             lua_process(
-                <<"function inc(base) base.count = (base.count or 0) + 1 return base end">>,
+                <<"function compute(base) base.count = (base.count or 0) + 1 return base end">>,
                 Opts
             ),
         Count = fun() ->
@@ -713,7 +713,7 @@ mixed_case_key_stays_a_value_test_() ->
         }),
         Base =
             lua_process(
-                <<"function inc(base) "
+                <<"function compute(base) "
                   "N = (N or 0) + 1 "
                   "base['balance-UEzu0jQBQIgGJnQ'] = tostring(N) "
                   "return base end">>,
@@ -750,7 +750,7 @@ read_below_retention_floor_test_() ->
         }),
         Base =
             lua_process(
-                <<"function inc(base) base.count = (base.count or 0) + 1 return base end">>,
+                <<"function compute(base) base.count = (base.count or 0) + 1 return base end">>,
                 Opts
             ),
         [ schedule_test_message(Base, <<"inc">>, #{ <<"path">> => <<"inc">> }, Opts)
@@ -848,22 +848,26 @@ error_slot_is_skipped_test_parallel() ->
     ),
     % A compute server that does not answer is a failure of this node, not an
     % error of the process, so the slot is not stored.
+    RemoteOpts = Opts#{
+        <<"delegated-compute-peer">> => <<"http://localhost:1">>,
+        <<"process-compute-on-schedule">> => false
+    },
     Delegated =
         hb_message:commit(
             hb_maps:merge(
-                hb_message:uncommitted(base_process(Opts), Opts),
+                hb_message:uncommitted(base_process(RemoteOpts), RemoteOpts),
                 #{ <<"execution-device">> => <<"delegated-compute@1.0">> },
-                Opts
+                RemoteOpts
             ),
-            Opts
+            RemoteOpts
         ),
-    schedule_test_message(Delegated, <<"one">>, Opts),
+    schedule_test_message(Delegated, <<"one">>, RemoteOpts),
     ?assertMatch(
         {failure, _},
         hb_ao:resolve(
             Delegated,
             #{ <<"path">> => <<"compute">>, <<"slot">> => 0 },
-            Opts#{ <<"delegated-compute-peer">> => <<"http://localhost:1">> }
+            RemoteOpts
         )
     ).
 

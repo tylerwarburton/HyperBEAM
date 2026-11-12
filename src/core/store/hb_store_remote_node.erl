@@ -42,7 +42,8 @@ remote_read(Opts = #{ <<"node">> := Node }, Key) ->
             true -> <<"/~cache@1.0/read=", (hb_util:human_id(Key))/binary>>;
             false -> <<"/~cache@1.0/read">>
         end,
-    Request = #{ <<"path">> => Path, <<"read">> => Key },
+    Request = #{ <<"path">> => Path, <<"read">> => Key,
+        <<"local-only">> => hb_maps:get(<<"local-only">>, Opts, false, Opts) },
     HTTPOpts = Opts#{ <<"http-only-result">> => true },
     HTTPRes =
         case Node of

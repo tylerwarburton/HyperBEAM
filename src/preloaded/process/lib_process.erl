@@ -58,7 +58,7 @@ shared_process_id(Process, Spec, Opts) ->
 %% and is verified again.
 verified_id(Process, Spec, Opts) ->
     Signers = hb_message:signers(Process, Opts),
-    case {hb_message:verify(Process, all, Opts), Signers} of
+    case {verified_definition_tree(Process, Opts), Signers} of
         {false, _} ->
             ?event({process_not_verified, {process, Process}}),
             throw({process_not_verified, Process});
@@ -68,6 +68,23 @@ verified_id(Process, Spec, Opts) ->
         {true, _} ->
             hb_message:id(Process, Spec, Opts)
     end.
+
+%% @doc A parent signature may bind a child's signed ID rather than its bytes.
+%% Materialized children must therefore verify independently before their code
+%% or authority values are used as part of a process definition.
+verified_definition_tree(Message, Opts) when is_map(Message) ->
+    Own = case hb_maps:get(<<"commitments">>, Message, #{}, Opts) of
+        Commitments when is_map(Commitments) ->
+            map_size(Commitments) =:= 0 orelse hb_message:verify(Message, all, Opts);
+        _ -> false
+    end,
+    Own andalso lists:all(fun({Key, Value}) ->
+        Key =:= <<"commitments">> orelse hb_private:is_private(Key)
+            orelse verified_definition_tree(Value, Opts)
+    end, maps:to_list(Message));
+verified_definition_tree(Values, Opts) when is_list(Values) ->
+    lists:all(fun(Value) -> verified_definition_tree(Value, Opts) end, Values);
+verified_definition_tree(_Value, _Opts) -> true.
 
 -define(PROCESS_IDS, lib_process_verified_ids).
 -define(PROCESS_IDS_MAX, 10000).
