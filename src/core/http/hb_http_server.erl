@@ -129,6 +129,9 @@
 -define(DEFAULT_ERROR_DETAILS_MAX_SIZE, 32*1024).
 %% At most this many media ranges in `accept' are considered.
 -define(MAX_ACCEPT_RANGES, 100).
+%% The default bound on writes in flight, per scheduler (PARALITH.md, "Write
+%% admission").
+-define(WRITES_IN_FLIGHT_PER_CORE, 8).
 
 %%% HTTP server start and management functions.
 
@@ -341,6 +344,46 @@ print_greeter(Config, PrivWallet) ->
         ]
     ).
 
+%% @doc A node with a durable delivery store delivers the outbox of every
+%% process it schedules itself, and answers a push with receipts
+%% (`lib_process_delivery'). It says so at `/~meta@1.0/info/outbox-delivery',
+%% which clients read to decide whether a push is a delivery or a wait.
+%% The test is `lib_process_cache:delivery_store/1''s: a writable LMDB store.
+advertise_delivery(NodeMsg) ->
+    Stores =
+        case hb_opts:get(<<"store">>, [], NodeMsg) of
+            M when is_map(M) -> [M];
+            L when is_list(L) -> L;
+            _ -> []
+        end,
+    Durable =
+        [ S || S = #{ <<"store-module">> := hb_store_lmdb } <- hb_store:normalize_stores(Stores),
+               not is_map_key(<<"access">>, S),
+               maps:get(<<"read-only">>, S, false) =/= true ],
+    case Durable of
+        [] -> NodeMsg;
+        _ -> NodeMsg#{ <<"outbox-delivery">> => <<"durable">> }
+    end.
+
+%% @doc Once the node is up, start a deliverer for every process it schedules
+%% that is owed an outbox delivery from before the restart
+%% (`process@1.0/deliveries'). It runs in the background and never fails the
+%% start.
+start_delivery_sweep(NodeMsg) ->
+    spawn(fun() ->
+        timer:sleep(1000),
+        try
+            hb_ao:raw(
+                <<"process@1.0">>,
+                #{},
+                #{ <<"path">> => <<"deliveries">> },
+                NodeMsg#{ <<"process-delivery-sweep">> => true }
+            )
+        catch Class:Reason ->
+            ?event(warning, {delivery_sweep_failed, {class, Class}, {reason, Reason}})
+        end
+    end).
+
 %% @doc Trigger the creation of a new HTTP server node. Accepts a `NodeMsg'
 %% message, which is used to configure the server. This function executed the
 %% `start' hook on the node, giving it the opportunity to modify the `NodeMsg'
@@ -355,7 +398,19 @@ new_server(RawNodeMsg) ->
     HookMsg = #{ <<"body">> => RawNodeMsgWithDefaults },
     NodeMsg =
         case hb_hook:on(<<"start">>, HookMsg, RawNodeMsgWithDefaults) of
-            {ok, #{ <<"body">> := NodeMsgAfterHook }} -> NodeMsgAfterHook;
+            {ok, #{ <<"body">> := NodeMsgAfterHook }} ->
+                % With an `irreplaceable-store', start it, make it the
+                % scheduler's store and add it (read-only) to the node's
+                % store list. Unchanged otherwise.
+                % Then start store retention, if it is on.
+                % Store modules as atoms, whatever the config format gave.
+                NodeMsgIrr =
+                    advertise_delivery(
+                        hb_store_irreplaceable:node_message(
+                            hb_store:normalize_opts(NodeMsgAfterHook))),
+                _ = hb_store_retention:maybe_start(NodeMsgIrr),
+                _ = start_delivery_sweep(NodeMsgIrr),
+                NodeMsgIrr;
             Unexpected ->
                 ?event(http,
                     {failed_to_start_server,
@@ -390,6 +445,7 @@ new_server(RawNodeMsg) ->
     % Put server ID into node message so it's possible to update current server
     % params.
     NodeMsgWithID = hb_maps:put(<<"http-server">>, ServerID, NodeMsg),
+    hb_phase_timer:configure(NodeMsg),
     ProtoOpts = listener_protocol_options(ServerID, NodeMsgWithID),
     PrometheusOpts =
         case hb_opts:get(prometheus, not hb_features:test(), NodeMsg) of
@@ -425,6 +481,7 @@ new_server(RawNodeMsg) ->
         #{ <<"port">> := _ } -> stop_tls(ServerID), [];
         _ -> prepare_tls(TLS, Wallet, ServerID, NodeMsg)
     end,
+    admission_start(ServerID, NodeMsg),
     {Port, Listener} = try
         case case {Protocol, TLSOpts} of
                 {http3, []} -> start_http3(ServerID, PrometheusOpts, NodeMsg);
@@ -691,8 +748,11 @@ init(Req, {ServerID, MaxBody}) ->
         {<<"OPTIONS">>, {tls_http_01, _}} ->
             request_body(Req, ServerID, MaxBody);
         {<<"OPTIONS">>, _} -> cors_reply(Req, ServerID);
-        _ ->
-            request_body(Req, ServerID, MaxBody)
+        {Method, _} ->
+            case admit(Method, ServerID) of
+                ok -> request_body(Req, ServerID, MaxBody);
+                full -> overloaded_reply(Req)
+            end
     end.
 
 %% @doc Read and handle a request body within the node's limits.
@@ -736,6 +796,81 @@ read_body(Req0, Max, Size, Fragments, Acc) ->
                 false -> {too_large, Req}
             end
     end.
+
+%%% Write admission.
+%%%
+%%% A node accepts at most `max-writes-in-flight' writes at once. A write is a
+%%% request whose method is not safe (RFC 9110: anything but `GET', `HEAD' and
+%%% `OPTIONS'), which is every request that can schedule a message. A write
+%%% that arrives while the bound is full is answered at once with a 503, a
+%%% `retry-after' and `hb-admission: busy', before its body is read, verified
+%%% or stored, so it was
+%%% never accepted and the client may send it again. Reads are never refused.
+%%%
+%%% Past its capacity a node that accepts every write spends its cores on
+%%% verifying, signing and storing writes that then time out, and its confirmed
+%%% throughput falls instead of levelling off (PARALITH.md, "Write admission").
+%%% A write is in flight while its request process lives: a watcher releases
+%%% its place when that process exits, however it exits.
+
+%% @doc Create the server's write counter and record its bound. The bound is
+%% read once, when the server starts.
+admission_start(ServerID, NodeMsg) ->
+    Limit =
+        hb_util:int(
+            hb_opts:get(
+                max_writes_in_flight,
+                ?WRITES_IN_FLIGHT_PER_CORE * erlang:system_info(schedulers_online),
+                NodeMsg
+            )
+        ),
+    persistent_term:put(
+        {?MODULE, admission, ServerID},
+        {atomics:new(1, []), Limit}
+    ).
+
+%% @doc Take a place for a write, or return `full'. Reads always pass.
+admit(<<"GET">>, _ServerID) -> ok;
+admit(<<"HEAD">>, _ServerID) -> ok;
+admit(_Method, ServerID) ->
+    case persistent_term:get({?MODULE, admission, ServerID}, undefined) of
+        undefined -> ok;
+        {Counter, Limit} ->
+            case atomics:add_get(Counter, 1, 1) > Limit of
+                true ->
+                    atomics:sub(Counter, 1, 1),
+                    full;
+                false ->
+                    Self = self(),
+                    spawn(
+                        fun() ->
+                            Ref = erlang:monitor(process, Self),
+                            receive {'DOWN', Ref, process, _, _} ->
+                                atomics:sub(Counter, 1, 1)
+                            end
+                        end
+                    ),
+                    ok
+            end
+    end.
+
+%% @doc The reply to a write that the node did not accept.
+overloaded_reply(Req) ->
+    Req2 = cowboy_req:reply(
+        503,
+        #{
+            <<"retry-after">> => <<"1">>,
+            % A proxy's 503 says nothing about acceptance; this one does.
+            <<"hb-admission">> => <<"busy">>,
+            <<"content-type">> => <<"text/plain">>,
+            <<"access-control-allow-origin">> => <<"*">>,
+            <<"access-control-expose-headers">> =>
+                <<"retry-after, hb-admission">>
+        },
+        <<"Node is at its write limit; the message was not accepted.">>,
+        Req
+    ),
+    {ok, Req2, no_state}.
 
 %% @doc Reply to CORS preflight requests.
 cors_reply(Req, _ServerID) ->
@@ -844,20 +979,21 @@ resolve_request(Path, Singleton, NodeMsg) ->
                     }
                 }},
         % Resolve the request message without the node's key material, and
-        % with `http_extra_opts' overriding the node defaults.
+        % with `http_extra_opts' overriding the node defaults. A client's
+        % `cache-control' may not make the node store a result.
         HTTPOpts =
-            maps:without(
+            (maps:without(
                 ?NODE_KEY_OPTS,
                 hb_maps:merge(
                     get_opts(NodeMsg),
                     hb_opts:get(http_extra_opts, #{}, NodeMsg),
                     NodeMsg
                 )
-            ),
+            ))#{ <<"request-cache-store">> => false },
         {ErlStatus, Res} =
             hb_ao:resolve_many(
                 PreProcessedMsgs,
-                HTTPOpts#{ <<"force-message">> => true }
+                (read_opts(Request, HTTPOpts))#{ <<"force-message">> => true }
             ),
         % The result keeps its Erlang status unless the `response' hook returns
         % an error.
@@ -870,6 +1006,24 @@ resolve_request(Path, Singleton, NodeMsg) ->
                     get_opts(NodeMsg)
                 )},
         {Request, {ErlStatus, Body}}
+    end.
+
+%% @doc The options a request resolves under. A hashpath has two consumers:
+%% the node's signature on a reply (`force-signed', or the request's
+%% `accept-signature', `accept_signature/2') and result caching. A GET whose
+%% reply is not signed uses neither, and computing it commits each stage's
+%% whole base with httpsig: for `/<pid>~process@1.0/now/<key>' that is the
+%% entire process state, for one key. Measured on the prod node 2026-11-04
+%% from inside it: 3.38M reductions (1.9 s) per vault read with a hashpath,
+%% 0.32M (0.17 s) without; a game shard 2.24M against 0.15M. The swarm's
+%% ~170 reads/s alone held all 15 cores and cut the shards from ~12 to ~3
+%% slots/s.
+read_opts(Request, Opts) ->
+    IsGet = hb_maps:get(<<"method">>, Request, <<"GET">>, Opts) == <<"GET">>,
+    Signed = hb_opts:get(force_signed, false, accept_signature(Request, Opts)),
+    case IsGet andalso Signed =/= true of
+        true -> Opts#{ <<"hashpath">> => ignore };
+        false -> Opts
     end.
 
 %% @doc Execute a hook from the node message upon the user's request, and
@@ -1078,7 +1232,9 @@ set_default_opts(Opts) ->
         <<"priv-wallet">> => Wallet,
         <<"address">> => hb_util:human_id(ar_wallet:to_address(Wallet)),
         <<"committer">> => hb_opts:committer(#{ <<"priv-wallet">> => Wallet }),
-        <<"force-signed">> => true
+        % Sign the hashpath of every reply unless the node is configured not
+        % to: each one is an RSA signature.
+        <<"force-signed">> => hb_opts:get(force_signed, true, TempOpts)
     }.
 
 %% @doc Test that we can start the server, send a message, and get a response.
@@ -2629,6 +2785,56 @@ cors_get_test() ->
         proplists:get_value(<<"content-length">>, Headers)
     ).
 
+%% @doc A write past the bound is refused with a 503 and a `retry-after',
+%% before it is parsed; a read is served.
+write_admission_refuses_writes_test() ->
+    Opts = isolated_test_opts(),
+    URL = start_node(Opts#{ <<"max-writes-in-flight">> => 0 }),
+    Raw =
+        fun(Method) ->
+            hb_http_client:request(
+                #{
+                    peer => URL,
+                    path => <<"/~meta@1.0/info">>,
+                    method => Method,
+                    headers => #{},
+                    body => <<"not a message">>
+                },
+                Opts
+            )
+        end,
+    {ok, 503, Headers, _} = Raw(<<"POST">>),
+    ?assertEqual(<<"1">>, proplists:get_value(<<"retry-after">>, Headers)),
+    ?assertEqual(<<"busy">>, proplists:get_value(<<"hb-admission">>, Headers)),
+    ?assertMatch({ok, 200, _, _}, Raw(<<"GET">>)).
+
+%% @doc A write holds its place while its request process lives, and gives it
+%% back when the process exits, even when it is killed.
+write_admission_releases_test() ->
+    ServerID = {?MODULE, write_admission_releases_test},
+    admission_start(ServerID, #{ <<"max-writes-in-flight">> => 1 }),
+    Parent = self(),
+    Holder =
+        spawn(fun() ->
+            Parent ! {admitted, admit(<<"POST">>, ServerID)},
+            receive never -> ok end
+        end),
+    receive {admitted, First} -> ?assertEqual(ok, First) end,
+    ?assertEqual(full, admit(<<"POST">>, ServerID)),
+    ?assertEqual(ok, admit(<<"GET">>, ServerID)),
+    exit(Holder, kill),
+    Wait =
+        fun Wait(0) -> timeout;
+            Wait(N) ->
+                Self = self(),
+                Pid = spawn(fun() -> Self ! {try_admit, admit(<<"POST">>, ServerID)} end),
+                receive {try_admit, ok} -> _ = Pid, ok;
+                        {try_admit, full} -> timer:sleep(10), Wait(N - 1)
+                end
+        end,
+    ?assertEqual(ok, Wait(100)),
+    persistent_term:erase({?MODULE, admission, ServerID}).
+
 index_test() ->
     NodeURL = start_node(),
     % The index page is the body of the HTTP reply, not a key of its message.
@@ -2765,3 +2971,24 @@ signed_request_query_riders_test() ->
             Opts
         )
     ).
+
+force_signed_follows_config_test() ->
+    Store = [hb_test_utils:test_store()],
+    Wallet = ar_wallet:new(),
+    Base = #{ <<"store">> => Store, <<"priv-wallet">> => Wallet },
+    ?assertEqual(true,
+        hb_maps:get(<<"force-signed">>, set_default_opts(Base), unset, #{})),
+    ?assertEqual(false,
+        hb_maps:get(<<"force-signed">>,
+            set_default_opts(Base#{ <<"force-signed">> => false }), unset, #{})).
+
+%% @doc An unsigned GET resolves without a hashpath; a POST, or a GET whose
+%% reply is signed (by config or `accept-signature'), keeps it.
+read_opts_test() ->
+    Opts = #{ <<"force-signed">> => false },
+    ?assertEqual(ignore,
+        maps:get(<<"hashpath">>, read_opts(#{ <<"method">> => <<"GET">> }, Opts))),
+    ?assertNot(maps:is_key(<<"hashpath">>,
+        read_opts(#{ <<"method">> => <<"POST">> }, Opts))),
+    ?assertNot(maps:is_key(<<"hashpath">>,
+        read_opts(#{ <<"method">> => <<"GET">> }, Opts#{ <<"force-signed">> => true }))).
