@@ -23,17 +23,17 @@
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
-%% @doc List computed outbox coordinates without a cached delivery assignment.
-%% An optional `process' restricts the query to one source. Reading this index
-%% neither computes nor delivers messages. Each entry can be sent to `schedule',
-%% or its source slot can be drained with `push'.
+%% @doc List the outbox entries this node has computed and not delivered: the
+%% deliverer's own `o' rows without an `x' receipt (`lib_process_delivery').
+%% An optional `process' restricts the query to one source. Reading it
+%% neither computes nor delivers messages. Each entry can be sent to
+%% `schedule', or its source slot can be drained with `push'.
 pending(_Base, Req, Opts) ->
-    IndexOpts = lib_process:scoped_opts(Opts),
-    Root = <<"~push@1.0/outbox">>,
-    Processes =
+    Pending =
         case hb_maps:get(<<"process">>, Req, undefined, Opts) of
-            undefined -> lists:sort(hb_cache:list(Root, IndexOpts));
-            ProcessID -> [ProcessID]
+            undefined -> lists:sort(lib_process_delivery:pending(Opts));
+            ProcessID ->
+                [{ProcessID, lib_process_delivery:pending(ProcessID, Opts)}]
         end,
     Entries = [
         #{
@@ -41,16 +41,13 @@ pending(_Base, Req, Opts) ->
             <<"slot">> => Slot,
             <<"outbox-key">> => Key
         }
-    || ProcessID <- Processes,
-        Path <- [[Root, hb_escape:encode_path_component(ProcessID)]],
-        Slot <- lists:sort(hb_cache:list_numbered(Path, IndexOpts)),
-        Keys <- [hb_cache:list(Path ++ [hb_util:bin(Slot)], IndexOpts)],
+    || {ProcessID, Slots} <- Pending,
+        Slot <- Slots,
         Key <-
             lists:sort(
                 fun(A, B) -> pending_order(A) =< pending_order(B) end,
-                [hb_escape:decode_path_component(K) || K <- Keys]
-            ),
-        pending_assignment(ProcessID, Slot, Key, Opts)
+                lib_process_delivery:pending_keys(ProcessID, Slot, Opts)
+            )
     ],
     {ok, #{
         <<"count">> => length(Entries),
@@ -58,23 +55,10 @@ pending(_Base, Req, Opts) ->
         <<"cache-control">> => <<"no-store">>
     }}.
 
-%% @doc Inspect durable receipts without waiting for delivery or computing.
-pending_assignment(ProcessID, Slot, Key, Opts) ->
-    case lib_process_cache:delivery_store(Opts) of
-        none -> true;
-        Store ->
-            ReceiptKey = lib_process_cache:blob_key(ProcessID, <<"x">>, Slot),
-            case lib_process_cache:blob_get(Store, ReceiptKey, Opts) of
-                {ok, Bin} ->
-                    not maps:is_key(Key, lib_process_cache:blob_decode(Bin));
-                not_found -> true
-            end
-    end.
-
 pending_order(Key) ->
     try {0, binary_to_integer(Key)} catch error:badarg -> {1, Key} end.
 
-%% @doc Drain indexed slots through the same durable delivery reader.
+%% @doc Drain pending slots through the same durable delivery reader.
 read_all(Process, Req, Opts) ->
     ID = lib_process:process_id(Process, #{}, Opts),
     {ok, Pending} = pending(Process, #{<<"process">> => ID}, Opts),
@@ -336,6 +320,40 @@ apply_security(Msg, Target, Codec, Opts) ->
 normalize_message(Msg, Opts) -> lib_process_delivery:normalize_message(Msg, Opts).
 
 %%% Tests
+
+%% @doc `pending' lists the targeted entries of the deliverer's own `o' rows
+%% that have no `x' receipt, and storing a slot writes no other index.
+pending_reads_delivery_rows_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb),
+    Opts = #{
+        <<"store">> => Store,
+        <<"process-state-blobs">> => true,
+        <<"priv-wallet">> => ar_wallet:new()
+    },
+    Proc = hb_message:commit(#{ <<"type">> => <<"Process">>,
+        <<"scheduler-location">> => hb_opts:address(Opts),
+        <<"nonce">> => hb_util:human_id(crypto:strong_rand_bytes(32)) }, Opts),
+    {ok, _} = hb_cache:write(Proc, Opts),
+    ProcID = hb_util:human_id(hb_message:id(Proc, all, Opts)),
+    Outbox = #{
+        <<"2">> => #{ <<"target">> => ProcID, <<"data">> => <<"b">> },
+        <<"1">> => #{ <<"target">> => ProcID, <<"data">> => <<"a">> },
+        <<"3">> => #{ <<"data">> => <<"no target">> }
+    },
+    [ {ok, _} = lib_process_cache:write(ProcID, Slot,
+        #{ <<"at-slot">> => Slot, <<"results">> => #{ <<"outbox">> => Outbox } }, Opts)
+    || Slot <- [0, 1] ],
+    ok = lib_process_cache:blob_put(Store, lib_process_cache:blob_key(ProcID, <<"x">>, 1),
+        lib_process_cache:blob_encode(#{}), Opts),
+    Entries = fun(Req) ->
+        {ok, Res} = pending(#{}, Req, Opts),
+        [ {hb_maps:get(<<"slot">>, E, Opts), hb_maps:get(<<"outbox-key">>, E, Opts)}
+        || E <- hb_util:message_to_ordered_list(hb_maps:get(<<"entries">>, Res, Opts), Opts),
+           hb_maps:get(<<"process">>, E, Opts) =:= ProcID ]
+    end,
+    ?assertEqual([{0, <<"1">>}, {0, <<"2">>}], Entries(#{ <<"process">> => ProcID })),
+    ?assertEqual([{0, <<"1">>}, {0, <<"2">>}], Entries(#{})),
+    ?assertEqual([], hb_cache:list(<<"~push@1.0/outbox">>, Opts)).
 
 %% @doc A target that failed to resolve is skipped until its entry expires.
 missing_target_memory_test() ->

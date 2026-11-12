@@ -63,7 +63,8 @@
 %%% rows when a step needs them. If anything in it fails, it starts again from
 %%% the rows, backing off.
 -module(lib_process_delivery).
--export([notify/3, ensure/2, await_delivered/3, sweep/1, pending/2]).
+-export([notify/3, ensure/2, await_delivered/3, sweep/1]).
+-export([pending/1, pending/2, pending_keys/3]).
 -export([delivers/2, delivers/3, metrics/0]).
 -export([read_target/2, recently_missing/2, remember_missing/2]).
 -export([augment_message/3, apply_security/4, normalize_message/2]).
@@ -240,21 +241,24 @@ await_delivered(ProcID, Slot, Ref, Store, Opts) ->
 %% @doc Start a deliverer for every process with an outbox this node has not
 %% delivered. Run once at boot: a slot stored before a restart is still owed.
 sweep(Opts) ->
+    length([ ok || {P, _} <- pending(Opts), element(1, ensure(P, Opts)) == ok ]).
+
+%% @doc Every process with an outbox this node has not delivered, with those
+%% slots: `[{ProcID, Slots}]'.
+pending(Opts) ->
     case store(Opts) of
-        none -> 0;
+        none -> [];
         Store ->
             Procs =
                 case hb_store:list([Store], <<"pstate">>, Opts) of
                     {ok, Names} -> Names;
                     _ -> []
                 end,
-            length(
-                [ ok
-                || P <- Procs,
-                   ?IS_ID(P),
-                   pending_slots(P, Store, Opts) =/= [],
-                   element(1, ensure(P, Opts)) == ok ]
-            )
+            [ {P, Slots}
+            || P <- Procs,
+               ?IS_ID(P),
+               Slots <- [pending_slots(P, Store, Opts)],
+               Slots =/= [] ]
     end.
 
 %% @doc The slots of `ProcID' with an outbox that is not delivered yet.
@@ -262,6 +266,22 @@ pending(ProcID, Opts) ->
     case store(Opts) of
         none -> [];
         Store -> pending_slots(ProcID, Store, Opts)
+    end.
+
+%% @doc The keys of a slot's undelivered outbox that name a target.
+pending_keys(ProcID, Slot, Opts) ->
+    case store(Opts) of
+        none -> [];
+        Store ->
+            case {receipts(ProcID, Slot, Store, Opts),
+                    get_row(ProcID, <<"o">>, Slot, Store, Opts)} of
+                {not_found, {ok, Row}} ->
+                    [ Key
+                    || {Key, Entry} <-
+                           maps:to_list(lib_process_cache:outbox_entries(Row, Opts)),
+                       entry_target(Entry) =/= undefined ];
+                _ -> []
+            end
     end.
 
 %% @doc The node's delivery backlog, for the metrics endpoint: every

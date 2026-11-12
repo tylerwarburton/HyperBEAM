@@ -46,7 +46,6 @@ write(ProcID, Slot, Msg, RawOpts) ->
     % slot the process worker will not compute again still has what it owes
     % its targets (`lib_process_delivery').
     _ = put_outbox(ProcID, Slot, Msg, Opts),
-    index_outbox(ProcID, Slot, Msg, Opts),
     Result =
         case {delta(Msg, Opts), blob_store(Opts)} of
             {{ok, Patches, Results}, Store} when Store =/= none, is_integer(Slot),
@@ -91,45 +90,6 @@ write_full(ProcID, Slot, Msg, Opts) ->
     ok = refresh(ProcID, Slot, Opts),
     % Return the slot number path.
     {ok, SlotNumPath}.
-
-%% @doc Record discoverable coordinates before publishing the computed slot.
-%% These empty markers are separate from cached delivery assignments, so a
-%% repeated compute cannot overwrite a receipt with a pending marker.
-index_outbox(ProcID, Slot, Msg, Opts) ->
-    Entries =
-        maps:from_list(
-            [
-                {
-                    hb_path:to_binary(
-                        [
-                            <<"~push@1.0/outbox">>,
-                            hb_util:human_id(ProcID),
-                            hb_util:bin(Slot),
-                            hb_escape:encode_path_component(Key)
-                        ]
-                    ),
-                    <<>>
-                }
-            || Results <- [hb_maps:get(<<"results">>, Msg, #{}, Opts)],
-                is_map(Results),
-                Outbox <-
-                    [
-                        hb_ao:normalize_keys(
-                            hb_private:reset(
-                                hb_maps:get(<<"outbox">>, Results, #{}, Opts)
-                            )
-                        )
-                    ],
-                is_map(Outbox),
-                {Key, Message} <- hb_maps:to_list(Outbox, Opts),
-                #{ <<"target">> := _ } <-
-                    [hb_cache:ensure_loaded(Message, Opts)]
-            ]
-        ),
-    case map_size(Entries) of
-        0 -> ok;
-        _ -> ok = hb_store:write(hb_opts:get(store, [], Opts), Entries, Opts)
-    end.
 
 %% @doc Mark the process as refreshed at the current clock time. The marker
 %% is the head: every slot at or below it that is not stored is refused with
@@ -1208,51 +1168,9 @@ process_cache_suite_test_() ->
                 fun(Store) ->
                     freshness_max_age(#{ <<"store">> => [Store] })
                 end
-            },
-            {
-                "index addressed outbox entries when storing results",
-                fun(Store) ->
-                    outbox_index(#{ <<"store">> => [Store] })
-                end
             }
         ],
         hb_store:test_stores()
-    ).
-
-%% @doc Index linked outboxes, ignore non-message results and targetless
-%% entries, and keep coordinates stable when the same slot is stored again.
-outbox_index(Opts) ->
-    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
-    {ok, OutboxID} =
-        hb_cache:write(
-            #{
-                <<"1">> => #{ <<"target">> => ProcID },
-                <<"2">> => #{ <<"body">> => <<"no target">> },
-                <<"3">> => <<"not a message">>
-            },
-            Opts
-        ),
-    State = #{ <<"results">> => #{ <<"outbox">> => {link, OutboxID, #{}} } },
-    {ok, _} = write(ProcID, 0, State, Opts),
-    {ok, _} = write(ProcID, 0, State, Opts),
-    {ok, _} = write(ProcID, 1, #{ <<"results">> => <<"data">> }, Opts),
-    {ok, _} =
-        write(
-            ProcID,
-            2,
-            #{ <<"results">> => #{ <<"outbox">> => <<"data">> } },
-            Opts
-        ),
-    Root = [<<"~push@1.0/outbox">>, ProcID],
-    ?assertEqual([<<"0">>], hb_cache:list(Root, Opts)),
-    ?assertEqual([<<"1">>], hb_cache:list(Root ++ [<<"0">>], Opts)),
-    ?assertEqual(
-        {ok, <<>>},
-        hb_store:read(
-            hb_opts:get(store, [], Opts),
-            Root ++ [<<"0">>, <<"1">>],
-            Opts
-        )
     ).
 
 %% @doc Test for writing multiple computed outputs, then getting them by
