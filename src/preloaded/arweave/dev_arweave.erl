@@ -21,6 +21,7 @@
 -export([post_tx_header/2, post_tx/3, post_tx/4, post_chunk/2]).
 %%% Helper functions
 -export([get_chunk/2]).
+-export([block_message/2]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -1147,6 +1148,22 @@ block_proofs(Block, Req, Opts) ->
                 [<<"poa">>, <<"poa2">>], hb_message:uncommitted(Block, Opts), Opts)
     end.
 
+%% @doc A block's JSON as the message this device returns for it.
+block_message(Body, Opts) ->
+    block_keys(
+        hb_message:convert(
+            Body,
+            <<"structured@1.0">>,
+            % `convert/4' asks the source codec to produce TABM first; put
+            % `bundle' on json@1.0 so that step does not linkify block fields.
+            #{
+                <<"device">> => <<"json@1.0">>,
+                <<"bundle">> => true
+            },
+            Opts
+        )
+    ).
+
 %% @doc Name the fields of a block as message keys: `-' in place of `_', as in
 %% `indep-hash', in the block and in the messages nested in it, and
 %% `block-signature' and `block-nonce' for the block's `signature' and `nonce'.
@@ -1407,19 +1424,7 @@ to_message(Path = <<"/raw/", _/binary>>, <<"GET">>, {ok, Response}, LogExtra, _R
     {ok, hb_maps:get(<<"body">>, Response, <<>>, Opts)};
 to_message(Path = <<"/block/", Ref/binary>>, <<"GET">>, {ok, #{ <<"body">> := Body }}, LogExtra, Req, Opts) ->
     event_request(Path, <<"GET">>, 200, LogExtra),
-    Decoded =
-        hb_message:convert(
-            Body,
-            <<"structured@1.0">>,
-            % `convert/4' asks the source codec to produce TABM first; put
-            % `bundle' on json@1.0 so that step does not linkify block fields.
-            #{
-                <<"device">> => <<"json@1.0">>,
-                <<"bundle">> => true
-            },
-            Opts
-        ),
-    Block = block_proofs(block_keys(Decoded), Req, Opts),
+    Block = block_proofs(block_message(Body, Opts), Req, Opts),
     maybe
         true ?= requested_block(Ref, Block, Opts),
         CacheRes =

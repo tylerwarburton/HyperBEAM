@@ -25,6 +25,7 @@ rebar3.crashdump
 *.json
 !test/metadata/signed-process.json
 !test/metadata/signed-process-header-authority.json
+!test/arweave-blocks/*.json
 !.vscode/*
 
 *.bin

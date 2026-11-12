@@ -362,11 +362,47 @@ arweave_assignment(A, Pusd, Slot, Opts) when is_map(A) ->
             andalso hb_util:int(Get(<<"block-height">>)) >= 0
             andalso hb_util:int(Get(<<"block-index">>)) >= 0
             andalso hb_util:int(Get(<<"timestamp">>)) >= 0
-            andalso is_binary(Hash) andalso byte_size(Hash) =:= 64,
+            andalso is_binary(Hash) andalso byte_size(Hash) =:= 64
+            andalso validated_block(hb_util:int(Get(<<"block-height">>)), Hash, Opts),
         case Valid of true -> A; false -> false end
     catch _:_ -> false
     end;
 arweave_assignment(_, _, _, _) -> false.
+
+%% The block an Arweave assignment names is the block this node's own sync
+%% verified at that height (dev_arweave_scheduler_sync: recomputed
+%% indep_hash and tx_root, confirmed by its descendants).
+validated_block(Height, Hash, Opts) ->
+    case dev_arweave_scheduler_cache:read_block(Height, Opts) of
+        {ok, Block} ->
+            hb_util:encode(hb_util:decode(
+                hb_maps:get(<<"indep-hash">>, Block, <<>>, Opts))) =:= Hash;
+        _ -> false
+    end.
+
+arweave_assignment_names_a_validated_block_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"replica-validated">>),
+    ok = hb_store:start(Store),
+    Opts = #{ <<"store">> => [Store] },
+    Pusd = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Hash = hb_util:encode(crypto:strong_rand_bytes(48)),
+    A = #{<<"process">> => Pusd, <<"slot">> => 1,
+        <<"type">> => <<"Assignment">>, <<"block-height">> => 100,
+        <<"block-index">> => 0, <<"timestamp">> => 1700000000,
+        <<"block-hash">> => Hash},
+    try
+        % No block this node verified at that height.
+        ?assertEqual(false, arweave_assignment(A, Pusd, 1, Opts)),
+        {ok, _} = dev_arweave_scheduler_cache:write_block(100,
+            #{ <<"height">> => 100, <<"indep-hash">> => Hash }, Opts),
+        ?assertEqual(A, arweave_assignment(A, Pusd, 1, Opts)),
+        % A block hash this node did not verify at that height.
+        ?assertEqual(false, arweave_assignment(
+            A#{ <<"block-hash">> => hb_util:encode(crypto:strong_rand_bytes(48)) },
+            Pusd, 1, Opts))
+    after
+        hb_store:stop(Store)
+    end.
 
 peer_arweave_metadata_is_not_authority_test() ->
     Pusd = hb_util:human_id(crypto:strong_rand_bytes(32)),
@@ -380,16 +416,24 @@ peer_arweave_metadata_is_not_authority_test() ->
 %% A slot that crashes a check is refused with the same scrubbed text as a
 %% failed pass: the public status never shows a call's arguments.
 replica_failure_is_scrubbed_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"replica-scrubbed">>),
+    ok = hb_store:start(Store),
     Pusd = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Secret = <<"https://rpc.example/v2/KEY">>,
+    Opts = #{<<"store">> => [Store], <<"rpc">> => Secret},
+    Hash = hb_util:encode(crypto:strong_rand_bytes(48)),
+    {ok, _} = dev_arweave_scheduler_cache:write_block(100,
+        #{<<"height">> => 100, <<"indep-hash">> => Hash}, Opts),
+    % A verified block, and an assignment with no message to load.
     A = #{<<"process">> => Pusd, <<"slot">> => 1,
         <<"type">> => <<"Assignment">>, <<"block-height">> => 100,
         <<"block-index">> => 0, <<"timestamp">> => 1700000000,
-        <<"block-hash">> => crypto:strong_rand_bytes(64)},
+        <<"block-hash">> => Hash},
     {refused, Why} = step({canonical_arweave, A}, #{pusd => Pusd, slot => 0,
         chain => none, schedulers => [], http => #{},
         scheduler_device => <<"arweave-scheduler@1.0">>,
-        opts => #{<<"rpc">> => Secret}}),
+        opts => Opts}),
+    hb_store:stop(Store),
     ?assertMatch(<<"malformed assignment: ", _/binary>>, Why),
     ?assertEqual(nomatch, binary:match(Why, <<"KEY">>)).
 
