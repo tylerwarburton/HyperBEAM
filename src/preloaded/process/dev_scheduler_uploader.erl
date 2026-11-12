@@ -201,8 +201,15 @@ links(#tx{ tags = Tags }) ->
 %% @doc Every message the items link to, and those link to, that is not among
 %% them and that this node holds.
 linked(Items, Opts) ->
-    Have = [ hb_util:human_id(I#tx.id) || I <- Items ],
+    Have = lists:flatmap(fun held/1, Items),
     linked(lists:usort(lists:flatmap(fun links/1, Items)) -- Have, Have, Opts).
+
+%% @doc The IDs an item stands for: its own, and the message it carries if the
+%% node wrapped one. A process signed with `httpsig@1.0' rides in a wrapper with
+%% an ID of its own, and its assignment links to it by the message's ID: without
+%% the second, the process went up twice in every first window.
+held(I = #tx{ tags = Tags }) ->
+    [hb_util:human_id(I#tx.id) | [ ID || {<<"Message-Id">>, ID} <- Tags ]].
 linked([], _Have, _Opts) -> [];
 linked([ID | IDs], Have, Opts) ->
     case lists:member(ID, Have) of
@@ -263,7 +270,7 @@ item(Msg, Opts) ->
     end.
 
 post(Serialized, Opts) ->
-    URL = hb_util:list(hb_opts:get(bundler_ans104, no_bundler, Opts)) ++ "/tx",
+    URL = upload_url(Opts),
     case httpc:request(
             post,
             {URL, [], "application/octet-stream", Serialized},
@@ -271,10 +278,34 @@ post(Serialized, Opts) ->
             [{body_format, binary}]) of
         {ok, {{_, Status, _}, _, _}} when Status >= 200, Status < 300 -> ok;
         {ok, {{_, Status, _}, Headers, Body}} ->
-            {error, {Status, proplists:get_value("retry-after", Headers),
-                binary:part(Body, 0, min(200, byte_size(Body)))}};
+            {error,
+                {Status,
+                    {url, hb_util:bin(URL)},
+                    {bytes, byte_size(Serialized)},
+                    {headers,
+                        [ {hb_util:bin(K), hb_util:bin(V)}
+                        || {K, V} <- Headers, logged_header(K) ]},
+                    {body, binary:part(Body, 0, min(1024, byte_size(Body)))}
+                }
+            };
         Error -> Error
     end.
+
+%% @doc Where a window is posted: `scheduler-upload-url' whole, or the
+%% `bundler-ans104' node's `/tx'. A Turbo-style bundler takes items at
+%% `/v1/tx', which no `bundler-ans104' base can name.
+upload_url(Opts) ->
+    case hb_opts:get(scheduler_upload_url, not_found, Opts) of
+        not_found ->
+            hb_util:list(hb_opts:get(bundler_ans104, no_bundler, Opts)) ++ "/tx";
+        URL -> hb_util:list(URL)
+    end.
+
+%% @doc The response headers that say why a bundler refused a window.
+logged_header(Name) ->
+    Lower = string:lowercase(Name),
+    lists:member(Lower, ["retry-after", "content-type", "reason", "status"])
+        orelse lists:prefix("x-", Lower).
 
 store(Opts) ->
     hb_opts:get(scheduler_store, hb_opts:get(store, no_viable_store, Opts), Opts).
@@ -632,3 +663,37 @@ linked_test() ->
     [Item] = linked([Spawn], Opts),
     ?assertEqual(ModID, hb_util:human_id(Item#tx.id)),
     ?assertEqual([], links(Item)).
+
+%% @doc A message the window already carries in a node-signed wrapper is not
+%% brought along a second time for the link its assignment makes to it.
+linked_wrapped_test() ->
+    Opts = #{ <<"store">> => [hb_test_utils:test_store()], <<"priv-wallet">> => hb:wallet() },
+    Proc = hb_message:commit(
+        #{ <<"type">> => <<"Process">>, <<"data">> => <<"module source">> },
+        Opts#{ <<"priv-wallet">> => ar_wallet:new() }, <<"httpsig@1.0">>),
+    {ok, _} = hb_cache:write(Proc, Opts),
+    ProcID = hb_message:id(Proc, signed, Opts),
+    Wrapped = item(Proc, Opts),
+    Assignment = sign(<<>>, [{<<"body">>, <<"ao:", ProcID/binary>>}], Opts),
+    ?assertEqual([], linked([Wrapped, Assignment], Opts)).
+
+%% @doc A refusal names the bundler's reason: its status, why-headers and body.
+refusal_is_logged_whole_test_() ->
+    {timeout, 30, fun refusal_is_logged_whole/0}.
+refusal_is_logged_whole() ->
+    {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(Listen),
+    ok = gen_tcp:close(Listen),
+    Base = <<"http://localhost:", (integer_to_binary(Port))/binary>>,
+    Stub = stub_bundler(Port, [402], self()),
+    Opts = #{ <<"scheduler-upload-url">> => <<Base/binary, "/v1/tx">> },
+    {error, {402, {url, URL}, {bytes, 3}, {headers, Headers}, {body, <<>>}}} =
+        post(<<"abc">>, Opts),
+    ?assertEqual(<<Base/binary, "/v1/tx">>, URL),
+    ?assertEqual([], Headers),
+    ?assert(logged_header("x-free-tier-exhausted")),
+    ?assert(logged_header("Retry-After")),
+    ?assertNot(logged_header("date")),
+    receive {posted, 402, <<"abc">>} -> ok after 5000 -> error(no_post) end,
+    unlink(Stub),
+    exit(Stub, kill).
