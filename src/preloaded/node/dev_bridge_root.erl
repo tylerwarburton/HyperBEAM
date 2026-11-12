@@ -357,3 +357,168 @@ possession_test() ->
     Raw = binary:decode_hex(binary:part(Key, 2, 96)),
     WrongTag = hb_util:encode(blst_nif:sign(Secret, possession_bytes(AO, Raw), ?DST)),
     ?assertMatch({error, _}, Run(#{<<"ao">> => AO, <<"bls">> => Key, <<"pop">> => WrongTag})).
+
+%% The BLS12-381 base field modulus, for building test points by hand.
+-define(P, 16#1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab).
+%% Compressed identity points: the infinity flag and nothing else.
+-define(G1_INF, <<16#c0, 0:376>>).
+-define(G2_INF, <<16#c0, 0:760>>).
+
+fp(X) -> ((X rem ?P) + ?P) rem ?P.
+fp_pow(B, E) -> binary:decode_unsigned(crypto:mod_pow(fp(B), E, ?P)).
+fp_square(A) -> fp_pow(A, (?P - 1) div 2) =:= 1.
+fp_sqrt(A) -> Y = fp_pow(A, (?P + 1) div 4), true = fp(Y * Y) =:= fp(A), Y.
+fp_inv(A) -> fp_pow(A, ?P - 2).
+
+%% A compressed G1 point from affine coordinates: the sort flag is set when y
+%% is the larger of its two roots.
+g1_compress(X, Y) -> <<1:1, 0:1, (case Y > (?P - 1) div 2 of true -> 1; false -> 0 end):1, X:381>>.
+
+g1_decompress(<<1:1, 0:1, S:1, X:381>>) ->
+    Y0 = fp_sqrt(X * X * X + 4),
+    Y = case {S, Y0 > (?P - 1) div 2} of {1, true} -> Y0; {0, false} -> Y0; _ -> ?P - Y0 end,
+    {X, Y}.
+
+g1_add({X1, Y1}, {X2, Y2}) when X1 =/= X2 ->
+    L = fp((Y2 - Y1) * fp_inv(fp(X2 - X1))),
+    X3 = fp(L * L - X1 - X2),
+    {X3, fp(L * (X1 - X3) - Y1)}.
+
+g1_negate({X, Y}) -> {X, fp(-Y)}.
+
+%% A point on y^2 = x^3 + 4 outside the prime-order subgroup: the cofactor is
+%% large, so the first x with a root gives one (the test checks blst agrees).
+g1_off_subgroup() -> g1_off_subgroup(1).
+g1_off_subgroup(X) ->
+    case fp_square(X * X * X + 4) of
+        true -> g1_compress(X, fp_sqrt(X * X * X + 4));
+        false -> g1_off_subgroup(X + 1)
+    end.
+
+%% The same on G2's y^2 = x^3 + 4(1 + u) over Fp2 (u^2 = -1): an element is a
+%% square exactly when its norm is a square in Fp. x = 1 + C1 u, encoded c1
+%% then c0.
+g2_off_subgroup() -> g2_off_subgroup(1).
+g2_off_subgroup(C1) ->
+    {S0, S1} = {fp(1 - C1 * C1), fp(2 * C1)},
+    {A0, A1} = {fp(S0 - S1 * C1 + 4), fp(S0 * C1 + S1 + 4)},
+    case fp_square(A0 * A0 + A1 * A1) of
+        true -> <<1:1, 0:1, 0:1, C1:381, 1:384>>;
+        false -> g2_off_subgroup(C1 + 1)
+    end.
+
+negative_certificate_test_() ->
+    {timeout, 120, fun negative_certificate/0}.
+
+%% @doc What a forger would try against the aggregate and the possession gate:
+%% the identity, points outside the prime-order subgroups, an infinity key with
+%% the "proof" that matches it, a rogue key built to cancel a victim's, a
+%% repeated key spelled in two hex cases, endorsements for one root presented
+%% at another, and the smallest (one member) and byte-exact (eight) bitmaps.
+negative_certificate() ->
+    hb:init(),
+    Opts = #{<<"store">> => hb_test_utils:test_store()},
+    Wallet = ar_wallet:new(),
+    Author = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Operation = #{<<"action">> => <<"Transfer">>, <<"quantity">> => <<"50">>,
+        <<"attestor-epoch">> => <<"7">>, <<"root-sequence">> => <<"1">>},
+    Intent = fun(Root) ->
+        Signed = hb_message:commit(Operation#{<<"recipient">> => Root, <<"target">> => Root,
+            <<"author">> => Author, <<"certificate-version">> => <<"pusd-root/v1">>},
+            #{<<"priv-wallet">> => Wallet}, <<"ans104@1.0">>),
+        hb_message:convert(Signed, <<"ans104@1.0">>, Opts)
+    end,
+    Run = fun(R) -> hb_ao:resolve(#{<<"device">> => <<"bridge-root@1.0">>}, R, Opts) end,
+    RootA = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    RootB = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    {ItemA, ItemB} = {Intent(RootA), Intent(RootB)},
+    IdOf = fun(Item) -> hb_util:human_id(Item#tx.id) end,
+    All = [test_member(I) || I <- lists:seq(1, 8)],
+    Members = fun(N) -> [maps:get(member, T) || T <- lists:sublist(All, N)] end,
+    Req = fun(Root, Item, Committee, Endorsements) -> #{<<"path">> => <<"verify">>,
+        <<"root">> => Root, <<"epoch">> => 7, <<"intent-id">> => IdOf(Item),
+        <<"committee">> => Committee,
+        <<"operation">> => hb_json:encode(Operation#{<<"recipient">> => Root}),
+        <<"authorization">> => <<(Item#tx.owner)/binary, (Item#tx.signature)/binary>>,
+        <<"endorsements">> => Endorsements} end,
+    BytesA = signing_bytes(RootA, 7, IdOf(ItemA)),
+    Sign = fun(I, Bytes) -> blst_nif:sign(maps:get(secret, lists:nth(I + 1, All)), Bytes, ?DST) end,
+    Endorse = fun(N, Indices, Bytes) -> <<(bitmap(N, Indices))/binary,
+        (blst_nif:aggregate([Sign(I, Bytes) || I <- Indices]))/binary>> end,
+    VerifyA = fun(N, Endorsements) -> Run(Req(RootA, ItemA, Members(N), Endorsements)) end,
+    Hex = fun(K) -> <<"0x", (binary:encode_hex(K, lowercase))/binary>> end,
+    Possession = fun(AO, Key, Pop) -> Run(#{<<"path">> => <<"possession">>, <<"ao">> => AO,
+        <<"bls">> => Hex(Key), <<"pop">> => hb_util:encode(Pop)}) end,
+    [M0, M1, M2 | _] = Members(3),
+    #{member := #{<<"ao">> := AO1}} = hd(All),
+    ?assertMatch({ok, _}, VerifyA(3, Endorse(3, [0, 1], BytesA))),
+    % The identity signature: e(sum, H(m)) is never e(g1, identity).
+    ?assertMatch({error, _}, VerifyA(3, <<(bitmap(3, [0, 1]))/binary, ?G2_INF/binary>>)),
+    ?assertMatch({error, _}, VerifyA(1, <<(bitmap(1, [0]))/binary, ?G2_INF/binary>>)),
+    % A G2 point on the curve but outside the subgroup is refused as a point,
+    % and so as an aggregate.
+    OffG2 = g2_off_subgroup(),
+    ?assertEqual({error, signature_not_in_group}, blst_nif:aggregate([OffG2])),
+    ?assertMatch({error, _}, VerifyA(3, <<(bitmap(3, [0, 1]))/binary, OffG2/binary>>)),
+    % A G1 point outside the subgroup is no member key, alone or in a sum,
+    % and has no possession to prove.
+    OffG1 = g1_off_subgroup(),
+    ?assertEqual({error, public_key_not_in_group},
+        blst_nif:fast_aggregate_verify([OffG1], BytesA, Sign(0, BytesA), ?DST)),
+    ?assertMatch({error, _}, Run(Req(RootA, ItemA, [M0, M1#{<<"bls">> => Hex(OffG1)}, M2],
+        Endorse(3, [0, 1], BytesA)))),
+    ?assertMatch({error, _}, Possession(AO1, OffG1, Sign(0, BytesA))),
+    % The infinity key, with the identity as its "proof": both pairings are
+    % one, so only refusing the identity as a key stops it.
+    ?assertMatch({error, _}, Possession(AO1, ?G1_INF, ?G2_INF)),
+    ?assertMatch({error, _}, Run(Req(RootA, ItemA, [M0#{<<"bls">> => Hex(?G1_INF)}, M1, M2],
+        <<(bitmap(3, [0, 1]))/binary, ?G2_INF/binary>>))),
+    % A rogue key: pk_x = pk_rogue - pk_victim, so pk_victim + pk_x = pk_rogue
+    % and the rogue alone "endorses" as both. The sum really does verify the
+    % rogue's lone signature, which is why no key is admitted without
+    % possession; the rogue cannot prove possession of pk_x.
+    {RogueSecret, RogueKey} = blst_nif:keygen(<<"rogue", 0:216>>),
+    Victim = key_bytes(maps:get(<<"bls">>, M0)),
+    {X, Y} = g1_add(g1_decompress(RogueKey), g1_negate(g1_decompress(Victim))),
+    RogueX = g1_compress(X, Y),
+    ?assert(blst_nif:fast_aggregate_verify([Victim, RogueX], BytesA,
+        blst_nif:sign(RogueSecret, BytesA, ?DST), ?DST)),
+    RogueAO = hb_util:human_id(crypto:hash(sha256, <<"rogue">>)),
+    ?assertMatch({error, _}, Possession(RogueAO, RogueX,
+        blst_nif:sign(RogueSecret, possession_bytes(RogueAO, RogueX), ?POP_DST))),
+    ?assertMatch({error, _}, Possession(RogueAO, RogueX,
+        blst_nif:sign(RogueSecret, possession_bytes(RogueAO, RogueKey), ?POP_DST))),
+    % One key spelled in two hex cases is still one key.
+    <<"0x", M0Hex/binary>> = maps:get(<<"bls">>, M0),
+    Upper = <<"0x", (string:uppercase(M0Hex))/binary>>,
+    ?assertNotEqual(Upper, maps:get(<<"bls">>, M0)),
+    ?assertMatch({error, _}, Run(Req(RootA, ItemA, [M0, M1#{<<"bls">> => Upper}, M2],
+        Endorse(3, [0, 1], BytesA)))),
+    % Cross-root replay: a valid intent for root B, endorsed over root A's
+    % domain, endorses nothing at B; over B's own domain it does. Nor does
+    % A's certificate become B's.
+    BytesAB = signing_bytes(RootA, 7, IdOf(ItemB)),
+    BytesB = signing_bytes(RootB, 7, IdOf(ItemB)),
+    ?assertMatch({error, _}, Run(Req(RootB, ItemB, Members(3), Endorse(3, [0, 1], BytesAB)))),
+    ?assertMatch({ok, _}, Run(Req(RootB, ItemB, Members(3), Endorse(3, [0, 1], BytesB)))),
+    ?assertMatch({error, _}, Run((Req(RootA, ItemA, Members(3), Endorse(3, [0, 1], BytesA)))#{
+        <<"root">> => RootB})),
+    % n = 1: one byte, bit 0, the one member's signature; nothing else.
+    ?assertMatch({ok, #{<<"signers">> := [_]}}, VerifyA(1, Endorse(1, [0], BytesA))),
+    One = blst_nif:aggregate([Sign(0, BytesA)]),
+    ?assertMatch({error, _}, VerifyA(1, <<0, One/binary>>)),
+    ?assertMatch({error, _}, VerifyA(1, <<3, One/binary>>)),
+    ?assertMatch({error, _}, VerifyA(1, <<2, One/binary>>)),
+    ?assertMatch({error, _}, VerifyA(1, <<1, 0, One/binary>>)),
+    ?assertMatch({error, _}, VerifyA(1, One)),
+    ?assertMatch({error, _}, VerifyA(1, <<1, (Sign(1, BytesA))/binary>>)),
+    % n = 8: exactly one byte, any five signers; four name no majority, and
+    % a second byte is no bitmap.
+    ?assertMatch({ok, #{<<"signers">> := [_, _, _, _, _]}},
+        VerifyA(8, Endorse(8, lists:seq(0, 4), BytesA))),
+    ?assertMatch({ok, _}, VerifyA(8, Endorse(8, [1, 3, 5, 6, 7], BytesA))),
+    ?assertMatch({error, _}, VerifyA(8, Endorse(8, lists:seq(0, 3), BytesA))),
+    <<_:8, Agg8/binary>> = Endorse(8, lists:seq(0, 4), BytesA),
+    ?assertMatch({error, _}, VerifyA(8, <<16#1f, 0, Agg8/binary>>)),
+    ?assertMatch({error, _}, VerifyA(8, <<16#2f, Agg8/binary>>)),
+    ?assertMatch({error, _}, VerifyA(8, <<16#ff, Agg8/binary>>)).
