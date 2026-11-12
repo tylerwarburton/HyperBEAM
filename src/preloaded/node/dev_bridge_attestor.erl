@@ -545,7 +545,11 @@ root_endorse_endpoint() ->
         ?assertNot(filelib:is_dir(<<Dir/binary, "/replica">>)),
         Loop ! pass,
         % The JSON answer resolves to the proof alone: no AO-wallet certificate.
-        {ok, Endorsement} = Run(Payload),
+        % Packaged, the answer stays the JSON body; loose, it resolves to a map.
+        Endorsement = case Run(Payload) of
+            {ok, #{<<"body">> := JSON}} -> hb_json:decode(JSON);
+            {ok, Map} -> Map
+        end,
         ?assertMatch(#{<<"signature">> := _, <<"intent-id">> := _}, Endorsement),
         ?assertNot(maps:is_key(<<"certificate">>, Endorsement)),
         ?assertMatch({error, _}, Run(Payload#{<<"quantity">> => <<"101">>})),
