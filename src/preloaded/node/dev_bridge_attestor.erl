@@ -61,7 +61,7 @@
 %%%   fast-ledgers => #{ LedgerProcess => #{ node => SchedulerURL } },
 %%%   scheduler-device (`scheduler@1.0' or `arweave-scheduler@1.0'),
 %%%   arweave-resend-ms (default 30 minutes),
-%%%   base => #{ rpc | rpc-file, contract, chain-id, confirmations, from-block, log-range },
+%%%   base => #{ rpc | rpc-file, contract, chain-id, from-block, log-range },
 %%%   solana => #{ rpc | rpc-file, program, commitment }, sui => #{ rpc, package, bridge }
 %%% `rpc-file' names a file holding the RPC URL. Use it: a URL carries its
 %%% provider key, and everything under `bridge' is served by
@@ -909,9 +909,8 @@ scan_chain(<<"sui">>, C, Cursor, Opts) ->
     end.
 
 scan_base(C, Cursor, Head, Opts) ->
-    Safe = Head - hb_util:int(maps:get(<<"confirmations">>, C, 12)),
-    From = case Cursor of undefined -> hb_util:int(maps:get(<<"from-block">>, C, Safe)); N -> N + 1 end,
-    To = min(Safe, From + hb_util:int(maps:get(<<"log-range">>, C, 2000)) - 1),
+    From = case Cursor of undefined -> hb_util:int(maps:get(<<"from-block">>, C, Head)); N -> N + 1 end,
+    To = min(Head, From + hb_util:int(maps:get(<<"log-range">>, C, 2000)) - 1),
     case To < From of
         true -> {ok, [], Cursor};
         false ->

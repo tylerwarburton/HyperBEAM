@@ -52,12 +52,20 @@ post_json(Url, Body, Opts) ->
 
 %%% Base ----------------------------------------------------------------------
 
-%% @doc The latest block number, through evm-rpc's passthrough.
+%% @doc The newest FINALIZED block number, through evm-rpc's passthrough.
+%% Base's own finality is the scan horizon: a block that can still be
+%% reorganised is never read, so no confirmation count is configured.
 base_head(Cfg, Opts) ->
-    case evm_rpc(<<"rpc">>, Cfg, #{ <<"rpc-method">> => <<"eth_blockNumber">> }, Opts) of
-        {ok, #{ <<"body">> := <<"0x", Hex/binary>> }} -> {ok, binary_to_integer(Hex, 16)};
-        {ok, #{ <<"body">> := Body }} when is_binary(Body) ->
-            {ok, binary_to_integer(string:trim(Body, both, "\""), 10)};
+    Req = #{ <<"rpc-method">> => <<"eth_getBlockByNumber">>,
+        <<"rpc-params">> => <<"[\"finalized\",false]">> },
+    case evm_rpc(<<"rpc">>, Cfg, Req, Opts) of
+        {ok, #{ <<"body">> := Body }} when is_binary(Body) -> finalized_number(Body);
+        Other -> {error, {base_head, Other}}
+    end.
+
+finalized_number(Body) ->
+    case catch hb_json:decode(Body) of
+        #{ <<"number">> := <<"0x", Hex/binary>> } -> {ok, binary_to_integer(Hex, 16)};
         Other -> {error, {base_head, Other}}
     end.
 
@@ -249,6 +257,11 @@ bin(N) when is_binary(N) -> N.
 deposit_bytes(Nonce, Amount, Ao) ->
     <<(discriminator(<<"DepositEvent">>))/binary, Nonce:64/little, (binary:copy(<<1>>, 32))/binary,
       (binary:copy(<<2>>, 32))/binary, Amount:64/little, (byte_size(Ao)):32/little, Ao/binary>>.
+
+finalized_number_test() ->
+    ?assertEqual({ok, 26}, finalized_number(<<"{\"number\":\"0x1a\",\"hash\":\"0x00\"}">>)),
+    %% No finalized block yet (the RPC's null result): no horizon, nothing scanned.
+    ?assertMatch({error, {base_head, _}}, finalized_number(<<"null">>)).
 
 anchor_events_test() ->
     Ao = <<"abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123-_Z">>,
