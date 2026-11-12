@@ -150,8 +150,9 @@ nudge(_Base, _Req, _Opts) ->
 
 %% @doc Endorse an independently signed root operation. The loop chooses its
 %% configured root and verified replica; the requester supplies no state or
-%% committee. The answer is this member's Ed25519 proof, not an on-chain vote
-%% or publication, and never a signature by the node's AO wallet.
+%% committee. The answer is this member's BLS endorsement, one share of the
+%% committee's aggregate: not an on-chain vote or publication, and never a
+%% signature by the node's AO wallet.
 root_endorse(_Base, Req, Opts) ->
     Candidate = hb_maps:get(<<"certificate">>, Req,
         hb_maps:get(<<"body">>, Req, Req, Opts), Opts),
@@ -360,7 +361,7 @@ root_certificate_approval(Message, View, St = #{cfg := Cfg, opts := Opts, me := 
             lane -> root_amount(Action, Payload) > 0;
             member -> committee_evidence(Action, Payload, Info, View, St)
         end,
-        % The endorsement is this member's Ed25519 proof over the root
+        % The endorsement is this member's BLS signature over the root
         % domain, and nothing else: the node's AO wallet signs no payload a
         % caller chose.
         Proof = #{} = root_inline_proof(Message, AuthorIDs, Members, St),
@@ -530,7 +531,7 @@ root_certificate_approval_test() ->
         <<"quantity">> => <<"50">>},
     Sign = fun(P, W) -> hb_message:commit(P, #{<<"priv-wallet">> => W}, <<"ans104@1.0">>) end,
     Signed = Sign(Payload, AuthorWallet),
-    % The endorsement is the Ed25519 proof alone: the node's AO wallet signs
+    % The answer is the BLS endorsement alone: the node's AO wallet signs
     % nothing a caller chose.
     {ok, Endorsed} = root_certificate_approval(Signed, View, St),
     ?assertEqual([<<"intent-id">>, <<"signature">>, <<"signer">>],
