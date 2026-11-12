@@ -136,7 +136,8 @@ nudge(_Base, _Req, _Opts) ->
 
 %% @doc Endorse an independently signed root operation. The loop chooses its
 %% configured root and verified replica; the requester supplies no state or
-%% committee. This creates a signature, not an on-chain vote or publication.
+%% committee. The answer is this member's Ed25519 proof, not an on-chain vote
+%% or publication, and never a signature by the node's AO wallet.
 root_endorse(_Base, Req, Opts) ->
     Candidate = hb_maps:get(<<"certificate">>, Req,
         hb_maps:get(<<"body">>, Req, Req, Opts), Opts),
@@ -147,24 +148,11 @@ root_endorse(_Base, Req, Opts) ->
     case hb_message:with_only_committed(Message, Opts) of
         {ok, Signed} ->
             case call({root_endorse, Signed}) of
-                {ok, Endorsement = #{<<"certificate">> := Certificate}} ->
-                    {ok, json(Endorsement#{<<"certificate">> => portable_certificate(Certificate)})};
+                {ok, Endorsement} -> {ok, json(Endorsement)};
                 Error -> Error
             end;
         _ -> {error, <<"A signed root operation is required">>}
     end.
-
-%% @doc JSON certificates use wallet addresses, as Lua's commitment tables do.
-%% Keep the signature's original keyid/public key and every signed field.
-portable_certificate(Message) ->
-    Public = hb_private:reset(Message),
-    Public#{<<"commitments">> => maps:filtermap(fun(_, Commitment) ->
-        case maps:find(<<"committer">>, Commitment) of
-            {ok, Signer} -> {true, Commitment#{<<"committer">> =>
-                hb_util:committer_address(Signer)}};
-            error -> false
-        end
-    end, maps:get(<<"commitments">>, Public))}.
 
 call(Msg) ->
     case hb_name:lookup(?NAME) of
@@ -326,17 +314,13 @@ root_certificate_approval(Message, View, St = #{cfg := Cfg, opts := Opts, me := 
         Intents = key(<<"rootintents">>, View),
         Previous = maps:get(Account, Intents, #{}),
         Sequence = hb_util:int(maps:get(<<"sequence">>, Previous, 0)) + 1,
-        true = maps:get(<<"status">>, Previous, <<>>) =/= <<"pending">>
-            orelse hb_util:int(maps:get(<<"epoch">>, Previous, -1)) =/=
-                binary_to_integer(Epoch),
         true = Action =:= <<"Ledger-Release">> orelse
             Amount =< root_balance(Account, View),
-        Signed = hb_message:commit(Message, Opts),
-        Result = #{<<"certificate">> => Signed},
-        case root_inline_proof(Message, AuthorIDs, Members, St) of
-            none -> {ok, Result};
-            Proof -> {ok, Result#{<<"inline-proof">> => Proof}}
-        end
+        % The endorsement is this member's Ed25519 proof over the root
+        % domain, and nothing else: the node's AO wallet signs no payload a
+        % caller chose.
+        Proof = #{} = root_inline_proof(Message, AuthorIDs, Members, St),
+        {ok, Proof}
     catch _:_ -> {error, <<"Root operation is not eligible for endorsement">>}
     end.
 
@@ -407,25 +391,12 @@ root_certificate_actor(<<"Ledger-Release">>, Author, Payload, Info, _View) ->
     Author = maps:get(<<"scheduler">>, Ledger),
     true = maps:get(<<"status">>, Ledger) =/= <<"disabled">>,
     Lane;
-root_certificate_actor(_Action, Author, Payload, _Info, {State, ROpts}) ->
-    case root_delivery_stamps(Payload) of
-        [] -> Author;
-        Stamps ->
-            Scheduler = case hb_ao:get(<<"scheduler-location">>, State, not_found, ROpts) of
-                not_found -> hb_ao:get(<<"process/scheduler-location">>, State, not_found, ROpts);
-                Address -> Address
-            end,
-            Author = Scheduler,
-            Normalized = lists:foldl(fun({K, V}, Acc) ->
-                case maps:find(K, Acc) of
-                    {ok, V} -> Acc;
-                    error -> Acc#{K => V}
-                end
-            end, #{}, Stamps),
-            Process = maps:get(<<"fromprocess">>, Normalized),
-            true = valid_root_address(Process),
-            Process
-    end.
+%% A root actor is the wallet whose signature authored the operation, and
+%% only that: an operation carrying `from-*' stamps is never endorsed
+%% (pusd.lua refuses it too).
+root_certificate_actor(_Action, Author, Payload, _Info, _View) ->
+    [] = root_delivery_stamps(Payload),
+    Author.
 
 root_delivery_stamps(Payload) ->
     [{N, V} || {K, V} <- maps:to_list(Payload),
@@ -446,8 +417,11 @@ root_certificate_approval_test() ->
     Root = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Lane = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Opts = #{<<"priv-wallet">> => MemberWallet, <<"store">> => hb_test_utils:test_store()},
-    St = #{cfg => #{<<"pusd">> => Root}, opts => Opts, me => Me},
-    Info = #{<<"epoch">> => 7, <<"attestors">> => [#{<<"ao">> => Me}],
+    Seed = <<42:256>>,
+    PublicKey = dev_bridge_attestor_sign:ed25519_public(Seed),
+    Registered = <<"0x", (binary:encode_hex(PublicKey))/binary>>,
+    St = #{cfg => #{<<"pusd">> => Root}, opts => Opts, me => Me, keys => #{sui => Seed}},
+    Info = #{<<"epoch">> => 7, <<"attestors">> => [#{<<"ao">> => Me, <<"sui">> => Registered}],
         <<"ledgers">> => #{Lane => #{<<"scheduler">> => LaneAuthority,
             <<"status">> => <<"active">>}}},
     State = #{<<"bridgeinfo">> => hb_json:encode(Info),
@@ -459,11 +433,19 @@ root_certificate_approval_test() ->
         <<"attestor-epoch">> => <<"7">>, <<"action">> => <<"Transfer">>,
         <<"root-sequence">> => <<"1">>, <<"recipient">> => Me,
         <<"quantity">> => <<"50">>},
-    Sign = fun(P, W) -> hb_message:commit(P, #{<<"priv-wallet">> => W}) end,
+    Sign = fun(P, W) -> hb_message:commit(P, #{<<"priv-wallet">> => W}, <<"ans104@1.0">>) end,
     Signed = Sign(Payload, AuthorWallet),
-    {ok, #{<<"certificate">> := Endorsed}} = root_certificate_approval(Signed, View, St),
-    ?assert(hb_message:verify(Endorsed, all, Opts)),
-    ?assert(hb_message:verify(Endorsed, [Author, Me], Opts)),
+    % The endorsement is the Ed25519 proof alone: the node's AO wallet signs
+    % nothing a caller chose.
+    {ok, Endorsed} = root_certificate_approval(Signed, View, St),
+    ?assertEqual([<<"intent-id">>, <<"signature">>, <<"signer">>],
+        lists:sort(maps:keys(Endorsed))),
+    % No inline encoding without an ANS-104 item; no stamped root actor.
+    ?assertMatch({error, _}, root_certificate_approval(
+        hb_message:commit(Payload, #{<<"priv-wallet">> => AuthorWallet}), View, St)),
+    ?assertMatch({error, _}, root_certificate_approval(
+        Sign(Payload#{<<"from-process">> => Lane, <<"from-slot">> => <<"1">>}, AuthorWallet),
+        View, St)),
     BalanceKey = hb_util:lowercase_key(<<"balance-", Author/binary>>),
     ?assertMatch({error, _}, root_certificate_approval(Signed,
         {State#{BalanceKey => <<"0">>}, Opts}, St)),
@@ -495,14 +477,10 @@ root_certificate_approval_test() ->
         <<"3:short:5">>, <<"3:", Me/binary, ":5,">>, <<"3:", Me/binary>>]),
     ?assertMatch({error, _}, root_certificate_approval(
         Sign(Release#{<<"author">> => Author}, AuthorWallet), View, St)),
-    Seed = <<42:256>>,
-    PublicKey = dev_bridge_attestor_sign:ed25519_public(Seed),
-    Registered = <<"0x", (binary:encode_hex(PublicKey))/binary>>,
-    InlineInfo = Info#{<<"attestors">> => [#{<<"ao">> => Me, <<"sui">> => Registered}]},
-    InlineView = {State#{<<"bridgeinfo">> => hb_json:encode(InlineInfo)}, Opts},
-    InlineSt = St#{keys => #{sui => Seed}},
+    InlineView = View,
+    InlineSt = St,
     WalletItem = hb_message:commit(Payload, #{<<"priv-wallet">> => AuthorWallet}, <<"ans104@1.0">>),
-    {ok, #{<<"inline-proof">> := #{<<"signature">> := Proof, <<"intent-id">> := IntentID}}} =
+    {ok, #{<<"signature">> := Proof, <<"intent-id">> := IntentID}} =
         root_certificate_approval(WalletItem, InlineView, InlineSt),
     {ok, ProofBytes} = hb_ao:resolve(#{<<"device">> => <<"bridge-root@1.0">>},
         #{<<"path">> => <<"domain">>, <<"root">> => Root, <<"epoch">> => 7,
@@ -556,7 +534,7 @@ root_endorse_endpoint() ->
             <<"root-sequence">> => <<"1">>, <<"recipient">> => Me,
             <<"quantity">> => <<"50">>},
         Run = fun(P) ->
-            Signed = hb_message:commit(P, #{<<"priv-wallet">> => AuthorWallet}),
+            Signed = hb_message:commit(P, #{<<"priv-wallet">> => AuthorWallet}, <<"ans104@1.0">>),
             hb_ao:resolve(#{<<"device">> => <<"bridge-attestor@1.0">>},
                 #{<<"path">> => <<"root-endorse">>, <<"certificate">> => Signed,
                     <<"balances">> => #{Author => <<"1000000">>}}, Opts)
@@ -566,12 +544,10 @@ root_endorse_endpoint() ->
         ?assertEqual({error, <<"Verified root state is not available">>}, Run(Payload)),
         ?assertNot(filelib:is_dir(<<Dir/binary, "/replica">>)),
         Loop ! pass,
-        {ok, #{<<"body">> := JSON}} = Run(Payload),
-        #{<<"certificate">> := Portable} = hb_json:decode(JSON),
-        Approved = Portable#{<<"commitments">> => maps:map(fun(_, C) ->
-            C#{<<"committer">> => hb_committer:uri(maps:get(<<"committer">>, C))}
-        end, maps:get(<<"commitments">>, Portable))},
-        ?assert(hb_message:verify(Approved, [Author, Me], Opts)),
+        % The JSON answer resolves to the proof alone: no AO-wallet certificate.
+        {ok, Endorsement} = Run(Payload),
+        ?assertMatch(#{<<"signature">> := _, <<"intent-id">> := _}, Endorsement),
+        ?assertNot(maps:is_key(<<"certificate">>, Endorsement)),
         ?assertMatch({error, _}, Run(Payload#{<<"quantity">> => <<"101">>})),
         WalletItem = hb_message:commit(Payload,
             #{<<"priv-wallet">> => AuthorWallet}, <<"ans104@1.0">>),
@@ -581,9 +557,8 @@ root_endorse_endpoint() ->
         {ok, {{_, 200, _}, _, ResponseBody}} = httpc:request(post,
             {Endpoint, [{"accept", "application/json"}], "application/ans104", Bytes},
             [{timeout, 60000}], [{body_format, binary}]),
-        #{<<"certificate">> := HTTPApproved, <<"inline-proof">> := HTTPProof} = hb_json:decode(ResponseBody),
-        ?assertEqual(Author, maps:get(<<"author">>, HTTPApproved)),
-        ?assertEqual(<<"50">>, maps:get(<<"quantity">>, HTTPApproved)),
+        HTTPProof = maps:with([<<"signer">>, <<"intent-id">>, <<"signature">>],
+            hb_json:decode(ResponseBody)),
         IntentID = hb_util:human_id(Item#tx.id),
         ?assertEqual(IntentID, maps:get(<<"intent-id">>, HTTPProof)),
         {ok, Domain} = hb_ao:resolve(#{<<"device">> => <<"bridge-root@1.0">>},
@@ -1383,8 +1358,8 @@ collect_root_proofs(Ref, Pending, Proofs, Request, Deadline, Opts) ->
 
 %% @doc Local requests traverse the same verified-state policy as remote ones.
 request_root_proof(#{<<"ao">> := Me}, Intent, #{me := Me}) ->
-    {ok, Result} = call({root_endorse, Intent}),
-    maps:get(<<"inline-proof">>, Result);
+    {ok, Proof} = call({root_endorse, Intent}),
+    Proof;
 request_root_proof(#{<<"ao">> := Address}, Intent, #{opts := Opts}) ->
     {ok, Location} = hb_ao:resolve(#{<<"device">> => <<"location@1.0">>},
         #{<<"path">> => Address, <<"variant">> => <<"ao.N.1">>}, Opts),
@@ -1400,7 +1375,7 @@ fetch_root_proof(Node, Intent, Opts) ->
         Bin when is_binary(Bin) -> hb_json:decode(Bin);
         Map -> Map
     end,
-    maps:get(<<"inline-proof">>, Result).
+    maps:with([<<"signer">>, <<"intent-id">>, <<"signature">>], Result).
 
 fast_ledger_node(Spec, Cfg) when is_binary(Spec) -> Spec;
 fast_ledger_node(Spec, Cfg) when is_map(Spec) ->
