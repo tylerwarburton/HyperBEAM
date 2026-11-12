@@ -48,11 +48,18 @@
 %%%   POST /~bridge-attestor@1.0/root-endorse signs an author-signed root
 %%%                                      certificate after local verification
 %%%
-%%% Passes run every `interval' while idle. A nudge only changes WHEN the next
-%%% pass happens, never what it does, so anyone may send one; passes are still
-%%% at least `fast-interval' apart however many arrive. A nudge re-arms fast
-%%% mode at most once per NUDGE_GAP_MS, and one fast stretch lasts at most three
-%%% `fast-window's; after that, nudges wait out COOL_MS.
+%%% Passes run every `interval' while idle, and every `fast-interval' for
+%%% `fast-window' after a pass that found new work (a chain event, or a record
+%%% to sign or certify that the pass before did not have). Only work found
+%%% keeps the node fast. A nudge only brings the next idle pass forward (still
+%%% at least `fast-interval' after the last), so anyone may send one: a nudged
+%%% pass that finds nothing new makes nudges wait for the next timed pass, so
+%%% a stream of them costs at most one extra pass per `interval'.
+%%%
+%%% `keys' and `status' are answered, like `chain-sig', from rows the loop
+%%% publishes, never by the loop: only `root-endorse' reaches it, and only a
+%%% signed request of bounded size, dropped unanswered once its caller has
+%%% stopped waiting.
 %%%
 %%% The cursors and the deposits and releases still waiting are kept in the
 %%% `state-file', so a restart picks up where the node left off.
@@ -87,15 +94,22 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(NAME, {<<"bridge-attestor@1.0">>, loop}).
-%% The chain signatures the last pass made, readable by every request without
-%% the loop: a flood of claimers never queues behind (or delays) a pass.
--define(CHAIN_SIGS, dev_bridge_attestor_chain_sigs).
+%% What requests read without the loop (the chain signatures the last pass
+%% made, the public keys, the status): a flood of readers never queues behind
+%% (or delays) a pass.
+-define(SERVED, dev_bridge_attestor_served).
 -define(RESEND_MS, 60000).
 -define(ARWEAVE_RESEND_MS, 1800000).
--define(NUDGE_GAP_MS, 10000).
-%% Nudges ignored after a capped fast stretch. Fixed, not `interval': a slow
-%% idle interval saves RPC spend and must not slow a busy bridge down.
--define(COOL_MS, 15000).
+%% How long a caller waits for the loop, and so how long a queued request
+%% stays worth answering: the loop drops one older than this unanswered.
+-define(CALL_MS, 60000).
+%% The largest root-endorse request the loop will see, as the decoded
+%% message's external term size. A real one is an ANS-104 intent whose
+%% operation fits a carrier (bridge-root caps it at 2,048 bytes): with its
+%% 512-byte owner and signature, both encoded, it measures under 8 KiB
+%% (root_endorse_bound_test), so twice that refuses nothing legitimate.
+-define(ENDORSE_MAX_BYTES, 16384).
+-define(AUTHOR_SIGNATURES, [<<"rsa-pss-sha256">>, <<"rsa-pss-sha512">>]).
 
 device_info(_) ->
     #{ exports => [<<"start">>, <<"status">>, <<"keys">>, <<"nudge">>,
@@ -130,16 +144,16 @@ start(_Base, Req, Opts) ->
     end,
     {ok, #{ <<"body">> => NodeMsg }}.
 
-status(_Base, _Req, _Opts) ->
-    case call(status) of
-        {ok, S} -> {ok, json(S)};
-        Error -> Error
-    end.
+status(_Base, _Req, _Opts) -> served(status).
 
-keys(_Base, _Req, _Opts) ->
-    case call(keys) of
-        {ok, K} -> {ok, json(K)};
-        Error -> Error
+%% @doc The public keys and possession proof, made once when the loop starts.
+keys(_Base, _Req, _Opts) -> served(keys).
+
+served(Row) ->
+    try ets:lookup(?SERVED, Row) of
+        [{Row, Answer}] -> {ok, json(Answer)};
+        [] -> {error, <<"The bridge loop is not running on this node">>}
+    catch error:badarg -> {error, <<"The bridge loop is not running on this node">>}
     end.
 
 nudge(_Base, _Req, _Opts) ->
@@ -160,13 +174,30 @@ root_endorse(_Base, Req, Opts) ->
         M when is_map(M) -> M;
         _ -> Req
     end,
-    case hb_message:with_only_committed(Message, Opts) of
-        {ok, Signed} ->
-            case call({root_endorse, Signed}) of
+    Signed = case endorsable(Message, Opts) of
+        true -> hb_message:with_only_committed(Message, Opts);
+        false -> refused
+    end,
+    case Signed of
+        {ok, Committed} ->
+            case call({root_endorse, Committed}) of
                 {ok, Endorsement} -> {ok, json(Endorsement)};
                 Error -> Error
             end;
         _ -> {error, <<"A signed root operation is required">>}
+    end.
+
+%% @doc What may queue on the loop at all: a request no larger than a real
+%% intent can be, carrying an RSA-PSS signature (the only kind an author's
+%% intent has). Everything else is refused here, at no cost to the loop.
+endorsable(Message, Opts) ->
+    try
+        true = erlang:external_size(Message) =< ?ENDORSE_MAX_BYTES,
+        Commitments = hb_maps:get(<<"commitments">>, Message, #{}, Opts),
+        lists:any(fun(C) -> is_map(C) andalso
+            lists:member(maps:get(<<"type">>, C, undefined), ?AUTHOR_SIGNATURES)
+        end, maps:values(Commitments))
+    catch _:_ -> false
     end.
 
 %% @doc This member's own chain signature for one record its last pass
@@ -191,12 +222,14 @@ chain_sig(_Base, Req, Opts) ->
             end
     end.
 
+%% The request carries the moment its caller stops waiting, so the loop never
+%% spends work on an answer nobody will read.
 call(Msg) ->
     case hb_name:lookup(?NAME) of
         Pid when is_pid(Pid) ->
             Ref = make_ref(),
-            Pid ! {Msg, self(), Ref},
-            receive {Ref, Reply} -> Reply after 60000 -> {error, timeout} end;
+            Pid ! {Msg, self(), Ref, erlang:monotonic_time(millisecond) + ?CALL_MS},
+            receive {Ref, Reply} -> Reply after ?CALL_MS -> {error, timeout} end;
         _ ->
             {error, <<"The bridge loop is not running on this node">>}
     end.
@@ -215,6 +248,7 @@ config(Opts) ->
 init(Cfg0, Opts) ->
     St = initial_state(Cfg0, Opts),
     ?event(bridge, {started, {ao, maps:get(me, St)}}),
+    serve({keys, maps:get(public, St)}),
     self() ! pass,
     loop(St).
 
@@ -223,31 +257,37 @@ initial_state(Cfg0, Opts) ->
     Keys = load_keys(maps:get(<<"keys-file">>, Cfg, <<"bridge-keys.json">>)),
     Me = hb_util:human_id(ar_wallet:to_address(hb_opts:get(priv_wallet, no_viable_wallet, Opts))),
     {Cursors, Deposits, Releases} = load_state(Cfg),
-    #{
+    St = #{
         cfg => Cfg, opts => Opts, keys => Keys, me => Me,
         cursors => Cursors, deposits => Deposits, releases => Releases, sent => #{},
         last_pass => 0, last_error => null, member => false, namespace => 0,
-        timer => undefined, pass_at => 0, fast_until => 0, fast_since => 0, nudge_at => 0,
+        timer => undefined, pass_at => 0, fast_until => 0, nudge => ready,
         skipped => #{}
-    }.
+    },
+    St#{ public => public_keys(St) }.
 
+%% Every turn of the loop first publishes what `status' answers, so the row is
+%% always the state the loop is in.
 loop(St) ->
+    serve({status, status_view(St)}),
     receive
         pass ->
             Start = os:system_time(millisecond),
-            St1 = St#{ timer => undefined, pass_at => Start },
+            St1 = St#{ timer => undefined, pass_at => Start, found_work => false },
             St2 = try pass(St1)
                   catch C:R:T ->
                       {LastError, Log} = failure(C, R, T),
                       ?event(bridge, Log),
                       St1#{ last_error => LastError }
                   end,
-            Next = next_interval(maps:get(cfg, St2), maps:get(fast_until, St2), os:system_time(millisecond)),
-            loop(St2#{ timer => erlang:send_after(Next, self(), pass) });
+            Now = os:system_time(millisecond),
+            St3 = pass_done(Now, St2),
+            publish_chain_sigs(St3),
+            Next = next_interval(maps:get(cfg, St3), maps:get(fast_until, St3), Now),
+            loop(St3#{ timer => erlang:send_after(Next, self(), pass) });
         nudge ->
             Now = os:system_time(millisecond),
-            Cfg = maps:get(cfg, St),
-            case nudge_arm(Now, Cfg, St) of
+            case nudge_accept(Now, St) of
                 ignore -> loop(St);
                 {ok, St1} ->
                     %% No timer means a pass is already queued; a timer that already
@@ -255,30 +295,19 @@ loop(St) ->
                     Timer = maps:get(timer, St1),
                     case Timer =/= undefined andalso erlang:cancel_timer(Timer) =/= false of
                         true ->
-                            Delay = max(0, maps:get(pass_at, St1) + cfg_ms(Cfg, <<"fast-interval">>, 1000) - Now),
+                            Delay = max(0, maps:get(pass_at, St1)
+                                + cfg_ms(maps:get(cfg, St1), <<"fast-interval">>, 1000) - Now),
                             loop(St1#{ timer => erlang:send_after(Delay, self(), pass) });
                         false ->
-                            loop(St1)
+                            loop(St)
                     end
             end;
-        {status, From, Ref} ->
-            From ! {Ref, {ok, status_view(St)}},
-            loop(St);
-        {keys, From, Ref} ->
-            From ! {Ref, {ok, public_keys(St)}},
-            loop(St);
-        {{root_endorse, Message}, From, Ref} ->
-            % Only the view the last pass verified: a request never moves the
-            % replica, so it cannot make the loop fetch or compute.
-            Reply = try
-                case {maps:get(root_view, St, none), maps:get(replica, St, none)} of
-                    {none, _} -> {error, <<"Verified root state is not available">>};
-                    {View, #{stopped := null}} -> root_certificate_approval(Message, View, St);
-                    _ -> {error, <<"Verified root state is still catching up">>}
-                end
-            catch _:_ -> {error, <<"Root certificate endorsement failed">>}
+        {{root_endorse, Message}, From, Ref, Deadline} ->
+            case erlang:monotonic_time(millisecond) > Deadline of
+                % Its caller has stopped waiting: no answer, and no work.
+                true -> ok;
+                false -> From ! {Ref, endorse(Message, St)}
             end,
-            From ! {Ref, Reply},
             loop(St);
         {root_publication_done, Pid, Result} ->
             case maps:get(root_publication, St, undefined) of
@@ -299,6 +328,18 @@ loop(St) ->
                     root_publication_error => <<"Root certificate publisher stopped; retained for retry">>});
                 _ -> loop(St)
             end
+    end.
+
+%% Only the view the last pass verified: a request never moves the replica,
+%% so it cannot make the loop fetch or compute.
+endorse(Message, St) ->
+    try
+        case {maps:get(root_view, St, none), maps:get(replica, St, none)} of
+            {none, _} -> {error, <<"Verified root state is not available">>};
+            {View, #{stopped := null}} -> root_certificate_approval(Message, View, St);
+            _ -> {error, <<"Verified root state is still catching up">>}
+        end
+    catch _:_ -> {error, <<"Root certificate endorsement failed">>}
     end.
 
 %% @doc Check the author, committee epoch, actor and next sequence against
@@ -332,8 +373,7 @@ root_certificate_approval(Message, View, St = #{cfg := Cfg, opts := Opts, me := 
         end, maps:values(Commitments)),
         AuthorIDs = [ID || {ID, Commitment} <- maps:to_list(Commitments),
             maps:get(<<"committer">>, Commitment, undefined) =:= AuthorURI,
-            lists:member(maps:get(<<"type">>, Commitment, undefined),
-                [<<"rsa-pss-sha256">>, <<"rsa-pss-sha512">>]),
+            lists:member(maps:get(<<"type">>, Commitment, undefined), ?AUTHOR_SIGNATURES),
             lists:member(maps:get(<<"commitment-device">>, Commitment, undefined),
                 [<<"httpsig@1.0">>, <<"ans104@1.0">>, <<"tx@1.0">>])],
         true = AuthorIDs =/= [],
@@ -771,12 +811,18 @@ root_endorse_endpoint() ->
         save_root_publication(JournalFile, PublicState),
         {ok, JournalBytes} = file:read_file(JournalFile),
         ?assertEqual(PublicState, binary_to_term(JournalBytes, [safe])),
-        root_publisher_retry_check(Root, St, hb_json:decode(Info), Opts),
-        root_publisher_lifecycle_check(St)
+        root_publisher_retry_check(Root, St, hb_json:decode(Info), Opts)
     after
-        exit(Loop, shutdown),
+        stop_and_wait(Loop),
         hb_name:unregister(?NAME)
-    end.
+    end,
+    % Each loop serves its own status, so these run with no other loop alive.
+    root_publisher_lifecycle_check(St).
+
+stop_and_wait(Pid) ->
+    Monitor = erlang:monitor(process, Pid),
+    exit(Pid, shutdown),
+    receive {'DOWN', Monitor, process, Pid, _} -> ok after 2000 -> error(loop_outlived_stop) end.
 
 %% @doc Exercise the actual signed carrier and HTTP submission without paying
 %% for an L1 transaction. The gateway fixture rejects its first POST; a fresh
@@ -851,14 +897,16 @@ root_publisher_lifecycle_check(St) ->
             loop(St#{root_publication => {Worker, Monitor, <<"test-job">>},
                 root_publication_error => <<"prior failure">>})
         end),
-        receive {publisher_ready, Loop, Worker} -> {Loop, Worker}
+        receive {publisher_ready, Loop, Worker} ->
+            hb_util:wait_until(fun() -> element(1, served(status)) =:= ok end, 2000),
+            {Loop, Worker}
         after 1000 -> error(publisher_start_timeout)
         end
     end,
-    Status = fun(Pid) ->
-        Ref = make_ref(),
-        Pid ! {status, self(), Ref},
-        receive {Ref, {ok, Result}} -> Result after 1000 -> error(attestor_unresponsive) end
+    % The served row is rewritten on every turn of the loop that owns it.
+    Status = fun(_Pid) ->
+        {ok, #{<<"body">> := JSON}} = status(#{}, #{}, #{}),
+        hb_json:decode(JSON)
     end,
     lists:foreach(fun(Outcome) ->
         {Loop, Worker} = Start(),
@@ -873,7 +921,7 @@ root_publisher_lifecycle_check(St) ->
                 finish -> ?assertEqual(null, maps:get(<<"root-publication-error">>, Result));
                 crash -> ?assertNotEqual(null, maps:get(<<"root-publication-error">>, Result))
             end
-        after exit(Loop, shutdown)
+        after stop_and_wait(Loop)
         end
     end, [crash, finish]),
     {Loop, Worker} = Start(),
@@ -914,27 +962,31 @@ scrub([H | T]) -> [scrub(H) | scrub(T)];
 scrub(T) when is_tuple(T) -> list_to_tuple(scrub(tuple_to_list(T)));
 scrub(X) -> X.
 
-%% Fast while a nudge is recent, idle otherwise.
+%% Fast while the last pass that found new work is recent, idle otherwise.
 next_interval(Cfg, FastUntil, Now) when Now < FastUntil -> cfg_ms(Cfg, <<"fast-interval">>, 1000);
 next_interval(Cfg, _FastUntil, _Now) -> cfg_ms(Cfg, <<"interval">>, 5000).
 
 cfg_ms(Cfg, Key, Default) -> hb_util:int(maps:get(Key, Cfg, Default)).
 
-%% Fast mode for a nudge, within limits: at most one arming per NUDGE_GAP_MS,
-%% one stretch of fast passes capped at three `fast-window's, and a capped
-%% stretch followed by COOL_MS before the next can start.
-nudge_arm(Now, Cfg, St = #{ nudge_at := NudgeAt, fast_since := Since0, fast_until := Until0 }) ->
-    Window = cfg_ms(Cfg, <<"fast-window">>, 120000),
-    Cap = 3 * Window,
-    Fast = Now < Until0,
-    Since = case Fast of true -> Since0; false -> Now end,
-    Until = min(Now + Window, Since + Cap),
-    Cooling = not Fast andalso Until0 =:= Since0 + Cap
-        andalso Now < Until0 + ?COOL_MS,
-    case Now - NudgeAt < ?NUDGE_GAP_MS orelse Cooling orelse Until =< Until0 of
-        true -> ignore;
-        false -> {ok, St#{ nudge_at := Now, fast_since := Since, fast_until := Until }}
-    end.
+%% A nudge brings the next idle pass forward, once: `nudge' is `ready' until
+%% one does (`pending'), and a nudged pass that finds no new work leaves it
+%% `spent' until a timed pass runs. While fast, passes are already as soon as
+%% they can be, so a nudge has nothing to bring forward.
+nudge_accept(Now, St = #{ nudge := ready, fast_until := FastUntil }) when Now >= FastUntil ->
+    {ok, St#{ nudge := pending }};
+nudge_accept(_Now, _St) -> ignore.
+
+%% After a pass: only new work keeps (or makes) the node fast.
+pass_done(Now, St = #{ cfg := Cfg, nudge := Nudge }) ->
+    Work = maps:get(found_work, St, false),
+    FastUntil = case Work of
+        true -> Now + cfg_ms(Cfg, <<"fast-window">>, 120000);
+        false -> maps:get(fast_until, St)
+    end,
+    St#{ fast_until := FastUntil, nudge := case {Nudge, Work} of
+        {pending, false} -> spent;
+        _ -> ready
+    end }.
 
 %% Everything a pass does, it does on `View': PUSD as this node computed it.
 pass(St = #{ cfg := Cfg }) ->
@@ -966,7 +1018,8 @@ attest(Info, View, St = #{ cfg := Cfg, me := Me }) ->
             Index = length(lists:takewhile(fun(A) -> maps:get(<<"ao">>, A, <<>>) =/= Me end,
                 maps:get(<<"attestors">>, Info))),
             St1 = remember(Found, St#{ cursors => Cursors, member => true, namespace => Ns,
-                skipped => #{}, index => Index, committee => [], lane_views => #{} }),
+                skipped => #{}, index => Index, committee => [], lane_views => #{},
+                planned => [] }),
             % What was found is on disk before the cursors pass it.
             save_state(Cfg, St1),
             St2 = attest_deposits(Info, St1),
@@ -978,8 +1031,58 @@ attest(Info, View, St = #{ cfg := Cfg, me := Me }) ->
                     root_certificate_info => Info}),
             St6 = committee_certificate(Epoch, channel_certificates(View, St5)),
             save_state(Cfg, St6),
-            St6#{ last_pass => os:system_time(millisecond), last_error => null }
+            St7 = sweep_root_journals(found_work(Found, St, St6)),
+            St7#{ last_pass => os:system_time(millisecond), last_error => null }
     end.
+
+%% @doc New work: a chain event, or something to sign or send (a chain
+%% signature, a root certificate, a relayed message) that the last member
+%% pass did not have. Only this keeps the node in fast mode.
+found_work(Found, Before, After) ->
+    Sigs = maps:get(chain_sigs, After, #{}),
+    Work = lists:usort(maps:get(planned, After, []) ++
+        [{Kind, Id} || Kind <- [withdrawal, proposal], Id <- maps:keys(maps:get(Kind, Sigs, #{}))]),
+    New = Found =/= [] orelse Work -- maps:get(work, Before, []) =/= [],
+    After#{ work => Work, found_work => New }.
+
+%% @doc A root publication journal lives exactly as long as a pass plans its
+%% key: a key the verified root no longer yields is decided (its carrier, or
+%% a peer's, landed) or no longer this node's to publish, and its journal and
+%% any half-written `.tmp' are deleted. Only a complete pass (nothing
+%% skipped) is the whole plan; the publication in flight keeps its own.
+sweep_root_journals(St = #{ cfg := Cfg, skipped := Skipped }) when map_size(Skipped) =:= 0 ->
+    Root = maps:get(<<"pusd">>, Cfg),
+    InFlight = case maps:get(root_publication, St, undefined) of
+        {_, _, Key} -> [Key];
+        undefined -> []
+    end,
+    Keep = [root_journal(Cfg, Root, K) || K <- InFlight ++ maps:get(planned, St, []), is_binary(K)],
+    Prefix = <<(root_journal_prefix(Cfg))/binary>>,
+    Dir = filename:dirname(Prefix),
+    Names = case file:list_dir(Dir) of
+        {ok, L} -> [hb_util:bin(filename:join(Dir, N)) || N <- L];
+        {error, _} -> []
+    end,
+    lists:foreach(fun(File) ->
+        Journal = case binary:longest_common_suffix([File, <<".tmp">>]) of
+            4 -> binary:part(File, 0, byte_size(File) - 4);
+            _ -> File
+        end,
+        case binary:longest_common_prefix([File, Prefix]) =:= byte_size(Prefix)
+                andalso not lists:member(Journal, Keep) of
+            true -> ok = file:delete(File);
+            false -> ok
+        end
+    end, Names),
+    St;
+sweep_root_journals(St) -> St.
+
+root_journal_prefix(Cfg) ->
+    <<(hb_util:bin(maps:get(<<"state-file">>, Cfg, <<"bridge-state.json">>)))/binary, ".root-">>.
+
+root_journal(Cfg, Root, Key) ->
+    <<(root_journal_prefix(Cfg))/binary,
+        (hb_util:human_id(crypto:hash(sha256, <<Root/binary, Key/binary>>)))/binary>>.
 
 %% Every chain that is configured, each failing on its own.
 scan(Cfg, Cursors, Opts) ->
@@ -1099,25 +1202,30 @@ chain_signatures(Info, Withdrawals, Epoch, St = #{ me := Me, cfg := Cfg, keys :=
         lists:any(fun(M) -> maps:get(<<"ao">>, M, <<>>) =:= Me end, maps:get(<<"prior">>, P, [])),
         Sigs <- [proposal_signatures(P, Cfg, Keys)], map_size(Sigs) > 0]),
     Sigs = #{ withdrawal => Releases, proposal => Changes },
-    publish_chain_sigs(Me, Sigs),
     St#{ chain_sigs => Sigs }.
 
-%% @doc Hand the pass's signatures to the request side: one ETS row, written
-%% only by this process (protected), replaced only when it changes.
-publish_chain_sigs(Me, Sigs) ->
-    case ets:whereis(?CHAIN_SIGS) of
-        undefined -> ets:new(?CHAIN_SIGS, [named_table, protected, set, {read_concurrency, true}]);
+%% @doc Hand the pass's signatures to the request side, replaced only when
+%% they change. Called by the loop after each pass.
+publish_chain_sigs(#{ me := Me, chain_sigs := Sigs }) ->
+    case catch ets:lookup(?SERVED, chain_sigs) of
+        [{chain_sigs, {Me, Sigs}}] -> ok;
+        _ -> serve({chain_sigs, {Me, Sigs}})
+    end;
+publish_chain_sigs(_St) -> ok.
+
+%% @doc One row of what requests read: a table only the loop writes
+%% (protected), and gone with it. Only the loop calls this.
+serve(Row) ->
+    case ets:whereis(?SERVED) of
+        undefined -> ets:new(?SERVED, [named_table, protected, set, {read_concurrency, true}]);
         _ -> ok
     end,
-    case ets:lookup(?CHAIN_SIGS, current) of
-        [{current, Me, Sigs}] -> ok;
-        _ -> ets:insert(?CHAIN_SIGS, {current, Me, Sigs})
-    end.
+    true = ets:insert(?SERVED, Row).
 
 %% @doc A request's answer from the published row: nothing is signed for it.
 served_chain_sig({Kind, Id}) ->
-    try ets:lookup(?CHAIN_SIGS, current) of
-        [{current, Me, Sigs}] -> chain_sig_answer(Kind, Id, #{ me => Me, chain_sigs => Sigs });
+    try ets:lookup(?SERVED, chain_sigs) of
+        [{chain_sigs, {Me, Sigs}}] -> chain_sig_answer(Kind, Id, #{ me => Me, chain_sigs => Sigs });
         [] -> {error, not_found}
     catch error:badarg -> {error, not_found}
     end.
@@ -1149,9 +1257,11 @@ committee_plan(Key, Tags, St) ->
 %% next pass plans it afresh; plans take turns, so one this member's peers
 %% will not endorse yet (a deposit they have not scanned) never blocks the
 %% rest.
-committee_certificate(Epoch, St = #{ cfg := Cfg, sent := Sent }) ->
+committee_certificate(Epoch, St0 = #{ cfg := Cfg, sent := Sent }) ->
     Now = os:system_time(millisecond),
     Key = fun(Plan) -> <<"root-cert:", (integer_to_binary(Epoch))/binary, ":", Plan/binary>> end,
+    St = lists:foldl(fun({Plan, _}, S) -> planned(Key(Plan), S) end, St0,
+        maps:get(committee, St0, [])),
     Due = [P || P = {Plan, _} <- maps:get(committee, St, []),
         Now - maps:get(Key(Plan), Sent, 0) >= resend_ms(Cfg)],
     case Due of
@@ -1597,7 +1707,8 @@ join_moves(Reversed) -> iolist_to_binary(lists:join(<<",">>, lists:reverse(Rever
 %% @doc One publisher per loop leaves the loop free to endorse requests from
 %% its own worker and from peers. Only a successful POST starts the resend
 %% delay; the canonical root receipt, not that POST, settles the source move.
-start_root_publication(Key, Tags, St = #{cfg := Cfg, sent := Sent}) ->
+start_root_publication(Key, Tags, St0 = #{cfg := Cfg, sent := Sent}) ->
+    St = planned(Key, St0),
     case maps:is_key(root_publication, St) orelse
             os:system_time(millisecond) - maps:get(Key, Sent, 0) < resend_ms(Cfg) of
         true -> St;
@@ -1640,8 +1751,7 @@ publish_root_certificate(Key, Tags, St = #{cfg := Cfg, opts := Opts, me := Me,
     Payload = (maps:merge(maps:remove(<<"rootsequence">>, Tags), Sequence))#{<<"target">> => Root,
         <<"author">> => Me, <<"certificate-version">> => <<"pusd-root/v1">>,
         <<"attestor-epoch">> => integer_to_binary(Epoch)},
-    StateFile = hb_util:bin(maps:get(<<"state-file">>, Cfg, <<"bridge-state.json">>)),
-    File = <<StateFile/binary, ".root-", (hb_util:human_id(crypto:hash(sha256, <<Root/binary, Key/binary>>)))/binary>>,
+    File = root_journal(Cfg, Root, Key),
     % The key names the root sequence, not the batch: what was journalled
     % first for it is what this sequence publishes, whatever a later pass plans.
     Saved = case file:read_file(File) of
@@ -1871,9 +1981,14 @@ item_id(#{ <<"id">> := Id }) when is_binary(Id) -> Id;
 item_id(#{ <<"id">> := Id }) when is_integer(Id) -> integer_to_binary(Id);
 item_id(_) -> <<"?">>.
 
+%% What this pass wants sent, whether or not it is due: the pass's work, and
+%% (for root certificates) the journals it keeps.
+planned(Key, St) -> St#{ planned => [Key | maps:get(planned, St, [])] }.
+
 %% Send at most once per RESEND_MS per key: PUSD is idempotent, but every
 %% message is a slot.
-once(Key, St = #{ sent := Sent }, Fun) ->
+once(Key, St0 = #{ sent := Sent }, Fun) ->
+    St = planned(Key, St0),
     Now = os:system_time(millisecond),
     Cfg = maps:get(cfg, St),
     Resend = resend_ms(Cfg),
@@ -2418,25 +2533,79 @@ resend_interval_test() ->
         <<"arweave-resend-ms">> => 900000
     })).
 
-nudge_arm_test() ->
+%% A nudge brings one idle pass forward; only a pass that finds new work
+%% makes the node fast. A stream of nudges costs at most one extra pass per
+%% timed pass, and none at all while fast.
+nudge_test() ->
     Cfg = #{ <<"interval">> => 15000, <<"fast-window">> => 100000 },
-    St0 = #{ nudge_at => 0, fast_since => 0, fast_until => 0 },
-    {ok, St1} = nudge_arm(1000000, Cfg, St0),
-    ?assertMatch(#{ fast_since := 1000000, fast_until := 1100000 }, St1),
-    % Too soon after the last one.
-    ?assertEqual(ignore, nudge_arm(1005000, Cfg, St1)),
-    {ok, St2} = nudge_arm(1010000, Cfg, St1),
-    ?assertMatch(#{ fast_since := 1000000, fast_until := 1110000 }, St2),
-    % Spam stretches fast mode to three windows and no further.
-    StN = lists:foldl(fun(T, S) -> case nudge_arm(T, Cfg, S) of {ok, S2} -> S2; ignore -> S end end,
-        St2, lists:seq(1020000, 1290000, 10000)),
-    ?assertMatch(#{ fast_until := 1300000 }, StN),
-    ?assertEqual(ignore, nudge_arm(1299000, Cfg, StN#{ nudge_at := 0 })),
-    % After a capped stretch, COOL_MS before the next, however slow `interval' is.
-    ?assertEqual(ignore, nudge_arm(1310000, Cfg, StN)),
-    ?assertMatch({ok, #{ fast_since := 1316000, fast_until := 1416000 }}, nudge_arm(1316000, Cfg, StN)),
-    Slow = Cfg#{ <<"interval">> => 120000 },
-    ?assertMatch({ok, #{ fast_since := 1316000 }}, nudge_arm(1316000, Slow, StN)).
+    St0 = #{ cfg => Cfg, nudge => ready, fast_until => 0 },
+    {ok, St1} = nudge_accept(1000, St0),
+    ?assertMatch(#{ nudge := pending }, St1),
+    % Until that pass runs, more nudges change nothing.
+    ?assertEqual(ignore, nudge_accept(1001, St1)),
+    % The nudged pass found nothing: no fast mode, and nudges wait for the
+    % next timed pass.
+    St2 = pass_done(2000, St1#{ found_work => false }),
+    ?assertMatch(#{ nudge := spent, fast_until := 0 }, St2),
+    ?assertEqual(15000, next_interval(Cfg, 0, 2000)),
+    ?assertEqual(ignore, nudge_accept(3000, St2)),
+    St3 = pass_done(17000, St2#{ found_work => false }),
+    ?assertMatch(#{ nudge := ready, fast_until := 0 }, St3),
+    % A nudged pass that finds work arms fast mode for one window.
+    {ok, St4} = nudge_accept(18000, St3),
+    St5 = pass_done(19000, St4#{ found_work => true }),
+    ?assertMatch(#{ nudge := ready, fast_until := 119000 }, St5),
+    ?assertEqual(1000, next_interval(Cfg#{ <<"fast-interval">> => 1000 }, 119000, 20000)),
+    % While fast, a nudge has nothing to bring forward and arms nothing.
+    ?assertEqual(ignore, nudge_accept(20000, St5)),
+    % Fast mode lasts only while passes keep finding new work.
+    St6 = pass_done(21000, St5#{ found_work => false }),
+    ?assertMatch(#{ fast_until := 119000 }, St6),
+    ?assertMatch(#{ fast_until := 122000 }, pass_done(22000, St6#{ found_work => true })),
+    % A timed pass with work also arms it; the nudge stays ready.
+    ?assertMatch(#{ nudge := ready, fast_until := 300000 },
+        pass_done(200000, St3#{ found_work => true })).
+
+%% New work is a chain event or a key the last pass did not plan or sign;
+%% the same plan again, however long it stays pending, is none.
+found_work_test() ->
+    Sigs = #{ withdrawal => #{ <<"5">> => <<"0xs">> }, proposal => #{} },
+    First = found_work([], #{}, #{ planned => [<<"root-cert:1:mint:a">>], chain_sigs => Sigs }),
+    ?assertMatch(#{ found_work := true }, First),
+    Again = found_work([], First, #{ planned => [<<"root-cert:1:mint:a">>], chain_sigs => Sigs }),
+    ?assertMatch(#{ found_work := false }, Again),
+    ?assertMatch(#{ found_work := true }, found_work([#{ kind => deposit }], Again,
+        #{ planned => [<<"root-cert:1:mint:a">>], chain_sigs => Sigs })),
+    ?assertMatch(#{ found_work := true }, found_work([], Again,
+        #{ planned => [<<"root-cert:1:mint:a">>],
+            chain_sigs => Sigs#{ proposal => #{ <<"2">> => #{} } } })),
+    ?assertMatch(#{ found_work := false }, found_work([], Again, #{ planned => [], chain_sigs => #{} })).
+
+%% A root publication journal (and its `.tmp') is deleted once a complete
+%% pass no longer plans its key; a planned key and the publication in
+%% flight keep theirs, and a pass that skipped something deletes nothing.
+root_journal_sweep_test() ->
+    Dir = <<"/tmp/root-journal-sweep-", (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary>>,
+    ok = file:make_dir(Dir),
+    Root = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Cfg = #{ <<"pusd">> => Root, <<"state-file">> => <<Dir/binary, "/state.json">> },
+    J = fun(K) -> root_journal(Cfg, Root, K) end,
+    Files = [J(<<"planned">>), J(<<"landed">>), <<(J(<<"landed">>))/binary, ".tmp">>,
+        J(<<"flight">>), <<(J(<<"flight">>))/binary, ".tmp">>, <<Dir/binary, "/state.json">>,
+        <<Dir/binary, "/keys.json">>],
+    [ok = file:write_file(F, <<"x">>) || F <- Files],
+    St = #{ cfg => Cfg, planned => [<<"planned">>, <<"once-key">>],
+        root_publication => {self(), make_ref(), <<"flight">>} },
+    sweep_root_journals(St#{ skipped => #{ <<"ledger:x">> => <<"down">> } }),
+    ?assert(lists:all(fun filelib:is_regular/1, Files)),
+    sweep_root_journals(St#{ skipped => #{} }),
+    {Gone, Kept} = lists:partition(fun(F) -> binary:match(F, J(<<"landed">>)) =/= nomatch end, Files),
+    ?assertEqual([], [F || F <- Gone, filelib:is_regular(F)]),
+    ?assert(lists:all(fun filelib:is_regular/1, Kept)),
+    % Nothing planned and nothing in flight: every journal goes, nothing else.
+    sweep_root_journals(#{ cfg => Cfg, skipped => #{}, planned => [] }),
+    ?assertEqual([<<Dir/binary, "/keys.json">>, <<Dir/binary, "/state.json">>],
+        lists:sort([F || F <- Files, filelib:is_regular(F)])).
 
 state_file_test() ->
     Dir = <<"/tmp/bridge-state-test">>,
@@ -2933,7 +3102,7 @@ start_hook_test_() ->
 
 stop_loop() ->
     case hb_name:lookup(?NAME) of
-        Pid when is_pid(Pid) -> hb_name:unregister(?NAME), exit(Pid, kill);
+        Pid when is_pid(Pid) -> hb_name:unregister(?NAME), stop_and_wait(Pid);
         _ -> ok
     end.
 
@@ -3003,10 +3172,16 @@ malformed_withdrawal_is_skipped_test() ->
     % The endpoint answers from the pass's published row, with no loop
     % running: a request can neither queue behind a pass nor make one sign.
     undefined = hb_name:lookup(?NAME),
-    ?assertMatch({ok, _}, chain_sig(#{}, #{ <<"withdrawal">> => <<"11">> }, #{})),
-    ?assertMatch({error, #{ <<"status">> := 404 }}, chain_sig(#{}, #{ <<"withdrawal">> => <<"9">> }, #{})),
-    ?assertMatch({error, #{ <<"status">> := 400 }},
-        chain_sig(#{}, #{ <<"withdrawal">> => <<"11">>, <<"proposal">> => <<"1">> }, #{})).
+    Parent = self(),
+    Owner = spawn(fun() -> publish_chain_sigs(St1), Parent ! served, receive stop -> ok end end),
+    receive served -> ok after 2000 -> error(not_served) end,
+    try
+        ?assertMatch({ok, _}, chain_sig(#{}, #{ <<"withdrawal">> => <<"11">> }, #{})),
+        ?assertMatch({error, #{ <<"status">> := 404 }}, chain_sig(#{}, #{ <<"withdrawal">> => <<"9">> }, #{})),
+        ?assertMatch({error, #{ <<"status">> := 400 }},
+            chain_sig(#{}, #{ <<"withdrawal">> => <<"11">>, <<"proposal">> => <<"1">> }, #{}))
+    after stop_and_wait(Owner)
+    end.
 
 %% A key file holds the BLS secret beside the chain secrets, owner-only, and
 %% no endpoint answer carries a secret. A key file from before the BLS key
@@ -3372,3 +3547,89 @@ unreadable_cursor_starts_over_test_() ->
         St2 = pass(St),
         ?assertMatch(#{ member := true, last_error := null }, St2)
     end}.
+
+%% The bound on a root-endorse request is twice the largest real one: an
+%% ANS-104 intent whose operation fills what bridge-root accepts (2,048
+%% bytes). Below the bound with no RSA-PSS signature, or above it signed,
+%% the request is refused before it can queue on the loop.
+root_endorse_bound_test() ->
+    hb:init(),
+    Opts = #{ <<"store">> => hb_test_utils:test_store() },
+    Wallet = ar_wallet:new(),
+    Id = fun() -> hb_util:human_id(crypto:strong_rand_bytes(32)) end,
+    Root = Id(),
+    Base = #{ <<"certificate-version">> => <<"pusd-root/v1">>, <<"target">> => Root,
+        <<"author">> => hb_util:human_id(ar_wallet:to_address(Wallet)),
+        <<"attestor-epoch">> => <<"7">>, <<"action">> => <<"Ledger-Release">>,
+        <<"ledger">> => Id(), <<"root-sequence">> => <<"1">> },
+    Operation = maps:without([<<"target">>, <<"author">>, <<"certificate-version">>], Base),
+    Fill = 2048 - byte_size(hb_json:encode(Operation#{ <<"moves">> => <<>> })),
+    Largest = Base#{ <<"moves">> => binary:copy(<<"9">>, Fill) },
+    2048 = byte_size(hb_json:encode(maps:without(
+        [<<"target">>, <<"author">>, <<"certificate-version">>], Largest))),
+    Signed = hb_message:commit(Largest, #{ <<"priv-wallet">> => Wallet }, <<"ans104@1.0">>),
+    % As it arrives over HTTP: the ANS-104 item decoded by its codec.
+    Item = hb_message:convert(Signed, <<"ans104@1.0">>, Opts),
+    Received = hb_message:convert(Item, <<"structured@1.0">>, <<"ans104@1.0">>, Opts),
+    ?assert(erlang:external_size(Signed) < 8192),
+    ?assert(erlang:external_size(Received) < 8192),
+    ?assert(endorsable(Signed, Opts)),
+    ?assert(endorsable(Received, Opts)),
+    Padded = hb_message:commit(Largest#{ <<"pad">> => binary:copy(<<"p">>, ?ENDORSE_MAX_BYTES) },
+        #{ <<"priv-wallet">> => Wallet }, <<"ans104@1.0">>),
+    ?assertNot(endorsable(Padded, Opts)),
+    ?assertNot(endorsable(Largest, Opts)),
+    ?assertNot(endorsable(Largest#{ <<"commitments">> => #{ <<"x">> =>
+        #{ <<"type">> => <<"hmac-sha256">>, <<"commitment-device">> => <<"httpsig@1.0">> } } }, Opts)),
+    ?assertNot(endorsable(Largest#{ <<"commitments">> => not_a_map }, Opts)),
+    % Refused at the endpoint with no loop running: it never reached one.
+    stop_loop(),
+    Refused = {error, <<"A signed root operation is required">>},
+    ?assertEqual(Refused, root_endorse(#{}, #{ <<"certificate">> => Padded }, Opts)),
+    ?assertEqual(Refused, root_endorse(#{}, #{ <<"certificate">> => Largest }, Opts)),
+    ?assertEqual({error, <<"The bridge loop is not running on this node">>},
+        root_endorse(#{}, #{ <<"certificate">> => Signed }, Opts)).
+
+served_rows_test_() ->
+    {timeout, 60, fun served_rows/0}.
+
+%% `keys' and `status' are answered with the loop suspended: they never
+%% queue on it. The keys' possession proof is made once, at start. A queued
+%% endorse request whose caller has stopped waiting gets no answer.
+served_rows() ->
+    hb:init(),
+    stop_loop(),
+    Dir = <<"/tmp/bridge-served-", (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary>>,
+    Opts = #{ <<"priv-wallet">> => ar_wallet:new(), <<"store">> => hb_test_utils:test_store() },
+    Cfg = (ao_test_cfg(<<"no-such-pusd">>, Dir))#{ <<"scheduler-url">> => <<"http://127.0.0.1:1">>,
+        <<"interval">> => 600000 },
+    St = initial_state(Cfg, Opts),
+    ?assertEqual(public_keys(St), maps:get(public, St)),
+    Loop = spawn(fun() -> init(Cfg, Opts) end),
+    try
+        hb_util:wait_until(fun() ->
+            case served(status) of
+                {ok, #{ <<"body">> := B }} -> maps:get(<<"last-pass">>, hb_json:decode(B)) =/= 0
+                    orelse maps:get(<<"last-error">>, hb_json:decode(B)) =/= null;
+                _ -> false
+            end
+        end, 10000),
+        erlang:suspend_process(Loop),
+        {ok, #{ <<"body">> := KeysJSON }} = keys(#{}, #{}, #{}),
+        ?assertEqual(hb_json:decode(hb_json:encode(maps:get(public, St))), hb_json:decode(KeysJSON)),
+        ?assertMatch({ok, #{ <<"body">> := _ }}, status(#{}, #{}, #{})),
+        Late = make_ref(),
+        Loop ! {{root_endorse, #{}}, self(), Late, erlang:monotonic_time(millisecond) - 1},
+        Live = make_ref(),
+        Loop ! {{root_endorse, #{}}, self(), Live, erlang:monotonic_time(millisecond) + 5000},
+        erlang:resume_process(Loop),
+        receive {Live, Reply} -> ?assertMatch({error, _}, Reply)
+        after 5000 -> error(no_answer_in_time)
+        end,
+        receive {Late, _} -> error(answered_after_deadline)
+        after 200 -> ok
+        end
+    after
+        stop_and_wait(Loop)
+    end,
+    ?assertMatch({error, _}, status(#{}, #{}, #{})).
