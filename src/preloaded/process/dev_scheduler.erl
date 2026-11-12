@@ -827,7 +827,11 @@ slot(M1, M2, Opts) ->
             case hb_opts:get(scheduler_follow_redirects, true, Opts) of
                 false -> {ok, Redirect};
                 true -> remote_slot(ProcID, Redirect, Opts)
-            end
+            end;
+        {error, Error} ->
+            % No scheduler can be found: refuse cleanly, as schedule does.
+            ?event({error_finding_scheduler, {error, Error}}),
+            {error, Error}
     end.
 
 %% @doc Get the current slot from a remote scheduler.
@@ -2007,8 +2011,10 @@ http_get_schedule_redirect() ->
     Res = hb_http:get(N, <<"/", ProcID/binary, "/schedule">>, Opts),
     % As redirect_from_graphql: the legacynet location record has no nonce,
     % so there is no redirect to give. The GET refuses cleanly with a 404,
-    % never a 500.
-    ?assertMatch({error, #{ <<"status">> := 404 }}, Res).
+    % never a 500. The slot endpoint refuses the same way.
+    ?assertMatch({error, #{ <<"status">> := 404 }}, Res),
+    ?assertMatch({error, #{ <<"status">> := 404 }},
+        hb_http:get(N, <<"/", ProcID/binary, "/slot">>, Opts)).
 
 http_post_schedule_test_parallel_() ->
     {timeout, 60, fun http_post_schedule/0}.

@@ -11,7 +11,7 @@
 %%%   3. authors a `Bridge-Mint' root certificate for each unminted deposit;
 %%%   4. authors a `Bridge-Sign' root certificate carrying its signature over
 %%%      each pending withdrawal for its chain;
-%%%   5. acknowledges each release it saw with `Bridge-Released';
+%%%   5. authors a `Bridge-Released' root certificate for each release it saw;
 %%%   6. relays root credits, and authors root certificates for fast-ledger
 %%%      exits (`Ledger-Exit') and ledger moves (`Ledger-Move-Root').
 %%%
@@ -314,11 +314,16 @@ root_certificate_approval(Message, View, St = #{cfg := Cfg, opts := Opts, me := 
         true = lists:all(fun(K) -> lists:member(K, Covered) end, maps:keys(Payload)),
         Action = maps:get(<<"action">>, Payload),
         By = root_action_author(Action),
-        Sequence = root_positive_integer(maps:get(<<"root-sequence">>, Payload)),
         Account = root_certificate_actor(By, Author, Payload, Info, Addresses),
-        Intents = key(<<"rootintents">>, View),
-        Previous = maps:get(Account, Intents, #{}),
-        Sequence = hb_util:int(maps:get(<<"sequence">>, Previous, 0)) + 1,
+        % A holder or lane runs at its account's next sequence; a committee
+        % action is keyed by the record it decides and carries none.
+        true = case By of
+            member -> not maps:is_key(<<"root-sequence">>, Payload);
+            _ ->
+                Sequence = root_positive_integer(maps:get(<<"root-sequence">>, Payload)),
+                Previous = maps:get(Account, key(<<"rootintents">>, View), #{}),
+                Sequence =:= hb_util:int(maps:get(<<"sequence">>, Previous, 0)) + 1
+        end,
         % A holder spends what it holds; a lane release is escrow the root
         % checks; a committee action is what THIS member saw for itself.
         true = case By of
@@ -330,7 +335,7 @@ root_certificate_approval(Message, View, St = #{cfg := Cfg, opts := Opts, me := 
         % domain, and nothing else: the node's AO wallet signs no payload a
         % caller chose.
         Proof = #{} = root_inline_proof(Message, AuthorIDs, Members, St),
-        {ok, Proof}
+        {ok, maps:merge(Proof, own_release_signature(Action, Payload, Info, View, St))}
     catch _:_ -> {error, <<"Root operation is not eligible for endorsement">>}
     end.
 
@@ -403,7 +408,12 @@ root_action_author(<<"Ledger-Release">>) -> lane;
 root_action_author(<<"Bridge-Mint">>) -> member;
 root_action_author(<<"Ledger-Exit">>) -> member;
 root_action_author(<<"Ledger-Move-Root">>) -> member;
-root_action_author(<<"Bridge-Sign">>) -> member.
+root_action_author(<<"Bridge-Sign">>) -> member;
+root_action_author(<<"Bridge-Released">>) -> member;
+root_action_author(<<"Ledger-Credited">>) -> member;
+root_action_author(<<"Channel-Open">>) -> member;
+root_action_author(<<"Channel-Settle">>) -> member;
+root_action_author(<<"Channel-Close">>) -> member.
 
 %% @doc Match the contract's actor: the account whose sequence the operation
 %% runs under. A root actor is the wallet whose signature authored the
@@ -436,49 +446,21 @@ root_name(K) ->
     binary:replace(binary:replace(hb_util:to_lower(K), <<"-">>, <<>>, [global]),
         <<"_">>, <<>>, [global]).
 
-%% @doc A committee action is endorsed only on this member's own evidence: a
-%% deposit its chain scan found and the root has not minted, a lane exit or
-%% move its own replica of that lane holds pending, or release signatures
-%% that each verify against the signing member's registered chain key for a
-%% withdrawal its root replica holds pending. Execution at the root rechecks
-%% everything in canonical order.
-committee_evidence(<<"Bridge-Mint">>, P, Info, _View, #{deposits := Deposits}) ->
-    absent = root_field(<<"ledger">>, P),
-    Chain = root_field(<<"chain">>, P),
-    Id = root_field(<<"depositid">>, P),
-    [Chain, NonceText] = binary:split(Id, <<":">>),
-    Nonce = root_positive_integer(NonceText),
-    Id = deposit_id(Chain, Nonce),
-    #{chain := Chain, token := Token, recipient := Recipient, amount := Amount} =
-        maps:get(Id, Deposits),
-    true = same_token(Chain, Token, root_field(<<"token">>, P)),
-    Recipient = root_field(<<"recipient">>, P),
-    true = hb_util:bin(Amount) =:= root_field(<<"quantity">>, P),
-    false = minted(Info, Chain, Nonce),
-    true;
-committee_evidence(<<"Ledger-Exit">>, P, _Info, _View, St) ->
-    Ledger = root_field(<<"ledger">>, P),
-    ExitId = root_field(<<"exitid">>, P),
-    [E] = [E || E <- lane_rows(<<"laneexits">>, Ledger, St),
-        maps:get(<<"id">>, E, undefined) =:= ExitId],
-    <<"pending">> = maps:get(<<"status">>, E),
-    true = lists:all(fun({Field, Row}) -> root_field(Field, P) =:= hb_util:bin(maps:get(Row, E)) end,
-        [{<<"account">>, <<"account">>}, {<<"chain">>, <<"chain">>}, {<<"token">>, <<"token">>},
-         {<<"recipient">>, <<"to">>}, {<<"quantity">>, <<"quantity">>}]);
-committee_evidence(<<"Ledger-Move-Root">>, P, _Info, _View, St) ->
-    Source = root_field(<<"source">>, P),
-    MoveId = root_field(<<"moveid">>, P),
-    [M] = [M || M <- lane_rows(<<"lanemoves">>, Source, St),
-        maps:get(<<"id">>, M, undefined) =:= MoveId],
-    <<"pending">> = maps:get(<<"status">>, M),
-    Source = maps:get(<<"source">>, M),
-    true = lists:all(fun(Field) -> root_field(Field, P) =:= hb_util:bin(maps:get(Field, M)) end,
-        [<<"destination">>, <<"account">>, <<"quantity">>]);
+%% @doc A committee certificate is endorsed only if this member would author
+%% that same decision itself: the operation equals one of this node's own
+%% committee plans from its last pass -- a deposit its chain scan found and the
+%% root has not minted, a lane exit, move or credit its own lane replica
+%% shows, a release its chain scan saw, a channel step both lanes' replicas
+%% support. One rule for every committee action. Release signatures are the
+%% one field members differ on: each listed one must verify against the
+%% signing member's registered chain key.
+%% Execution at the root rechecks everything in canonical order.
 committee_evidence(<<"Bridge-Sign">>, P, Info, View, St) ->
     Id = root_field(<<"withdrawalid">>, P),
-    [W] = [W || W <- key(<<"withdrawals">>, View), is_map(W),
-        hb_util:bin(maps:get(<<"id">>, W, <<>>)) =:= Id],
-    <<"pending">> = maps:get(<<"status">>, W),
+    true = lists:any(fun({_, T}) ->
+        maps:get(<<"action">>, T) =:= <<"Bridge-Sign">> andalso maps:get(<<"withdrawal-id">>, T) =:= Id
+    end, maps:get(committee, St, [])),
+    W = pending_withdrawal(Id, View),
     Members = maps:get(<<"attestors">>, Info),
     Epoch = hb_util:int(maps:get(<<"epoch">>, Info)),
     Namespace = hb_util:int(maps:get(<<"namespace">>, Info, 0)),
@@ -490,15 +472,37 @@ committee_evidence(<<"Bridge-Sign">>, P, Info, View, St) ->
         true = release_signature_valid(W, lists:nth(Index + 1, Members), Sig, Epoch, Namespace, St),
         Index
     end || Entry <- Entries],
-    true = Indices =:= lists:usort(Indices).
+    % At least k of them is the root's rule; a draft carrying fewer is still
+    % answered, so the author can collect the rest (release_signatures/2).
+    Indices =:= lists:usort(Indices);
+committee_evidence(_Action, P, _Info, _View, St) ->
+    Want = committee_fields(P),
+    lists:any(fun({_, Tags}) -> committee_fields(Tags) =:= Want end, maps:get(committee, St, [])).
 
-lane_rows(Key, Ledger, St) ->
-    LaneView = maps:get(Ledger, maps:get(lane_views, St, #{})),
-    [R || R <- key(Key, LaneView), is_map(R)].
+%% @doc An operation's record fields, names normalised: everything but the
+%% certificate's own envelope.
+committee_fields(M) ->
+    maps:from_list([{root_name(K), V} || {K, V} <- maps:to_list(M),
+        not lists:member(root_name(K), [<<"author">>, <<"target">>, <<"certificateversion">>,
+            <<"attestorepoch">>, <<"rootsequence">>])]).
 
-%% EVM token addresses are case-insensitive; the rest are exact.
-same_token(<<"base">>, A, B) when is_binary(B) -> hb_util:to_lower(A) =:= hb_util:to_lower(B);
-same_token(_, A, B) -> A =:= B.
+pending_withdrawal(Id, View) ->
+    [W] = [W || W <- key(<<"withdrawals">>, View), is_map(W),
+        hb_util:bin(maps:get(<<"id">>, W, <<>>)) =:= Id],
+    <<"pending">> = maps:get(<<"status">>, W),
+    W.
+
+%% @doc A Bridge-Sign endorsement also answers with this member's own release
+%% signature (`<index>:<signature>'), so the author can collect k of them
+%% through root-endorse into the ONE certificate a withdrawal costs.
+own_release_signature(<<"Bridge-Sign">>, P, Info, View, St = #{me := Me, cfg := Cfg, keys := Keys}) ->
+    W = pending_withdrawal(root_field(<<"withdrawalid">>, P), View),
+    Members = maps:get(<<"attestors">>, Info),
+    Index = length(lists:takewhile(fun(A) -> maps:get(<<"ao">>, A, <<>>) =/= Me end, Members)),
+    Sig = withdrawal_signature(W, hb_util:int(maps:get(<<"epoch">>, Info)), Cfg, Keys,
+        hb_util:int(maps:get(<<"namespace">>, Info, maps:get(namespace, St, 0)))),
+    #{<<"release-sig">> => <<(integer_to_binary(Index))/binary, ":", Sig/binary>>};
+own_release_signature(_Action, _P, _Info, _View, _St) -> #{}.
 
 %% @doc Whether `Sig' is `Member''s own release signature for withdrawal `W'
 %% on its chain, under this node's chain configuration: the check the chain
@@ -655,13 +659,20 @@ committee_certificate_approval_test() ->
             <<"quantity">> => <<"30">>}])},
     Cfg = #{<<"pusd">> => Root, <<"base">> => #{<<"chain-id">> => 8453,
         <<"contract">> => <<"0x1111111111111111111111111111111111111111">>}},
-    St = #{cfg => Cfg, opts => Opts, me => Me, keys => #{sui => Seed},
+    St0 = #{cfg => Cfg, opts => Opts, me => Me, keys => #{sui => Seed, base => <<8:256>>},
         deposits => #{<<"base:3">> => #{kind => deposit, chain => <<"base">>, nonce => 3,
             token => Token, recipient => Holder, amount => <<"500">>}},
-        lane_views => #{Lane => {LaneState, Opts}}},
+        lane_views => #{Lane => {LaneState, Opts}}, namespace => 3, index => 0, sent => #{},
+        skipped => #{}, committee => []},
     View = {State, Opts},
+    % This member's own plans, from the real planners: what it endorses.
+    LaneRows = fun(K) -> key(K, {LaneState, Opts}) end,
+    Own = [{K, T} || {root, K, T} <- exit_plans(Lane, LaneRows(<<"laneexits">>), [])
+        ++ move_root_plans(7, Lane, LaneRows(<<"lanemoves">>), [], #{Lane => #{}, Lane2 => #{}})],
+    St1 = sign_withdrawals([W], 7, attest_deposits(Info, St0)),
+    St = St1#{committee => maps:get(committee, St1) ++ Own},
     Base = #{<<"certificate-version">> => <<"pusd-root/v1">>, <<"target">> => Root,
-        <<"author">> => Peer, <<"attestor-epoch">> => <<"7">>, <<"root-sequence">> => <<"1">>},
+        <<"author">> => Peer, <<"attestor-epoch">> => <<"7">>},
     Sign = fun(P, Wallet) -> hb_message:commit(P, #{<<"priv-wallet">> => Wallet}, <<"ans104@1.0">>) end,
     Approve = fun(P) -> root_certificate_approval(Sign(P, PeerWallet), View, St) end,
     Refused = fun(P) -> ?assertMatch({error, _}, Approve(P), P) end,
@@ -669,15 +680,17 @@ committee_certificate_approval_test() ->
         <<"deposit-id">> => <<"base:3">>, <<"token">> => Token, <<"recipient">> => Holder,
         <<"quantity">> => <<"500">>},
     ?assertMatch({ok, #{<<"signer">> := Me}}, Approve(Mint)),
-    ?assertMatch({ok, _}, Approve(Mint#{<<"token">> => string:uppercase(Token)})),
+    % Spelled as the JS relay emits it, the same record endorses.
+    ?assertMatch({ok, _}, Approve(maps:remove(<<"deposit-id">>, Mint#{<<"depositid">> => <<"base:3">>}))),
     lists:foreach(Refused, [Mint#{<<"quantity">> => <<"501">>}, Mint#{<<"recipient">> => Lane},
         Mint#{<<"deposit-id">> => <<"base:03">>}, Mint#{<<"deposit-id">> => <<"base:4">>},
-        Mint#{<<"ledger">> => Lane}, Mint#{<<"root-sequence">> => <<"2">>}]),
+        Mint#{<<"ledger">> => Lane}, Mint#{<<"token">> => string:uppercase(Token)},
+        Mint#{<<"root-sequence">> => <<"1">>}]),
     ?assertMatch({error, _}, root_certificate_approval(Sign(Mint#{<<"author">> => Stranger},
         StrangerWallet), View, St)),
     MintedInfo = Info#{<<"processed">> => #{<<"base">> => #{<<"floor">> => 3}}},
-    ?assertMatch({error, _}, root_certificate_approval(Sign(Mint, PeerWallet),
-        {State#{<<"bridgeinfo">> => hb_json:encode(MintedInfo)}, Opts}, St)),
+    ?assertEqual([], [P || {<<"mint:", _/binary>>, _} = P <- maps:get(committee,
+        attest_deposits(MintedInfo, St0))], "a minted deposit is no plan, so no endorsement"),
     Exit = Base#{<<"action">> => <<"Ledger-Exit">>, <<"ledger">> => Lane, <<"exit-id">> => <<"4">>,
         <<"account">> => Holder, <<"chain">> => <<"base">>, <<"token">> => Token,
         <<"recipient">> => To, <<"quantity">> => <<"2000000">>},
@@ -693,8 +706,10 @@ committee_certificate_approval_test() ->
     Sig = withdrawal_signature(W, 7, Cfg, #{base => PeerBase}, 3),
     Signs = Base#{<<"action">> => <<"Bridge-Sign">>, <<"withdrawal-id">> => <<"5">>,
         <<"release-sigs">> => <<"1:", Sig/binary>>},
-    ?assertMatch({ok, _}, Approve(Signs)),
     Mine = withdrawal_signature(W, 7, Cfg, #{base => <<8:256>>}, 3),
+    % A draft is answered with this member's own signature, for the author
+    % to collect k of into the one certificate the withdrawal costs.
+    ?assertMatch({ok, #{<<"release-sig">> := <<"0:", Mine/binary>>}}, Approve(Signs)),
     ?assertMatch({ok, _}, Approve(Signs#{<<"release-sigs">> => <<"0:", Mine/binary, ",1:", Sig/binary>>})),
     lists:foreach(Refused, [Signs#{<<"release-sigs">> => <<"0:", Sig/binary>>},
         Signs#{<<"release-sigs">> => <<"1:", Sig/binary, ",0:", Mine/binary>>},
@@ -990,7 +1005,7 @@ attest(Info, View, St = #{ cfg := Cfg, me := Me }) ->
             Index = length(lists:takewhile(fun(A) -> maps:get(<<"ao">>, A, <<>>) =/= Me end,
                 maps:get(<<"attestors">>, Info))),
             St1 = remember(Found, St#{ cursors => Cursors, member => true, namespace => Ns,
-                skipped => #{}, index => Index, committee => [] }),
+                skipped => #{}, index => Index, committee => [], lane_views => #{} }),
             % What was found is on disk before the cursors pass it.
             save_state(Cfg, St1),
             St2 = attest_deposits(Info, St1),
@@ -1000,11 +1015,7 @@ attest(Info, View, St = #{ cfg := Cfg, me := Me }) ->
             St5 = relay_fast_ledgers(Info, LedgerDeposits, LedgerReceipts,
                 MoveReceipts, Epoch, St4#{root_intents => key(<<"rootintents">>, View),
                     root_certificate_info => Info}),
-            StCommittee = committee_certificate(Epoch, St5),
-            StRoots = case maps:get(<<"rootCertificateVersion">>, Info, 0) of
-                0 -> approve_root_intents(View, Epoch, StCommittee);
-                _ -> StCommittee
-            end,
+            StRoots = committee_certificate(Epoch, channel_certificates(View, St5)),
             St6 = lists:foldl(
                 fun(P, S) ->
                     guard(<<"proposal:", (item_id(P))/binary>>, S, fun() ->
@@ -1015,84 +1026,6 @@ attest(Info, View, St = #{ cfg := Cfg, me := Me }) ->
             save_state(Cfg, St6),
             St6#{ last_pass => os:system_time(millisecond), last_error => null }
     end.
-
-%% @doc Vote only from this node's independently computed canonical root view.
-%% Pending holder and lane-authority intents were authenticated by the root;
-%% neither a remote /now response nor a caller-supplied intent is used here.
-approve_root_intents(View, Epoch, St = #{cfg := Cfg, me := Me}) ->
-    Rows = case key(<<"rootintents">>, View) of M when is_map(M) -> M; _ -> #{} end,
-    lists:foldl(fun({Account, Row}, State) ->
-        guard(<<"root-intent:", Account/binary>>, State, fun() ->
-            case root_intent_vote(maps:get(<<"pusd">>, Cfg), Account, Row, Epoch, Me) of
-                false -> State;
-                {ok, Tags} ->
-                    Seq = maps:get(<<"rootsequence">>, Tags),
-                    Id = <<"root-intent:", (integer_to_binary(Epoch))/binary,
-                        ":", Account/binary, ":", Seq/binary>>,
-                    once(Id, State, fun() -> send(Tags, State) end)
-            end
-        end)
-    end, St, maps:to_list(Rows)).
-
-root_intent_vote(Root, Account, Row, Epoch, Me) ->
-    try
-        true = is_binary(Account) andalso byte_size(Account) == 43,
-        <<"pending">> = maps:get(<<"status">>, Row),
-        Account = maps:get(<<"account">>, Row),
-        Epoch = hb_util:int(maps:get(<<"epoch">>, Row)),
-        false = maps:get(Me, maps:get(<<"votes">>, Row, #{}), false),
-        Seq = maps:get(<<"sequence">>, Row),
-        true = is_binary(Seq) andalso binary_to_integer(Seq) > 0,
-        Seq = integer_to_binary(binary_to_integer(Seq)),
-        Action = maps:get(<<"action">>, Row),
-        true = lists:member(Action, [<<"Transfer">>, <<"Ledger-Enter">>,
-            <<"Bridge-Redeem">>, <<"Ledger-Release">>]),
-        Intent = maps:get(<<"intent">>, Row),
-        Action = maps:get(<<"Action">>, Intent),
-        Fields = [<<"Recipient">>, <<"Quantity">>, <<"Ledger">>, <<"Chain">>,
-            <<"Token">>, <<"EntrySequence">>, <<"X-Reference">>, <<"X-Transfer-Sequence">>],
-        ExtraKeys = lists:sort([K || K <- maps:keys(Intent),
-            case hb_util:to_lower(K) of
-                <<"from", _/binary>> -> true;
-                <<"x-", _/binary>> -> true;
-                _ -> false
-            end]),
-        Parts = [<<"pusd-certificate/v2">>, <<"Root-Intent">>, Root,
-            integer_to_binary(Epoch), Action, Account, Seq]
-            ++ [maps:get(K, Intent, <<>>) || K <- Fields]
-            ++ lists:flatmap(fun(K) -> [K, maps:get(K, Intent)] end, ExtraKeys),
-        Digest = iolist_to_binary(lists:join(<<"|">>,
-            [[integer_to_binary(byte_size(P)), <<":">>, P] || P <- Parts])),
-        Digest = maps:get(<<"digest">>, Row),
-        {ok, #{<<"action">> => <<"Root-Approve">>, <<"account">> => Account,
-            <<"rootsequence">> => Seq, <<"requestdigest">> => Digest,
-            <<"attestorepoch">> => integer_to_binary(Epoch)}}
-    catch _:_ -> false
-    end.
-
-root_intent_vote_test() ->
-    Root = binary:copy(<<"R">>, 43),
-    Account = binary:copy(<<"A">>, 43),
-    Recipient = binary:copy(<<"B">>, 43),
-    Me = binary:copy(<<"M">>, 43),
-    Memo = <<16#C3, 16#A9, $|, $:>>,
-    Digest = <<"19:pusd-certificate/v2|11:Root-Intent|43:", Root/binary,
-        "|1:3|8:Transfer|43:", Account/binary, "|1:1|43:", Recipient/binary,
-        "|2:10|0:|0:|0:|0:|0:|0:|6:X-Memo|4:", Memo/binary>>,
-    Intent = #{<<"Action">> => <<"Transfer">>, <<"Recipient">> => Recipient,
-        <<"Quantity">> => <<"10">>, <<"X-Memo">> => Memo},
-    Row = #{<<"status">> => <<"pending">>, <<"account">> => Account,
-        <<"epoch">> => 3, <<"sequence">> => <<"1">>,
-        <<"action">> => <<"Transfer">>, <<"intent">> => Intent,
-        <<"digest">> => Digest, <<"votes">> => #{}},
-    ?assertMatch({ok, #{<<"requestdigest">> := Digest}},
-        root_intent_vote(Root, Account, Row, 3, Me)),
-    ?assertEqual(false, root_intent_vote(Root, Account, Row, 4, Me)),
-    ?assertEqual(false, root_intent_vote(Recipient, Account, Row, 3, Me)),
-    ?assertEqual(false, root_intent_vote(Root, Account,
-        Row#{<<"votes">> => #{Me => true}}, 3, Me)),
-    ?assertEqual(false, root_intent_vote(Root, Account,
-        Row#{<<"intent">> => Intent#{<<"Quantity">> => <<"11">>}}, 3, Me)).
 
 %% Every chain that is configured, each failing on its own.
 scan(Cfg, Cursors, Opts) ->
@@ -1210,31 +1143,195 @@ sign_withdrawals(Withdrawals, Epoch, St = #{ me := Me }) ->
 committee_plan(Key, Tags, St) ->
     St#{ committee => maps:get(committee, St, []) ++ [{Key, Tags}] }.
 
-%% @doc At most one committee certificate in flight, at this member's next
-%% root sequence. The sequence keys the journal, so what was journalled first
-%% for it is what that sequence publishes until it lands; one that cannot be
-%% endorsed is forgotten (publish_root_certificate) and the next pass plans
-%% afresh.
-committee_certificate(Epoch, St = #{ me := Me }) ->
-    case maps:get(committee, St, []) of
+%% @doc At most one committee certificate in flight. A committee action decides
+%% one record and the record keys it: the plan key (with the epoch the intent
+%% states) is the journal key, so what was journalled first for a record is
+%% what that record publishes until it lands, and a second member's copy, or
+%% this member's replay, decides nothing at the root and spends no sequence.
+%% One that cannot be endorsed is forgotten (publish_root_certificate) and the
+%% next pass plans it afresh; plans take turns, so one this member's peers
+%% will not endorse yet (a deposit they have not scanned) never blocks the
+%% rest.
+committee_certificate(Epoch, St = #{ cfg := Cfg, sent := Sent }) ->
+    Now = os:system_time(millisecond),
+    Key = fun(Plan) -> <<"root-cert:", (integer_to_binary(Epoch))/binary, ":", Plan/binary>> end,
+    Due = [P || P = {Plan, _} <- maps:get(committee, St, []),
+        Now - maps:get(Key(Plan), Sent, 0) >= resend_ms(Cfg)],
+    case Due of
         [] -> St;
-        Plans ->
-            % Plans take turns, so one this member's peers will not endorse
-            % (a deposit they have not scanned yet) never blocks the rest.
+        _ ->
             Turn = maps:get(committee_turn, St, 0),
-            {_Plan, Tags} = lists:nth(Turn rem length(Plans) + 1, Plans),
-            Row = case maps:get(root_intents, St, #{}) of
-                Rows when is_map(Rows) -> maps:get(Me, Rows, #{});
-                _ -> #{}
-            end,
-            Seq = integer_to_binary(hb_util:int(maps:get(<<"sequence">>, Row, 0)) + 1),
-            Key = <<"root-member:", Me/binary, ":", (integer_to_binary(Epoch))/binary, ":", Seq/binary>>,
-            start_root_publication(Key, Tags#{ <<"rootsequence">> => Seq },
-                St#{ committee_turn => Turn + 1 })
+            {Plan, Tags} = lists:nth(Turn rem length(Due) + 1, Due),
+            start_root_publication(Key(Plan), Tags, St#{ committee_turn => Turn + 1 })
     end.
 
+%% @doc The root's channel decisions this node would certify: open, settle and
+%% close requests from the lanes it relays, each certified only against both
+%% sides' own replicated records (the JS relay's channelPlans, the same rule
+%% and the same fields). The lane legs (deposit, results, freeze) stay votes
+%% at the lanes and are relayed by relay.mjs.
+channel_certificates(View, St = #{ cfg := Cfg }) ->
+    Root = maps:get(<<"pusd">>, Cfg),
+    RootCh = case key(<<"ledgerchannels">>, View) of M when is_map(M) -> M; _ -> #{} end,
+    Allowed = maps:get(fast_ledgers, St, #{}),
+    Lanes = maps:fold(fun(L, LV, Acc) ->
+        case key(<<"lanechannels">>, LV) of
+            C when is_map(C) -> Acc#{ L => C };
+            _ -> Acc
+        end
+    end, #{}, maps:with(maps:keys(Allowed), maps:get(lane_views, St, #{}))),
+    lists:foldl(fun({root, K, T}, S) -> committee_plan(K, T, S) end, St,
+        channel_plans(Root, RootCh, Lanes, Allowed)).
+
+channel_plans(Root, RootCh, Lanes, Allowed) ->
+    Channels = cmap(maps:get(<<"channels">>, RootCh, #{})),
+    Decided = maps:from_list([{maps:get(<<"key">>, R), true} || R <- clist(maps:get(<<"receipts">>, RootCh, [])),
+        is_binary(maps:get(<<"key">>, R, undefined))]),
+    View = fun(L) ->
+        case maps:find(L, Lanes) of
+            {ok, V} ->
+                case {maps:get(<<"ledger">>, V, undefined), maps:get(<<"root">>, V, undefined)} of
+                    {L, Root} -> V;
+                    _ -> none
+                end;
+            error -> none
+        end
+    end,
+    lists:append([case View(Requester) of
+        none -> [];
+        Lane -> lists:append([channel_request_plan(Root, Requester, Q, Channels, Decided, Allowed, View, Lane)
+            || Q <- clist(maps:get(<<"requests">>, Lane, []))])
+    end || Requester <- lists:sort(maps:keys(Allowed))]).
+
+channel_request_plan(Root, Requester, Q, Channels, Decided, Allowed, View, Lane) ->
+    Id = exact(maps:get(<<"id">>, Q, undefined)),
+    Gen = exact(maps:get(<<"generation">>, Q, undefined)),
+    Peer = maps:get(<<"peer">>, Q, undefined),
+    Op = maps:get(<<"op">>, Q, undefined),
+    Ok = maps:get(<<"status">>, Q, undefined) =:= <<"pending">> andalso is_integer(Id) andalso Id > 0
+        andalso is_integer(Gen) andalso is_binary(Op) andalso Peer =/= Requester
+        andalso maps:is_key(Peer, Allowed),
+    case Ok of
+        false -> [];
+        true ->
+            IdText = integer_to_binary(Id),
+            K = <<Requester/binary, "|", Op/binary, "|", IdText/binary>>,
+            Common = #{ <<"root">> => Root, <<"generation">> => integer_to_binary(Gen),
+                <<"requestid">> => IdText },
+            case maps:is_key(K, Decided) of
+                true -> [];
+                false when Op =:= <<"open">> ->
+                    case exact(maps:get(<<"quantity">>, Q, undefined)) of
+                        N when is_integer(N), N > 0 ->
+                            [{root, <<"channel-open:", K/binary>>, Common#{ <<"action">> => <<"Channel-Open">>,
+                                <<"source">> => Requester, <<"destination">> => Peer,
+                                <<"quantity">> => integer_to_binary(N) }}];
+                        _ -> []
+                    end;
+                false when Op =:= <<"settle">> ->
+                    settle_plan(K, Common, Requester, Peer, Q, Gen,
+                        cmap(maps:get(<<Peer/binary, "|", Requester/binary>>, Channels, #{})), View(Peer), Lane);
+                false when Op =:= <<"close">> ->
+                    close_plan(K, Common, Requester, Peer, Gen,
+                        cmap(maps:get(<<Requester/binary, "|", Peer/binary>>, Channels, #{})), Lane, View(Peer));
+                false -> []
+            end
+    end.
+
+%% A receiver's settle, certified only against the SENDER's own record.
+settle_plan(K, Common, Receiver, Sender, Q, Gen, Ch, SenderView, ReceiverView) ->
+    Seq = exact(maps:get(<<"seq">>, Q, undefined)),
+    Cum = exact(maps:get(<<"cumulative">>, Q, undefined)),
+    Plan = fun(C) -> [{root, <<"channel-settle:", K/binary>>, Common#{ <<"action">> => <<"Channel-Settle">>,
+        <<"source">> => Sender, <<"destination">> => Receiver, <<"seq">> => integer_to_binary(Seq),
+        <<"cumulative">> => integer_to_binary(C) }}] end,
+    RootGen = exact(maps:get(<<"generation">>, Ch, undefined)),
+    Inbound = cmap(maps:get(Sender, cmap(maps:get(<<"in">>, ReceiverView, #{})), #{})),
+    Exact = is_integer(Seq) andalso Seq > 0 andalso is_integer(Cum),
+    % The root has moved past this generation: it can only refuse, and
+    % records that refusal; a cumulative of 0 can move nothing.
+    MovedPast = is_integer(RootGen) andalso (RootGen > Gen orelse
+        (RootGen =:= Gen andalso map_get_bin(<<"status">>, Ch) =:= <<"closed">>)),
+    if
+        not Exact -> [];
+        MovedPast -> Plan(0);
+        RootGen =/= Gen -> [];
+        true ->
+            Deposit = exact(maps:get(<<"deposit">>, Ch, undefined)),
+            InSeq = exact(maps:get(<<"seq">>, Inbound, undefined)),
+            Received = exact(maps:get(<<"received">>, Inbound, undefined)),
+            Out = case SenderView of
+                none -> #{};
+                SV -> cmap(maps:get(Receiver, cmap(maps:get(<<"out">>, SV, #{})), #{}))
+            end,
+            SentSeq = exact(maps:get(<<"seq">>, Out, undefined)),
+            Sent = exact(maps:get(<<"sent">>, Out, undefined)),
+            Supported = is_integer(Deposit) andalso Cum =< Deposit
+                andalso exact(maps:get(<<"generation">>, Inbound, undefined)) =:= Gen
+                andalso is_integer(InSeq) andalso InSeq >= Seq
+                andalso is_integer(Received) andalso Received >= Cum
+                andalso SenderView =/= none
+                andalso exact(maps:get(<<"generation">>, Out, undefined)) =:= Gen
+                andalso is_integer(SentSeq) andalso SentSeq >= Seq
+                andalso is_integer(Sent) andalso Sent >= Cum
+                andalso (SentSeq =/= Seq orelse Sent =:= Cum),
+            case Supported of true -> Plan(Cum); false -> [] end
+    end.
+
+%% A close, once the receiver is frozen at exactly the sender's final point
+%% and has landed everything up to it.
+close_plan(K, Common, Sender, Receiver, Gen, Ch, SenderView, ReceiverView) ->
+    Out = cmap(maps:get(Receiver, cmap(maps:get(<<"out">>, SenderView, #{})), #{})),
+    FinalSeq = exact(maps:get(<<"finalSeq">>, Out, undefined)),
+    FinalSent = exact(maps:get(<<"finalSent">>, Out, undefined)),
+    AtFinal = map_get_bin(<<"status">>, Out) =:= <<"closing">>
+        andalso exact(maps:get(<<"generation">>, Out, undefined)) =:= Gen
+        andalso is_integer(FinalSeq) andalso FinalSeq =:= exact(maps:get(<<"seq">>, Out, undefined))
+        andalso is_integer(FinalSent) andalso FinalSent =:= exact(maps:get(<<"sent">>, Out, undefined)),
+    Deposit = exact(maps:get(<<"deposit">>, Ch, undefined)),
+    In = case ReceiverView of
+        none -> #{};
+        RV -> cmap(maps:get(Sender, cmap(maps:get(<<"in">>, RV, #{})), #{}))
+    end,
+    Supported = AtFinal
+        andalso exact(maps:get(<<"generation">>, Ch, undefined)) =:= Gen
+        andalso map_get_bin(<<"status">>, Ch) =:= <<"open">>
+        andalso is_integer(Deposit) andalso FinalSent =< Deposit
+        andalso ReceiverView =/= none
+        andalso exact(maps:get(<<"generation">>, In, undefined)) =:= Gen
+        andalso map_get_bin(<<"status">>, In) =:= <<"frozen">>
+        andalso exact(maps:get(<<"finalSeq">>, In, undefined)) =:= FinalSeq
+        andalso exact(maps:get(<<"finalReceived">>, In, undefined)) =:= FinalSent
+        andalso exact(maps:get(<<"seq">>, In, undefined)) =:= FinalSeq
+        andalso exact(maps:get(<<"received">>, In, undefined)) =:= FinalSent,
+    case Supported of
+        false -> [];
+        true -> [{root, <<"channel-close:", K/binary>>, Common#{ <<"action">> => <<"Channel-Close">>,
+            <<"source">> => Sender, <<"destination">> => Receiver,
+            <<"finalseq">> => integer_to_binary(FinalSeq),
+            <<"finalcumulative">> => integer_to_binary(FinalSent) }}]
+    end.
+
+%% An exact non-negative integer below 2^53, from a JSON number or canonical
+%% decimal text; anything else is `undefined'.
+exact(N) when is_integer(N), N >= 0, N < 9007199254740992 -> N;
+exact(B) when is_binary(B), byte_size(B) > 0, byte_size(B) < 17 ->
+    case re:run(B, <<"^(0|[1-9][0-9]*)$">>, [{capture, none}]) of
+        match -> exact(binary_to_integer(B));
+        nomatch -> undefined
+    end;
+exact(_) -> undefined.
+
+cmap(M) when is_map(M) -> M;
+cmap(_) -> #{}.
+clist(L) when is_list(L) -> [X || X <- L, is_map(X)];
+clist(_) -> [].
+map_get_bin(K, M) -> maps:get(K, M, undefined).
+
 committee_action(A) ->
-    lists:member(A, [<<"Bridge-Mint">>, <<"Ledger-Exit">>, <<"Ledger-Move-Root">>, <<"Bridge-Sign">>]).
+    lists:member(A, [<<"Bridge-Mint">>, <<"Ledger-Exit">>, <<"Ledger-Move-Root">>, <<"Bridge-Sign">>,
+        <<"Bridge-Released">>, <<"Ledger-Credited">>, <<"Channel-Open">>, <<"Channel-Settle">>,
+        <<"Channel-Close">>]).
 
 acknowledge(Withdrawals, St = #{ releases := Rel }) ->
     Pending = maps:from_list([{maps:get(<<"id">>, W), true} || W <- Withdrawals,
@@ -1244,10 +1341,14 @@ acknowledge(Withdrawals, St = #{ releases := Rel }) ->
             case maps:is_key(Id, Pending) of
                 false -> S#{ releases := maps:remove(Id, maps:get(releases, S)) };
                 true ->
-                    once(<<"ack:", Id/binary>>, S, fun() ->
-                        send(#{ <<"action">> => <<"Bridge-Released">>, <<"withdrawalid">> => Id,
-                            <<"desttx">> => maps:get(tx, E, <<>>) }, S)
-                    end)
+                    % A release certificate names the destination transaction
+                    % this node saw; without one there is nothing to certify.
+                    case hb_util:bin(maps:get(tx, E, <<>>)) of
+                        <<>> -> S;
+                        Tx -> committee_plan(<<"released:", Id/binary>>, #{
+                            <<"action">> => <<"Bridge-Released">>, <<"withdrawal-id">> => Id,
+                            <<"dest-tx">> => Tx }, S)
+                    end
             end
         end, St, Rel).
 
@@ -1535,8 +1636,11 @@ publish_root_certificate(Key, Tags, St = #{cfg := Cfg, opts := Opts, me := Me,
         root_certificate_info := Info}) ->
     Root = maps:get(<<"pusd">>, Cfg),
     Epoch = hb_util:int(maps:get(<<"epoch">>, Info)),
-    Payload = (maps:remove(<<"rootsequence">>, Tags))#{<<"target">> => Root,
-        <<"root-sequence">> => maps:get(<<"rootsequence">>, Tags),
+    Sequence = case maps:find(<<"rootsequence">>, Tags) of
+        {ok, Seq} -> #{<<"root-sequence">> => Seq};
+        error -> #{}
+    end,
+    Payload = (maps:merge(maps:remove(<<"rootsequence">>, Tags), Sequence))#{<<"target">> => Root,
         <<"author">> => Me, <<"certificate-version">> => <<"pusd-root/v1">>,
         <<"attestor-epoch">> => integer_to_binary(Epoch)},
     StateFile = hb_util:bin(maps:get(<<"state-file">>, Cfg, <<"bridge-state.json">>)),
@@ -1546,8 +1650,9 @@ publish_root_certificate(Key, Tags, St = #{cfg := Cfg, opts := Opts, me := Me,
     Saved = case file:read_file(File) of
         {ok, Bin} -> binary_to_term(Bin, [safe]);
         {error, enoent} ->
-            Intent = hb_message:commit(Payload, Opts, <<"ans104@1.0">>),
-            Initial = #{payload => Payload, intent => Intent},
+            Final = release_signatures(Payload, St),
+            Intent = hb_message:commit(Final, Opts, <<"ans104@1.0">>),
+            Initial = #{payload => Final, intent => Intent},
             save_root_publication(File, Initial),
             Initial;
         {error, Reason} -> error({root_journal_unreadable, Reason})
@@ -1588,6 +1693,51 @@ save_root_publication(File, State) ->
     Tmp = <<File/binary, ".tmp">>,
     ok = file:write_file(Tmp, term_to_binary(State), [raw, binary, sync]),
     ok = file:rename(Tmp, File).
+
+%% @doc A withdrawal costs ONE carrier: before its Bridge-Sign intent is
+%% journalled, this member sends a draft (carrying only its own signature) to
+%% every member's root-endorse and keeps each answered `release-sig' that
+%% verifies against that member's registered chain key, then names the lowest
+%% k of them. Any other operation is published as planned.
+release_signatures(Payload = #{<<"action">> := <<"Bridge-Sign">>},
+        St = #{opts := Opts, root_certificate_info := Info, root_view := View}) ->
+    Members = maps:get(<<"attestors">>, Info),
+    Epoch = hb_util:int(maps:get(<<"epoch">>, Info)),
+    Namespace = hb_util:int(maps:get(<<"namespace">>, Info, 0)),
+    W = pending_withdrawal(maps:get(<<"withdrawal-id">>, Payload), View),
+    Draft = hb_message:commit(Payload, Opts, <<"ans104@1.0">>),
+    Answers = [maps:get(<<"release-sig">>, R, <<>>) || R <- collect_root_responses(Members, Draft, St)],
+    Valid = lists:usort([{Index, Sig} || Entry <- [maps:get(<<"release-sigs">>, Payload) | Answers],
+        [IndexText, Sig] <- [binary:split(Entry, <<":">>)],
+        Index <- [catch binary_to_integer(IndexText)], is_integer(Index), Index >= 0,
+        Index < length(Members),
+        (catch release_signature_valid(W, lists:nth(Index + 1, Members), Sig, Epoch, Namespace, St)) =:= true]),
+    K = length(Members) div 2 + 1,
+    Chosen = lists:sublist(lists:ukeysort(1, Valid), K),
+    K = length(Chosen),
+    Payload#{<<"release-sigs">> => iolist_to_binary(lists:join(<<",">>,
+        [<<(integer_to_binary(I))/binary, ":", S/binary>> || {I, S} <- Chosen]))};
+release_signatures(Payload, _St) -> Payload.
+
+%% @doc Every member's root-endorse answer to one intent, within the deadline.
+collect_root_responses(Members, Intent, St) ->
+    Parent = self(),
+    Ref = make_ref(),
+    Workers = [spawn(fun() ->
+        Answer = try request_root_proof(Member, Intent, St) catch _:_ -> #{} end,
+        Parent ! {Ref, Answer}
+    end) || Member <- Members],
+    Deadline = erlang:monotonic_time(millisecond) + 65000,
+    Collect = fun Loop(0, Acc) -> Acc;
+                  Loop(N, Acc) ->
+                      receive {Ref, A} when is_map(A) -> Loop(N - 1, [A | Acc]);
+                              {Ref, _} -> Loop(N - 1, Acc)
+                      after max(0, Deadline - erlang:monotonic_time(millisecond)) -> Acc
+                      end
+              end,
+    try Collect(length(Workers), [])
+    after lists:foreach(fun(Pid) -> exit(Pid, kill) end, Workers)
+    end.
 
 %% @doc Request proofs concurrently. Location records are routing hints only:
 %% the assembler checks every proof against the verified membership snapshot.
@@ -1638,7 +1788,7 @@ fetch_root_proof(Node, Intent, Opts) ->
         Bin when is_binary(Bin) -> hb_json:decode(Bin);
         Map -> Map
     end,
-    maps:with([<<"signer">>, <<"intent-id">>, <<"signature">>], Result).
+    maps:with([<<"signer">>, <<"intent-id">>, <<"signature">>, <<"release-sig">>], Result).
 
 fast_ledger_node(Spec, Cfg) when is_binary(Spec) -> Spec;
 fast_ledger_node(Spec, Cfg) when is_map(Spec) ->
@@ -2513,6 +2663,53 @@ fast_ledger_move_plans_test() ->
     ?assertEqual(<<"cap">>, maps:get(<<"error">>, Rejection)),
     ?assertEqual([], move_receipt_plans(Root, [Receipt], maps:remove(Source, Allowed))),
     ?assertEqual([], move_receipt_plans(<<"other-root">>, [Receipt], Allowed)).
+
+%% @doc The root's channel steps this node would certify, from both lanes' own
+%% records, with the JS relay's fields: an open, a settle the sender's record
+%% supports, a close once the receiver is frozen at the sender's final point.
+%% A step the records do not support, or a decided one, is no plan.
+channel_plans_test() ->
+    Root = <<"root">>, A = <<"lane-a">>, B = <<"lane-b">>,
+    Allowed = #{A => #{}, B => #{}},
+    Lane = fun(L, Out, In, Requests) -> #{<<"ledger">> => L, <<"root">> => Root, <<"out">> => Out,
+        <<"in">> => In, <<"requests">> => Requests} end,
+    Open = #{<<"id">> => 3, <<"op">> => <<"open">>, <<"peer">> => B, <<"generation">> => 1,
+        <<"quantity">> => <<"50">>, <<"status">> => <<"pending">>},
+    [{root, <<"channel-open:lane-a|open|3">>, OpenTags}] =
+        channel_plans(Root, #{}, #{A => Lane(A, #{}, #{}, [Open])}, Allowed),
+    ?assertEqual(#{<<"action">> => <<"Channel-Open">>, <<"root">> => Root, <<"source">> => A,
+        <<"destination">> => B, <<"generation">> => <<"1">>, <<"requestid">> => <<"3">>,
+        <<"quantity">> => <<"50">>}, OpenTags),
+    Decided = #{<<"receipts">> => [#{<<"key">> => <<"lane-a|open|3">>}]},
+    ?assertEqual([], channel_plans(Root, Decided, #{A => Lane(A, #{}, #{}, [Open])}, Allowed)),
+    ?assertEqual([], channel_plans(<<"other">>, #{}, #{A => Lane(A, #{}, #{}, [Open])}, Allowed)),
+    RootCh = #{<<"channels">> => #{<<"lane-a|lane-b">> => #{<<"generation">> => 1,
+        <<"deposit">> => <<"100">>, <<"status">> => <<"open">>}}},
+    Settle = #{<<"id">> => 4, <<"op">> => <<"settle">>, <<"peer">> => A, <<"generation">> => 1,
+        <<"seq">> => 5, <<"cumulative">> => <<"50">>, <<"status">> => <<"pending">>},
+    Sender = fun(Seq, Sent) -> Lane(A, #{B => #{<<"generation">> => 1, <<"seq">> => Seq,
+        <<"sent">> => Sent, <<"status">> => <<"open">>}}, #{}, []) end,
+    Receiver = Lane(B, #{}, #{A => #{<<"generation">> => 1, <<"seq">> => 5, <<"received">> => <<"50">>}}, [Settle]),
+    [{root, _, SettleTags}] = channel_plans(Root, RootCh, #{A => Sender(5, <<"50">>), B => Receiver}, Allowed),
+    ?assertEqual({<<"Channel-Settle">>, A, B, <<"5">>, <<"50">>}, {maps:get(<<"action">>, SettleTags),
+        maps:get(<<"source">>, SettleTags), maps:get(<<"destination">>, SettleTags),
+        maps:get(<<"seq">>, SettleTags), maps:get(<<"cumulative">>, SettleTags)}),
+    ?assertEqual([], channel_plans(Root, RootCh, #{A => Sender(4, <<"40">>), B => Receiver}, Allowed),
+        "the receiver claims more than the sender sent"),
+    ?assertEqual([], channel_plans(Root, RootCh, #{A => Sender(5, <<"49">>), B => Receiver}, Allowed)),
+    ?assertEqual([], channel_plans(Root, RootCh, #{B => Receiver}, Allowed), "sender unreadable"),
+    Close = #{<<"id">> => 5, <<"op">> => <<"close">>, <<"peer">> => B, <<"generation">> => 1,
+        <<"status">> => <<"pending">>},
+    Closing = Lane(A, #{B => #{<<"generation">> => 1, <<"seq">> => 7, <<"sent">> => <<"70">>,
+        <<"status">> => <<"closing">>, <<"finalSeq">> => 7, <<"finalSent">> => <<"70">>}}, #{}, [Close]),
+    Frozen = fun(Seq, Got) -> Lane(B, #{}, #{A => #{<<"generation">> => 1, <<"seq">> => Seq,
+        <<"received">> => Got, <<"status">> => <<"frozen">>, <<"finalSeq">> => 7,
+        <<"finalReceived">> => <<"70">>}}, []) end,
+    [{root, _, CloseTags}] = channel_plans(Root, RootCh, #{A => Closing, B => Frozen(7, <<"70">>)}, Allowed),
+    ?assertEqual({<<"Channel-Close">>, <<"7">>, <<"70">>}, {maps:get(<<"action">>, CloseTags),
+        maps:get(<<"finalseq">>, CloseTags), maps:get(<<"finalcumulative">>, CloseTags)}),
+    ?assertEqual([], channel_plans(Root, RootCh, #{A => Closing, B => Frozen(6, <<"60">>)}, Allowed),
+        "credits still in flight").
 
 %% @doc The plan for a root sequence is keyed by that sequence alone, so a
 %% retry reuses its journal whatever arrived since. Only an advanced verified
