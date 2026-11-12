@@ -423,6 +423,7 @@ message_for_process(Body, Pusd, Slot, Opts) ->
         {none, none, 0} ->
             hb_maps:get(<<"type">>, Body, none, Opts) =:= <<"Process">>
                 andalso (catch hb_message:id(Body, all, Opts)) =:= Pusd;
+        {none, none, _} -> true;
         _ -> false
     end.
 

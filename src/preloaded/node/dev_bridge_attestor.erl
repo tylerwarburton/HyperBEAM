@@ -2747,8 +2747,11 @@ message_for_another_process_is_not_used_test_() ->
             maps:get(replica, St1))
     end}.
 
-%% A scheduler cannot supply the missing destination authority of a signature.
-message_without_destination_is_refused_test_() ->
+%% A signed message without a `target', scheduled on PUSD: the honest
+%% scheduler takes the process from the path, so any wallet can send one. The
+%% assignment says the slot is PUSD's; the replica goes on past it, and the
+%% Redeem it carries is signed. Only a provenance failure stops a replica.
+message_without_target_is_pusds_test_() ->
     {timeout, 120, fun() ->
         Make = fun(_Orig) ->
             hb_message:commit(#{ <<"action">> => <<"Redeem">>, <<"to">> => ?TEST_TO,
@@ -2757,9 +2760,7 @@ message_without_destination_is_refused_test_() ->
         end,
         St = replica_setup(<<"no-target">>, fun(W) -> replace_redeem(W, Make) end),
         St1 = pass(St),
-        ?assertEqual(<<>>, raw(<<"signs">>, St1)),
-        ?assertMatch(#{stopped := <<"message is for another process", _/binary>>},
-            maps:get(replica, St1))
+        ?assertEqual(<<"1=", (true_signature(St1))/binary, ";">>, raw(<<"signs">>, St1))
     end}.
 
 %% A signed Assign-To authorizes the root even without a native TX target.
