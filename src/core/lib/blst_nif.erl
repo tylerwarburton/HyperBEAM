@@ -7,7 +7,7 @@
 %%% `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_'. A threshold group signature
 %%% verifies the same way under the group public key.
 -module(blst_nif).
--export([verify/3]).
+-export([verify/3, keygen/1, sign/3, aggregate/1, fast_aggregate_verify/4]).
 
 -on_load(init/0).
 
@@ -24,4 +24,28 @@ init() ->
 %% check. Runs on a dirty CPU scheduler.
 -spec verify(binary(), binary(), binary()) -> boolean() | {error, atom()}.
 verify(_PublicKey, _Message, _Signature) ->
+	erlang:nif_error(nif_not_loaded).
+
+%% @doc A secret key (32 bytes) and its compressed G1 public key (48 bytes),
+%% derived from at least 32 bytes of key material (IETF KeyGen).
+-spec keygen(binary()) -> {binary(), binary()} | {error, atom()}.
+keygen(_IKM) ->
+	erlang:nif_error(nif_not_loaded).
+
+%% @doc Sign `Message' under the caller's domain separation tag `DST'.
+-spec sign(binary(), binary(), binary()) -> binary() | {error, atom()}.
+sign(_Secret, _Message, _DST) ->
+	erlang:nif_error(nif_not_loaded).
+
+%% @doc The sum of 1 to 64 signatures, each checked to be in G2.
+-spec aggregate([binary()]) -> binary() | {error, atom()}.
+aggregate(_Signatures) ->
+	erlang:nif_error(nif_not_loaded).
+
+%% @doc Verify one aggregate signature over one `Message' under the sum of
+%% 1 to 64 public keys, each checked to be in G1 and not the identity. Only
+%% keys whose possession was proven may be passed: that is what makes the
+%% sum safe against rogue keys.
+-spec fast_aggregate_verify([binary()], binary(), binary(), binary()) -> boolean() | {error, atom()}.
+fast_aggregate_verify(_PublicKeys, _Message, _Aggregate, _DST) ->
 	erlang:nif_error(nif_not_loaded).

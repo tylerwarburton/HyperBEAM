@@ -9,8 +9,9 @@
 %%%   2. scans Base (through `evm-rpc@1.0'), Solana and Sui for deposits and
 %%%      releases since its cursors;
 %%%   3. authors a `Bridge-Mint' root certificate for each unminted deposit;
-%%%   4. authors a `Bridge-Sign' root certificate carrying its signature over
-%%%      each pending withdrawal for its chain;
+%%%   4. signs each pending withdrawal for its chain, and each applied change
+%%%      it was a prior member for, and serves those signatures from
+%%%      `chain-sig' (they are never stored on the root);
 %%%   5. authors a `Bridge-Released' root certificate for each release it saw;
 %%%   6. relays root credits, and authors root certificates for fast-ledger
 %%%      exits (`Ledger-Exit') and ledger moves (`Ledger-Move-Root').
@@ -41,6 +42,9 @@
 %%%   GET  /~bridge-attestor@1.0/nudge   a bridge transaction was just sent: pass
 %%%                                      now, then every `fast-interval' for
 %%%                                      `fast-window'
+%%%   GET  /~bridge-attestor@1.0/chain-sig?withdrawal=ID | ?proposal=ID
+%%%                                      this node's chain signature for a
+%%%                                      record its last pass verified
 %%%   POST /~bridge-attestor@1.0/root-endorse signs an author-signed root
 %%%                                      certificate after local verification
 %%%
@@ -75,14 +79,17 @@
 %%% GET /~meta@1.0/info/bridge.
 -module(dev_bridge_attestor).
 -implements(<<"bridge-attestor@1.0">>).
--export([device_info/1, start/3, status/3, keys/3, nudge/3, root_endorse/3]).
--export([proposals_to_vote/2, successor_ok/3]).
+-export([device_info/1, start/3, status/3, keys/3, nudge/3, root_endorse/3, chain_sig/3]).
+-export([successor_ok/3]).
 -export([withdrawal_signature/5, minted/3]).
--device_libraries([lib_bridge_replica, lib_arweave_scheduler_blocks]).
+-device_libraries([lib_bridge_replica, lib_arweave_scheduler_blocks, lib_bridge_bls]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -define(NAME, {<<"bridge-attestor@1.0">>, loop}).
+%% The chain signatures the last pass made, readable by every request without
+%% the loop: a flood of claimers never queues behind (or delays) a pass.
+-define(CHAIN_SIGS, dev_bridge_attestor_chain_sigs).
 -define(RESEND_MS, 60000).
 -define(ARWEAVE_RESEND_MS, 1800000).
 -define(NUDGE_GAP_MS, 10000).
@@ -92,7 +99,7 @@
 
 device_info(_) ->
     #{ exports => [<<"start">>, <<"status">>, <<"keys">>, <<"nudge">>,
-        <<"root-endorse">>] }.
+        <<"root-endorse">>, <<"chain-sig">>] }.
 
 %%% Endpoints -----------------------------------------------------------------
 
@@ -159,6 +166,28 @@ root_endorse(_Base, Req, Opts) ->
                 Error -> Error
             end;
         _ -> {error, <<"A signed root operation is required">>}
+    end.
+
+%% @doc This member's own chain signature for one record its last pass
+%% verified: `withdrawal=<id>' (a pending withdrawal's release on its chain) or
+%% `proposal=<id>' (an applied membership, migration or administration change
+%% it was a prior member for, one signature per chain). Never computed for a
+%% request: answered only from what the pass already signed, so a claimer can
+%% neither make the node sign anything nor make it work for an answer.
+chain_sig(_Base, Req, Opts) ->
+    Query = fun(K) -> hb_maps:get(K, Req, undefined, Opts) end,
+    Lookup = case {Query(<<"withdrawal">>), Query(<<"proposal">>)} of
+        {W, undefined} when is_binary(W) -> {withdrawal, W};
+        {undefined, P} when is_binary(P) -> {proposal, P};
+        _ -> invalid
+    end,
+    case Lookup of
+        invalid -> {error, #{<<"status">> => 400, <<"body">> => <<"Name one withdrawal or one proposal">>}};
+        _ ->
+            case served_chain_sig(Lookup) of
+                {ok, Answer} -> {ok, json(Answer)};
+                _ -> {error, #{<<"status">> => 404, <<"body">> => <<"No chain signature for that record">>}}
+            end
     end.
 
 call(Msg) ->
@@ -335,7 +364,7 @@ root_certificate_approval(Message, View, St = #{cfg := Cfg, opts := Opts, me := 
         % domain, and nothing else: the node's AO wallet signs no payload a
         % caller chose.
         Proof = #{} = root_inline_proof(Message, AuthorIDs, Members, St),
-        {ok, maps:merge(Proof, own_release_signature(Action, Payload, Info, View, St))}
+        {ok, Proof}
     catch _:_ -> {error, <<"Root operation is not eligible for endorsement">>}
     end.
 
@@ -347,27 +376,28 @@ root_balance(Account, View = {State, ROpts}) ->
         Current -> hb_util:int(Current)
     end.
 
-%% @doc Compact proofs use the current set's registered Sui public key, with
-%% the root certificate domain. A changed key must be installed locally before
-%% this node can endorse that epoch. Non-ANS requests have no inline encoding.
+%% @doc This member's endorsement: its BLS signature over the root domain,
+%% under the committee's own tag (dev_bridge_root). The current set must
+%% register exactly this node's BLS key for it; a changed key must be
+%% installed locally before this node can endorse that epoch. Non-ANS
+%% requests have no inline encoding.
 root_inline_proof(Message, AuthorIDs, Members, #{keys := Keys, me := Me, opts := Opts}) ->
     Commitments = maps:get(<<"commitments">>, Message),
     ANS = [ID || ID <- AuthorIDs,
         maps:get(<<"commitment-device">>, maps:get(ID, Commitments)) =:= <<"ans104@1.0">>],
     [Member] = [M || M <- Members, maps:get(<<"ao">>, M) =:= Me],
-    case {ANS, maps:find(<<"sui">>, Member)} of
+    case {ANS, maps:find(<<"bls">>, Member)} of
         {[], _} -> none;
         {_, error} -> none;
         {[IntentID], {ok, Registered}} ->
-            Seed = maps:get(sui, Keys),
-            PublicKey = dev_bridge_attestor_sign:ed25519_public(Seed),
-            PublicKey = unhex(Registered),
+            {Secret, Public} = maps:get(bls, Keys),
+            Registered = <<"0x", (dev_bridge_attestor_sign:hex(Public))/binary>>,
             {ok, Bytes} = hb_ao:resolve(#{<<"device">> => <<"bridge-root@1.0">>},
                 #{<<"path">> => <<"domain">>, <<"root">> => maps:get(<<"target">>, Message),
                     <<"epoch">> => maps:get(<<"attestor-epoch">>, Message),
                     <<"intent-id">> => IntentID}, Opts),
             #{<<"signer">> => Me, <<"intent-id">> => IntentID,
-                <<"signature">> => hb_util:encode(dev_bridge_attestor_sign:ed25519_sign(Bytes, Seed))}
+                <<"signature">> => hb_util:encode(blst_nif:sign(Secret, Bytes, lib_bridge_bls:dst()))}
     end;
 root_inline_proof(_Message, _AuthorIDs, _Members, _State) -> none.
 
@@ -408,12 +438,12 @@ root_action_author(<<"Ledger-Release">>) -> lane;
 root_action_author(<<"Bridge-Mint">>) -> member;
 root_action_author(<<"Ledger-Exit">>) -> member;
 root_action_author(<<"Ledger-Move-Root">>) -> member;
-root_action_author(<<"Bridge-Sign">>) -> member;
 root_action_author(<<"Bridge-Released">>) -> member;
 root_action_author(<<"Ledger-Credited">>) -> member;
 root_action_author(<<"Channel-Open">>) -> member;
 root_action_author(<<"Channel-Settle">>) -> member;
-root_action_author(<<"Channel-Close">>) -> member.
+root_action_author(<<"Channel-Close">>) -> member;
+root_action_author(<<"Attestor-Apply">>) -> member.
 
 %% @doc Match the contract's actor: the account whose sequence the operation
 %% runs under. A root actor is the wallet whose signature authored the
@@ -451,30 +481,8 @@ root_name(K) ->
 %% committee plans from its last pass -- a deposit its chain scan found and the
 %% root has not minted, a lane exit, move or credit its own lane replica
 %% shows, a release its chain scan saw, a channel step both lanes' replicas
-%% support. One rule for every committee action. Release signatures are the
-%% one field members differ on: each listed one must verify against the
-%% signing member's registered chain key.
-%% Execution at the root rechecks everything in canonical order.
-committee_evidence(<<"Bridge-Sign">>, P, Info, View, St) ->
-    Id = root_field(<<"withdrawalid">>, P),
-    true = lists:any(fun({_, T}) ->
-        maps:get(<<"action">>, T) =:= <<"Bridge-Sign">> andalso maps:get(<<"withdrawal-id">>, T) =:= Id
-    end, maps:get(committee, St, [])),
-    W = pending_withdrawal(Id, View),
-    Members = maps:get(<<"attestors">>, Info),
-    Epoch = hb_util:int(maps:get(<<"epoch">>, Info)),
-    Namespace = hb_util:int(maps:get(<<"namespace">>, Info, 0)),
-    Entries = binary:split(root_field(<<"releasesigs">>, P), <<",">>, [global]),
-    Indices = [begin
-        [IndexText, Sig] = binary:split(Entry, <<":">>),
-        Index = binary_to_integer(IndexText),
-        IndexText = integer_to_binary(Index),
-        true = release_signature_valid(W, lists:nth(Index + 1, Members), Sig, Epoch, Namespace, St),
-        Index
-    end || Entry <- Entries],
-    % At least k of them is the root's rule; a draft carrying fewer is still
-    % answered, so the author can collect the rest (release_signatures/2).
-    Indices =:= lists:usort(Indices);
+%% support, a proposal its operator approved. One rule for every committee
+%% action. Execution at the root rechecks everything in canonical order.
 committee_evidence(_Action, P, _Info, _View, St) ->
     Want = committee_fields(P),
     lists:any(fun({_, Tags}) -> committee_fields(Tags) =:= Want end, maps:get(committee, St, [])).
@@ -485,53 +493,6 @@ committee_fields(M) ->
     maps:from_list([{root_name(K), V} || {K, V} <- maps:to_list(M),
         not lists:member(root_name(K), [<<"author">>, <<"target">>, <<"certificateversion">>,
             <<"attestorepoch">>, <<"rootsequence">>])]).
-
-pending_withdrawal(Id, View) ->
-    [W] = [W || W <- key(<<"withdrawals">>, View), is_map(W),
-        hb_util:bin(maps:get(<<"id">>, W, <<>>)) =:= Id],
-    <<"pending">> = maps:get(<<"status">>, W),
-    W.
-
-%% @doc A Bridge-Sign endorsement also answers with this member's own release
-%% signature (`<index>:<signature>'), so the author can collect k of them
-%% through root-endorse into the ONE certificate a withdrawal costs.
-own_release_signature(<<"Bridge-Sign">>, P, Info, View, St = #{me := Me, cfg := Cfg, keys := Keys}) ->
-    W = pending_withdrawal(root_field(<<"withdrawalid">>, P), View),
-    Members = maps:get(<<"attestors">>, Info),
-    Index = length(lists:takewhile(fun(A) -> maps:get(<<"ao">>, A, <<>>) =/= Me end, Members)),
-    Sig = withdrawal_signature(W, hb_util:int(maps:get(<<"epoch">>, Info)), Cfg, Keys,
-        hb_util:int(maps:get(<<"namespace">>, Info, maps:get(namespace, St, 0)))),
-    #{<<"release-sig">> => <<(integer_to_binary(Index))/binary, ":", Sig/binary>>};
-own_release_signature(_Action, _P, _Info, _View, _St) -> #{}.
-
-%% @doc Whether `Sig' is `Member''s own release signature for withdrawal `W'
-%% on its chain, under this node's chain configuration: the check the chain
-%% contract makes, made before endorsing rather than after paying gas.
-release_signature_valid(W, Member, <<"0x", Hex/binary>>, Epoch, Namespace, #{cfg := Cfg}) ->
-    Chain = maps:get(<<"chain">>, W),
-    C = maps:get(Chain, Cfg),
-    Root = maps:get(<<"pusd">>, Cfg),
-    Id = (Namespace bsl 32) bor hb_util:int(maps:get(<<"id">>, W)),
-    Token = maps:get(<<"token">>, W),
-    To = maps:get(<<"to">>, W),
-    Amount = maps:get(<<"amount">>, W),
-    Sig = unhex(Hex),
-    case Chain of
-        <<"base">> ->
-            Inner = dev_bridge_attestor_sign:base_release(hb_util:int(maps:get(<<"chain-id">>, C)),
-                maps:get(<<"contract">>, C), Root, Epoch, Id, Token, To, Amount),
-            dev_bridge_attestor_sign:base_signer(Inner, Sig) =:=
-                hb_util:to_lower(maps:get(<<"base">>, Member));
-        <<"solana">> ->
-            Msg = dev_bridge_attestor_sign:solana_release(maps:get(<<"program">>, C),
-                Root, Epoch, Id, Token, To, Amount),
-            crypto:verify(eddsa, none, Msg, Sig,
-                [dev_bridge_attestor_sign:address(solana, maps:get(<<"solana">>, Member)), ed25519]);
-        <<"sui">> ->
-            Msg = dev_bridge_attestor_sign:sui_release(maps:get(<<"bridge">>, C),
-                Root, Epoch, Id, Token, To, Amount),
-            crypto:verify(eddsa, none, Msg, Sig, [unhex(maps:get(<<"sui">>, Member)), ed25519])
-    end.
 
 root_delivery_stamps(Payload) ->
     [{N, V} || {K, V} <- maps:to_list(Payload),
@@ -552,11 +513,10 @@ root_certificate_approval_test() ->
     Root = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Lane = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Opts = #{<<"priv-wallet">> => MemberWallet, <<"store">> => hb_test_utils:test_store()},
-    Seed = <<42:256>>,
-    PublicKey = dev_bridge_attestor_sign:ed25519_public(Seed),
-    Registered = <<"0x", (binary:encode_hex(PublicKey))/binary>>,
-    St = #{cfg => #{<<"pusd">> => Root}, opts => Opts, me => Me, keys => #{sui => Seed}},
-    Info = #{<<"epoch">> => 7, <<"attestors">> => [#{<<"ao">> => Me, <<"sui">> => Registered}],
+    {Secret, PublicKey} = BlsKey = blst_nif:keygen(<<42:256>>),
+    Registered = <<"0x", (binary:encode_hex(PublicKey, lowercase))/binary>>,
+    St = #{cfg => #{<<"pusd">> => Root}, opts => Opts, me => Me, keys => #{bls => BlsKey}},
+    Info = #{<<"epoch">> => 7, <<"attestors">> => [#{<<"ao">> => Me, <<"bls">> => Registered}],
         <<"ledgers">> => #{Lane => #{<<"scheduler">> => LaneAuthority,
             <<"status">> => <<"active">>}}},
     State = #{<<"bridgeinfo">> => hb_json:encode(Info),
@@ -620,9 +580,12 @@ root_certificate_approval_test() ->
     {ok, ProofBytes} = hb_ao:resolve(#{<<"device">> => <<"bridge-root@1.0">>},
         #{<<"path">> => <<"domain">>, <<"root">> => Root, <<"epoch">> => 7,
             <<"intent-id">> => IntentID}, Opts),
-    ?assert(crypto:verify(eddsa, none, ProofBytes, hb_util:decode(Proof), [PublicKey, ed25519])),
+    ?assert(blst_nif:fast_aggregate_verify([PublicKey], ProofBytes, hb_util:decode(Proof), lib_bridge_bls:dst())),
+    _ = Secret,
+    % A node whose own key is not the one the set registered endorses nothing:
+    % after a rotation it cannot sign for a key it no longer holds.
     ?assertMatch({error, _}, root_certificate_approval(WalletItem, InlineView,
-        InlineSt#{keys => #{sui => <<43:256>>}})).
+        InlineSt#{keys => #{bls => blst_nif:keygen(<<43:256>>)}})).
 
 %% @doc A committee certificate is endorsed only on this member's own evidence,
 %% authored by a member, spelled as the authoring node emits it. Each action:
@@ -639,9 +602,10 @@ committee_certificate_approval_test() ->
     PeerBase = <<7:256>>,
     Token = <<"0x2222222222222222222222222222222222222222">>,
     To = <<"0x3333333333333333333333333333333333333333">>,
-    Members = [#{<<"ao">> => Me, <<"sui">> => Hex(dev_bridge_attestor_sign:ed25519_public(Seed)),
+    MyBls = blst_nif:keygen(Seed),
+    Members = [#{<<"ao">> => Me, <<"bls">> => Hex(element(2, MyBls)),
             <<"base">> => dev_bridge_attestor_sign:base_address(<<8:256>>)},
-        #{<<"ao">> => Peer, <<"sui">> => Hex(dev_bridge_attestor_sign:ed25519_public(<<9:256>>)),
+        #{<<"ao">> => Peer, <<"bls">> => Hex(element(2, blst_nif:keygen(<<9:256>>))),
             <<"base">> => dev_bridge_attestor_sign:base_address(PeerBase)}],
     Info = #{<<"epoch">> => 7, <<"namespace">> => 3, <<"attestors">> => Members,
         <<"ledgers">> => #{Lane => #{<<"status">> => <<"active">>}, Lane2 => #{<<"status">> => <<"active">>}},
@@ -659,7 +623,7 @@ committee_certificate_approval_test() ->
             <<"quantity">> => <<"30">>}])},
     Cfg = #{<<"pusd">> => Root, <<"base">> => #{<<"chain-id">> => 8453,
         <<"contract">> => <<"0x1111111111111111111111111111111111111111">>}},
-    St0 = #{cfg => Cfg, opts => Opts, me => Me, keys => #{sui => Seed, base => <<8:256>>},
+    St0 = #{cfg => Cfg, opts => Opts, me => Me, keys => #{bls => MyBls, base => <<8:256>>},
         deposits => #{<<"base:3">> => #{kind => deposit, chain => <<"base">>, nonce => 3,
             token => Token, recipient => Holder, amount => <<"500">>}},
         lane_views => #{Lane => {LaneState, Opts}}, namespace => 3, index => 0, sent => #{},
@@ -669,7 +633,7 @@ committee_certificate_approval_test() ->
     LaneRows = fun(K) -> key(K, {LaneState, Opts}) end,
     Own = [{K, T} || {root, K, T} <- exit_plans(Lane, LaneRows(<<"laneexits">>), [])
         ++ move_root_plans(7, Lane, LaneRows(<<"lanemoves">>), [], #{Lane => #{}, Lane2 => #{}})],
-    St1 = sign_withdrawals([W], 7, attest_deposits(Info, St0)),
+    St1 = attest_deposits(Info, St0),
     St = St1#{committee => maps:get(committee, St1) ++ Own},
     Base = #{<<"certificate-version">> => <<"pusd-root/v1">>, <<"target">> => Root,
         <<"author">> => Peer, <<"attestor-epoch">> => <<"7">>},
@@ -703,20 +667,16 @@ committee_certificate_approval_test() ->
     ?assertMatch({ok, _}, Approve(Move)),
     lists:foreach(Refused, [Move#{<<"destination">> => Root}, Move#{<<"quantity">> => <<"31">>},
         Move#{<<"move-id">> => <<"10">>}]),
-    Sig = withdrawal_signature(W, 7, Cfg, #{base => PeerBase}, 3),
-    Signs = Base#{<<"action">> => <<"Bridge-Sign">>, <<"withdrawal-id">> => <<"5">>,
-        <<"release-sigs">> => <<"1:", Sig/binary>>},
-    Mine = withdrawal_signature(W, 7, Cfg, #{base => <<8:256>>}, 3),
-    % A draft is answered with this member's own signature, for the author
-    % to collect k of into the one certificate the withdrawal costs.
-    ?assertMatch({ok, #{<<"release-sig">> := <<"0:", Mine/binary>>}}, Approve(Signs)),
-    ?assertMatch({ok, _}, Approve(Signs#{<<"release-sigs">> => <<"0:", Mine/binary, ",1:", Sig/binary>>})),
-    lists:foreach(Refused, [Signs#{<<"release-sigs">> => <<"0:", Sig/binary>>},
-        Signs#{<<"release-sigs">> => <<"1:", Sig/binary, ",0:", Mine/binary>>},
-        Signs#{<<"release-sigs">> => <<"1:", Sig/binary, ",1:", Sig/binary>>},
-        Signs#{<<"release-sigs">> => <<"2:", Sig/binary>>},
-        Signs#{<<"withdrawal-id">> => <<"6">>},
-        Signs#{<<"release-sigs">> => <<"1:", (withdrawal_signature(W, 7, Cfg, #{base => PeerBase}, 4))/binary>>}]).
+    _ = {PeerBase, W},
+    % A proposal is endorsed only once this node's operator approved it.
+    Proposal = #{<<"id">> => 12, <<"status">> => <<"open">>, <<"approvals">> => #{Peer => true}},
+    Apply = Base#{<<"action">> => <<"Attestor-Apply">>, <<"proposal-id">> => <<"12">>},
+    ?assertEqual([], [P || {<<"apply:", _/binary>>, _} = P <- maps:get(committee,
+        apply_proposals(Info#{<<"proposals">> => [Proposal]}, St0))]),
+    Refused(Apply),
+    Approved = apply_proposals(Info#{<<"proposals">> => [Proposal#{<<"approvals">> => #{Me => true}}]}, St0),
+    ?assertMatch({ok, _}, root_certificate_approval(Sign(Apply, PeerWallet), View,
+        St#{committee => maps:get(committee, Approved)})).
 
 root_endorse_endpoint_test_() ->
     {timeout, 120, fun root_endorse_endpoint/0}.
@@ -733,10 +693,10 @@ root_endorse_endpoint() ->
     Dir = <<"/tmp/root-endorsement-", (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary>>,
     ok = file:make_dir(Dir),
     NodeKeys = load_keys(<<Dir/binary, "/keys.json">>),
-    SuiPublic = dev_bridge_attestor_sign:ed25519_public(maps:get(sui, NodeKeys)),
+    {_, BlsPublic} = maps:get(bls, NodeKeys),
     Info = hb_json:encode(#{<<"epoch">> => 7,
         <<"attestors">> => [#{<<"ao">> => Me,
-            <<"sui">> => <<"0x", (binary:encode_hex(SuiPublic))/binary>>}], <<"ledgers">> => #{}}),
+            <<"bls">> => <<"0x", (binary:encode_hex(BlsPublic, lowercase))/binary>>}], <<"ledgers">> => #{}}),
     Balances = hb_json:encode(#{Author => <<"100">>, Me => <<"100">>}),
     Script = <<"function compute(base, req) base.bridgeinfo = '", Info/binary,
         "'; base.balances = '", Balances/binary,
@@ -797,12 +757,12 @@ root_endorse_endpoint() ->
         {ok, Domain} = hb_ao:resolve(#{<<"device">> => <<"bridge-root@1.0">>},
             #{<<"path">> => <<"domain">>, <<"root">> => Root, <<"epoch">> => 7,
                 <<"intent-id">> => IntentID}, Opts),
-        ?assert(crypto:verify(eddsa, none, Domain,
-            hb_util:decode(maps:get(<<"signature">>, HTTPProof)), [SuiPublic, ed25519])),
+        ?assert(blst_nif:fast_aggregate_verify([BlsPublic], Domain,
+            hb_util:decode(maps:get(<<"signature">>, HTTPProof)), lib_bridge_bls:dst())),
         CodecProof = fetch_root_proof(url(Node), WalletItem, Opts),
         ?assertEqual(HTTPProof, CodecProof),
         Committee = [#{<<"ao">> => Me,
-            <<"sui">> => <<"0x", (binary:encode_hex(SuiPublic))/binary>>}],
+            <<"bls">> => <<"0x", (binary:encode_hex(BlsPublic, lowercase))/binary>>}],
         ?assertMatch({ok, #{<<"tags">> := _}},
             collect_root_carrier(Root, 7, Committee, WalletItem, St)),
         JournalFile = <<Dir/binary, "/public-root-journal">>,
@@ -1010,19 +970,12 @@ attest(Info, View, St = #{ cfg := Cfg, me := Me }) ->
             save_state(Cfg, St1),
             St2 = attest_deposits(Info, St1),
             Epoch = hb_util:int(maps:get(<<"epoch">>, Info)),
-            St3 = sign_withdrawals(Withdrawals, Epoch, St2),
-            St4 = acknowledge(Withdrawals, St3),
+            St3 = apply_proposals(Info, St2),
+            St4 = acknowledge(Withdrawals, chain_signatures(Info, Withdrawals, Epoch, St3)),
             St5 = relay_fast_ledgers(Info, LedgerDeposits, LedgerReceipts,
                 MoveReceipts, Epoch, St4#{root_intents => key(<<"rootintents">>, View),
                     root_certificate_info => Info}),
-            StRoots = committee_certificate(Epoch, channel_certificates(View, St5)),
-            St6 = lists:foldl(
-                fun(P, S) ->
-                    guard(<<"proposal:", (item_id(P))/binary>>, S, fun() ->
-                        Id = hb_util:int(maps:get(<<"id">>, P)),
-                        once(<<"vote:", (integer_to_binary(Id))/binary>>, S, fun() -> vote(P, S) end)
-                    end)
-                end, StRoots, proposals_to_vote(Info, Me)),
+            St6 = committee_certificate(Epoch, channel_certificates(View, St5)),
             save_state(Cfg, St6),
             St6#{ last_pass => os:system_time(millisecond), last_error => null }
     end.
@@ -1111,28 +1064,71 @@ attest_deposits(Info, St = #{ deposits := Deps }) ->
             end
         end, St, Deps).
 
-%% Each pending withdrawal this node has not signed is a release-signature
-%% certificate carrying its own signature, at its own committee index.
-sign_withdrawals(Withdrawals, Epoch, St = #{ me := Me }) ->
-    lists:foldl(
-        fun(W, S) -> guard(<<"withdrawal:", (item_id(W))/binary>>, S, fun() ->
-            Sigs = maps:get(<<"sigs">>, W, #{}),
-            Pending = maps:get(<<"status">>, W, <<>>) =:= <<"pending">>,
-            Signed = is_map(Sigs) andalso maps:is_key(Me, Sigs),
-            Id = maps:get(<<"id">>, W),
-            case Pending andalso not Signed of
-                false -> S;
-                true ->
-                    % `release-sigs', never `signature': that is the name of a
-                    % message's own signature, and the scheduler refuses a
-                    % message that carries both.
-                    Sig = withdrawal_signature(W, Epoch, maps:get(cfg, S), maps:get(keys, S),
-                        maps:get(namespace, S)),
-                    committee_plan(<<"sign:", Id/binary>>, #{ <<"action">> => <<"Bridge-Sign">>,
-                        <<"withdrawal-id">> => Id, <<"release-sigs">> =>
-                            <<(integer_to_binary(maps:get(index, S)))/binary, ":", Sig/binary>> }, S)
-            end
-        end) end, St, Withdrawals).
+%% @doc Each open proposal this node's operator approved is an Attestor-Apply
+%% certificate this node may author, and the only one it endorses: the person
+%% decides, the node holds the key.
+apply_proposals(Info, St = #{ me := Me }) ->
+    lists:foldl(fun(P, S) ->
+        case maps:get(<<"status">>, P, <<>>) =:= <<"open">>
+                andalso maps:get(Me, maps:get(<<"approvals">>, P, #{}), false) =:= true of
+            true ->
+                Id = integer_to_binary(hb_util:int(maps:get(<<"id">>, P))),
+                committee_plan(<<"apply:", Id/binary>>, #{ <<"action">> => <<"Attestor-Apply">>,
+                    <<"proposal-id">> => Id }, S);
+            false -> S
+        end
+    end, St, [P || P <- maps:get(<<"proposals">>, Info, []), is_map(P)]).
+
+%% @doc The chain signatures this member serves (chain-sig), made from its
+%% verified replica only: its release signature for each pending withdrawal,
+%% and its signature for each chain over each applied change it was a prior
+%% member for. Chain signatures are never stored on the root; a claimer or
+%% set-relayer collects k of them from the members and the chain checks them.
+%% A record this node cannot sign (a chain it does not run) is skipped alone.
+chain_signatures(Info, Withdrawals, Epoch, St = #{ me := Me, cfg := Cfg, keys := Keys }) ->
+    Namespace = hb_util:int(maps:get(<<"namespace">>, Info, 0)),
+    Releases = maps:from_list([{Id, Sig} || W <- Withdrawals, is_map(W),
+        maps:get(<<"status">>, W, <<>>) =:= <<"pending">>,
+        Id <- [hb_util:bin(maps:get(<<"id">>, W, <<>>))],
+        Sig <- [try withdrawal_signature(W, Epoch, Cfg, Keys, Namespace) catch _:_ -> skip end],
+        Sig =/= skip]),
+    Changes = maps:from_list([{integer_to_binary(hb_util:int(maps:get(<<"id">>, P))), Sigs}
+        || P <- maps:get(<<"proposals">>, Info, []), is_map(P),
+        maps:get(<<"status">>, P, <<>>) =:= <<"applied">>,
+        lists:any(fun(M) -> maps:get(<<"ao">>, M, <<>>) =:= Me end, maps:get(<<"prior">>, P, [])),
+        Sigs <- [proposal_signatures(P, Cfg, Keys)], map_size(Sigs) > 0]),
+    Sigs = #{ withdrawal => Releases, proposal => Changes },
+    publish_chain_sigs(Me, Sigs),
+    St#{ chain_sigs => Sigs }.
+
+%% @doc Hand the pass's signatures to the request side: one ETS row, written
+%% only by this process (protected), replaced only when it changes.
+publish_chain_sigs(Me, Sigs) ->
+    case ets:whereis(?CHAIN_SIGS) of
+        undefined -> ets:new(?CHAIN_SIGS, [named_table, protected, set, {read_concurrency, true}]);
+        _ -> ok
+    end,
+    case ets:lookup(?CHAIN_SIGS, current) of
+        [{current, Me, Sigs}] -> ok;
+        _ -> ets:insert(?CHAIN_SIGS, {current, Me, Sigs})
+    end.
+
+%% @doc A request's answer from the published row: nothing is signed for it.
+served_chain_sig({Kind, Id}) ->
+    try ets:lookup(?CHAIN_SIGS, current) of
+        [{current, Me, Sigs}] -> chain_sig_answer(Kind, Id, #{ me => Me, chain_sigs => Sigs });
+        [] -> {error, not_found}
+    catch error:badarg -> {error, not_found}
+    end.
+
+chain_sig_answer(Kind, Id, St = #{ me := Me }) ->
+    case maps:find(Id, maps:get(Kind, maps:get(chain_sigs, St, #{}), #{})) of
+        {ok, Sig} when Kind =:= withdrawal ->
+            {ok, #{ <<"signer">> => Me, <<"withdrawal">> => Id, <<"sig">> => Sig }};
+        {ok, Sigs} ->
+            {ok, maps:merge(Sigs, #{ <<"signer">> => Me, <<"proposal">> => Id })};
+        error -> {error, not_found}
+    end.
 
 %%% Committee certificates ------------------------------------------------------
 
@@ -1329,9 +1325,9 @@ clist(_) -> [].
 map_get_bin(K, M) -> maps:get(K, M, undefined).
 
 committee_action(A) ->
-    lists:member(A, [<<"Bridge-Mint">>, <<"Ledger-Exit">>, <<"Ledger-Move-Root">>, <<"Bridge-Sign">>,
+    lists:member(A, [<<"Bridge-Mint">>, <<"Ledger-Exit">>, <<"Ledger-Move-Root">>,
         <<"Bridge-Released">>, <<"Ledger-Credited">>, <<"Channel-Open">>, <<"Channel-Settle">>,
-        <<"Channel-Close">>]).
+        <<"Channel-Close">>, <<"Attestor-Apply">>]).
 
 acknowledge(Withdrawals, St = #{ releases := Rel }) ->
     Pending = maps:from_list([{maps:get(<<"id">>, W), true} || W <- Withdrawals,
@@ -1650,9 +1646,8 @@ publish_root_certificate(Key, Tags, St = #{cfg := Cfg, opts := Opts, me := Me,
     Saved = case file:read_file(File) of
         {ok, Bin} -> binary_to_term(Bin, [safe]);
         {error, enoent} ->
-            Final = release_signatures(Payload, St),
-            Intent = hb_message:commit(Final, Opts, <<"ans104@1.0">>),
-            Initial = #{payload => Final, intent => Intent},
+            Intent = hb_message:commit(Payload, Opts, <<"ans104@1.0">>),
+            Initial = #{payload => Payload, intent => Intent},
             save_root_publication(File, Initial),
             Initial;
         {error, Reason} -> error({root_journal_unreadable, Reason})
@@ -1693,51 +1688,6 @@ save_root_publication(File, State) ->
     Tmp = <<File/binary, ".tmp">>,
     ok = file:write_file(Tmp, term_to_binary(State), [raw, binary, sync]),
     ok = file:rename(Tmp, File).
-
-%% @doc A withdrawal costs ONE carrier: before its Bridge-Sign intent is
-%% journalled, this member sends a draft (carrying only its own signature) to
-%% every member's root-endorse and keeps each answered `release-sig' that
-%% verifies against that member's registered chain key, then names the lowest
-%% k of them. Any other operation is published as planned.
-release_signatures(Payload = #{<<"action">> := <<"Bridge-Sign">>},
-        St = #{opts := Opts, root_certificate_info := Info, root_view := View}) ->
-    Members = maps:get(<<"attestors">>, Info),
-    Epoch = hb_util:int(maps:get(<<"epoch">>, Info)),
-    Namespace = hb_util:int(maps:get(<<"namespace">>, Info, 0)),
-    W = pending_withdrawal(maps:get(<<"withdrawal-id">>, Payload), View),
-    Draft = hb_message:commit(Payload, Opts, <<"ans104@1.0">>),
-    Answers = [maps:get(<<"release-sig">>, R, <<>>) || R <- collect_root_responses(Members, Draft, St)],
-    Valid = lists:usort([{Index, Sig} || Entry <- [maps:get(<<"release-sigs">>, Payload) | Answers],
-        [IndexText, Sig] <- [binary:split(Entry, <<":">>)],
-        Index <- [catch binary_to_integer(IndexText)], is_integer(Index), Index >= 0,
-        Index < length(Members),
-        (catch release_signature_valid(W, lists:nth(Index + 1, Members), Sig, Epoch, Namespace, St)) =:= true]),
-    K = length(Members) div 2 + 1,
-    Chosen = lists:sublist(lists:ukeysort(1, Valid), K),
-    K = length(Chosen),
-    Payload#{<<"release-sigs">> => iolist_to_binary(lists:join(<<",">>,
-        [<<(integer_to_binary(I))/binary, ":", S/binary>> || {I, S} <- Chosen]))};
-release_signatures(Payload, _St) -> Payload.
-
-%% @doc Every member's root-endorse answer to one intent, within the deadline.
-collect_root_responses(Members, Intent, St) ->
-    Parent = self(),
-    Ref = make_ref(),
-    Workers = [spawn(fun() ->
-        Answer = try request_root_proof(Member, Intent, St) catch _:_ -> #{} end,
-        Parent ! {Ref, Answer}
-    end) || Member <- Members],
-    Deadline = erlang:monotonic_time(millisecond) + 65000,
-    Collect = fun Loop(0, Acc) -> Acc;
-                  Loop(N, Acc) ->
-                      receive {Ref, A} when is_map(A) -> Loop(N - 1, [A | Acc]);
-                              {Ref, _} -> Loop(N - 1, Acc)
-                      after max(0, Deadline - erlang:monotonic_time(millisecond)) -> Acc
-                      end
-              end,
-    try Collect(length(Workers), [])
-    after lists:foreach(fun(Pid) -> exit(Pid, kill) end, Workers)
-    end.
 
 %% @doc Request proofs concurrently. Location records are routing hints only:
 %% the assembler checks every proof against the verified membership snapshot.
@@ -1788,7 +1738,7 @@ fetch_root_proof(Node, Intent, Opts) ->
         Bin when is_binary(Bin) -> hb_json:decode(Bin);
         Map -> Map
     end,
-    maps:with([<<"signer">>, <<"intent-id">>, <<"signature">>, <<"release-sig">>], Result).
+    maps:with([<<"signer">>, <<"intent-id">>, <<"signature">>], Result).
 
 fast_ledger_node(Spec, Cfg) when is_binary(Spec) -> Spec;
 fast_ledger_node(Spec, Cfg) when is_map(Spec) ->
@@ -1973,16 +1923,6 @@ withdrawal_signature(W, Epoch, Cfg, Keys, Namespace) ->
     end,
     <<"0x", (dev_bridge_attestor_sign:hex(Sig))/binary>>.
 
-%% @doc Approved open/applied proposals this node has not voted on. Applied
-%% proposals keep collecting signatures so one bad chain signature cannot make
-%% an otherwise-settled proposal impossible to submit.
-proposals_to_vote(Info, Me) ->
-    [P || P <- maps:get(<<"proposals">>, Info, []),
-        (maps:get(<<"status">>, P, <<>>) =:= <<"open">> orelse
-            maps:get(<<"status">>, P, <<>>) =:= <<"applied">>),
-        maps:get(Me, maps:get(<<"approvals">>, P, #{}), false) =:= true,
-        not maps:is_key(Me, maps:get(<<"votes">>, P, #{}))].
-
 %% @doc The membership proposal's frozen epochs, which must describe the one
 %% transition every chain contract accepts.
 proposal_epochs(P) ->
@@ -2082,56 +2022,49 @@ zero_token(<<"base">>) -> <<"0x0000000000000000000000000000000000000000">>;
 zero_token(<<"solana">>) -> <<"11111111111111111111111111111111">>;
 zero_token(<<"sui">>) -> <<>>.
 
-%% The vote IS the chain authorisation: this node's signature over the
-%% proposal's whole set, at its epoch, for each chain. A migration signs the
-%% exact old-root to successor transition for every chain.
-vote(#{ <<"kind">> := <<"admin">> } = P, St = #{ cfg := Cfg, keys := Keys }) ->
-    send(admin_vote_tags(P, Cfg, Keys), St);
-vote(#{ <<"op">> := <<"migrate">> } = P, St = #{ cfg := Cfg, keys := Keys }) ->
-    Id = hb_util:int(maps:get(<<"id">>, P)),
+%% @doc This node's signature, per chain it runs, over an applied change: the
+%% chain authorisation for the proposal's whole set at its epochs, for a
+%% migration's exact old-root to successor transition, or for an
+%% administration action. A chain this node does not run is left out.
+proposal_signatures(#{ <<"kind">> := <<"admin">> } = P, Cfg, Keys) ->
+    Tags = try admin_vote_tags(P, Cfg, Keys) catch _:_ -> #{} end,
+    maps:from_list([{Chain, V} || {K, Chain} <- [{<<"basesig">>, <<"base">>},
+        {<<"solanasig">>, <<"solana">>}, {<<"suisig">>, <<"sui">>}], V <- [maps:get(K, Tags, none)], V =/= none]);
+proposal_signatures(#{ <<"op">> := <<"migrate">> } = P, Cfg, Keys) ->
     Epoch = migration_epoch(P),
     Root = maps:get(<<"pusd">>, Cfg),
     Successor = maps:get(<<"successor">>, P),
-    Hex = fun(S) -> <<"0x", (dev_bridge_attestor_sign:hex(S))/binary>> end,
-    B = maps:get(<<"base">>, Cfg), Sol = maps:get(<<"solana">>, Cfg), Sui = maps:get(<<"sui">>, Cfg),
-    send(#{
-        <<"action">> => <<"Attestor-Vote">>, <<"proposalid">> => integer_to_binary(Id),
-        <<"currentepoch">> => integer_to_binary(Epoch), <<"newepoch">> => integer_to_binary(Epoch),
-        <<"basesig">> => Hex(dev_bridge_attestor_sign:base_sign(
+    per_chain(Cfg, #{
+        <<"base">> => fun(B) -> dev_bridge_attestor_sign:base_sign(
             dev_bridge_attestor_sign:base_root(hb_util:int(maps:get(<<"chain-id">>, B)),
-                maps:get(<<"contract">>, B), Epoch, Root, Successor), maps:get(base, Keys))),
-        <<"solanasig">> => Hex(dev_bridge_attestor_sign:ed25519_sign(
+                maps:get(<<"contract">>, B), Epoch, Root, Successor), maps:get(base, Keys)) end,
+        <<"solana">> => fun(Sol) -> dev_bridge_attestor_sign:ed25519_sign(
             dev_bridge_attestor_sign:solana_root(maps:get(<<"program">>, Sol),
-                Epoch, Root, Successor), maps:get(solana, Keys))),
-        <<"suisig">> => Hex(dev_bridge_attestor_sign:ed25519_sign(
+                Epoch, Root, Successor), maps:get(solana, Keys)) end,
+        <<"sui">> => fun(Sui) -> dev_bridge_attestor_sign:ed25519_sign(
             dev_bridge_attestor_sign:sui_root(maps:get(<<"bridge">>, Sui),
-                Epoch, Root, Successor), maps:get(sui, Keys)))
-    }, St);
-vote(P, St = #{ cfg := Cfg, keys := Keys }) ->
-    Id = hb_util:int(maps:get(<<"id">>, P)),
+                Epoch, Root, Successor), maps:get(sui, Keys)) end});
+proposal_signatures(P, Cfg, Keys) ->
     Set = maps:get(<<"set">>, P),
     {CurrentEpoch, NewEpoch} = proposal_epochs(P),
     Root = maps:get(<<"pusd">>, Cfg),
     Field = fun(K) -> [maps:get(K, M) || M <- Set] end,
-    Hex = fun(S) -> <<"0x", (dev_bridge_attestor_sign:hex(S))/binary>> end,
-    B = maps:get(<<"base">>, Cfg), Sol = maps:get(<<"solana">>, Cfg), Sui = maps:get(<<"sui">>, Cfg),
-    send(#{
-        <<"action">> => <<"Attestor-Vote">>, <<"proposalid">> => integer_to_binary(Id),
-        <<"currentepoch">> => integer_to_binary(CurrentEpoch),
-        <<"newepoch">> => integer_to_binary(NewEpoch),
-        <<"basesig">> => Hex(dev_bridge_attestor_sign:base_sign(
+    per_chain(Cfg, #{
+        <<"base">> => fun(B) -> dev_bridge_attestor_sign:base_sign(
             dev_bridge_attestor_sign:base_attestors(hb_util:int(maps:get(<<"chain-id">>, B)),
                 maps:get(<<"contract">>, B), Root, CurrentEpoch, NewEpoch,
-                Field(<<"base">>)), maps:get(base, Keys))),
-        <<"solanasig">> => Hex(dev_bridge_attestor_sign:ed25519_sign(
+                Field(<<"base">>)), maps:get(base, Keys)) end,
+        <<"solana">> => fun(Sol) -> dev_bridge_attestor_sign:ed25519_sign(
             dev_bridge_attestor_sign:solana_attestors(maps:get(<<"program">>, Sol),
-                Root, CurrentEpoch, NewEpoch, Field(<<"solana">>)),
-            maps:get(solana, Keys))),
-        <<"suisig">> => Hex(dev_bridge_attestor_sign:ed25519_sign(
+                Root, CurrentEpoch, NewEpoch, Field(<<"solana">>)), maps:get(solana, Keys)) end,
+        <<"sui">> => fun(Sui) -> dev_bridge_attestor_sign:ed25519_sign(
             dev_bridge_attestor_sign:sui_attestors(maps:get(<<"bridge">>, Sui),
-                Root, CurrentEpoch, NewEpoch, Field(<<"sui">>)),
-            maps:get(sui, Keys)))
-    }, St).
+                Root, CurrentEpoch, NewEpoch, Field(<<"sui">>)), maps:get(sui, Keys)) end}).
+
+per_chain(Cfg, Signers) ->
+    maps:from_list([{Chain, <<"0x", (dev_bridge_attestor_sign:hex(Sig))/binary>>}
+        || {Chain, Sign} <- maps:to_list(Signers), C <- [maps:get(Chain, Cfg, none)], C =/= none,
+        Sig <- [try Sign(C) catch _:_ -> skip end], Sig =/= skip]).
 
 %%% Succession ----------------------------------------------------------------
 
@@ -2328,23 +2261,46 @@ local_withdrawal(ChainId, #{ namespace := Ns }) ->
 
 %%% Keys and state on disk ----------------------------------------------------
 
-%% The chain keys, made on first start. Hex 32-byte secrets.
+%% The chain keys and the committee's BLS key, made on first start: hex
+%% 32-byte secrets, and the BLS public key beside its secret. A key file
+%% from before the BLS key gains one, written once and never replaced: a
+%% node's registered BLS key is as permanent as its chain keys. The file is
+%% owner-only before a secret byte is in it, and no endpoint returns a secret.
 load_keys(File) ->
     case file:read_file(File) of
         {ok, Bin} ->
             K = hb_json:decode(Bin),
-            #{ base => unhex(maps:get(<<"base">>, K)), solana => unhex(maps:get(<<"solana">>, K)),
-               sui => unhex(maps:get(<<"sui">>, K)) };
+            Keys = #{ base => unhex(maps:get(<<"base">>, K)), solana => unhex(maps:get(<<"solana">>, K)),
+               sui => unhex(maps:get(<<"sui">>, K)) },
+            case {maps:find(<<"bls">>, K), maps:find(<<"bls-public">>, K)} of
+                {{ok, Secret}, {ok, Public}} -> Keys#{ bls => {unhex(Secret), unhex(Public)} };
+                {error, error} ->
+                    WithBls = Keys#{ bls => new_bls_key() },
+                    write_keys(File, WithBls),
+                    WithBls;
+                _ -> error(bls_key_file_is_partial)
+            end;
         {error, enoent} ->
             K = #{ base => crypto:strong_rand_bytes(32), solana => crypto:strong_rand_bytes(32),
-                   sui => crypto:strong_rand_bytes(32) },
-            % Owner-only before a secret byte is in it.
-            ok = file:write_file(File, <<>>),
-            ok = file:change_mode(File, 8#600),
-            ok = file:write_file(File, hb_json:encode(maps:from_list(
-                [{atom_to_binary(N), dev_bridge_attestor_sign:hex(V)} || {N, V} <- maps:to_list(K)]))),
+                   sui => crypto:strong_rand_bytes(32), bls => new_bls_key() },
+            write_keys(File, K),
             K
     end.
+
+new_bls_key() ->
+    {Secret, Public} = blst_nif:keygen(crypto:strong_rand_bytes(32)),
+    {Secret, Public}.
+
+write_keys(File, K) ->
+    {Secret, Public} = maps:get(bls, K),
+    Fields = [{<<"base">>, maps:get(base, K)}, {<<"solana">>, maps:get(solana, K)},
+        {<<"sui">>, maps:get(sui, K)}, {<<"bls">>, Secret}, {<<"bls-public">>, Public}],
+    Tmp = <<(hb_util:bin(File))/binary, ".tmp">>,
+    ok = file:write_file(Tmp, <<>>),
+    ok = file:change_mode(Tmp, 8#600),
+    ok = file:write_file(Tmp, hb_json:encode(maps:from_list(
+        [{N, dev_bridge_attestor_sign:hex(V)} || {N, V} <- Fields])), [raw, binary, sync]),
+    ok = file:rename(Tmp, File).
 
 unhex(<<"0x", H/binary>>) -> dev_bridge_attestor_sign:unhex(H);
 unhex(H) -> dev_bridge_attestor_sign:unhex(H).
@@ -2354,8 +2310,15 @@ public_keys(#{ me := Me, keys := K }) ->
         <<"ao">> => Me,
         <<"base">> => dev_bridge_attestor_sign:base_address(maps:get(base, K)),
         <<"solana">> => dev_bridge_attestor_sign:base58_encode(dev_bridge_attestor_sign:ed25519_public(maps:get(solana, K))),
-        <<"sui">> => <<"0x", (dev_bridge_attestor_sign:hex(dev_bridge_attestor_sign:ed25519_public(maps:get(sui, K))))/binary>>
+        <<"sui">> => <<"0x", (dev_bridge_attestor_sign:hex(dev_bridge_attestor_sign:ed25519_public(maps:get(sui, K))))/binary>>,
+        <<"bls">> => <<"0x", (dev_bridge_attestor_sign:hex(element(2, maps:get(bls, K))))/binary>>,
+        <<"blsPop">> => bls_possession(Me, maps:get(bls, K))
     }.
+
+%% @doc This node's proof of possession of its BLS key, for its registration.
+bls_possession(Me, {Secret, Public}) ->
+    <<"0x", (dev_bridge_attestor_sign:hex(blst_nif:sign(Secret,
+        lib_bridge_bls:possession_bytes(Me, Public), lib_bridge_bls:pop_dst())))/binary>>.
 
 %% Cursors, deposits and releases. A file holding only cursors (the old shape)
 %% loads with nothing waiting.
@@ -2506,18 +2469,6 @@ rpc_hosts_test() ->
     ?assertEqual(#{ <<"base">> => <<"base-mainnet.g.alchemy.com">>,
         <<"solana">> => <<"solana-mainnet.g.alchemy.com">>, <<"sui">> => <<"graphql.mainnet.sui.io">>,
         <<"scheduler-url">> => <<"hyperbeam.tylerw.ai">> }, rpc_hosts(Cfg)).
-
-proposals_to_vote_test() ->
-    Me = <<"me">>,
-    P = fun(Id, Status, Appr, Votes) -> #{ <<"id">> => Id, <<"status">> => Status,
-        <<"approvals">> => Appr, <<"votes">> => Votes } end,
-    Info = #{ <<"proposals">> => [
-        P(1, <<"open">>, #{ Me => true }, #{}),
-        P(2, <<"open">>, #{ <<"other">> => true }, #{}),
-        P(3, <<"open">>, #{ Me => true }, #{ Me => #{} }),
-        P(4, <<"applied">>, #{ Me => true }, #{})
-    ] },
-    ?assertEqual([1, 4], [maps:get(<<"id">>, X) || X <- proposals_to_vote(Info, Me)]).
 
 proposal_epochs_test() ->
     ?assertEqual({4, 5}, proposal_epochs(#{ <<"priorEpoch">> => 4,
@@ -2917,21 +2868,19 @@ ao_test_cfg(Pusd, Dir) ->
         <<"follow-file">> => <<Dir/binary, "/follow.json">> }.
 
 %% One pass against a PUSD: it reads `bridgeinfo', finds itself in the set,
-%% and votes on the approved proposal. PUSD sees the vote committed by the
-%% node's own address.
+%% and plans ONE Attestor-Apply certificate for the proposal its operator
+%% approved. It sends no per-member vote.
 vote_reaches_pusd(Cfg0, Opts) ->
     St0 = initial_state(Cfg0, Opts),
-    Me = maps:get(me, St0),
     % A first message, so PUSD has computed and published something.
     {ok, _} = send(#{ <<"action">> => <<"Ping">> }, St0),
     {ok, View, _} = view(maps:get(<<"pusd">>, Cfg0), St0),
     ?assertMatch(#{ <<"epoch">> := 2 }, key(<<"bridgeinfo">>, View)),
     St1 = pass(St0),
     ?assertMatch(#{ member := true, last_error := null }, St1),
-    ?assertEqual(<<"1:", Me/binary, ";">>, raw(<<"votes">>, St1)),
-    % Within RESEND_MS the vote is not sent again.
-    _ = pass(St1),
-    ?assertEqual(<<"1:", Me/binary, ";">>, raw(<<"votes">>, St1)).
+    ?assertMatch([{<<"apply:1">>, #{<<"action">> := <<"Attestor-Apply">>, <<"proposal-id">> := <<"1">>}}],
+        [P || {<<"apply:", _/binary>>, _} = P <- maps:get(committee, St1)]),
+    ?assertEqual(<<>>, raw(<<"votes">>, St1)).
 
 %% A plain-string key of the real PUSD, read where it runs.
 raw(Key, #{ cfg := Cfg, opts := Opts }) ->
@@ -3035,15 +2984,62 @@ malformed_withdrawal_is_skipped_test() ->
         <<"token">> => <<"0x2222222222222222222222222222222222222222">> } end,
     St = #{ me => <<"me">>, namespace => 0, sent => #{}, skipped => #{},
         keys => #{ base => binary:copy(<<1>>, 32) },
-        cfg => #{ <<"pusd">> => <<"p">>, <<"base">> => #{ <<"chain-id">> => 8453,
+        cfg => #{ <<"pusd">> => <<"qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo">>, <<"base">> => #{ <<"chain-id">> => 8453,
             <<"contract">> => <<"0x1111111111111111111111111111111111111111">> } } },
-    St1 = sign_withdrawals([W(<<"9">>, <<"base">>, <<"0xnot-an-address">>),
-        W(<<"10">>, <<"eth">>, <<"0x3333333333333333333333333333333333333333">>), not_a_map], 0, St),
-    ?assertEqual(3, maps:size(maps:get(skipped, St1))),
-    ?assertEqual(#{}, maps:get(sent, St1)),
-    ?assertMatch(#{ <<"skipped">> := [_, _, _] },
-        status_view(St1#{ cursors => #{}, deposits => #{}, releases => #{}, member => true,
-            last_pass => 0, last_error => null })).
+    Good = W(<<"11">>, <<"base">>, <<"0x3333333333333333333333333333333333333333">>),
+    St1 = chain_signatures(#{}, [W(<<"9">>, <<"base">>, <<"0xnot-an-address">>),
+        W(<<"10">>, <<"eth">>, <<"0x3333333333333333333333333333333333333333">>), not_a_map, Good], 0, St),
+    % Only the withdrawal this node can sign is served; the rest are skipped.
+    ?assertEqual([<<"11">>], maps:keys(maps:get(withdrawal, maps:get(chain_sigs, St1)))),
+    ?assertMatch({ok, #{<<"signer">> := <<"me">>, <<"withdrawal">> := <<"11">>, <<"sig">> := <<"0x", _/binary>>}},
+        chain_sig_answer(withdrawal, <<"11">>, St1)),
+    % Nothing is signed for a request: an id the pass did not sign is unknown,
+    % whatever the requester claims about it.
+    ?assertEqual({error, not_found}, chain_sig_answer(withdrawal, <<"9">>, St1)),
+    ?assertEqual({error, not_found}, chain_sig_answer(withdrawal, <<"12">>, St1)),
+    ?assertEqual({error, not_found}, chain_sig_answer(proposal, <<"11">>, St1)),
+    ?assertEqual({error, not_found}, chain_sig_answer(withdrawal, <<"11">>, St)),
+    % The endpoint answers from the pass's published row, with no loop
+    % running: a request can neither queue behind a pass nor make one sign.
+    undefined = hb_name:lookup(?NAME),
+    ?assertMatch({ok, _}, chain_sig(#{}, #{ <<"withdrawal">> => <<"11">> }, #{})),
+    ?assertMatch({error, #{ <<"status">> := 404 }}, chain_sig(#{}, #{ <<"withdrawal">> => <<"9">> }, #{})),
+    ?assertMatch({error, #{ <<"status">> := 400 }},
+        chain_sig(#{}, #{ <<"withdrawal">> => <<"11">>, <<"proposal">> => <<"1">> }, #{})).
+
+%% A key file holds the BLS secret beside the chain secrets, owner-only, and
+%% no endpoint answer carries a secret. A key file from before the BLS key
+%% gains one, once; a partial BLS entry is refused rather than replaced.
+bls_key_file_test() ->
+    Dir = <<"/tmp/bls-keys-", (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary>>,
+    ok = file:make_dir(Dir),
+    File = <<Dir/binary, "/keys.json">>,
+    K = load_keys(File),
+    {Secret, Public} = maps:get(bls, K),
+    ?assertEqual(K, load_keys(File)),
+    {ok, Info} = file:read_file_info(File),
+    ?assertEqual(8#600, element(8, Info) band 8#777),
+    Me = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Public0x = public_keys(#{ me => Me, keys => K }),
+    ?assertEqual(<<"0x", (dev_bridge_attestor_sign:hex(Public))/binary>>, maps:get(<<"bls">>, Public0x)),
+    Answer = hb_json:encode(Public0x),
+    ?assertEqual(nomatch, binary:match(Answer, dev_bridge_attestor_sign:hex(Secret))),
+    ?assertEqual(nomatch, binary:match(Answer, dev_bridge_attestor_sign:hex(maps:get(base, K)))),
+    % The registration proof verifies at the root's possession check.
+    ?assertMatch({ok, _}, hb_ao:resolve(#{<<"device">> => <<"bridge-root@1.0">>},
+        #{<<"path">> => <<"possession">>, <<"ao">> => Me, <<"bls">> => maps:get(<<"bls">>, Public0x),
+            <<"pop">> => maps:get(<<"blsPop">>, Public0x)}, #{})),
+    Old = <<Dir/binary, "/old.json">>,
+    ok = file:write_file(Old, hb_json:encode(#{<<"base">> => dev_bridge_attestor_sign:hex(maps:get(base, K)),
+        <<"solana">> => dev_bridge_attestor_sign:hex(maps:get(solana, K)),
+        <<"sui">> => dev_bridge_attestor_sign:hex(maps:get(sui, K))})),
+    Upgraded = load_keys(Old),
+    ?assertEqual(maps:get(base, K), maps:get(base, Upgraded)),
+    ?assertEqual(Upgraded, load_keys(Old)),
+    Partial = <<Dir/binary, "/partial.json">>,
+    ok = file:write_file(Partial, hb_json:encode(#{<<"base">> => <<"01">>, <<"solana">> => <<"01">>,
+        <<"sui">> => <<"01">>, <<"bls">> => dev_bridge_attestor_sign:hex(Secret)})),
+    ?assertError(bls_key_file_is_partial, load_keys(Partial)).
 
 %%% The replica: what is signed comes from this node's own PUSD ------------------
 
@@ -3088,11 +3084,10 @@ url(Node) -> hb_util:bin(string:trim(hb_util:list(Node), trailing, "/")).
 
 honest(_Wallet) -> fun(_Path, Body) -> Body end.
 
-%% The release signatures this node would certify (its `Bridge-Sign' root
-%% certificates, index 0 as the only member), as `<id>=<signature>;'.
+%% The release signatures this node serves from chain-sig, as `<id>=<sig>;'.
 signs(St) ->
-    iolist_to_binary([[Id, "=", Sig, ";"] || {_, #{<<"action">> := <<"Bridge-Sign">>,
-        <<"withdrawal-id">> := Id, <<"release-sigs">> := <<"0:", Sig/binary>>}} <- maps:get(committee, St, [])]).
+    Map = maps:get(withdrawal, maps:get(chain_sigs, St, #{}), #{}),
+    iolist_to_binary([[Id, "=", Sig, ";"] || {Id, Sig} <- lists:sort(maps:to_list(Map))]).
 
 %% The signature this node owes PUSD's real withdrawal 1.
 true_signature(St = #{ cfg := Cfg, keys := Keys }) ->
