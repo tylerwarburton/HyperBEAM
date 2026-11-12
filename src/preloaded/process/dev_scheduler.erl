@@ -948,7 +948,12 @@ get_schedule(Base, Req, Opts) ->
                     end;
                 false ->
                     {ok, Redirect}
-            end
+            end;
+        {error, Error} ->
+            % No scheduler can be found (a location record that does not
+            % validate, say): refuse cleanly, as POST does, never a crash.
+            ?event({error_finding_scheduler, {error, Error}}),
+            {error, Error}
     end.
 
 %% @doc Get a schedule from a remote scheduler, but first read all of the 
@@ -1863,8 +1868,12 @@ redirect_from_graphql() ->
             ]
         },
     {ok, Msg} = hb_cache:read(<<"0syT13r0s0tgPmIed95bJnuSqaD29HQNN8D3ElLSrsc">>, Opts),
+    % The legacynet scheduler's gateway location record (ao.TN.1) carries no
+    % nonce, and a nonce-less record is refused as a routing hint
+    % (dev_location:validate_gateway_location/3). The redirect is therefore a
+    % clean 404, not a location.
     ?assertMatch(
-        {ok, #{ <<"location">> := Location }} when is_binary(Location),
+        {error, #{ <<"status">> := 404 }},
         hb_ao:resolve(
             Msg,
             #{
@@ -1996,7 +2005,10 @@ http_get_schedule_redirect() ->
     start(),
     ProcID = <<"0syT13r0s0tgPmIed95bJnuSqaD29HQNN8D3ElLSrsc">>,
     Res = hb_http:get(N, <<"/", ProcID/binary, "/schedule">>, Opts),
-    ?assertMatch({ok, #{ <<"location">> := Location }} when is_binary(Location), Res).
+    % As redirect_from_graphql: the legacynet location record has no nonce,
+    % so there is no redirect to give. The GET refuses cleanly with a 404,
+    % never a 500.
+    ?assertMatch({error, #{ <<"status">> := 404 }}, Res).
 
 http_post_schedule_test_parallel_() ->
     {timeout, 60, fun http_post_schedule/0}.
