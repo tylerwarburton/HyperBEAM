@@ -243,12 +243,13 @@ loop(St) ->
             From ! {Ref, {ok, public_keys(St)}},
             loop(St);
         {{root_endorse, Message}, From, Ref} ->
+            % Only the view the last pass verified: a request never moves the
+            % replica, so it cannot make the loop fetch or compute.
             Reply = try
-                Root = maps:get(<<"pusd">>, maps:get(cfg, St)),
-                case view(Root, St) of
-                    {ok, View, #{stopped := null}} -> root_certificate_approval(Message, View, St);
-                    {ok, _View, _Replica} -> {error, <<"Verified root state is still catching up">>};
-                    {not_yet, _} -> {error, <<"Verified root state is not available">>}
+                case {maps:get(root_view, St, none), maps:get(replica, St, none)} of
+                    {none, _} -> {error, <<"Verified root state is not available">>};
+                    {View, #{stopped := null}} -> root_certificate_approval(Message, View, St);
+                    _ -> {error, <<"Verified root state is still catching up">>}
                 end
             catch _:_ -> {error, <<"Root certificate endorsement failed">>}
             end,
@@ -536,6 +537,11 @@ root_endorse_endpoint() ->
                 #{<<"path">> => <<"root-endorse">>, <<"certificate">> => Signed,
                     <<"balances">> => #{Author => <<"1000000">>}}, Opts)
         end,
+        % Before a pass has verified the root, a request cannot move the
+        % replica: it is refused, and nothing was replayed.
+        ?assertEqual({error, <<"Verified root state is not available">>}, Run(Payload)),
+        ?assertNot(filelib:is_dir(<<Dir/binary, "/replica">>)),
+        Loop ! pass,
         {ok, #{<<"body">> := JSON}} = Run(Payload),
         #{<<"certificate">> := Portable} = hb_json:decode(JSON),
         Approved = Portable#{<<"commitments">> => maps:map(fun(_, C) ->
@@ -736,7 +742,7 @@ nudge_arm(Now, Cfg, St = #{ nudge_at := NudgeAt, fast_since := Since0, fast_unti
 %% Everything a pass does, it does on `View': PUSD as this node computed it.
 pass(St = #{ cfg := Cfg }) ->
     case view(maps:get(<<"pusd">>, Cfg), St) of
-        {ok, View, Replica} -> act(View, St#{ replica => Replica });
+        {ok, View, Replica} -> act(View, St#{ replica => Replica, root_view => View });
         {not_yet, Why} -> St#{ last_error => Why, last_pass => os:system_time(millisecond) }
     end.
 
