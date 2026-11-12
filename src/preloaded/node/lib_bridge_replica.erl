@@ -453,13 +453,15 @@ canonical_schedule_is_read_locally() ->
         <<"on">> => #{<<"response">> => #{<<"device">> => #{<<"response">> => Hook}}}}),
     % The scheduler reads Arweave only from the node's `gateway'.
     Opts = (execution_opts(#{}, Store))#{<<"arweave-scheduler-from">> => 10,
+        <<"arweave-scheduler-from-hash">> => <<"anchor">>,
         <<"gateway">> => hb_util:bin(Node)},
     Pusd = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Put = fun(Path, Value) ->
         {ok, ID} = hb_cache:write(Value, Opts),
         ok = hb_cache:link(ID, Path, Opts)
     end,
-    Put(<<"~arweave-scheduler@1.0/sync/global">>, #{<<"from">> => 10, <<"to">> => 18}),
+    Put(<<"~arweave-scheduler@1.0/sync/global">>,
+        #{<<"from">> => 10, <<"to">> => 18, <<"from-hash">> => <<"anchor">>}),
     Put(<<"~arweave-scheduler@1.0/sync/process/", Pusd/binary>>,
         #{<<"process">> => Pusd, <<"spawn-ordinate">> => <<"10-0">>,
             <<"synced-to">> => 18, <<"next-slot">> => 2}),

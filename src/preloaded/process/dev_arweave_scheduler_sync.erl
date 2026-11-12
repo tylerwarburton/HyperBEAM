@@ -3,12 +3,17 @@
 %%% inverted `targets/<address>/<ordinate> -> TXID' index used by every
 %%% process schedule.
 %%%
-%%% The gateway is transport; nothing it says is taken on trust. A block is
-%%% indexed only when its fields recompute its `indep_hash' (which commits its
-%%% height, its previous block and its transaction list in order), it extends
-%%% the last indexed block, `arweave-scheduler-confirmation-depth' blocks that
-%%% pass the same checks extend it in turn, and the signed headers of its
-%%% transactions recompute its `tx_root'. Anything else stops the sync.
+%%% A block is indexed only when its fields recompute its `indep_hash' (which
+%%% commits its height, its previous block and its transaction list in order),
+%%% it extends the last indexed block -- the first one, at
+%%% `arweave-scheduler-from', must BE the pinned
+%%% `arweave-scheduler-from-hash' -- `arweave-scheduler-confirmation-depth'
+%%% blocks that pass the same checks extend it in turn, and the signed headers
+%%% of its transactions recompute its `tx_root'. Anything else stops the sync.
+%%%
+%%% What this does not check is proof of work: a gateway can still mint blocks
+%%% that extend the pinned anchor. The gateway is trusted for that, and only
+%%% for that; independent sources per node are the documented next step.
 -module(dev_arweave_scheduler_sync).
 -export([sync/1, process/2, from_height/1, confirmed_tip/1]).
 -export([fetch_block/2, fetch_header/2, spawn_ordinate/2]).
@@ -112,16 +117,20 @@ do_sync(StateResult, Opts) ->
     From = from_height(Opts),
     maybe
         {ok, Upper} ?= confirmed_tip(Opts),
-        {ok, State} ?= initial_state(StateResult, From),
+        {ok, State} ?= initial_state(StateResult, From, from_hash(Opts)),
         sync_blocks(State, Upper, Opts)
     end.
 
-initial_state(not_found, From) ->
-    {ok, #{ <<"from">> => From, <<"to">> => From - 1 }};
-initial_state({ok, State}, From) ->
-    case hb_util:int(hb_maps:get(<<"from">>, State, -1, #{})) of
-        From -> {ok, State};
-        StoredFrom ->
+initial_state(_, _From, not_found) ->
+    {error, #{ <<"status">> => 500,
+        <<"reason">> => <<"No arweave-scheduler-from-hash is pinned.">> }};
+initial_state(not_found, From, FromHash) ->
+    {ok, #{ <<"from">> => From, <<"to">> => From - 1, <<"from-hash">> => FromHash }};
+initial_state({ok, State}, From, FromHash) ->
+    case {hb_util:int(hb_maps:get(<<"from">>, State, -1, #{})),
+            hb_maps:get(<<"from-hash">>, State, not_found, #{})} of
+        {From, FromHash} -> {ok, State};
+        {StoredFrom, _} ->
             {error,
                 #{
                     <<"status">> => 409,
@@ -133,8 +142,9 @@ initial_state({ok, State}, From) ->
                 }
             }
     end;
-initial_state({error, not_found}, From) -> initial_state(not_found, From);
-initial_state(Error, _From) -> Error.
+initial_state({error, not_found}, From, FromHash) ->
+    initial_state(not_found, From, FromHash);
+initial_state(Error, _From, _FromHash) -> Error.
 
 sync_blocks(State = #{ <<"to">> := To }, Upper, _Opts) when To >= Upper ->
     {ok, State};
@@ -643,6 +653,11 @@ from_height(Opts) ->
         hb_opts:get(arweave_scheduler_from, ?DEFAULT_FROM_HEIGHT, Opts)
     ).
 
+%% The pinned `indep_hash' of the block at `from_height/1', as the gateway
+%% encodes it; `not_found' when none is configured, which syncs nothing.
+from_hash(Opts) ->
+    hb_opts:get(arweave_scheduler_from_hash, not_found, Opts).
+
 %% @doc The highest block safe to index. A configured maximum pins the chain
 %% frontier and is also useful for deterministic isolated tests.
 confirmed_tip(Opts) ->
@@ -1085,11 +1100,17 @@ response_status(_) -> 999.
 validate_block(Height, State, Block, Opts) ->
     ActualHeight = hb_util:int(hb_maps:get(<<"height">>, Block, -1, Opts)),
     Previous = hb_maps:get(<<"previous-block">>, Block, not_found, Opts),
-    ExpectedPrevious = hb_maps:get(<<"block-hash">>, State, not_found, Opts),
-    case {
-        ActualHeight =:= Height,
-        ExpectedPrevious =:= not_found orelse Previous =:= ExpectedPrevious
-    } of
+    % The first block is the pinned anchor itself; every later one extends
+    % the block before it.
+    Extends =
+        case hb_maps:get(<<"block-hash">>, State, not_found, Opts) of
+            not_found ->
+                Pinned = hb_maps:get(<<"from-hash">>, State, not_found, Opts),
+                Pinned =/= not_found andalso
+                    hb_maps:get(<<"indep-hash">>, Block, not_found, Opts) =:= Pinned;
+            ExpectedPrevious -> Previous =:= ExpectedPrevious
+        end,
+    case {ActualHeight =:= Height, Extends} of
         {true, true} -> ok;
         {false, _} ->
             {error,
@@ -1675,6 +1696,7 @@ rehashed_json(Body, Changes) ->
 
 real_block_indep_hash_test() ->
     Heights = [2002970, 2002971, 2002972],
+    Anchored = #{ <<"from-hash">> => maps:get(<<"indep-hash">>, fixture_block(2002970)) },
     Chain =
         [
             begin
@@ -1692,11 +1714,31 @@ real_block_indep_hash_test() ->
         ],
     ?assertMatch(
         {ok, #{ <<"to">> := 2002972 }},
-        validate_blocks(Chain, #{}, #{})
+        validate_blocks(Chain, Anchored, #{})
     ),
     % Out of order, the same blocks do not form a chain.
     [First, Second, Third] = Chain,
-    ?assertMatch({error, _}, validate_blocks([First, Third, Second], #{}, #{})).
+    ?assertMatch({error, _}, validate_blocks([First, Third, Second], Anchored, #{})),
+    % Without the pinned anchor, or from another one, nothing is a chain.
+    ?assertMatch({error, _}, validate_blocks(Chain, #{}, #{})),
+    ?assertMatch({error, _},
+        validate_blocks(Chain, #{ <<"from-hash">> => maps:get(<<"indep-hash">>,
+            fixture_block(2002971)) }, #{})).
+
+%% A gateway that drops a transaction and rehashes the chain from the anchor
+%% height on forges a self-consistent chain; the pinned anchor refuses it.
+forged_chain_from_anchor_refused_test() ->
+    B70 = fixture_block(2002970),
+    [_Dropped | TXs] = maps:get(<<"txs">>, B70),
+    F70 = rehashed(B70#{ <<"txs">> => TXs }),
+    F71 = rehashed((fixture_block(2002971))#{
+        <<"previous-block">> => maps:get(<<"indep-hash">>, F70) }),
+    F72 = rehashed((fixture_block(2002972))#{
+        <<"previous-block">> => maps:get(<<"indep-hash">>, F71) }),
+    Forged = [ {H, element(2, {ok, _} = verified_block(B, #{}))}
+        || {H, B} <- [{2002970, F70}, {2002971, F71}, {2002972, F72}] ],
+    Pinned = #{ <<"from-hash">> => maps:get(<<"indep-hash">>, B70) },
+    ?assertMatch({error, #{ <<"status">> := 409 }}, validate_blocks(Forged, Pinned, #{})).
 
 wrong_indep_hash_test() ->
     Block = fixture_block(2002970),
@@ -1801,6 +1843,7 @@ sync_from(Files) ->
         <<"store">> => [Store],
         <<"gateway">> => URL,
         <<"arweave-scheduler-from">> => 2002970,
+        <<"arweave-scheduler-from-hash">> => maps:get(<<"indep-hash">>, fixture_block(2002970)),
         <<"arweave-scheduler-block-batch">> => 1,
         <<"arweave-scheduler-fetch-attempts">> => 1
     },
