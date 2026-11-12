@@ -61,8 +61,11 @@
 %%%   fast-ledgers => #{ LedgerProcess => #{ node => SchedulerURL } },
 %%%   scheduler-device (`scheduler@1.0' or `arweave-scheduler@1.0'),
 %%%   arweave-resend-ms (default 30 minutes),
-%%%   base => #{ rpc, contract, chain-id, confirmations, from-block, log-range },
-%%%   solana => #{ rpc, program, commitment }, sui => #{ rpc, package, bridge }
+%%%   base => #{ rpc | rpc-file, contract, chain-id, confirmations, from-block, log-range },
+%%%   solana => #{ rpc | rpc-file, program, commitment }, sui => #{ rpc, package, bridge }
+%%% `rpc-file' names a file holding the RPC URL. Use it: a URL carries its
+%%% provider key, and everything under `bridge' is served by
+%%% GET /~meta@1.0/info/bridge.
 -module(dev_bridge_attestor).
 -implements(<<"bridge-attestor@1.0">>).
 -export([device_info/1, start/3, status/3, keys/3, nudge/3, root_endorse/3]).
@@ -190,7 +193,7 @@ init(Cfg0, Opts) ->
     loop(St).
 
 initial_state(Cfg0, Opts) ->
-    Cfg = load_follow(Cfg0),
+    Cfg = rpc_files(load_follow(Cfg0)),
     Keys = load_keys(maps:get(<<"keys-file">>, Cfg, <<"bridge-keys.json">>)),
     Me = hb_util:human_id(ar_wallet:to_address(hb_opts:get(priv_wallet, no_viable_wallet, Opts))),
     {Cursors, Deposits, Releases} = load_state(Cfg),
@@ -1714,6 +1717,19 @@ successor_ok(Info, Next, Here) ->
 
 follow_file(Cfg) -> maps:get(<<"follow-file">>, Cfg, <<"bridge-follow.json">>).
 
+%% Each chain's `rpc-file', read into its `rpc' in the loop's own state only:
+%% the node message keeps the path, never the URL. An unreadable file stops
+%% the loop at start.
+rpc_files(Cfg) ->
+    maps:map(
+        fun(_Chain, #{ <<"rpc-file">> := File } = C) ->
+                {ok, Url} = file:read_file(File),
+                C#{ <<"rpc">> => string:trim(Url) };
+           (_Key, Value) -> Value
+        end,
+        Cfg
+    ).
+
 %% The configured PUSD, or where the node has followed it to since.
 load_follow(Cfg) ->
     Genesis = maps:get(<<"pusd">>, Cfg),
@@ -1953,6 +1969,17 @@ status_view(St) ->
     }.
 
 %%% Tests ---------------------------------------------------------------------
+
+rpc_files_test() ->
+    File = <<"/tmp/bridge-rpc-files-test.txt">>,
+    ok = file:write_file(File, <<"https://rpc.example/v2/KEY
+">>),
+    Cfg = rpc_files(#{ <<"pusd">> => <<"p">>,
+        <<"base">> => #{ <<"rpc-file">> => File, <<"chain-id">> => 8453 },
+        <<"sui">> => #{ <<"package">> => <<"x">> } }),
+    ?assertEqual(<<"https://rpc.example/v2/KEY">>, maps:get(<<"rpc">>, maps:get(<<"base">>, Cfg))),
+    ?assertEqual(#{ <<"package">> => <<"x">> }, maps:get(<<"sui">>, Cfg)),
+    ?assertEqual(<<"p">>, maps:get(<<"pusd">>, Cfg)).
 
 next_interval_test() ->
     Cfg = #{ <<"interval">> => 15000, <<"fast-interval">> => 1000 },
