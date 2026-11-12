@@ -396,7 +396,8 @@ entry_taken_once_test() ->
     Peer = ar_wallet:new(),
     PeerAddr = hb_util:human_id(ar_wallet:to_address(Peer)),
     Opts = #{ <<"priv-wallet">> => ar_wallet:new(), <<"store">> => [Store],
-        <<"scheduler-admission">> => #{ <<"peers">> => #{ PeerAddr => #{ <<"policy">> => <<"trusted">> } } } },
+        <<"scheduler-admission">> => #{ <<"peers">> =>
+            [#{ <<"address">> => PeerAddr, <<"policy">> => <<"trusted">> }] } },
     Sender = hb_message:commit(#{ <<"type">> => <<"Process">>, <<"scheduler">> => PeerAddr },
         #{ <<"priv-wallet">> => ar_wallet:new() }, <<"httpsig@1.0">>),
     {ok, _} = hb_cache:write(Sender, Opts),

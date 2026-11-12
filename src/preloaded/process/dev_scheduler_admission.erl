@@ -150,13 +150,15 @@ policy(S, Opts) ->
             end
     end.
 
-%% @doc Scheduler `S''s entry in the node's `scheduler-admission' peers
-%% (`policy', `location'), or `#{}'.
+%% @doc Scheduler `S''s entry in the node's `scheduler-admission' peers, a
+%% list of `#{ address, policy, location }', or `#{}'. A list, not a map keyed
+%% by address: loading a node config lowercases map keys, and an address is
+%% case-sensitive.
 peer(S, Opts) ->
     Cfg = hb_opts:get(<<"scheduler-admission">>, #{}, Opts),
     URI = hb_committer:uri(S),
-    case [ V || {A, V} <- maps:to_list(hb_maps:get(<<"peers">>, Cfg, #{}, Opts)),
-            hb_committer:uri(A) =:= URI ] of
+    Peers = hb_util:message_to_ordered_list(hb_maps:get(<<"peers">>, Cfg, [], Opts), Opts),
+    case [ V || V = #{ <<"address">> := A } <- Peers, hb_committer:uri(A) =:= URI ] of
         [V] -> V;
         _ -> #{}
     end.
@@ -302,7 +304,7 @@ push(Wallet, Target, Overrides, Opts) ->
 
 with_peer(Opts, W, Policy) ->
     Opts#{ <<"scheduler-admission">> => #{ <<"epoch">> => 3,
-        <<"peers">> => #{ addr(W) => #{ <<"policy">> => Policy } } } }.
+        <<"peers">> => [#{ <<"address">> => addr(W), <<"policy">> => Policy }] } }.
 
 target() -> hb_util:human_id(crypto:strong_rand_bytes(32)).
 
@@ -331,6 +333,21 @@ local_push_admitted_test() ->
     ?assertEqual(<<"local">>, maps:get(<<"admit-policy">>, Keys)),
     ?assertEqual(7, maps:get(<<"admit-slot">>, Keys)),
     ?assertEqual(1, length(ids(Keys, Opts))).
+
+%% The policy as a node loads it from its JSON config: an address is
+%% case-sensitive, and the loader lowercases map keys, so peers are a list.
+json_config_peer_is_found_test() ->
+    Peer = ar_wallet:new(),
+    JSON = hb_json:encode(#{ <<"scheduler-admission">> => #{ <<"epoch">> => 2,
+        <<"peers">> => [#{ <<"address">> => addr(Peer), <<"policy">> => <<"trusted">>,
+            <<"location">> => <<"http://peer.example">> }] } }),
+    File = "/tmp/admission-" ++ integer_to_list(erlang:unique_integer([positive])) ++ ".json",
+    ok = file:write_file(File, JSON),
+    {ok, Loaded} = hb_opts:load(File),
+    file:delete(File),
+    Opts = maps:merge(test_opts(), Loaded),
+    ?assertEqual({trusted, 2}, policy(addr(Peer), Opts)),
+    ?assertMatch(#{ <<"location">> := <<"http://peer.example">> }, peer(addr(Peer), Opts)).
 
 trusted_push_admitted_test() ->
     Peer = ar_wallet:new(),
@@ -364,8 +381,9 @@ unknown_sender_waits_test() ->
     Unknown = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Msg = push(Peer, Target, #{ <<"from-process">> => Unknown }, Opts),
     ?assert(unadmitted(Msg, admit(Target, Msg, Opts), Opts)),
-    Located = Opts#{ <<"scheduler-admission">> => #{ <<"peers">> => #{
-        addr(Peer) => #{ <<"policy">> => <<"trusted">>, <<"location">> => <<"http://127.0.0.1:1">> } } } },
+    Located = Opts#{ <<"scheduler-admission">> => #{ <<"peers">> => [
+        #{ <<"address">> => addr(Peer), <<"policy">> => <<"trusted">>,
+           <<"location">> => <<"http://127.0.0.1:1">> }] } },
     ?assertEqual(503, status(admit(Target, Msg, Located))).
 
 %% A signer with no policy admits nothing: the message is scheduled as sent,
