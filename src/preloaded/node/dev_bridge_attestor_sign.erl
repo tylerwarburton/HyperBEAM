@@ -13,10 +13,10 @@
 %%%
 %%% Pure functions: no node state, no network.
 -module(dev_bridge_attestor_sign).
--export([base_release/8, base_attestors/6, base_root/5, base_admin/7,
+-export([base_release/8, base_attestors/6, base_root/5, base_admin/8,
     base_sign/2, base_address/1, base_signer/2]).
--export([solana_release/7, solana_attestors/5, solana_root/4, solana_admin/6]).
--export([sui_release/7, sui_attestors/5, sui_root/4, sui_admin/6]).
+-export([solana_release/7, solana_attestors/5, solana_root/4, solana_admin/7]).
+-export([sui_release/7, sui_attestors/5, sui_root/4, sui_admin/7]).
 -export([ed25519_sign/2, ed25519_public/1, threshold/1, address/2]).
 -export([base58_encode/1, base58_decode/1, hex/1, unhex/1]).
 -include_lib("eunit/include/eunit.hrl").
@@ -24,7 +24,7 @@
 -define(RELEASE, <<"PARALITH_RELEASE_V2">>).
 -define(ATTESTORS, <<"PARALITH_ATTESTORS_V2">>).
 -define(ROOT, <<"PARALITH_ROOT_V1">>).
--define(ADMIN, <<"PARALITH_ADMIN_V1">>).
+-define(ADMIN, <<"PARALITH_ADMIN_V2">>).
 -define(ALLOW_TOKEN, <<"ALLOW_TOKEN">>).
 -define(UNPAUSE, <<"UNPAUSE">>).
 
@@ -62,12 +62,14 @@ base_root(ChainId, Bridge, Epoch, Root, Successor) ->
         (ao_id(Root))/binary, (ao_id(Successor))/binary
     >>).
 
-%% @doc The inner hash of `ParaBridge.adminDigest'.
-base_admin(ChainId, Bridge, Root, Epoch, Action, Token, Value) ->
+%% @doc The inner hash of `ParaBridge.adminDigest': every chain binds its own
+%% admin nonce, which it accepts exactly once.
+base_admin(ChainId, Bridge, Root, Epoch, Nonce, Action, Token, Value) ->
     hb_keccak:keccak_256(<<
         (hb_keccak:keccak_256(?ADMIN))/binary,
         (word(ChainId))/binary, (evm(Bridge))/binary, (ao_id(Root))/binary,
-        (word(Epoch))/binary, (base_admin_action(Action))/binary,
+        (word(Epoch))/binary, (word(admin_nonce(Nonce)))/binary,
+        (base_admin_action(Action))/binary,
         (base_admin_token(Action, Token))/binary, (word(boolean(Value)))/binary
     >>).
 
@@ -132,10 +134,10 @@ solana_root(Program, Epoch, Root, Successor) ->
     <<?ROOT/binary, (address(solana, Program))/binary, (int(Epoch)):64/little,
       (ao_id(Root))/binary, (ao_id(Successor))/binary>>.
 
-%% @doc A Solana `PARALITH_ADMIN_V1' message.
-solana_admin(Program, Root, Epoch, Action, Token, Value) ->
+%% @doc `D || program id || root || epoch u64le || admin nonce u64le || action u8 || mint || value u8`
+solana_admin(Program, Root, Epoch, Nonce, Action, Token, Value) ->
     <<?ADMIN/binary, (address(solana, Program))/binary, (ao_id(Root))/binary,
-      (int(Epoch)):64/little, (admin_action(Action)):8,
+      (int(Epoch)):64/little, (admin_nonce(Nonce)):64/little, (admin_action(Action)):8,
       (solana_admin_token(Action, Token))/binary, (boolean(Value)):8>>.
 
 solana_admin_token(2, _) -> <<0:256>>;
@@ -162,16 +164,21 @@ sui_root(BridgeId, Epoch, Root, Successor) ->
     <<?ROOT/binary, (address(sui, BridgeId))/binary, (int(Epoch)):64/little,
       (ao_id(Root))/binary, (ao_id(Successor))/binary>>.
 
-%% @doc A Sui `PARALITH_ADMIN_V1' message. Token is the canonical coin type
-%% string, and is empty for actions that do not name a coin.
-sui_admin(BridgeId, Root, Epoch, Action, Token, Value) when is_binary(Token) ->
+%% @doc `D || bridge id || root || epoch u64le || admin nonce u64le || action u8 || coin type || value u8`.
+%% Token is the canonical coin type string, and is empty for actions that do
+%% not name a coin.
+sui_admin(BridgeId, Root, Epoch, Nonce, Action, Token, Value) when is_binary(Token) ->
     <<?ADMIN/binary, (address(sui, BridgeId))/binary, (ao_id(Root))/binary,
-      (int(Epoch)):64/little, (admin_action(Action)):8,
+      (int(Epoch)):64/little, (admin_nonce(Nonce)):64/little, (admin_action(Action)):8,
       Token/binary, (boolean(Value)):8>>.
 
 admin_action(1) -> 1;
 admin_action(2) -> 2;
 admin_action(Action) -> error({bad_admin_action, Action}).
+
+%% A chain's admin nonce: a u64, never coerced.
+admin_nonce(N) when is_integer(N), N >= 0, N < 1 bsl 64 -> N;
+admin_nonce(N) -> error({bad_admin_nonce, N}).
 
 boolean(true) -> 1;
 boolean(false) -> 0;
@@ -298,20 +305,29 @@ base_root_test() ->
           "7e28b5dcf9a848353271698c09638cd051d1ac9154197720bf4550df1986e7531b">>,
         hex(base_sign(Inner, ?PRIV))).
 
+%% paralith-mono products/bridge/admin-vectors.json (epoch 4, admin nonce 7),
+%% the same bytes ParaBridge.t.sol and the operator CLI check; the signature
+%% is viem's signMessage over the raw inner hash.
 base_admin_test() ->
-    Allow = base_admin(8453, ?BRIDGE, ?ROOT_ID, 4, 1, ?TOKEN, true),
+    Allow = base_admin(8453, ?BRIDGE, ?ROOT_ID, 4, 7, 1, ?TOKEN, true),
     ?assertEqual(
-        <<"983a0bddf7524c157f5d2bb6cdaf30eae1baa4d03ab4c00ca0590fbe6108147c">>,
+        <<"18dddabaa51affdfd69375e620fd1bae830f126ba1a011bd8af1e96478c0e718">>,
         hex(Allow)),
     ?assertEqual(
-        <<"6e34706165a3a9170a0d54b1f5ed5600e516cc2e98c111ac2664d75b46ddbb44",
-          "0c48762fee0aee83ca6b4d6344230e8bf4694ea6601dc90d33db19f61d9e1a561c">>,
+        <<"2a2c5d56ba8abb54cd7326f1ec0314081066a8a2753dfe20d9a5f04232e9b028",
+          "2cf26c202ac25921c562f6c1b2f3d130e94b986a7114892bcf8a5d8552c6eac91b">>,
         hex(base_sign(Allow, ?PRIV))),
-    Unpause = base_admin(8453, ?BRIDGE, ?ROOT_ID, 4, 2,
+    Unpause = base_admin(8453, ?BRIDGE, ?ROOT_ID, 4, 7, 2,
         <<"0x0000000000000000000000000000000000000000">>, true),
     ?assertEqual(
-        <<"079f8a13a555549ca5589e6dae7c3f195076c90556b26021d9f11c17e73fe2bf">>,
-        hex(Unpause)).
+        <<"dab375bed5edad1e50801ebbfcf700e6238ed0abcb7390a5ef3cdfe35a2e187c">>,
+        hex(Unpause)),
+    % The nonce is bound: the same action at another nonce is another digest.
+    ?assertNotEqual(Allow, base_admin(8453, ?BRIDGE, ?ROOT_ID, 4, 8, 1, ?TOKEN, true)),
+    ?assertError({bad_admin_nonce, -1}, base_admin(8453, ?BRIDGE, ?ROOT_ID, 4, -1, 1, ?TOKEN, true)),
+    ?assertError({bad_admin_nonce, <<"7">>}, base_admin(8453, ?BRIDGE, ?ROOT_ID, 4, <<"7">>, 1, ?TOKEN, true)),
+    ?assertError({bad_admin_nonce, 1 bsl 64}, solana_admin(base58_encode(binary:copy(<<1>>, 32)), ?ROOT_ID, 4,
+        1 bsl 64, 2, <<>>, true)).
 
 ed25519_test() ->
     Seed = ?PRIV,
@@ -355,30 +371,42 @@ solana_release_test() ->
         (binary:copy(<<16#aa>>, 32))/binary, (binary:copy(<<16#bb>>, 32))/binary>>,
         solana_root(B58(1), 4, ?ROOT_ID, ?SUCCESSOR)).
 
+%% paralith-mono products/bridge/admin-vectors.json (epoch 4, admin nonce 7):
+%% the Solana program's and the Move package's admin_message byte for byte.
 admin_messages_test() ->
-    B58 = fun(Byte) -> base58_encode(binary:copy(<<Byte>>, 32)) end,
+    Program = <<"98HwxH5HhiosRX5VDMR4NW1uxL4wrndjF46p6XE58UVZ">>,
+    Mint = base58_encode(binary:copy(<<2>>, 32)),
+    ?assertEqual(<<"8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR">>, Mint),
     ?assertEqual(
-        <<"504152414c4954485f41444d494e5f5631010101010101010101010101010101"
-          "0101010101010101010101010101010101aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa040000000000000001020202020202"
-          "020202020202020202020202020202020202020202020202020201">>,
-        hex(solana_admin(B58(1), ?ROOT_ID, 4, 1, B58(2), true))),
+        <<"504152414c4954485f41444d494e5f563278bbb94031494ec59412b8ce2d0811",
+          "afb95bec36756c1b21f1fe48d0fe5e6abcaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa040000000000000007000000000000",
+          "0001020202020202020202020202020202020202020202020202020202020202",
+          "020201">>,
+        hex(solana_admin(Program, ?ROOT_ID, 4, 7, 1, Mint, true))),
+    ?assertEqual(
+        <<"504152414c4954485f41444d494e5f563278bbb94031494ec59412b8ce2d0811",
+          "afb95bec36756c1b21f1fe48d0fe5e6abcaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa040000000000000007000000000000",
+          "0002000000000000000000000000000000000000000000000000000000000000",
+          "000001">>,
+        hex(solana_admin(Program, ?ROOT_ID, 4, 7, 2, <<"11111111111111111111111111111111">>, true))),
     Bridge = <<"0x034401905bebdf8c04f3cd5f04f442a39372c8dc321c29edfb4f9cb30b23ab96">>,
     Coin = <<"0x0000000000000000000000000000000000000000000000000000000000000000::test_usdc::TEST_USDC">>,
-    % Byte layout from para_bridge.move admin_message, including the coin type.
     ?assertEqual(
-        <<"504152414c4954485f41444d494e5f5631034401905bebdf8c04f3cd5f04f442",
+        <<"504152414c4954485f41444d494e5f5632034401905bebdf8c04f3cd5f04f442",
           "a39372c8dc321c29edfb4f9cb30b23ab96aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa040000000000000001307830303030",
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa040000000000000007000000000000",
+          "0001307830303030303030303030303030303030303030303030303030303030",
           "3030303030303030303030303030303030303030303030303030303030303030",
-          "303030303030303030303030303030303030303030303030303030303a3a7465",
-          "73745f757364633a3a544553545f5553444301">>,
-        hex(sui_admin(Bridge, ?ROOT_ID, 4, 1, Coin, true))),
+          "303030303a3a746573745f757364633a3a544553545f5553444301">>,
+        hex(sui_admin(Bridge, ?ROOT_ID, 4, 7, 1, Coin, true))),
     ?assertEqual(
-        <<"504152414c4954485f41444d494e5f5631034401905bebdf8c04f3cd5f04f442a",
-          "39372c8dc321c29edfb4f9cb30b23ab96aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa04000000000000000201">>,
-        hex(sui_admin(Bridge, ?ROOT_ID, 4, 2, <<>>, true))).
+        <<"504152414c4954485f41444d494e5f5632034401905bebdf8c04f3cd5f04f442",
+          "a39372c8dc321c29edfb4f9cb30b23ab96aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa040000000000000007000000000000",
+          "000201">>,
+        hex(sui_admin(Bridge, ?ROOT_ID, 4, 7, 2, <<>>, true))).
 
 %% Each chain's one form, and nothing else: a 32-character base58 text (32
 %% '1's) is not 32 raw bytes, and a short or raw form is refused, not guessed.

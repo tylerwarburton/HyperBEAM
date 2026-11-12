@@ -1956,61 +1956,62 @@ admin_epoch(P) ->
     end.
 
 %% @doc Chain signatures carried by a majority-controlled administration vote.
+%% Each binds the admin nonce the root froze for that chain (`admin.nonces'):
+%% the chain accepts exactly its current nonce, once. A chain the decision
+%% names no nonce for is never signed.
 admin_vote_tags(P, Cfg, Keys) ->
     Id = integer_to_binary(hb_util:int(maps:get(<<"id">>, P))),
     Epoch = admin_epoch(P),
     EpochText = integer_to_binary(Epoch),
     Base = #{ <<"action">> => <<"Attestor-Vote">>, <<"proposalid">> => Id,
         <<"currentepoch">> => EpochText, <<"newepoch">> => EpochText },
+    Admin = maps:get(<<"admin">>, P, #{}),
     case maps:get(<<"op">>, P) of
         <<"add-token">> ->
-            Admin = maps:get(<<"admin">>, P),
             Chain = maps:get(<<"chain">>, Admin),
-            Token = maps:get(<<"token">>, Admin),
-            maps:merge(Base, admin_chain_signature(Chain, Token,
-                Epoch, Cfg, Keys));
+            maps:merge(Base, admin_chain_signature(Chain, maps:get(<<"token">>, Admin),
+                Epoch, admin_nonce(Admin, Chain), Cfg, Keys, 1));
         <<"unpause">> ->
-            maps:merge(Base, maps:merge(
-                admin_chain_signature(<<"base">>, zero_token(<<"base">>),
-                    Epoch, Cfg, Keys, 2),
-                maps:merge(
-                    admin_chain_signature(<<"solana">>, zero_token(<<"solana">>),
-                        Epoch, Cfg, Keys, 2),
-                    admin_chain_signature(<<"sui">>, zero_token(<<"sui">>),
-                        Epoch, Cfg, Keys, 2)
-                )
-            ));
+            lists:foldl(fun(Chain, Acc) ->
+                maps:merge(Acc, admin_chain_signature(Chain, zero_token(Chain),
+                    Epoch, admin_nonce(Admin, Chain), Cfg, Keys, 2))
+            end, Base, [C || C <- [<<"base">>, <<"solana">>, <<"sui">>],
+                maps:is_key(C, maps:get(<<"nonces">>, Admin, #{}))]);
         _ -> Base
     end.
 
-admin_chain_signature(Chain, Token, Epoch, Cfg, Keys) ->
-    admin_chain_signature(Chain, Token, Epoch, Cfg, Keys, 1).
+%% @doc The admin nonce the decision binds for `Chain': a whole number, or none.
+admin_nonce(Admin, Chain) ->
+    case maps:get(Chain, maps:get(<<"nonces">>, Admin, #{}), none) of
+        N when is_integer(N), N >= 0 -> N;
+        N -> error({bad_admin_nonce, Chain, N})
+    end.
 
-admin_chain_signature(<<"base">>, Token, Epoch, Cfg, Keys, Action) ->
+admin_chain_signature(<<"base">>, Token, Epoch, Nonce, Cfg, Keys, Action) ->
     C = maps:get(<<"base">>, Cfg),
     Root = maps:get(<<"pusd">>, Cfg),
     Sig = dev_bridge_attestor_sign:base_sign(
         dev_bridge_attestor_sign:base_admin(
             hb_util:int(maps:get(<<"chain-id">>, C)), maps:get(<<"contract">>, C),
-            Root, Epoch, Action, Token, true),
+            Root, Epoch, Nonce, Action, Token, true),
         maps:get(base, Keys)
     ),
     #{ <<"basesig">> => signature_hex(Sig) };
-admin_chain_signature(<<"solana">>, Token, Epoch, Cfg, Keys, Action) ->
+admin_chain_signature(<<"solana">>, Token, Epoch, Nonce, Cfg, Keys, Action) ->
     C = maps:get(<<"solana">>, Cfg),
     Root = maps:get(<<"pusd">>, Cfg),
     Sig = dev_bridge_attestor_sign:ed25519_sign(
         dev_bridge_attestor_sign:solana_admin(
-            maps:get(<<"program">>, C), Root, Epoch, Action, Token, true),
+            maps:get(<<"program">>, C), Root, Epoch, Nonce, Action, Token, true),
         maps:get(solana, Keys)
     ),
     #{ <<"solanasig">> => signature_hex(Sig) };
-admin_chain_signature(<<"sui">>, Token, Epoch, Cfg, Keys, Action) ->
+admin_chain_signature(<<"sui">>, Token, Epoch, Nonce, Cfg, Keys, Action) ->
     C = maps:get(<<"sui">>, Cfg),
     Root = maps:get(<<"pusd">>, Cfg),
     Sig = dev_bridge_attestor_sign:ed25519_sign(
         dev_bridge_attestor_sign:sui_admin(
-            maps:get(<<"bridge">>, C), Root, Epoch, Action, Token, true),
+            maps:get(<<"bridge">>, C), Root, Epoch, Nonce, Action, Token, true),
         maps:get(sui, Keys)
     ),
     #{ <<"suisig">> => signature_hex(Sig) }.
@@ -2738,18 +2739,39 @@ admin_vote_tags_test() ->
         <<"op">> => <<"add-token">>, <<"priorEpoch">> => 4,
         <<"currentEpoch">> => 4, <<"newEpoch">> => 4, <<"epoch">> => 4,
         <<"admin">> => #{ <<"chain">> => <<"solana">>,
-            <<"token">> => SolanaToken } },
+            <<"token">> => SolanaToken, <<"nonces">> => #{ <<"solana">> => 7 } } },
     Add = admin_vote_tags(Proposal, Cfg, Keys),
     ?assertEqual(<<"4">>, maps:get(<<"currentepoch">>, Add)),
     ?assertEqual(<<"4">>, maps:get(<<"newepoch">>, Add)),
     ?assert(maps:is_key(<<"solanasig">>, Add)),
     ?assertNot(maps:is_key(<<"basesig">>, Add)),
     ?assertNot(maps:is_key(<<"suisig">>, Add)),
+    % The vote signs exactly the message at the root's frozen nonce.
+    Msg = dev_bridge_attestor_sign:solana_admin(Solana, Root, 4, 7, 1, SolanaToken, true),
+    ?assertEqual(signature_hex(dev_bridge_attestor_sign:ed25519_sign(Msg, maps:get(solana, Keys))),
+        maps:get(<<"solanasig">>, Add)),
+    % No nonce, or not a whole number: nothing is signed, and
+    % proposal_signatures serves no signature for it.
+    NoNonce = Proposal#{ <<"admin">> => #{ <<"chain">> => <<"solana">>, <<"token">> => SolanaToken } },
+    ?assertError({bad_admin_nonce, <<"solana">>, none}, admin_vote_tags(NoNonce, Cfg, Keys)),
+    ?assertEqual(#{}, proposal_signatures(NoNonce, Cfg, Keys)),
+    ?assertError({bad_admin_nonce, <<"solana">>, <<"7">>}, admin_vote_tags(Proposal#{ <<"admin">> =>
+        #{ <<"chain">> => <<"solana">>, <<"token">> => SolanaToken,
+            <<"nonces">> => #{ <<"solana">> => <<"7">> } } }, Cfg, Keys)),
+    % A nonce for another chain does not stand in for the token's own.
+    ?assertError({bad_admin_nonce, <<"solana">>, none}, admin_vote_tags(Proposal#{ <<"admin">> =>
+        #{ <<"chain">> => <<"solana">>, <<"token">> => SolanaToken,
+            <<"nonces">> => #{ <<"base">> => 7 } } }, Cfg, Keys)),
     Unpause = admin_vote_tags(Proposal#{ <<"op">> => <<"unpause">>,
-        <<"admin">> => #{} }, Cfg, Keys),
+        <<"admin">> => #{ <<"nonces">> => #{ <<"base">> => 1, <<"solana">> => 2, <<"sui">> => 3 } } }, Cfg, Keys),
     ?assert(maps:is_key(<<"basesig">>, Unpause)),
     ?assert(maps:is_key(<<"solanasig">>, Unpause)),
     ?assert(maps:is_key(<<"suisig">>, Unpause)),
+    BaseOnly = admin_vote_tags(Proposal#{ <<"op">> => <<"unpause">>,
+        <<"admin">> => #{ <<"nonces">> => #{ <<"base">> => 1 } } }, Cfg, Keys),
+    ?assert(maps:is_key(<<"basesig">>, BaseOnly)),
+    ?assertNot(maps:is_key(<<"solanasig">>, BaseOnly)),
+    ?assertNot(maps:is_key(<<"suisig">>, BaseOnly)),
     ?assertError({bad_admin_epochs, 4, 4, 5, 4},
         admin_epoch(Proposal#{ <<"newEpoch">> => 5 })).
 
