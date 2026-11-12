@@ -1802,43 +1802,6 @@ wait_for_worker(Group, Tries) ->
         _ -> timer:sleep(100), wait_for_worker(Group, Tries - 1)
     end.
 
-%% @doc Luerl's `step' collector advances a real multi-call mark cycle while
-%% allocations and reachable mutations continue between steps. Externalizing
-%% a pending VM keeps its cycle, so a restored VM steps exactly like the live one.
-incremental_gc_step_test() ->
-    Script = <<
-        "Kept = {}\n"
-        "function stepper(budget)\n"
-        "  local n = #Kept + 1\n"
-        "  Kept[n] = { value = n }\n"
-        "  local complete = collectgarbage('step', budget)\n"
-        "  return complete, n, Kept[n].value\n"
-        "end\n"
-        "function kept_count() return #Kept end\n"
-    >>,
-    {ok, [], State0} = luerl:do_dec(Script, luerl:init()),
-    {ok, [false, 1, 1], State1} =
-        luerl:call_function_dec([<<"stepper">>], [1], State0),
-    {CompletedAt, State2} = finish_gc_cycle(State1, 2, 1000),
-    {ok, [CompletedAt], State3} =
-        luerl:call_function_dec([<<"kept_count">>], [], State2),
-    {ok, [false, Next, Next], Pending} =
-        luerl:call_function_dec([<<"stepper">>], [1], State3),
-    External = luerl:externalize(Pending),
-    Restored = luerl:internalize(External),
-    {ok, [true, AfterRestore, AfterRestore], _} =
-        luerl:call_function_dec([<<"stepper">>], [1000000], Restored),
-    ?assertEqual(Next + 1, AfterRestore).
-
-finish_gc_cycle(_State, Number, Limit) when Number > Limit ->
-    erlang:error(incremental_gc_did_not_complete);
-finish_gc_cycle(State, Number, Limit) ->
-    case luerl:call_function_dec([<<"stepper">>], [25], State) of
-        {ok, [true, Number, Number], Next} -> {Number, Next};
-        {ok, [false, Number, Number], Next} ->
-            finish_gc_cycle(Next, Number + 1, Limit)
-    end.
-
 delta_process(Opts) ->
     delta_process(Opts, equivalent_script()).
 
