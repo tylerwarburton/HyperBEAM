@@ -14,7 +14,7 @@
 %%% Pure functions: no node state, no network.
 -module(dev_bridge_attestor_sign).
 -export([base_release/8, base_attestors/6, base_root/5, base_admin/7,
-    base_sign/2, base_address/1]).
+    base_sign/2, base_address/1, base_signer/2]).
 -export([solana_release/7, solana_attestors/5, solana_root/4, solana_admin/6]).
 -export([sui_release/7, sui_attestors/5, sui_root/4, sui_admin/6]).
 -export([ed25519_sign/2, ed25519_public/1, threshold/1, address/2]).
@@ -82,6 +82,22 @@ base_admin_action(Action) -> error({bad_admin_action, Action}).
 %% on the EIP-191 hash accepts.
 base_sign(Inner, Priv) ->
     secp256k1_nif:sign(Inner, Priv, ethereum).
+
+%% @doc The lowercase 0x address whose `base_sign' over `Inner' this is, or
+%% `false': what the contract's `ECDSA.recover' would accept it as.
+base_signer(Inner, Sig) ->
+    P = 16#FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F,
+    case catch secp256k1_nif:ecrecover(Inner, Sig, ethereum) of
+        {true, <<Prefix:8, X:256>>} when Prefix =:= 2; Prefix =:= 3 ->
+            Root = binary:decode_unsigned(crypto:mod_pow((X * X * X + 7) rem P, (P + 1) div 4, P)),
+            Y = case Root rem 2 =:= Prefix - 2 of true -> Root; false -> P - Root end,
+            <<_:12/binary, Addr:20/binary>> = hb_keccak:keccak_256(<<X:256, Y:256>>),
+            <<"0x", (hex(Addr))/binary>>;
+        {true, <<4:8, Pub:64/binary>>} ->
+            <<_:12/binary, Addr:20/binary>> = hb_keccak:keccak_256(Pub),
+            <<"0x", (hex(Addr))/binary>>;
+        _ -> false
+    end.
 
 %% @doc The 0x address of a 32-byte private key, lowercase.
 base_address(Priv) ->
@@ -246,6 +262,15 @@ threshold_test() ->
 
 base_address_test() ->
     ?assertEqual(<<"0x1a642f0e3c3af545e7acbd38b07251b3990914f1">>, base_address(?PRIV)).
+
+%% A Base release signature names its signer's address, and no other.
+base_signer_test() ->
+    Inner = base_release(8453, ?BRIDGE, ?ROOT_ID, 3, 7, ?TOKEN, ?TO, 1234567),
+    Sig = base_sign(Inner, ?PRIV),
+    ?assertEqual(base_address(?PRIV), base_signer(Inner, Sig)),
+    Other = base_release(8453, ?BRIDGE, ?ROOT_ID, 3, 8, ?TOKEN, ?TO, 1234567),
+    ?assertNotEqual(base_address(?PRIV), base_signer(Other, Sig)),
+    ?assertEqual(false, base_signer(Inner, <<0:520>>)).
 
 base_release_test() ->
     Inner = base_release(8453, ?BRIDGE, ?ROOT_ID, 3,
