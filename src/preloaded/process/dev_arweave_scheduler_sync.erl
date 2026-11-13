@@ -14,6 +14,18 @@
 %%% What this does not check is proof of work: a gateway can still mint blocks
 %%% that extend the pinned anchor. The gateway is trusted for that, and only
 %%% for that; independent sources per node are the documented next step.
+%%%
+%%% Cost: one block and one header per transaction in it, each fetched once.
+%%% Membership needs nothing more -- the `indep_hash' commits the TXID list
+%%% and a header's signature reproduces its TXID -- but the index needs every
+%%% header anyway: which process a transaction targets is only in its header,
+%%% so a schedule that read only "its" transactions would have to trust
+%%% whoever listed them, and a lagging list would silently drop messages. The
+%%% blocks that confirm a batch open the next one, so are not fetched twice;
+%%% a gateway's `retry-after' is waited out; and one call advances the index
+%%% for at most `arweave-scheduler-sync-budget-ms', so a read returns the
+%%% committed (older, still complete) schedule instead of waiting out a
+%%% catch-up.
 -module(dev_arweave_scheduler_sync).
 -export([sync/1, process/2, from_height/1, confirmed_tip/1]).
 -export([fetch_block/2, fetch_header/2, spawn_ordinate/2]).
@@ -30,6 +42,9 @@
 -define(DEFAULT_FETCH_ATTEMPTS, 20).
 -define(DEFAULT_FETCH_RETRY_MS, 250).
 -define(DEFAULT_SYNC_INTERVAL_MS, 1000).
+-define(DEFAULT_SYNC_BUDGET_MS, 20000).
+-define(MAX_RETRY_WAIT_MS, 120000).
+-define(MAX_BACKOFF_MS, 30000).
 -define(PROCESS_IDLE_MS, 1000).
 
 %% @doc Bring the global target index to the confirmed chain frontier. The
@@ -73,6 +88,9 @@ process(ProcessID, Opts) ->
             }
     end.
 
+%% The runner keeps, besides the last committed record, the verified blocks
+%% past it that confirmed the last batch (`Ahead'): the next batch indexes
+%% them, so they are not fetched again. Any failure drops them.
 sync_request(Cached, Opts) ->
     case recent_state(Cached, Opts) of
         {ok, _} = Recent -> {Recent, Cached};
@@ -80,17 +98,21 @@ sync_request(Cached, Opts) ->
             Result =
                 do_sync(
                     dev_arweave_scheduler_cache:read_global(Opts),
+                    cached_ahead(Cached),
                     Opts
                 ),
             case Result of
-                {ok, State} ->
+                {ok, State, Ahead} ->
                     {
-                        Result,
-                        {erlang:monotonic_time(millisecond), State}
+                        {ok, State},
+                        {erlang:monotonic_time(millisecond), State, Ahead}
                     };
                 _ -> {Result, undefined}
             end
     end.
+
+cached_ahead({_CheckedAt, _State, Ahead}) -> Ahead;
+cached_ahead(_) -> [].
 
 recent_state(Cached, Opts) ->
     Interval =
@@ -104,7 +126,7 @@ recent_state(Cached, Opts) ->
     Now = erlang:monotonic_time(millisecond),
     ConfiguredFrom = from_height(Opts),
     case Cached of
-        {CheckedAt, State}
+        {CheckedAt, State, _Ahead}
                 when Interval > 0, Now - CheckedAt < Interval ->
             case hb_util:int(hb_maps:get(<<"from">>, State, -1, #{})) of
                 ConfiguredFrom -> {ok, State};
@@ -113,13 +135,33 @@ recent_state(Cached, Opts) ->
         _ -> stale
     end.
 
+%% @doc Advance the index toward the confirmed tip for at most
+%% `arweave-scheduler-sync-budget-ms' (at least one batch), and return the
+%% record committed so far. A caller -- a `/now' read among them -- gets a
+%% complete, if older, schedule instead of waiting out an hours-long catch-up;
+%% the next call continues from there.
 do_sync(StateResult, Opts) ->
+    case do_sync(StateResult, [], Opts) of
+        {ok, State, _Ahead} -> {ok, State};
+        Error -> Error
+    end.
+do_sync(StateResult, Ahead, Opts) ->
     From = from_height(Opts),
+    Deadline = erlang:monotonic_time(millisecond) + sync_budget(Opts),
     maybe
         {ok, Upper} ?= confirmed_tip(Opts),
         {ok, State} ?= initial_state(StateResult, From, from_hash(Opts)),
-        sync_blocks(State, Upper, Opts)
+        sync_blocks(State, Upper, Ahead, Deadline, Opts)
     end.
+
+sync_budget(Opts) ->
+    hb_util:int(
+        hb_opts:get(
+            arweave_scheduler_sync_budget_ms,
+            ?DEFAULT_SYNC_BUDGET_MS,
+            Opts
+        )
+    ).
 
 initial_state(_, _From, not_found) ->
     {error, #{ <<"status">> => 500,
@@ -146,9 +188,10 @@ initial_state({error, not_found}, From, FromHash) ->
     initial_state(not_found, From, FromHash);
 initial_state(Error, _From, _FromHash) -> Error.
 
-sync_blocks(State = #{ <<"to">> := To }, Upper, _Opts) when To >= Upper ->
-    {ok, State};
-sync_blocks(State = #{ <<"to">> := To }, Upper, Opts) ->
+sync_blocks(State = #{ <<"to">> := To }, Upper, Ahead, _Deadline, _Opts)
+        when To >= Upper ->
+    {ok, State, Ahead};
+sync_blocks(State = #{ <<"to">> := To }, Upper, Ahead, Deadline, Opts) ->
     BatchEnd =
         min(
             Upper,
@@ -165,26 +208,37 @@ sync_blocks(State = #{ <<"to">> := To }, Upper, Opts) ->
                 )
         ),
     % The batch and the descendants that confirm it, verified as one chain;
-    % only the batch is indexed.
+    % only the batch is indexed. The descendants are kept: they open the next
+    % batch's chain, which verifies them again from the new record (and fails,
+    % dropping them, if they no longer link to what is served after them).
     Heights = lists:seq(To + 1, BatchEnd + confirmation_depth(Opts)),
     maybe
-        {ok, Chain} ?= fetch_blocks(Heights, Opts),
+        {ok, Chain} ?= fetch_blocks(Heights, Ahead, Opts),
         {ok, _} ?= validate_blocks(Chain, State, Opts),
-        {Blocks, _Descendants} = lists:split(BatchEnd - To, Chain),
+        {Blocks, Descendants} = lists:split(BatchEnd - To, Chain),
         {ok, NewState} ?= validate_blocks(Blocks, State, Opts),
         ok ?= index_blocks(Blocks, Opts),
         ok ?= write_blocks(Blocks, Opts),
         {ok, _} ?=
             dev_arweave_scheduler_cache:write_global(NewState, Opts),
-        sync_blocks(NewState, Upper, Opts)
+        case erlang:monotonic_time(millisecond) >= Deadline of
+            true -> {ok, NewState, Descendants};
+            false -> sync_blocks(NewState, Upper, Descendants, Deadline, Opts)
+        end
     end.
 
-%% @doc Fetch one bounded batch of canonical blocks concurrently.
-fetch_blocks(Heights, Opts) ->
+%% @doc Fetch one bounded batch of canonical blocks concurrently, taking the
+%% heights already verified in `Ahead' from it.
+fetch_blocks(Heights, Ahead, Opts) ->
     Results =
         hb_pmap:parallel_map(
             Heights,
-            fun(Height) -> fetch_block(Height, Opts) end,
+            fun(Height) ->
+                case lists:keyfind(Height, 1, Ahead) of
+                    {Height, Block} -> {ok, Block};
+                    false -> fetch_block(Height, Opts)
+                end
+            end,
             max(
                 1,
                 hb_util:int(
@@ -716,12 +770,12 @@ fetch_block_remote(Height, Attempts, Opts) ->
             try verified_block(hb_cache:ensure_all_loaded(Block, FetchOpts), Opts)
             catch
                 throw:{necessary_message_not_found, _, _} ->
-                    retry_block(Height, Attempts, Opts);
+                    retry_block(Height, incomplete, Attempts, Opts);
                 throw:{could_not_read_lazy_link, _, _, _} ->
-                    retry_block(Height, Attempts, Opts)
+                    retry_block(Height, incomplete, Attempts, Opts)
             end;
-        _ when Attempts > 1 ->
-            retry_block(Height, Attempts, Opts);
+        Failed when Attempts > 1 ->
+            retry_block(Height, Failed, Attempts, Opts);
         _ ->
             {error,
                 #{
@@ -763,11 +817,11 @@ verified_block(Block, Opts) ->
             }
     end.
 
-%% @doc Retry an incomplete or unavailable block after a bounded delay.
-retry_block(Height, Attempts, Opts) when Attempts > 1 ->
-    timer:sleep(fetch_retry_delay(Opts)),
+%% @doc Retry an incomplete or unavailable block after `retry_wait/3'.
+retry_block(Height, Failed, Attempts, Opts) when Attempts > 1 ->
+    timer:sleep(retry_wait(Failed, Attempts, Opts)),
     fetch_block_remote(Height, Attempts - 1, Opts);
-retry_block(Height, _Attempts, _Opts) ->
+retry_block(Height, _Failed, _Attempts, _Opts) ->
     {error,
         #{
             <<"status">> => 503,
@@ -811,8 +865,8 @@ fetch_header_remote(TXID, Attempts, Opts) ->
                 Result -> Result
             end;
         {error, #{ <<"status">> := 422 }} = Error -> Error;
-        _ when Attempts > 1 ->
-            timer:sleep(fetch_retry_delay(Opts)),
+        Failed when Attempts > 1 ->
+            timer:sleep(retry_wait(Failed, Attempts, Opts)),
             fetch_header_remote(TXID, Attempts - 1, Opts);
         _ ->
             {error,
@@ -834,8 +888,8 @@ fetch_full_header(TXID, Attempts, Opts) ->
     ) of
         {ok, Header} -> cache_header(TXID, Header, Opts);
         {error, #{ <<"status">> := 422 }} = Error -> Error;
-        _ when Attempts > 1 ->
-            timer:sleep(fetch_retry_delay(Opts)),
+        Failed when Attempts > 1 ->
+            timer:sleep(retry_wait(Failed, Attempts, Opts)),
             fetch_full_header(TXID, Attempts - 1, Opts);
         _ ->
             {error,
@@ -870,18 +924,50 @@ fetch_attempts(Opts) ->
         )
     ).
 
-%% @doc Return the non-negative delay between network fetch attempts.
+%% @doc The non-negative base delay between network fetch attempts. Nodes
+%% configure `arweave-scheduler-fetch-retry-ms'; the older spelling without
+%% `-ms' is still read.
 fetch_retry_delay(Opts) ->
     max(
         0,
         hb_util:int(
             hb_opts:get(
-                arweave_scheduler_fetch_retry,
-                ?DEFAULT_FETCH_RETRY_MS,
+                arweave_scheduler_fetch_retry_ms,
+                hb_opts:get(
+                    arweave_scheduler_fetch_retry,
+                    ?DEFAULT_FETCH_RETRY_MS,
+                    Opts
+                ),
                 Opts
             )
         )
     ).
+
+%% @doc How long to wait before the next attempt. A gateway that refuses
+%% with `retry-after' (arweave.net: 429, 20-30 s) is waited out as asked:
+%% asking again sooner is refused again and only extends the refusal. Any
+%% other failure backs off exponentially from the base delay. Both are capped.
+retry_wait(Failed, Attempts, Opts) ->
+    Base = fetch_retry_delay(Opts),
+    Retry = max(0, fetch_attempts(Opts) - Attempts),
+    Backoff = min(?MAX_BACKOFF_MS, Base * (1 bsl min(Retry, 16))),
+    case retry_after(Failed) of
+        undefined -> Backoff;
+        Seconds -> min(?MAX_RETRY_WAIT_MS, max(Base, Seconds * 1000))
+    end.
+
+%% @doc The seconds a refusing gateway asked for, if it asked.
+retry_after({error, Response}) when is_map(Response) ->
+    case maps:get(<<"status">>, Response, undefined) of
+        Status when Status =:= 429; Status =:= 503 ->
+            try hb_util:int(maps:get(<<"retry-after">>, Response)) of
+                Seconds when Seconds >= 0 -> Seconds;
+                _ -> undefined
+            catch _:_ -> undefined
+            end;
+        _ -> undefined
+    end;
+retry_after(_) -> undefined.
 
 %% @doc Every Arweave read of the scheduler goes to the node's `gateway'
 %% (HTTPS in our nodes' config). What it returns is verified, not trusted.
@@ -1327,7 +1413,7 @@ public_process_path_test() ->
             fun(_Cached) ->
                 {
                     {ok, seeded},
-                    {erlang:monotonic_time(millisecond), Global}
+                    {erlang:monotonic_time(millisecond), Global, []}
                 }
             end
         )
@@ -1836,19 +1922,25 @@ honest_files() ->
 
 %% Sync from the gateway into a fresh store: `{Result, Global, Indexed}'.
 sync_from(Files) ->
+    sync_from(Files, [], #{}).
+sync_from(Files, Ahead, Extra) ->
     {Handle, URL} = fixture_gateway(Files),
     Store = hb_test_utils:test_store(hb_store_volatile, <<"ar-sched-verified">>),
     ok = hb_store:start(Store),
-    Opts = #{
+    Opts = maps:merge(#{
         <<"store">> => [Store],
         <<"gateway">> => URL,
         <<"arweave-scheduler-from">> => 2002970,
         <<"arweave-scheduler-from-hash">> => maps:get(<<"indep-hash">>, fixture_block(2002970)),
         <<"arweave-scheduler-block-batch">> => 1,
         <<"arweave-scheduler-fetch-attempts">> => 1
-    },
+    }, Extra),
     try
-        Result = do_sync(not_found, Opts),
+        Result =
+            case do_sync(not_found, Ahead, Opts) of
+                {ok, State, _NewAhead} when Ahead =:= [] -> {ok, State};
+                Other -> Other
+            end,
         {
             Result,
             dev_arweave_scheduler_cache:read_global(Opts),
@@ -1896,3 +1988,116 @@ verified_sync() ->
     % A transaction whose header is unavailable: tx_root cannot be checked.
     [Header | _] = fixture_headers(),
     Refused(maps:remove(<<"tx/", (maps:get(<<"id">>, Header))/binary>>, Honest)).
+
+verified(Height) ->
+    {ok, Block} = verified_block(fixture_block(Height), #{}),
+    {Height, Block}.
+
+%% The blocks that confirmed the last batch open the next one: they are not
+%% fetched again, and they are checked again against the chain.
+ahead_reuse_test_() ->
+    {timeout, 120, fun ahead_reuse/0}.
+
+ahead_reuse() ->
+    Honest = honest_files(),
+    Hash70 = maps:get(<<"indep-hash">>, fixture_block(2002970)),
+    Ahead = [verified(2002971), verified(2002972)],
+    WithoutDescendants =
+        maps:without(
+            [<<"block/height/2002971">>, <<"block/height/2002972">>],
+            Honest
+        ),
+    % Verified blocks the gateway no longer serves are enough to confirm
+    % 2002970, and they are handed on.
+    ?assertMatch(
+        {{ok, #{ <<"to">> := 2002970, <<"block-hash">> := Hash70 }, Ahead},
+            {ok, _}, [2002970]},
+        sync_from(WithoutDescendants, Ahead, #{})
+    ),
+    % Carried blocks that no longer extend the chain stop the sync.
+    Orphan =
+        ar_block:block_message(
+            rehashed_json(fixture(<<"2002972">>),
+                #{ <<"previous_block">> => Hash70 }),
+            #{}
+        ),
+    {ok, VerifiedOrphan} = verified_block(Orphan, #{}),
+    {Result, _, Indexed} =
+        sync_from(
+            WithoutDescendants,
+            [verified(2002971), {2002972, VerifiedOrphan}],
+            #{}
+        ),
+    ?assertMatch({error, _}, Result),
+    ?assertEqual([], Indexed).
+
+%% A call advances the index for its budget, then returns what is committed:
+%% with depth 0 the second batch (2002971, whose headers this gateway lacks)
+%% fails, so only a call whose budget ends after the first one succeeds.
+sync_budget_test_() ->
+    {timeout, 120, fun sync_budget/0}.
+
+sync_budget() ->
+    Depth0 = #{ <<"arweave-scheduler-confirmation-depth">> => 0 },
+    ?assertMatch(
+        {{ok, #{ <<"to">> := 2002970 }}, {ok, _}, [2002970]},
+        sync_from(honest_files(),
+            [], Depth0#{ <<"arweave-scheduler-sync-budget-ms">> => 0 })
+    ),
+    ?assertMatch(
+        {{error, _}, {ok, #{ <<"to">> := 2002970 }}, [2002970]},
+        sync_from(honest_files(), [], Depth0)
+    ).
+
+retry_wait_test() ->
+    Opts = #{
+        <<"arweave-scheduler-fetch-attempts">> => 10,
+        <<"arweave-scheduler-fetch-retry-ms">> => 100
+    },
+    Refused = {error, #{ <<"status">> => 429, <<"retry-after">> => <<"30">> }},
+    ?assertEqual(30000, retry_wait(Refused, 10, Opts)),
+    ?assertEqual(100, retry_wait({error, #{ <<"status">> => 500 }}, 10, Opts)),
+    ?assertEqual(400, retry_wait({error, timeout}, 8, Opts)),
+    ?assertEqual(?MAX_BACKOFF_MS, retry_wait(incomplete, 1, Opts#{
+        <<"arweave-scheduler-fetch-attempts">> => 100 })),
+    ?assertEqual(100,
+        fetch_retry_delay(#{ <<"arweave-scheduler-fetch-retry-ms">> => 100 })).
+
+%% A gateway's `retry-after' reaches the retry through `~arweave@2.9'.
+retry_after_honoured_test_() ->
+    {timeout, 60, fun retry_after_honoured/0}.
+
+retry_after_honoured() ->
+    [Header | _] = fixture_headers(),
+    TXID = maps:get(<<"id">>, Header),
+    Calls = counters:new(1, []),
+    {ok, URL, Handle} =
+        hb_mock_server:start(
+            [
+                {"/[...]", gateway,
+                    fun(_) ->
+                        counters:add(Calls, 1, 1),
+                        case counters:get(Calls, 1) of
+                            1 -> {429, #{ <<"retry-after">> => <<"1">> }, <<>>};
+                            _ -> {200, hb_json:encode(Header)}
+                        end
+                    end}
+            ]
+        ),
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"ar-sched-retry">>),
+    ok = hb_store:start(Store),
+    Opts = #{
+        <<"store">> => [Store],
+        <<"gateway">> => URL,
+        <<"arweave-scheduler-fetch-attempts">> => 2,
+        <<"arweave-scheduler-fetch-retry-ms">> => 0
+    },
+    try
+        Start = erlang:monotonic_time(millisecond),
+        ?assertMatch({ok, _, _}, fetch_header_remote(TXID, Opts)),
+        ?assert(erlang:monotonic_time(millisecond) - Start >= 1000),
+        ?assertEqual(2, counters:get(Calls, 1))
+    after
+        hb_store:stop(Store),
+        hb_mock_server:stop(Handle)
+    end.

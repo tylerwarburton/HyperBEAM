@@ -19,6 +19,7 @@
 %% Response formats:
 %%   {Status, Body}     - Static response
 %%   fun(Req) -> ...    - Function called with request map, returns {Status, Body}
+%%                        or {Status, Headers, Body}
 %%
 %% Paths support Cowboy route patterns:
 %%   "/price/:amount"  - Matches /price/123, /price/abc, etc.
@@ -154,8 +155,13 @@ init(Req0, {Tag, Response, CollectorPID} = State) ->
     Msg = request_to_message(Req, Body),
     CollectorPID ! {request, Tag, Msg},
     %% Determine the response - either call the function or use the static value
-    {StatusCode, ResponseBody} = case is_function(Response) of
-        true -> Response(Msg);
-        false -> Response
-    end,
-    {ok, cowboy_req:reply(StatusCode, #{}, ResponseBody, Req), State}.
+    %% `{Status, Headers, Body}' replies with those headers as well.
+    {StatusCode, Headers, ResponseBody} =
+        case case is_function(Response) of
+            true -> Response(Msg);
+            false -> Response
+        end of
+            {S, H, B} -> {S, H, B};
+            {S, B} -> {S, #{}, B}
+        end,
+    {ok, cowboy_req:reply(StatusCode, Headers, ResponseBody, Req), State}.

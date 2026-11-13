@@ -558,6 +558,12 @@ the numbers below with the reason they moved.
      inclusive boundary without changing or rebuilding any local schedule.
      It replaces the scheduler cache store completely, so an old global index
      in the main store cannot satisfy or conflict with the dedicated index.
+   - The global sync fetches each block once (the blocks that confirm a batch
+     open the next), waits out a gateway's `retry-after` (cap 120 s; other
+     failures back off from `arweave-scheduler-fetch-retry-ms`, cap 30 s), and
+     advances for at most `arweave-scheduler-sync-budget-ms` (20 s) per call,
+     so `/now` on an Arweave-scheduled process returns its committed schedule
+     during a catch-up instead of hanging until the index reaches the tip.
 
    Node config for an attestor: `on.start.device` = `bridge-attestor@1.0`
    (was `bridge@1.0`); the `bridge` block uses (`pusd`, `scheduler-url`,
