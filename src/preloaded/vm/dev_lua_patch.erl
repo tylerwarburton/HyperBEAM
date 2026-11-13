@@ -1911,6 +1911,120 @@ literal_process_input_loads_stored_values_test() ->
     ?assertEqual(98, byte_size(hb_ao:get(<<"seen-bls">>, Result, Opts))),
     ?assertEqual(194, byte_size(hb_ao:get(<<"seen-blspop">>, Result, Opts))).
 
+%% @doc The production root's path: `arweave-scheduler@1.0' hands the process
+%% an assignment read back from its store, whose body is the `ao:' link to a
+%% real signed, data-free format-2 Arweave transaction (as the scheduler's
+%% sync writes it), so every tag value of 60 bytes or more reaches lua-patch
+%% as a lazy link. In literal mode Lua must still receive each value whole.
+%% The schedule is seeded in the store as the index would leave it (the
+%% global and process sync records, one assignment per slot), and the node's
+%% gateway answers the tip height, so `next' reads it without fetching a
+%% block. Slot 0's body is the process message itself, not an `ao:' link to
+%% an L1 spawn transaction.
+literal_process_arweave_schedule_delivers_stored_values_test_() ->
+    {timeout, 60, fun literal_process_arweave_schedule_delivers_stored_values/0}.
+
+literal_process_arweave_schedule_delivers_stored_values() ->
+    hb:init(),
+    Store = hb_test_utils:test_store(),
+    Hook = fun(_, Request, _) ->
+        {ok, Request#{<<"body">> => #{<<"status">> => 200,
+            <<"content-type">> => <<"application/json">>,
+            <<"body">> => <<"{\"height\":20}">>}}}
+    end,
+    Node = hb_http_server:start_node(#{<<"port">> => 0,
+        <<"on">> => #{<<"response">> => #{<<"device">> => #{<<"response">> => Hook}}}}),
+    Wallet = ar_wallet:new(),
+    Opts = #{
+        <<"store">> => [Store],
+        <<"scheduler-store">> => [Store],
+        <<"arweave-scheduler-store">> => [Store],
+        <<"priv-wallet">> => Wallet,
+        <<"hashpath">> => ignore,
+        <<"gateway">> => hb_util:bin(Node),
+        <<"arweave-scheduler-from">> => 10,
+        <<"arweave-scheduler-from-hash">> => <<"anchor">>,
+        <<"process-workers">> => false,
+        <<"spawn-worker">> => false,
+        <<"process-worker-spawn">> => false,
+        <<"process-delta-cache">> => false,
+        <<"process-now-from-cache">> => false,
+        <<"process-compute-on-schedule">> => false,
+        <<"scheduler-lookahead">> => false,
+        <<"await-inprogress">> => false
+    },
+    Keys = [<<"action">>, <<"bls">>, <<"blspop">>, <<"config">>, <<"v59">>, <<"v60">>],
+    Script = <<"function compute(req) local out = {}\n"
+        " for _, k in ipairs({", (iolist_to_binary(lists:join(<<",">>,
+            [<<"'", K/binary, "'">> || K <- Keys])))/binary, "}) do\n"
+        "  out[#out+1] = {path='/seen-'..k, value=tostring(req.body[k])} end\n"
+        " return {patches=out, results={}} end">>,
+    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Process = hb_message:commit(#{
+        <<"device">> => <<"process@1.0">>,
+        <<"type">> => <<"Process">>,
+        <<"scheduler-device">> => <<"arweave-scheduler@1.0">>,
+        <<"execution-device">> => <<"lua-patch@1.0">>,
+        <<"lua-input-links">> => <<"literal">>,
+        <<"module">> => #{<<"content-type">> => <<"application/lua">>, <<"body">> => Script},
+        <<"authority">> => [Address],
+        <<"scheduler-location">> => Address,
+        <<"test-random-seed">> => 53
+    }, Opts),
+    {ok, _} = hb_cache:write(Process, Opts),
+    ProcID = hb_util:human_id(hb_message:id(Process, all, Opts)),
+    % The carrier: a data-free format-2 transaction, signed by its fee payer,
+    % through the gateway's JSON as the scheduler's header fetch receives it.
+    Hex = fun(N) -> <<"0x", (binary:encode_hex(crypto:strong_rand_bytes(N), lowercase))/binary>> end,
+    Values = #{
+        <<"action">> => <<"Admin.StageCommitteeKey">>,
+        <<"bls">> => Hex(48),
+        <<"blspop">> => Hex(96),
+        <<"config">> => <<"{\"set\":[],\"tokens\":[],\"ledgers\":[],\"epoch\":\"2\",\"namespace\":\"1\"}">>,
+        <<"v59">> => binary:copy(<<"a">>, 59),
+        <<"v60">> => binary:copy(<<"b">>, 60)
+    },
+    TagNames = #{<<"action">> => <<"Action">>, <<"bls">> => <<"Bls">>,
+        <<"blspop">> => <<"BlsPop">>, <<"config">> => <<"Config">>,
+        <<"v59">> => <<"V59">>, <<"v60">> => <<"V60">>},
+    Signed = ar_tx:sign(#tx{format = 2, target = hb_util:native_id(ProcID),
+        tags = [{maps:get(K, TagNames), maps:get(K, Values)} || K <- Keys]}, Wallet),
+    TX = ar_tx:json_struct_to_tx(hb_json:decode(hb_json:encode(ar_tx:tx_to_json_struct(Signed)))),
+    TXID = hb_util:human_id(Signed#tx.id),
+    Header = hb_message:convert(TX, <<"structured@1.0">>, <<"tx@1.0">>, Opts),
+    ?assert(hb_message:verify(Header, all, Opts)),
+    {ok, _} = hb_cache:write(Header, Opts),
+    Put = fun(Path, Value) ->
+        {ok, ID} = hb_cache:write(Value, Opts),
+        ok = hb_cache:link(ID, Path, Opts)
+    end,
+    Put(<<"~arweave-scheduler@1.0/sync/global">>,
+        #{<<"from">> => 10, <<"to">> => 18, <<"from-hash">> => <<"anchor">>}),
+    Put(<<"~arweave-scheduler@1.0/sync/process/", ProcID/binary>>,
+        #{<<"process">> => ProcID, <<"spawn-ordinate">> => <<"10-0">>,
+            <<"synced-to">> => 18, <<"next-slot">> => 2}),
+    Assignment = fun(Slot, Body) ->
+        #{<<"path">> => <<"compute">>, <<"data-protocol">> => <<"ao">>,
+            <<"variant">> => <<"ao.N.1">>, <<"process">> => ProcID,
+            <<"epoch">> => <<"0">>, <<"slot">> => Slot,
+            <<"block-height">> => 10 + Slot, <<"block-index">> => 0,
+            <<"block-hash">> => hb_util:encode(crypto:strong_rand_bytes(48)),
+            <<"timestamp">> => 1700000000 + Slot, <<"body">> => Body,
+            <<"type">> => <<"Assignment">>}
+    end,
+    Put(<<"~arweave-scheduler@1.0/assignments/", ProcID/binary, "/0">>, Assignment(0, Process)),
+    Put(<<"~arweave-scheduler@1.0/assignments/", ProcID/binary, "/1">>,
+        Assignment(1, {link, <<"ao:", TXID/binary>>, #{}})),
+    {ok, State} = hb_ao:resolve(Process,
+        #{<<"path">> => <<"compute">>, <<"slot">> => 1}, Opts),
+    lists:foreach(
+        fun(K) ->
+            ?assertEqual({K, maps:get(K, Values)},
+                {K, hb_ao:get(<<"seen-", K/binary>>, State, Opts)})
+        end,
+        Keys
+    ).
+
 delta_process(Opts, Script) ->
     delta_process(Opts, Script, #{}).
 delta_process(Opts, Script, Extra) ->
