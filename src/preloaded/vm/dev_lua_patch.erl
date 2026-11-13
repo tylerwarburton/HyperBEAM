@@ -166,12 +166,20 @@ literal_request(Req, Opts) ->
     Loaded = hb_cache:read_all_commitments(Body, Opts),
     Commitments = hb_cache:ensure_all_loaded(
         hb_maps:get(<<"commitments">>, Loaded, #{}, Opts), Opts),
-    literal_links(Req#{<<"body">> => Loaded#{<<"commitments">> => Commitments}}).
+    literal_links(Req#{<<"body">> => Loaded#{<<"commitments">> => Commitments}}, Opts).
 
-literal_links({link, URI, _}) -> URI;
-literal_links(Map) when is_map(Map) -> maps:map(fun(_, V) -> literal_links(V) end, Map);
-literal_links(List) when is_list(List) -> [literal_links(V) || V <- List];
-literal_links(Value) -> Value.
+%% A `lazy' link is the store's own handle on a value of this message: the
+%% cache writes every value of 60 bytes or more (`?DIRECT_VALUE_LENGTH') as a
+%% `ni:' name and reads it back as a lazy link. Load it, so a long tag reaches
+%% Lua as its bytes and not as `ni:///sha-256;...'. Only a link decoded from a
+%% tag's own text stays a literal URI.
+literal_links(Link = {link, _, #{<<"lazy">> := true}}, Opts) ->
+    literal_links(hb_cache:ensure_loaded(Link, Opts), Opts);
+literal_links({link, URI, _}, _Opts) -> URI;
+literal_links(Map, Opts) when is_map(Map) ->
+    maps:map(fun(_, V) -> literal_links(V, Opts) end, Map);
+literal_links(List, Opts) when is_list(List) -> [literal_links(V, Opts) || V <- List];
+literal_links(Value, _Opts) -> Value.
 
 %% @doc Collect the VM's garbage after every `lua-gc-interval-slots'th slot.
 %% Contracts on this device collect in full only on checkpoint slots
@@ -1857,6 +1865,51 @@ literal_process_input_does_not_fetch_unknown_links_test() ->
         #{<<"path">> => <<"compute">>, <<"slot">> => 1,
             <<"body">> => #{<<"unused">> => {link, Missing, #{}}}}, Opts),
     ?assertEqual(<<"literal">>, hb_ao:get(<<"seen">>, Result, Opts)).
+
+%% @doc A scheduled message reaches compute as the store wrote it: every tag
+%% value of 60 bytes or more is a lazy link to its bytes. In literal mode Lua
+%% must still receive those values whole (a BLS key, its proof, a JSON
+%% Config), not the store's `ni:' name for them.
+literal_process_input_loads_stored_values_test() ->
+    hb:init(),
+    Opts = #{<<"store">> => hb_test_utils:test_store(), <<"hashpath">> => ignore},
+    Hex = fun(N) -> <<"0x", (binary:encode_hex(crypto:strong_rand_bytes(N), lowercase))/binary>> end,
+    Fields = #{
+        <<"type">> => <<"Message">>,
+        <<"action">> => <<"Admin.StageCommitteeKey">>,
+        <<"ao">> => hb_util:human_id(crypto:strong_rand_bytes(32)),
+        <<"bls">> => Hex(48),
+        <<"blspop">> => Hex(96),
+        <<"v59">> => binary:copy(<<"a">>, 59),
+        <<"v60">> => binary:copy(<<"b">>, 60),
+        <<"config">> => <<"{\"set\":[],\"tokens\":[],\"ledgers\":[],\"epoch\":\"2\",\"namespace\":\"1\"}">>
+    },
+    Keys = maps:keys(Fields),
+    Signed = hb_message:commit(Fields, #{<<"priv-wallet">> => ar_wallet:new()}),
+    {ok, ID} = hb_cache:write(Signed, Opts),
+    {ok, FromStore} = hb_cache:read(ID, Opts),
+    % The store really does hand back links for the long values.
+    ?assertMatch({link, _, #{<<"lazy">> := true}}, maps:get(<<"bls">>, FromStore)),
+    ?assertMatch({link, _, #{<<"lazy">> := true}}, maps:get(<<"config">>, FromStore)),
+    Script = <<"function compute(req) local out = {}\n"
+        " for _, k in ipairs({", (iolist_to_binary(lists:join(<<",">>,
+            [<<"'", K/binary, "'">> || K <- Keys])))/binary, "}) do\n"
+        "  out[#out+1] = {path='/seen-'..k, value=tostring(req.body[k])} end\n"
+        " return {patches=out, results={}} end">>,
+    Base = (base(<<"lua-patch@1.0">>, Script))#{<<"lua-input-links">> => <<"literal">>},
+    {ok, Initialized} = hb_ao:resolve(Base, <<"init">>, Opts),
+    ProcessState = hb_private:set(Initialized, <<"initialized">>, true, Opts),
+    {ok, Result} = hb_ao:resolve(ProcessState,
+        #{<<"path">> => <<"compute">>, <<"slot">> => 1, <<"body">> => FromStore}, Opts),
+    lists:foreach(
+        fun(K) ->
+            ?assertEqual({K, maps:get(K, Fields)},
+                {K, hb_ao:get(<<"seen-", K/binary>>, Result, Opts)})
+        end,
+        Keys
+    ),
+    ?assertEqual(98, byte_size(hb_ao:get(<<"seen-bls">>, Result, Opts))),
+    ?assertEqual(194, byte_size(hb_ao:get(<<"seen-blspop">>, Result, Opts))).
 
 delta_process(Opts, Script) ->
     delta_process(Opts, Script, #{}).
