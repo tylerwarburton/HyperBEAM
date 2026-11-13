@@ -20,7 +20,11 @@
 %%% and a header's signature reproduces its TXID -- but the index needs every
 %%% header anyway: which process a transaction targets is only in its header,
 %%% so a schedule that read only "its" transactions would have to trust
-%%% whoever listed them, and a lagging list would silently drop messages. The
+%%% whoever listed them, and a lagging list would silently drop messages. A
+%%% header is verified as the raw record Arweave signed; only one that names a
+%%% target is converted to a HyperBEAM message, and one with no message form
+%%% is a message to nobody, so a stranger's odd transaction cannot stop the
+%%% index. The
 %%% blocks that confirm a batch open the next one, so are not fetched twice;
 %%% a gateway's `retry-after' is waited out; and one call advances the index
 %%% for at most `arweave-scheduler-sync-budget-ms', so a read returns the
@@ -398,7 +402,8 @@ initialize_process(
     maybe
         {ok, Height, Index, SpawnOrdinate} ?= spawn_ordinate(ProcessID, Opts),
         ok ?= require_covered_spawn(ProcessID, Height, From, To),
-        {ok, Header, #tx{}} ?= fetch_header(ProcessID, Opts),
+        {ok, TX} ?= fetch_header(ProcessID, Opts),
+        {ok, Header} ?= process_message(ProcessID, TX, Opts),
         {ok, _} ?=
             dev_arweave_scheduler_cache:write_header(Header, Opts),
         {ok, _} ?=
@@ -424,6 +429,23 @@ initialize_process(
         {ok, State}
     else
         Error -> Error
+    end.
+
+%% @doc A process is scheduled only if its spawn has a message form. Unlike a
+%% stranger's transaction it is refused, not passed over: that stops this one
+%% process, never the index.
+process_message(ProcessID, TX, Opts) ->
+    case message(ProcessID, TX, Opts) of
+        {ok, Header} -> {ok, Header};
+        not_message ->
+            {error,
+                #{
+                    <<"status">> => 422,
+                    <<"reason">> =>
+                        <<"Process transaction has no HyperBEAM message form.">>,
+                    <<"process">> => ProcessID
+                }
+            }
     end.
 
 require_covered_spawn(_ProcessID, Height, From, _To) when Height < From ->
@@ -669,27 +691,53 @@ assignment_provenance_missing_test() ->
 %% transaction's header is needed: the block's `tx_root' is recomputed from
 %% all of them.
 index_transaction(Height, Index, TXID, Opts) ->
-    case fetch_header(TXID, Opts) of
-        {ok, Header, TX} ->
-            Ordinate = ordinate(Height, Index),
-            Targets = transaction_targets(TX),
-            case Targets of
-                [] -> {ok, Height, TX, []};
-                _ ->
-                    case dev_arweave_scheduler_cache:write_execution_header(
-                            Header, Opts) of
-                        {ok, _} ->
-                            {ok, Height, TX,
-                                [
-                                    {Address, Ordinate, TXID}
-                                ||
-                                    Address <- Targets
-                                ]
-                            };
-                        Error -> Error
-                    end
-            end;
-        Error -> Error
+    maybe
+        {ok, TX} ?= fetch_header(TXID, Opts),
+        {ok, Targets} ?= message_targets(TXID, TX, Opts),
+        Ordinate = ordinate(Height, Index),
+        {ok, Height, TX, [{Address, Ordinate, TXID} || Address <- Targets]}
+    end.
+
+%% @doc The addresses a verified transaction is a message to. Authenticity
+%% and inclusion are checked on the raw header for every transaction; only one
+%% that names a target needs a HyperBEAM message form. A header with no such
+%% form (Arweave accepts headers `tx@1.0' refuses, e.g. a 3-byte `target') is
+%% a message to nobody: a fixed rule over the signed header, the same on every
+%% node, and never a reason to stop the index.
+message_targets(TXID, TX, Opts) ->
+    case transaction_targets(TX) of
+        [] -> {ok, []};
+        Targets ->
+            case message(TXID, TX, Opts) of
+                {ok, Header} ->
+                    maybe
+                        {ok, _} ?=
+                            dev_arweave_scheduler_cache:write_header(
+                                Header, Opts),
+                        {ok, _} ?=
+                            dev_arweave_scheduler_cache:write_execution_header(
+                                Header, Opts),
+                        {ok, Targets}
+                    end;
+                not_message ->
+                    ?event(warning,
+                        {arweave_scheduler_unconvertible_message,
+                            {tx, TXID}, {targets, Targets}}),
+                    {ok, []}
+            end
+    end.
+
+%% @doc The signed HyperBEAM message of a raw header, when it has one that
+%% converts back to the same signed transaction.
+message(TXID, TX, Opts) ->
+    try hb_message:convert(TX, <<"structured@1.0">>, <<"tx@1.0">>, Opts) of
+        Header ->
+            case validate_header(TXID, Header, Opts) of
+                {ok, Header, _} -> {ok, Header};
+                _ -> not_message
+            end
+    catch
+        _:_ -> not_message
     end.
 
 transaction_targets(TX = #tx{ data_size = 0 }) -> targets(TX);
@@ -830,14 +878,14 @@ retry_block(Height, _Failed, _Attempts, _Opts) ->
         }
     }.
 
-%% @doc Read a signed transaction header locally when possible, otherwise
-%% fetch it without data. The signed commitment must reproduce the requested
-%% TXID before it is admitted to the scheduler store.
+%% @doc The verified raw header of a transaction: a message header this node
+%% already admitted, otherwise the gateway's. Either way its signature must
+%% reproduce the requested TXID.
 fetch_header(TXID, Opts) ->
     case dev_arweave_scheduler_cache:read_header(TXID, Opts) of
         {ok, Header} ->
             case validate_header(TXID, Header, Opts) of
-                {ok, _, #tx{ data = <<>> }} = Valid -> Valid;
+                {ok, _, TX = #tx{ data = <<>> }} -> {ok, TX};
                 _ -> fetch_header_remote(TXID, Opts)
             end;
         _ -> fetch_header_remote(TXID, Opts)
@@ -846,25 +894,28 @@ fetch_header(TXID, Opts) ->
 fetch_header_remote(TXID, Opts) ->
     fetch_header_remote(TXID, fetch_attempts(Opts), Opts).
 
-%% @doc Retry transient header transport failures before failing the batch.
+%% @doc Read the gateway's JSON header as the raw `#tx' record it encodes,
+%% with no HyperBEAM message conversion: a stranger's header only has to be
+%% authentic, not representable. A format-one header carries its data, which
+%% its signature commits. Transient transport failures are retried before the
+%% batch fails.
 fetch_header_remote(TXID, Attempts, Opts) ->
-    case hb_ao:resolve(
-        <<
-            ?ARWEAVE_DEVICE/binary, "/tx&tx=", TXID/binary,
-            "&exclude-data=true"
-        >>,
-        no_result_cache(fetch_opts(Opts))
-    ) of
-        {ok, Header} ->
-            case cache_header(TXID, Header, Opts) of
-                {error, _} = Error ->
-                    case needs_format_one_data(Header, Opts) of
-                        true -> fetch_full_header(TXID, Attempts, Opts);
-                        false -> Error
-                    end;
-                Result -> Result
-            end;
-        {error, #{ <<"status">> := 422 }} = Error -> Error;
+    FetchOpts = fetch_opts(Opts),
+    Response =
+        best_response(
+            hb_http:request(
+                #{
+                    <<"path">> => <<"/arweave/tx/", TXID/binary>>,
+                    <<"method">> => <<"GET">>
+                },
+                FetchOpts#{
+                    <<"cache-control">> => [<<"no-cache">>, <<"no-store">>]
+                }
+            )
+        ),
+    case Response of
+        {ok, #{ <<"status">> := 200, <<"body">> := Body }} ->
+            raw_header(TXID, Body);
         Failed when Attempts > 1 ->
             timer:sleep(retry_wait(Failed, Attempts, Opts)),
             fetch_header_remote(TXID, Attempts - 1, Opts);
@@ -879,36 +930,30 @@ fetch_header_remote(TXID, Attempts, Opts) ->
             }
     end.
 
-%% @doc A format-one signature commits the complete data payload, so retrieve
-%% it only when a data-bearing format-one header cannot verify without it.
-fetch_full_header(TXID, Attempts, Opts) ->
-    case hb_ao:resolve(
-        <<?ARWEAVE_DEVICE/binary, "/tx&tx=", TXID/binary>>,
-        no_result_cache(fetch_opts(Opts))
-    ) of
-        {ok, Header} -> cache_header(TXID, Header, Opts);
-        {error, #{ <<"status">> := 422 }} = Error -> Error;
-        Failed when Attempts > 1 ->
-            timer:sleep(retry_wait(Failed, Attempts, Opts)),
-            fetch_full_header(TXID, Attempts - 1, Opts);
-        _ ->
+%% @doc A gateway JSON header, kept only if its signature reproduces `TXID'.
+raw_header(TXID, Body) ->
+    Verified =
+        try
+            TX = ar_tx:json_struct_to_tx(hb_json:decode(Body)),
+            Native = hb_util:native_id(TXID),
+            case ar_tx:verify_tx_id(Native, TX) of
+                true -> {ok, TX};
+                false -> invalid
+            end
+        catch
+            _:_ -> invalid
+        end,
+    case Verified of
+        {ok, _} -> Verified;
+        invalid ->
             {error,
                 #{
-                    <<"status">> => 503,
+                    <<"status">> => 502,
                     <<"reason">> =>
-                        <<"Arweave format-one transaction is not retrievable.">>,
+                        <<"Arweave header signature or TXID is invalid.">>,
                     <<"tx">> => TXID
                 }
             }
-    end.
-
-%% @doc Identify headers whose format-one signatures require omitted data.
-needs_format_one_data(Header, Opts) ->
-    try hb_message:convert(Header, <<"tx@1.0">>, Opts) of
-        #tx{ format = 1, data = <<>> } -> true;
-        #tx{} -> false
-    catch
-        _:_ -> false
     end.
 
 %% @doc Return the positive number of attempts allowed per network object.
@@ -987,17 +1032,6 @@ fetch_opts(Opts) ->
                 }
             ]
     }.
-
-cache_header(TXID, Header, Opts) ->
-    case validate_header(TXID, Header, Opts) of
-        {ok, Header, TX = #tx{ data_size = 0 }} ->
-            case dev_arweave_scheduler_cache:write_header(Header, Opts) of
-                {ok, _} -> {ok, Header, TX};
-                Error -> Error
-            end;
-        {ok, Header, TX} -> {ok, Header, TX};
-        Error -> Error
-    end.
 
 validate_header(TXID, Header, Opts) ->
     try
@@ -1594,13 +1628,113 @@ format_one_data_verification_test_() ->
                     <<"priv-wallet">> => ar_wallet:new()
                 },
             TXID = <<"bxjwGJjTYxOrZbrB5IhniCMwRkK_v0H3ddbz035LRn8">>,
-            {ok, _Header, TX} = fetch_header(TXID, Opts),
+            {ok, TX} = fetch_header(TXID, Opts),
             ?assertEqual(1, TX#tx.format),
             ?assertEqual(304801, TX#tx.data_size),
             ?assertEqual(TX#tx.data_size, byte_size(TX#tx.data)),
             ?assert(ar_tx:verify_tx_id(hb_util:native_id(TXID), TX)),
             ok = hb_store:stop(Store)
         end}.
+
+%% A signed format-2 header with no data, a native `target' and an
+%% `Assign-To' tag, as the gateway's JSON.
+signed_header(Target, AssignTo) ->
+    TX =
+        ar_tx:sign(
+            #tx{
+                format = 2,
+                anchor = crypto:strong_rand_bytes(32),
+                target = Target,
+                tags = [{<<"Assign-To">>, AssignTo}],
+                reward = 1,
+                data_size = 0
+            },
+            ar_wallet:new()
+        ),
+    {hb_util:human_id(TX#tx.id), hb_json:encode(ar_tx:tx_to_json_struct(TX))}.
+
+%% Arweave admits any `target' of up to 32 bytes; `tx@1.0' only 0 or 32. A
+%% header with a 3-byte `target' verifies, has no message form, and addresses
+%% nobody, even with an `Assign-To' naming a process. The same header with a
+%% 32-byte `target' is a message to both.
+unconvertible_message_is_addressed_to_nobody_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"ar-sched-odd">>),
+    ok = hb_store:start(Store),
+    Opts = #{ <<"store">> => [Store] },
+    Process = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    try
+        {OddID, OddJSON} = signed_header(<<1, 2, 3>>, Process),
+        {ok, Odd} = raw_header(OddID, OddJSON),
+        ?assertEqual([Process], transaction_targets(Odd)),
+        ?assertEqual(not_message, message(OddID, Odd, Opts)),
+        ?assertEqual({ok, []}, message_targets(OddID, Odd, Opts)),
+        ?assertNotMatch({ok, _},
+            dev_arweave_scheduler_cache:read_header(OddID, Opts)),
+        ?assertMatch({error, #{ <<"status">> := 422 }},
+            process_message(OddID, Odd, Opts)),
+        Native = crypto:strong_rand_bytes(32),
+        {ID, JSON} = signed_header(Native, Process),
+        {ok, TX} = raw_header(ID, JSON),
+        Targets = lists:usort([hb_util:human_id(Native), Process]),
+        ?assertEqual({ok, Targets}, message_targets(ID, TX, Opts)),
+        ?assertMatch({ok, _}, dev_arweave_scheduler_cache:read_header(ID, Opts)),
+        % A header that does not reproduce its TXID is refused, not skipped.
+        ?assertMatch({error, #{ <<"status">> := 502 }}, raw_header(OddID, JSON))
+    after
+        hb_store:stop(Store)
+    end.
+
+%% Block 2041444 holds `dACyhKIttr3mYXDdcI1xFdJ4NjvTtmfmq1ox4_0fQSI', an
+%% ArDrive bundle whose JSON `target' is the string "null": base64url for
+%% three bytes. It verifies and is in the block, and `tx@1.0' refuses it. The
+%% index passes over it and reaches the block.
+real_unconvertible_header_indexed_test_() ->
+    {timeout, 60, fun real_unconvertible_header_indexed/0}.
+
+real_unconvertible_header_indexed() ->
+    Headers = hb_json:decode(fixture(<<"2041444-txs">>)),
+    Odd = <<"dACyhKIttr3mYXDdcI1xFdJ4NjvTtmfmq1ox4_0fQSI">>,
+    [OddHeader] = [H || H = #{ <<"id">> := ID } <- Headers, ID =:= Odd],
+    {ok, OddTX} = raw_header(Odd, hb_json:encode(OddHeader)),
+    ?assertEqual(<<158, 233, 101>>, OddTX#tx.target),
+    ?assertThrow({invalid_field, target, _},
+        hb_message:convert(OddTX, <<"structured@1.0">>, <<"tx@1.0">>, #{})),
+    Block = fixture(<<"2041444">>),
+    Files =
+        maps:from_list(
+            [
+                {<<"block/height/2041444">>, Block},
+                {<<"block/current">>, Block}
+            |
+                [
+                    {<<"tx/", ID/binary>>, hb_json:encode(H)}
+                ||
+                    H = #{ <<"id">> := ID } <- Headers
+                ]
+            ]
+        ),
+    {Handle, URL} = fixture_gateway(Files),
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"ar-sched-2041444">>),
+    ok = hb_store:start(Store),
+    Opts = #{
+        <<"store">> => [Store],
+        <<"gateway">> => URL,
+        <<"arweave-scheduler-from">> => 2041444,
+        <<"arweave-scheduler-from-hash">> =>
+            maps:get(<<"indep-hash">>, fixture_block(2041444)),
+        <<"arweave-scheduler-confirmation-depth">> => 0,
+        <<"arweave-scheduler-block-batch">> => 1,
+        <<"arweave-scheduler-fetch-attempts">> => 1
+    },
+    try
+        ?assertMatch({ok, #{ <<"to">> := 2041444 }, _},
+            do_sync(not_found, [], Opts)),
+        ?assertMatch({ok, #{ <<"to">> := 2041444 }},
+            dev_arweave_scheduler_cache:read_global(Opts))
+    after
+        hb_store:stop(Store),
+        hb_mock_server:stop(Handle)
+    end.
 
 target_listing_failure_does_not_advance_test() ->
     Store = hb_test_utils:test_store(hb_store_volatile, <<"ar-sched-list">>),
@@ -2094,7 +2228,7 @@ retry_after_honoured() ->
     },
     try
         Start = erlang:monotonic_time(millisecond),
-        ?assertMatch({ok, _, _}, fetch_header_remote(TXID, Opts)),
+        ?assertMatch({ok, #tx{}}, fetch_header_remote(TXID, Opts)),
         ?assert(erlang:monotonic_time(millisecond) - Start >= 1000),
         ?assertEqual(2, counters:get(Calls, 1))
     after
