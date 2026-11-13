@@ -161,12 +161,14 @@ literal_input_links(Base, Opts) ->
 %% @doc Load the scheduled header and its signature metadata, then preserve
 %% payload links as strings. An unknown tag must not make execution depend on
 %% retrieval of an arbitrary remote object before the contract can reject it.
+%% The commitments are the ones the scheduled ID names, never every one the
+%% store holds for the same content: two signers' identical messages share an
+%% uncommitted ID, and merging them gives each the other's signature.
 literal_request(Req, Opts) ->
     Body = hb_cache:ensure_loaded(hb_maps:get(<<"body">>, Req, #{}, Opts), Opts),
-    Loaded = hb_cache:read_all_commitments(Body, Opts),
     Commitments = hb_cache:ensure_all_loaded(
-        hb_maps:get(<<"commitments">>, Loaded, #{}, Opts), Opts),
-    literal_links(Req#{<<"body">> => Loaded#{<<"commitments">> => Commitments}}, Opts).
+        hb_maps:get(<<"commitments">>, Body, #{}, Opts), Opts),
+    literal_links(Req#{<<"body">> => Body#{<<"commitments">> => Commitments}}, Opts).
 
 %% A `lazy' link is the store's own handle on a value of this message: the
 %% cache writes every value of 60 bytes or more (`?DIRECT_VALUE_LENGTH') as a
@@ -2024,6 +2026,116 @@ literal_process_arweave_schedule_delivers_stored_values() ->
         end,
         Keys
     ).
+
+%% @doc Two scheduled messages with the same content reach Lua with only their
+%% own signatures. The store keeps commitments under a message's uncommitted
+%% ID, so two signers' identical carriers share one commitment set there.
+%% These are the real L1 headers of slots 6 and 7 of the prod PUSD root
+%% (block 2041664): the same `Attestor-Approve' and anchor from two operators.
+%% Merging every stored commitment gave each slot two signers, and the root
+%% refused both as `Not authorised'.
+literal_process_identical_carriers_keep_their_own_signer_test_() ->
+    {timeout, 60, fun literal_process_identical_carriers_keep_their_own_signer/0}.
+
+literal_process_identical_carriers_keep_their_own_signer() ->
+    hb:init(),
+    Store = hb_test_utils:test_store(),
+    Hook = fun(_, Request, _) ->
+        {ok, Request#{<<"body">> => #{<<"status">> => 200,
+            <<"content-type">> => <<"application/json">>,
+            <<"body">> => <<"{\"height\":20}">>}}}
+    end,
+    Node = hb_http_server:start_node(#{<<"port">> => 0,
+        <<"on">> => #{<<"response">> => #{<<"device">> => #{<<"response">> => Hook}}}}),
+    Wallet = ar_wallet:new(),
+    Opts = #{
+        <<"store">> => [Store],
+        <<"scheduler-store">> => [Store],
+        <<"arweave-scheduler-store">> => [Store],
+        <<"priv-wallet">> => Wallet,
+        <<"hashpath">> => ignore,
+        <<"gateway">> => hb_util:bin(Node),
+        <<"arweave-scheduler-from">> => 10,
+        <<"arweave-scheduler-from-hash">> => <<"anchor">>,
+        <<"process-workers">> => false,
+        <<"spawn-worker">> => false,
+        <<"process-worker-spawn">> => false,
+        <<"process-delta-cache">> => false,
+        <<"process-now-from-cache">> => false,
+        <<"process-compute-on-schedule">> => false,
+        <<"scheduler-lookahead">> => false,
+        <<"await-inprogress">> => false
+    },
+    Script = <<"function compute(req) local s = {}\n"
+        " for _, c in pairs(req.body.commitments or {}) do\n"
+        "  if type(c) == 'table' and c.type == 'rsa-pss-sha256' then\n"
+        "   s[#s+1] = c.committer end end\n"
+        " table.sort(s)\n"
+        " return {patches={{path='/signers', value=table.concat(s, ',')}},"
+        " results={}} end">>,
+    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Process = hb_message:commit(#{
+        <<"device">> => <<"process@1.0">>,
+        <<"type">> => <<"Process">>,
+        <<"scheduler-device">> => <<"arweave-scheduler@1.0">>,
+        <<"execution-device">> => <<"lua-patch@1.0">>,
+        <<"lua-input-links">> => <<"literal">>,
+        <<"module">> => #{<<"content-type">> => <<"application/lua">>, <<"body">> => Script},
+        <<"authority">> => [Address],
+        <<"scheduler-location">> => Address,
+        <<"test-random-seed">> => 54
+    }, Opts),
+    {ok, _} = hb_cache:write(Process, Opts),
+    ProcID = hb_util:human_id(hb_message:id(Process, all, Opts)),
+    % Admitted as the index admits a header with a target: verified raw, then
+    % its message form written to the store (`message_targets' in
+    % `dev_arweave_scheduler_sync'; every store is one here).
+    {ok, JSON} = file:read_file(<<"test/arweave-blocks/2041664-approvals.json">>),
+    Headers =
+        lists:map(
+            fun(Struct = #{ <<"id">> := TXID }) ->
+                TX = ar_tx:json_struct_to_tx(Struct),
+                true = ar_tx:verify_tx_id(hb_util:native_id(TXID), TX),
+                Header = hb_message:convert(TX, <<"structured@1.0">>, <<"tx@1.0">>, Opts),
+                {ok, _} = hb_cache:write(Header, Opts),
+                {TXID, Header}
+            end,
+            hb_json:decode(JSON)
+        ),
+    [{Second, SecondHeader}, {Owner, OwnerHeader}] = Headers,
+    ?assertEqual(<<"u6XQ7awPGftygNr6RjFjgL3UzIJlb21O94Vpxt9UsBw">>, Second),
+    ?assertEqual(<<"JMnrx820AiiKvdS362Fe3-za92QbcHf7w_gFYfHgigY">>, Owner),
+    ?assertEqual(hb_message:id(SecondHeader, none, Opts), hb_message:id(OwnerHeader, none, Opts)),
+    Put = fun(Path, Value) ->
+        {ok, ID} = hb_cache:write(Value, Opts),
+        ok = hb_cache:link(ID, Path, Opts)
+    end,
+    Put(<<"~arweave-scheduler@1.0/sync/global">>,
+        #{<<"from">> => 10, <<"to">> => 18, <<"from-hash">> => <<"anchor">>}),
+    Put(<<"~arweave-scheduler@1.0/sync/process/", ProcID/binary>>,
+        #{<<"process">> => ProcID, <<"spawn-ordinate">> => <<"10-0">>,
+            <<"synced-to">> => 18, <<"next-slot">> => 3}),
+    Assignment = fun(Slot, Body) ->
+        #{<<"path">> => <<"compute">>, <<"data-protocol">> => <<"ao">>,
+            <<"variant">> => <<"ao.N.1">>, <<"process">> => ProcID,
+            <<"epoch">> => <<"0">>, <<"slot">> => Slot,
+            <<"block-height">> => 10 + Slot, <<"block-index">> => 0,
+            <<"block-hash">> => hb_util:encode(crypto:strong_rand_bytes(48)),
+            <<"timestamp">> => 1700000000 + Slot, <<"body">> => Body,
+            <<"type">> => <<"Assignment">>}
+    end,
+    Put(<<"~arweave-scheduler@1.0/assignments/", ProcID/binary, "/0">>, Assignment(0, Process)),
+    Put(<<"~arweave-scheduler@1.0/assignments/", ProcID/binary, "/1">>,
+        Assignment(1, {link, <<"ao:", Second/binary>>, #{}})),
+    Put(<<"~arweave-scheduler@1.0/assignments/", ProcID/binary, "/2">>,
+        Assignment(2, {link, <<"ao:", Owner/binary>>, #{}})),
+    Signers = fun(Slot) ->
+        {ok, State} = hb_ao:resolve(Process,
+            #{<<"path">> => <<"compute">>, <<"slot">> => Slot}, Opts),
+        binary:split(hb_ao:get(<<"signers">>, State, Opts), <<",">>, [global])
+    end,
+    ?assertEqual([<<"BALLSyZq_a6-7zdU_dU85E2VkoRnEVEDqkdZWlFx6uU">>], Signers(1)),
+    ?assertEqual([<<"efH9MDGEFZqQ4nTTRNxl8WXJi2NbZvd2xVgCWmG5EeM">>], Signers(2)).
 
 delta_process(Opts, Script) ->
     delta_process(Opts, Script, #{}).
