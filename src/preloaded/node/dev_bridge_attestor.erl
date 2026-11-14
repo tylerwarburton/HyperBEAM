@@ -3570,6 +3570,38 @@ unreadable_cursor_starts_over_test_() ->
         ?assertMatch(#{ member := true, last_error := null }, St2)
     end}.
 
+%% A replica's store holds every slot's computed state, the work of the build
+%% that computed it. The prod root's replicas computed its two Attestor-Approve
+%% slots on a build that refused them, and kept that result across the
+%% upgrade that fixed it: no node ever saw the approvals, so none authored the
+%% Attestor-Apply. A cursor another build wrote, or one from before cursors
+%% named their build, drops the store and replays; this build's own keeps it.
+replica_of_another_build_replays_test_() ->
+    {timeout, 120, fun() ->
+        St = #{ cfg := Cfg } = replica_setup(<<"build">>, fun honest/1),
+        ?assertMatch(#{ member := true, last_error := null }, pass(St)),
+        Base = <<(maps:get(<<"replica-dir">>, Cfg))/binary, "/", (maps:get(<<"pusd">>, Cfg))/binary>>,
+        Cursor = <<Base/binary, ".cursor.json">>,
+        ROpts = #{ <<"store">> => [#{ <<"store-module">> => hb_store_lmdb, <<"name">> => Base }] },
+        {ok, Bin} = file:read_file(Cursor),
+        Written = #{ <<"build">> := _ } = hb_json:decode(Bin),
+        Cached = fun() ->
+            {ok, Id} = hb_cache:write(#{ <<"computed">> => hb_util:encode(crypto:strong_rand_bytes(8)) }, ROpts),
+            Id
+        end,
+        Kept = Cached(),
+        ?assertMatch(#{ member := true, last_error := null }, pass(St)),
+        ?assertMatch({ok, _}, hb_cache:read(Kept, ROpts)),
+        lists:foreach(fun(Foreign) ->
+            Stale = Cached(),
+            ok = file:write_file(Cursor, hb_json:encode(Foreign)),
+            ?assertMatch(#{ member := true, last_error := null }, pass(St)),
+            ?assertEqual({error, not_found}, hb_cache:read(Stale, ROpts)),
+            {ok, Rewritten} = file:read_file(Cursor),
+            ?assertEqual(Written, hb_json:decode(Rewritten))
+        end, [Written#{ <<"build">> => <<"another@1">> }, maps:remove(<<"build">>, Written)])
+    end}.
+
 %% The bound on a root-endorse request is twice the largest real one: an
 %% ANS-104 intent whose operation fills what bridge-root accepts (2,048
 %% bytes). Below the bound with no RSA-PSS signature, or above it signed,

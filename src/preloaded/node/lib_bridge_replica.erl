@@ -27,8 +27,13 @@
 %%% computed elsewhere on the node (no workers, no shared hot cache, no
 %%% look-ahead, no joining another request's computation) and with the
 %%% result-affecting options pinned to what our nodes run. The cursor (slot,
-%%% chain, last assignment) is kept beside the store; a cursor that cannot be
-%%% read or does not match the store means starting over from slot 0.
+%%% chain, last assignment, build) is kept beside the store; a cursor that
+%%% cannot be read or does not match the store means starting over from slot 0.
+%%% The store also holds every slot's computed state, and that is the work of
+%%% the build that computed it: a cursor written by another build (or by one
+%%% from before cursors named their build) drops the store and replays from
+%%% slot 0, so a node upgrade that changes a result is never hidden behind a
+%%% result the old code cached.
 -module(lib_bridge_replica).
 -export([view/3]).
 %% For `dev_scheduler_follower', which follows any process this way.
@@ -105,15 +110,41 @@ body(_, _) -> false.
 load(Pusd, Url, NodeOpts, Dir) ->
     Base = <<Dir/binary, "/", Pusd/binary>>,
     Store = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => Base },
+    Cursor = <<Base/binary, ".cursor.json">>,
+    Build = build(NodeOpts),
     ok = filelib:ensure_dir(binary_to_list(<<Base/binary, "/">>)),
+    ok = same_build(Cursor, Build, Store),
     ok = hb_store:start([Store]),
     ROpts = execution_opts(NodeOpts, Store),
     R = #{ pusd => Pusd, url => Url, opts => ROpts, http => NodeOpts,
-        cursor => <<Base/binary, ".cursor.json">>,
+        cursor => Cursor, build => Build,
         proc => undefined, schedulers => [], scheduler_device => <<"scheduler@1.0">>,
         slot => -1, chain => Pusd, last => none,
         stopped => null },
     resume(process(R)).
+
+%% This node's build: its source commit and when it was built.
+build(Opts) ->
+    {ok, B} = hb_ao:resolve(#{ <<"device">> => <<"meta@1.0">> }, #{ <<"path">> => <<"build">> }, Opts),
+    <<(hb_util:bin(hb_maps:get(<<"source">>, B, <<"unknown">>, Opts)))/binary, "@",
+        (hb_util:bin(hb_maps:get(<<"build-time">>, B, 0, Opts)))/binary>>.
+
+%% A store another build computed is dropped before it is opened: the store
+%% first, then the cursor, so a halt between them drops it again next time.
+same_build(Cursor, Build, Store) ->
+    case file:read_file(Cursor) of
+        {error, enoent} -> ok;
+        {ok, Bin} ->
+            case catch hb_json:decode(Bin) of
+                #{ <<"build">> := Build } -> ok;
+                _ -> drop(Cursor, Store)
+            end;
+        _ -> drop(Cursor, Store)
+    end.
+
+drop(Cursor, Store) ->
+    ok = hb_store:reset([Store]),
+    ok = file:delete(Cursor).
 
 %% @doc Replayed code gets the same key isolation as public HTTP execution.
 %% The attestor retains its signing keys outside the foreign Lua environment.
@@ -522,7 +553,7 @@ need(true, _) -> true;
 need(Value, _) -> Value.
 
 accept(Kept, Id, R = #{ pusd := Pusd, slot := Slot, chain := Chain, proc := Proc, opts := ROpts,
-        scheduler_device := SchedulerDevice, http := Opts, cursor := File }) ->
+        scheduler_device := SchedulerDevice, http := Opts, cursor := File, build := Build }) ->
     % Kept where the scheduler cache keeps a slot, so PUSD computes from it.
     {ok, _} = hb_cache:write(Kept, ROpts),
     Stored = hb_message:id(Kept, signed, ROpts),
@@ -535,7 +566,7 @@ accept(Kept, Id, R = #{ pusd := Pusd, slot := Slot, chain := Chain, proc := Proc
         end,
     Next = R#{ slot := Slot + 1, last := Stored, chain := NextChain },
     ok = write_durably(File, hb_json:encode(#{ <<"slot">> => Slot + 1,
-        <<"chain">> => maps:get(chain, Next), <<"last">> => Stored })),
+        <<"chain">> => maps:get(chain, Next), <<"last">> => Stored, <<"build">> => Build })),
     Next.
 
 %% The cursor reaches the disk before it replaces the old one.
