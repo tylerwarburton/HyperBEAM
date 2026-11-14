@@ -384,6 +384,35 @@ start_delivery_sweep(NodeMsg) ->
         end
     end).
 
+%% @doc Keep the node's Arweave index at the confirmed tip in the background.
+%% Without it the index advances only when something reads a schedule, one sync
+%% budget per read, so a node nobody happens to query falls hours behind and its
+%% `/now' serves an old state. Runs only when an anchor is pinned. It goes
+%% through the device, as the sweep does, because preloaded device modules are
+%% not loaded yet when the node starts.
+start_arweave_follow(NodeMsg) ->
+    Interval = hb_util:int(
+        hb_opts:get(arweave_scheduler_follow_ms, 30000, NodeMsg)),
+    case hb_opts:get(arweave_scheduler_from_hash, not_found, NodeMsg) of
+        not_found -> ok;
+        _ when Interval =< 0 -> ok;
+        _ -> spawn(fun() -> arweave_follow(Interval, NodeMsg) end)
+    end.
+
+arweave_follow(Interval, NodeMsg) ->
+    timer:sleep(Interval),
+    try
+        hb_ao:raw(
+            <<"arweave-scheduler@1.0">>,
+            #{},
+            #{ <<"path">> => <<"sync">> },
+            NodeMsg
+        )
+    catch Class:Reason ->
+        ?event(warning, {arweave_follow_failed, {class, Class}, {reason, Reason}})
+    end,
+    arweave_follow(Interval, NodeMsg).
+
 %% @doc Trigger the creation of a new HTTP server node. Accepts a `NodeMsg'
 %% message, which is used to configure the server. This function executed the
 %% `start' hook on the node, giving it the opportunity to modify the `NodeMsg'
@@ -410,7 +439,7 @@ new_server(RawNodeMsg) ->
                             hb_store:normalize_opts(NodeMsgAfterHook))),
                 _ = hb_store_retention:maybe_start(NodeMsgIrr),
                 _ = start_delivery_sweep(NodeMsgIrr),
-                _ = dev_arweave_scheduler_sync:maybe_follow(NodeMsgIrr),
+                _ = start_arweave_follow(NodeMsgIrr),
                 NodeMsgIrr;
             Unexpected ->
                 ?event(http,
