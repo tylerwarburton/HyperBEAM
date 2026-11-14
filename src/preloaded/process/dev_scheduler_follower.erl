@@ -44,7 +44,10 @@
 
 %% @doc `ok' when the delivered `Req' is exactly the entry this node verified
 %% for its stamps; throws `{refused, 403 | 503, Why}' otherwise.
-check(S, Stamps, Req, ProcID, Opts) ->
+check(Signer, Stamps, Req, ProcID, Opts) ->
+    % Admission names a scheduler by its committer URI (`uri-did-ar-...');
+    % the follower keys, queries and stores by its address.
+    S = scheduler_address(Signer),
     #{ <<"admit-process">> := P, <<"admit-slot">> := Slot,
        <<"admit-outbox-key">> := Key, <<"admit-entry">> := EntryID } = Stamps,
     case forked(S, Opts) of
@@ -84,6 +87,14 @@ check(S, Stamps, Req, ProcID, Opts) ->
 
 need(true, _) -> ok;
 need(_, Why) -> throw({refused, 403, Why}).
+
+%% The address a scheduler URI or address names; a name that is neither is
+%% refused, never a crash in the door.
+scheduler_address(S) ->
+    case hb_committer:address(S) of
+        {ok, Address} -> hb_util:human_id(Address);
+        error -> throw({refused, 403, <<"the sender's scheduler is not an address">>})
+    end.
 
 delivered_id(Msg, Opts) ->
     hb_message:id(

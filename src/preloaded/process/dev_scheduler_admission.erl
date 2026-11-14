@@ -357,6 +357,18 @@ trusted_push_admitted_test() ->
     ?assertMatch(#{ <<"admit-policy">> := <<"trusted">>, <<"admit-policy-epoch">> := 3 },
         keys(Admitted, Opts)).
 
+%% A verified scheduler's push waits (503) until its entry is recomputed from
+%% the confirmed schedule. The door names the signer by its committer URI,
+%% and the follower must take it: it used to crash on it (500 on every push).
+verified_push_waits_for_its_entry_test() ->
+    Peer = ar_wallet:new(),
+    Opts = test_opts(),
+    Verified = Opts#{ <<"scheduler-admission">> => #{ <<"peers">> => [
+        #{ <<"address">> => addr(Peer), <<"policy">> => <<"verified">>,
+           <<"location">> => <<"http://127.0.0.1:1">> }] } },
+    Target = target(),
+    ?assertEqual(503, status(admit(Target, push(Peer, Target, #{}, Verified), Verified))).
+
 %% A trusted scheduler speaks for the processes it schedules, and for no
 %% other: not another node's, not ours.
 trusted_peer_cannot_speak_for_another_schedulers_process_test() ->
