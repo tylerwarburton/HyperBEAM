@@ -225,7 +225,7 @@ with_windows(F = #{ p := P, s := S, depth := Depth, opts := Opts, windows := Hav
 
 %% Every archive transaction of P that S signed, page by page.
 archive_edges(Gateway, S, P, After) ->
-    Query = <<"query($o:[String!],$p:[String!],$a:String){transactions(owners:$o,",
+    Query = <<"query($o:[String!],$p:[String!]!,$a:String){transactions(owners:$o,",
         "tags:[{name:\"Data-Protocol\",values:[\"ao-schedule-archive\"]},",
         "{name:\"Process\",values:$p}],first:100,after:$a,sort:HEIGHT_ASC)",
         "{pageInfo{hasNextPage} edges{cursor node{id tags{name value} block{height}}}}}">>,
