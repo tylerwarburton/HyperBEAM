@@ -410,6 +410,7 @@ new_server(RawNodeMsg) ->
                             hb_store:normalize_opts(NodeMsgAfterHook))),
                 _ = hb_store_retention:maybe_start(NodeMsgIrr),
                 _ = start_delivery_sweep(NodeMsgIrr),
+                _ = dev_arweave_scheduler_sync:maybe_follow(NodeMsgIrr),
                 NodeMsgIrr;
             Unexpected ->
                 ?event(http,

@@ -31,7 +31,7 @@
 %%% committed (older, still complete) schedule instead of waiting out a
 %%% catch-up.
 -module(dev_arweave_scheduler_sync).
--export([sync/1, process/2, from_height/1, confirmed_tip/1]).
+-export([sync/1, process/2, from_height/1, confirmed_tip/1, maybe_follow/1]).
 -export([fetch_block/2, fetch_header/2, spawn_ordinate/2]).
 -export([targets/1, ordinate/2, parse_ordinate/1]).
 -include("include/hb.hrl").
@@ -50,6 +50,8 @@
 -define(MAX_RETRY_WAIT_MS, 120000).
 -define(MAX_BACKOFF_MS, 30000).
 -define(PROCESS_IDLE_MS, 1000).
+-define(DEFAULT_FOLLOW_MS, 30000).
+-define(FOLLOWER, arweave_scheduler_follower).
 
 %% @doc Bring the global target index to the confirmed chain frontier. The
 %% pass is serialized per scheduler store, and repeated callers within
@@ -61,6 +63,34 @@ sync(Opts) ->
         {?MODULE, sync, Store},
         fun(Cached) -> sync_request(Cached, Opts) end
     ).
+
+%% @doc Keep the node's index at the confirmed tip in the background. Without
+%% it the index advances only when something reads a schedule, one sync budget
+%% per read, so a node nobody happens to query falls hours behind and its
+%% `/now' serves an old state. Runs only when an anchor is pinned; one per node.
+maybe_follow(Opts) ->
+    Interval = hb_util:int(hb_opts:get(arweave_scheduler_follow_ms,
+        ?DEFAULT_FOLLOW_MS, Opts)),
+    case {from_hash(Opts), Interval > 0, whereis(?FOLLOWER)} of
+        {not_found, _, _} -> ok;
+        {_, false, _} -> ok;
+        {_, true, undefined} ->
+            Pid = spawn(fun() -> follow(Interval, Opts) end),
+            try register(?FOLLOWER, Pid), ok
+            catch error:badarg -> exit(Pid, kill), ok
+            end;
+        _ -> ok
+    end.
+
+follow(Interval, Opts) ->
+    try sync(Opts) of
+        {ok, _} -> ok;
+        Error -> ?event(warning, {arweave_scheduler_follow_failed, Error})
+    catch Class:Reason ->
+        ?event(warning, {arweave_scheduler_follow_crashed, Class, Reason})
+    end,
+    timer:sleep(Interval),
+    follow(Interval, Opts).
 
 %% @doc Synchronize the global index and materialize one process's relevant
 %% entries into contiguous AO slots. Each process is serialized independently;
