@@ -14,8 +14,14 @@
 %%% Nothing here is on the scheduling path: the server only sends a message,
 %%% so a slow or absent bundler slows nobody's assignment. A client asking for
 %%% `remote_confirmation' is answered by the uploader, once its slot is up.
+%%%
+%%% Uploading costs the node's bundler credit, so only the processes the
+%%% operator lists in `scheduler-upload-processes' are archived. Anyone may
+%%% schedule on a public node; nobody else's schedule is paid for. With no
+%%% list nothing is uploaded, and a process off the list is not verifiable from
+%%% Arweave by another node's follower (`dev_scheduler_follower').
 -module(dev_scheduler_uploader).
--export([start/2, cursor/2, posted/2]).
+-export([start/2, cursor/2, posted/2, allowed/2, list_option/2]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -23,8 +29,38 @@
 -define(MIN_BACKOFF, 1000).
 -define(MAX_BACKOFF, 60000).
 
-%% @doc Start the uploader of `ProcID', linked to the caller.
+%% @doc Start the uploader of `ProcID', linked to the caller, or `undefined'
+%% for a process that is not on `scheduler-upload-processes'.
 start(ProcID, Opts) ->
+    case allowed(ProcID, Opts) of
+        true -> start_uploader(ProcID, Opts);
+        false ->
+            ?event(warning, {schedule_upload_skipped, {proc_id, ProcID},
+                {reason, not_in_scheduler_upload_processes}}),
+            undefined
+    end.
+
+%% @doc Whether this node pays to archive `ProcID'.
+allowed(ProcID, Opts) ->
+    lists:member(hb_util:human_id(ProcID),
+        list_option(hb_opts:get(scheduler_upload_processes, [], Opts), Opts)).
+
+%% @doc A list-valued node option as a list of binaries, however it arrived:
+%% a list, a numbered message, a JSON array or a comma-separated binary.
+%% Absent or empty is `[]'.
+list_option(Value, Opts) when is_map(Value) ->
+    list_option(hb_util:message_to_ordered_list(Value, Opts), Opts);
+list_option(Value, _Opts) when is_list(Value), Value =/= [], is_integer(hd(Value)) ->
+    list_option(list_to_binary(Value), _Opts);
+list_option(Value, _Opts) when is_list(Value) ->
+    [ B || V <- Value, B <- [string:trim(hb_util:bin(V))], B =/= <<>> ];
+list_option(<<"[", _/binary>> = JSON, Opts) ->
+    list_option(hb_json:decode(JSON), Opts);
+list_option(Value, Opts) when is_binary(Value) ->
+    list_option(binary:split(Value, <<",">>, [global]), Opts);
+list_option(_, _Opts) -> [].
+
+start_uploader(ProcID, Opts) ->
     spawn_link(
         fun() ->
             loop(#{
@@ -442,16 +478,17 @@ retries_until_bundler_answers() ->
     ok = gen_tcp:close(Listen),
     Self = self(),
     {Gateway, GatewayPID} = stub_gateway(Self),
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Opts = #{
         <<"store">> => [hb_test_utils:test_store()],
         <<"priv-wallet">> => hb:wallet(),
         <<"scheduler-upload-gateway">> => Gateway,
         <<"scheduler-upload-poll-ms">> => 10,
         <<"scheduler-upload-retry-seconds">> => 0,
+        <<"scheduler-upload-processes">> => [ProcID],
         <<"bundler-ans104">> =>
             <<"http://localhost:", (integer_to_binary(Port))/binary>>
     },
-    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Slots = lists:seq(0, 4),
     IDs =
         lists:flatmap(
@@ -697,3 +734,62 @@ refusal_is_logged_whole() ->
     receive {posted, 402, <<"abc">>} -> ok after 5000 -> error(no_post) end,
     unlink(Stub),
     exit(Stub, kill).
+
+%% @doc The upload list arrives as a list, a numbered message, a JSON array or
+%% a comma-separated binary; absent or empty, it lists nothing.
+list_option_test() ->
+    A = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    B = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Opts = #{},
+    ?assertEqual([A, B], list_option([A, B], Opts)),
+    ?assertEqual([A, B], list_option(#{ <<"1">> => A, <<"2">> => B }, Opts)),
+    ?assertEqual([A, B], list_option(hb_json:encode([A, B]), Opts)),
+    ?assertEqual([A, B], list_option(<<A/binary, ", ", B/binary>>, Opts)),
+    ?assertEqual([A], list_option(binary_to_list(A), Opts)),
+    ?assertEqual([], list_option([], Opts)),
+    ?assertEqual([], list_option(<<>>, Opts)),
+    ?assertEqual([], list_option(not_found, Opts)),
+    ?assert(allowed(A, #{ <<"scheduler-upload-processes">> => <<A/binary, ",", B/binary>> })),
+    ?assertNot(allowed(A, #{ <<"scheduler-upload-processes">> => [B] })),
+    ?assertNot(allowed(A, #{})).
+
+%% @doc A process off the upload list, or any process on a node with no list,
+%% gets no uploader: the bundler is never asked, and no window is written.
+unlisted_is_never_uploaded_test_() ->
+    {timeout, 30, fun unlisted_is_never_uploaded/0}.
+unlisted_is_never_uploaded() ->
+    {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(Listen),
+    ok = gen_tcp:close(Listen),
+    Bundler = stub_bundler(Port, [200], self()),
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Listed = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Base = #{
+        <<"store">> => [hb_test_utils:test_store()],
+        <<"priv-wallet">> => hb:wallet(),
+        <<"bundler-ans104">> =>
+            <<"http://localhost:", (integer_to_binary(Port))/binary>>
+    },
+    Body = hb_message:commit(#{ <<"data">> => <<"0">> }, Base, <<"ans104@1.0">>),
+    Assignment = hb_message:commit(
+        #{ <<"process">> => ProcID, <<"slot">> => 0, <<"body">> => Body,
+           <<"type">> => <<"Assignment">>, <<"variant">> => <<"ao.N.1">> },
+        Base, <<"ans104@1.0">>),
+    ok = dev_scheduler_cache:write(ProcID, Assignment, Base),
+    ok = dev_scheduler_cache:flush(Base),
+    lists:foreach(
+        fun(Opts) ->
+            ?assertEqual(undefined, start(ProcID, Opts)),
+            ?assertNot(allowed(ProcID, Opts))
+        end,
+        [Base, Base#{ <<"scheduler-upload-processes">> => [Listed] },
+            Base#{ <<"scheduler-upload-processes">> => <<>> }]
+    ),
+    receive {posted, _, _} -> error(unlisted_process_uploaded)
+    after 1500 -> ok
+    end,
+    ?assertEqual(-1, posted(ProcID, Base)),
+    ?assertEqual({error, not_found}, hb_store:read(store(Base),
+        #{ <<"read">> => window_path(ProcID, 0), <<"exact">> => true }, Base)),
+    unlink(Bundler),
+    exit(Bundler, kill).

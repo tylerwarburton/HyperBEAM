@@ -527,9 +527,12 @@ schedule_valid(ProcID, PID, Type, Req, Opts) ->
             % store (the node's store when none is set).
             {ok, _} = dev_scheduler_cache:write_spawn(Req, Opts),
             ok = dev_scheduler_cache:flush(Opts),
-            case hb_opts:get(scheduler_publish_remote, true, Opts) of
+            Upload =
+                hb_opts:get(scheduler_publish_remote, true, Opts) =/= false
+                    andalso dev_scheduler_uploader:allowed(ProcID, Opts),
+            case Upload of
                 false -> ok;
-                _ ->
+                true ->
                     spawn(
                         fun() ->
                             {ok, Results} = hb_client_remote:upload(Req, Opts),

@@ -26,8 +26,21 @@
 %%% index: it never computes, fetches or waits.
 %%%
 %%% Following is lazy: a follower starts at the first push from P and keeps
-%%% polling while the node runs. Its state is cache; losing it costs a
+%%% running while the node runs. Its state is cache; losing it costs a
 %%% recompute, not safety.
+%%%
+%%% It polls only as fast as a push is waiting. While a push of P has been
+%%% refused 503 for a slot not yet indexed, the replica is brought forward
+%%% every `poll-ms' (S's own node, not Arweave). Otherwise it is brought
+%%% forward every `idle-poll-ms', to index ahead of the next push. Arweave is
+%%% read only when the replica holds slots not yet indexed, at most every
+%%% `archive-poll-ms': a window needs `confirmations' blocks of about two
+%%% minutes each, so asking more often only spends the gateway's rate limit.
+%%% A gateway that refuses (429, 5xx, a transport error, a body that does not
+%%% parse) is not asked again before its `Retry-After', nor sooner than a
+%%% backoff that doubles per refusal in a row; the next gateway of
+%%% `scheduler-follower-gateways' is asked instead. A refusal is never a
+%%% crash: the windows stay as they were, so the slot waits (fail closed).
 -module(dev_scheduler_follower).
 -device_libraries([lib_bridge_replica, lib_process_cache, lib_process_delivery,
     lib_arweave_scheduler_blocks]).
@@ -38,7 +51,12 @@
 
 -define(PREFIX, <<"~scheduler@1.0">>).
 -define(DEFAULT_POLL_MS, 5000).
+-define(DEFAULT_IDLE_POLL_MS, 300000).
+-define(DEFAULT_ARCHIVE_POLL_MS, 60000).
+-define(MIN_GATEWAY_BACKOFF, 30000).
+-define(MAX_GATEWAY_BACKOFF, 600000).
 -define(DEFAULT_DEPTH, 3).
+-define(DEFAULT_GATEWAY, <<"https://arweave.net">>).
 
 %%% The door ------------------------------------------------------------------
 
@@ -56,7 +74,9 @@ check(Signer, Stamps, Req, ProcID, Opts) ->
     end,
     case entry(P, Slot, Key, Opts) of
         not_found ->
-            ensure(P, S, Opts),
+            % A push is waiting for this slot: the follower polls fast until
+            % it is indexed.
+            ensure(P, S, Opts) ! {wanted, hb_util:int(Slot)},
             throw({refused, 503, <<"entry not verified yet">>});
         {ok, #{ <<"entry">> := Entry, <<"origin">> := Origin }} ->
             need(hb_message:id(Entry, all, Opts) =:= EntryID, <<"entry ID does not match">>),
@@ -103,7 +123,8 @@ delivered_id(Msg, Opts) ->
 
 %%% The follower --------------------------------------------------------------
 
-%% @doc Start following P (scheduled by S) if nothing follows it yet.
+%% @doc Start following P (scheduled by S) if nothing follows it yet; the
+%% follower's PID.
 ensure(P, S, Opts) ->
     hb_name:singleton({?MODULE, hb_util:human_id(P)},
         fun() -> follow(P, S, Opts) end).
@@ -112,12 +133,32 @@ follow(P, S, Opts) ->
     Cfg = hb_opts:get(<<"scheduler-admission">>, #{}, Opts),
     Url = hb_maps:get(<<"location">>, dev_scheduler_admission:peer(S, Opts), undefined, Opts),
     Dir = hb_util:bin(hb_maps:get(<<"replica-dir">>, Cfg, <<"admission-replica">>, Opts)),
+    Ms = fun(Key, Default) -> hb_util:int(hb_maps:get(Key, Cfg, Default, Opts)) end,
+    Indexed = indexed(P, Opts),
     loop(#{ p => hb_util:human_id(P), s => S, url => Url, dir => Dir, opts => Opts,
-        poll => hb_util:int(hb_maps:get(<<"poll-ms">>, Cfg, ?DEFAULT_POLL_MS, Opts)),
-        depth => hb_util:int(hb_maps:get(<<"confirmations">>, Cfg, ?DEFAULT_DEPTH, Opts)),
-        indexed => indexed(P, Opts), windows => [] }).
+        poll => Ms(<<"poll-ms">>, ?DEFAULT_POLL_MS),
+        idle_poll => Ms(<<"idle-poll-ms">>, ?DEFAULT_IDLE_POLL_MS),
+        archive_poll => Ms(<<"archive-poll-ms">>, ?DEFAULT_ARCHIVE_POLL_MS),
+        depth => Ms(<<"confirmations">>, ?DEFAULT_DEPTH),
+        gateways => gateways(Opts), archive_at => now_ms(),
+        indexed => Indexed, wanted => Indexed, windows => [] }).
 
-loop(F = #{ poll := Poll }) ->
+%% @doc The gateways the follower reads Arweave from, in order of preference:
+%% `scheduler-follower-gateways', else `scheduler-upload-gateway', else
+%% arweave.net. Each carries when it may next be asked and its backoff.
+gateways(Opts) ->
+    Listed =
+        dev_scheduler_uploader:list_option(
+            hb_opts:get(<<"scheduler-follower-gateways">>, [], Opts), Opts),
+    URLs =
+        case Listed of
+            [] -> [hb_util:bin(hb_opts:get(<<"scheduler-upload-gateway">>,
+                    ?DEFAULT_GATEWAY, Opts))];
+            _ -> Listed
+        end,
+    [ #{ url => URL, not_before => now_ms(), backoff => 0 } || URL <- URLs ].
+
+loop(F) ->
     F2 =
         try pass(F)
         catch Class:Reason:Stack ->
@@ -127,8 +168,27 @@ loop(F = #{ poll := Poll }) ->
         end,
     case maps:get(stopped, F2, false) of
         true -> ok;
-        false -> receive after Poll -> loop(F2) end
+        false -> wait(F2#{ next_at => now_ms() + interval(F2) })
     end.
+
+%% Sleep until the next pass. A push refused for a slot not yet indexed
+%% brings it forward to `poll-ms' from now, if it was further off.
+wait(F = #{ next_at := At }) ->
+    receive
+        {wanted, Slot} -> wait(wanted(F, Slot, now_ms()))
+    after max(0, At - now_ms()) -> loop(F)
+    end.
+
+wanted(F = #{ wanted := Wanted, next_at := At, poll := Poll }, Slot, Now) ->
+    F#{ wanted := max(Wanted, Slot), next_at := min(At, Now + Poll) }.
+
+%% Fast while a push waits for a slot not yet indexed; slow otherwise.
+interval(#{ wanted := Wanted, indexed := Indexed, poll := Poll })
+        when Wanted > Indexed -> Poll;
+interval(#{ idle_poll := Idle }) -> Idle.
+
+%% Monotonic, and possibly negative: every deadline starts at `now_ms()', never 0.
+now_ms() -> erlang:monotonic_time(millisecond).
 
 %% One pass: bring the replica forward, then index every slot that is
 %% verified, archived deep enough and whose inputs we re-admit.
@@ -137,7 +197,7 @@ pass(F = #{ p := P, url := Url, dir := Dir, opts := Opts, indexed := Indexed }) 
         lib_bridge_replica:load(P, Url, Opts, Dir)),
     case R of
         #{ slot := Top } when Top > Indexed ->
-            index(lists:seq(Indexed + 1, Top), R, with_windows(F));
+            index(lists:seq(Indexed + 1, Top), R, with_windows(F, now_ms()));
         _ -> F
     end.
 
@@ -200,28 +260,64 @@ archived(N, AssignmentID, #{ windows := Windows }) ->
             end
     end.
 
-%% The archive windows of P that S signed and that are mined deep enough.
-with_windows(F = #{ p := P, s := S, depth := Depth, opts := Opts, windows := Have }) ->
-    Gateway = hb_util:list(hb_opts:get(<<"scheduler-upload-gateway">>,
-        <<"https://arweave.net">>, Opts)),
-    {ok, {{_, 200, _}, _, HeightBody}} = httpc:request(get,
-        {Gateway ++ "/height", []}, [{timeout, 15000}], [{body_format, binary}]),
-    Height = binary_to_integer(string:trim(HeightBody)),
+%% The archive windows of P that S signed and that are mined deep enough, read
+%% from the first gateway that may be asked and answers, once `archive-poll-ms'
+%% has passed since the last read. A read is all from one gateway; one that
+%% fails leaves the windows as they were.
+with_windows(F = #{ archive_at := At }, Now) when Now < At -> F;
+with_windows(F = #{ gateways := Gateways, archive_poll := Every }, Now) ->
+    case read_archive(Gateways, Now, F, []) of
+        {{ok, New}, Gateways2} ->
+            F#{ windows := maps:get(windows, F) ++ New, gateways := Gateways2,
+                archive_at := Now + Every };
+        {none, Gateways2} ->
+            % Every gateway is cooling down: ask again when the first may be.
+            Next = lists:min([ NB || #{ not_before := NB } <- Gateways2 ]),
+            F#{ gateways := Gateways2, archive_at := max(Next, Now + 1000) }
+    end.
+
+%% Try each gateway in order, skipping one not to be asked yet; a gateway that
+%% fails is backed off and the next one tried. The gateways come back in the
+%% order to try them next time: the one that answered first.
+read_archive([], _Now, _F, Tried) -> {none, lists:reverse(Tried)};
+read_archive([G = #{ not_before := NB } | Rest], Now, F, Tried) when NB > Now ->
+    read_archive(Rest, Now, F, [G | Tried]);
+read_archive([G = #{ url := URL } | Rest], Now, F = #{ p := P }, Tried) ->
+    try new_windows(hb_util:list(URL), F) of
+        New -> {{ok, New}, [G#{ backoff := 0 } | Rest] ++ lists:reverse(Tried)}
+    catch Class:Reason ->
+        G2 = back_off(G, retry_after(Reason), Now),
+        ?event(warning, {foreign_follower_gateway_refused,
+            {p, P}, {gateway, URL}, {reason, refusal(Class, Reason)},
+            {retry_in_ms, maps:get(not_before, G2) - Now}}),
+        read_archive(Rest, Now, F, [G2 | Tried])
+    end.
+
+%% Not before the gateway's `Retry-After', nor sooner than double the last
+%% backoff (at least `?MIN_GATEWAY_BACKOFF', at most `?MAX_GATEWAY_BACKOFF').
+back_off(G = #{ backoff := Last }, RetryAfter, Now) ->
+    Doubled = min(?MAX_GATEWAY_BACKOFF, max(?MIN_GATEWAY_BACKOFF, 2 * Last)),
+    G#{ backoff := Doubled, not_before := Now + max(Doubled, RetryAfter) }.
+
+retry_after({gateway_status, _Status, RetryAfter}) -> RetryAfter;
+retry_after(_) -> 0.
+
+refusal(_, {gateway_status, Status, _}) -> {status, Status};
+refusal(Class, Reason) -> {Class, Reason}.
+
+new_windows(Gateway, #{ p := P, s := S, depth := Depth, windows := Have }) ->
+    Height = binary_to_integer(string:trim(gateway(get, Gateway, "/height", none, 15000))),
     Edges = archive_edges(Gateway, S, P, #{}),
     Known = [ maps:get(id, W) || W <- Have ],
-    New =
-        [ begin
-              {ok, {{_, 200, _}, _, Data}} = httpc:request(get,
-                  {Gateway ++ "/" ++ hb_util:list(ID), []},
-                  [{timeout, 60000}], [{body_format, binary}]),
-              #{ id => ID, from => hb_util:int(tag(<<"From-Slot">>, Tags)),
-                 to => hb_util:int(tag(<<"To-Slot">>, Tags)), ids => archived_ids(Data) }
-          end
-        || #{ <<"node">> := #{ <<"id">> := ID, <<"tags">> := Tags,
-                <<"block">> := Block } } <- Edges,
-           not lists:member(ID, Known),
-           window_confirmed(Block, Height, Depth, true) ],
-    F#{ windows := Have ++ New }.
+    [ begin
+          Data = gateway(get, Gateway, "/" ++ hb_util:list(ID), none, 60000),
+          #{ id => ID, from => hb_util:int(tag(<<"From-Slot">>, Tags)),
+             to => hb_util:int(tag(<<"To-Slot">>, Tags)), ids => archived_ids(Data) }
+      end
+    || #{ <<"node">> := #{ <<"id">> := ID, <<"tags">> := Tags,
+            <<"block">> := Block } } <- Edges,
+       not lists:member(ID, Known),
+       window_confirmed(Block, Height, Depth, true) ].
 
 %% Every archive transaction of P that S signed, page by page.
 archive_edges(Gateway, S, P, After) ->
@@ -231,9 +327,7 @@ archive_edges(Gateway, S, P, After) ->
         "{pageInfo{hasNextPage} edges{cursor node{id tags{name value} block{height}}}}}">>,
     Body = hb_json:encode(#{ <<"query">> => Query, <<"variables">> =>
         After#{ <<"o">> => [hb_util:human_id(S)], <<"p">> => [P] } }),
-    {ok, {{_, 200, _}, _, Res}} = httpc:request(post,
-        {Gateway ++ "/graphql", [], "application/json", Body},
-        [{timeout, 15000}], [{body_format, binary}]),
+    Res = gateway(post, Gateway, "/graphql", Body, 15000),
     #{ <<"data">> := #{ <<"transactions">> := #{
         <<"pageInfo">> := #{ <<"hasNextPage">> := More }, <<"edges">> := Edges } } } =
         hb_json:decode(Res),
@@ -241,6 +335,29 @@ archive_edges(Gateway, S, P, After) ->
         {true, [#{ <<"cursor">> := Cursor } | _]} ->
             Edges ++ archive_edges(Gateway, S, P, #{ <<"a">> => Cursor });
         _ -> Edges
+    end.
+
+%% One gateway request: the body of a 200, else throws
+%% `{gateway_status, Status, RetryAfterMs}'.
+gateway(Method, Gateway, Path, Body, Timeout) ->
+    Request =
+        case Method of
+            get -> {Gateway ++ Path, []};
+            post -> {Gateway ++ Path, [], "application/json", Body}
+        end,
+    case httpc:request(Method, Request, [{timeout, Timeout}], [{body_format, binary}]) of
+        {ok, {{_, 200, _}, _, Res}} -> Res;
+        {ok, {{_, Status, _}, Headers, _}} ->
+            throw({gateway_status, Status, retry_after_ms(Headers)});
+        {error, Reason} -> throw({gateway_unreachable, Reason})
+    end.
+
+%% A `Retry-After' in seconds, as milliseconds; 0 when absent or a date.
+retry_after_ms(Headers) ->
+    case catch list_to_integer(string:trim(
+            proplists:get_value("retry-after", Headers, ""))) of
+        Secs when is_integer(Secs), Secs >= 0 -> Secs * 1000;
+        _ -> 0
     end.
 
 %% @doc A window is confirmed when its block is `Depth' deep, inclusion
@@ -421,3 +538,163 @@ entry_taken_once_test() ->
     {ok, [ID]} = readmit(#{ <<"body">> => Body }, P, Opts, Opts),
     ok = hb_store:write(store(Opts), #{ taken_path(P, ID) => <<"4">> }, Opts),
     ?assertMatch({refused, _}, readmit(#{ <<"body">> => Body }, P, Opts, Opts)).
+
+%% A follower state for the archive tests, reading through `Gateways'.
+archive_state(Gateways) ->
+    #{ p => hb_util:human_id(crypto:strong_rand_bytes(32)),
+       s => hb_util:human_id(crypto:strong_rand_bytes(32)),
+       opts => #{}, depth => 3, poll => 5000, idle_poll => ?DEFAULT_IDLE_POLL_MS,
+       archive_poll => ?DEFAULT_ARCHIVE_POLL_MS, archive_at => now_ms(),
+       gateways => gateways(#{ <<"scheduler-follower-gateways">> => Gateways }),
+       indexed => -1, wanted => -1, windows => [] }.
+
+%% A gateway answering `Route(Method, Path)' with `{Status, Headers, Body}',
+%% telling `Test' of every request as `{gateway_hit, Name, Path}'.
+stub_gateway(Name, Route, Test) ->
+    {ok, _} = application:ensure_all_started(inets),
+    {ok, Listen} = gen_tcp:listen(0,
+        [binary, {active, false}, {reuseaddr, true}, {packet, http_bin}]),
+    {ok, Port} = inet:port(Listen),
+    Pid = spawn_link(fun() -> stub_accept(Listen, Name, Route, Test) end),
+    {<<"http://localhost:", (integer_to_binary(Port))/binary>>, Pid}.
+
+stub_accept(Listen, Name, Route, Test) ->
+    case gen_tcp:accept(Listen) of
+        {ok, Socket} ->
+            stub_serve(Socket, Name, Route, Test),
+            stub_accept(Listen, Name, Route, Test);
+        {error, _} -> ok
+    end.
+
+stub_serve(Socket, Name, Route, Test) ->
+    {ok, {http_request, Method, {abs_path, Path}, _}} = gen_tcp:recv(Socket, 0, 5000),
+    ok = stub_body(Socket, 0),
+    Test ! {gateway_hit, Name, Path},
+    {Status, Headers, Body} = Route(Method, Path),
+    gen_tcp:send(Socket, [<<"HTTP/1.1 ">>, integer_to_binary(Status), <<" X\r\n">>,
+        [ [K, <<": ">>, V, <<"\r\n">>] || {K, V} <- Headers ],
+        <<"content-length: ">>, integer_to_binary(byte_size(Body)),
+        <<"\r\nconnection: close\r\n\r\n">>, Body]),
+    gen_tcp:close(Socket).
+
+stub_body(Socket, Length) ->
+    case gen_tcp:recv(Socket, 0, 5000) of
+        {ok, {http_header, _, 'Content-Length', _, Value}} ->
+            stub_body(Socket, binary_to_integer(Value));
+        {ok, http_eoh} ->
+            ok = inet:setopts(Socket, [{packet, raw}]),
+            case Length of
+                0 -> ok;
+                _ -> {ok, _} = gen_tcp:recv(Socket, Length, 5000), ok
+            end;
+        {ok, _} -> stub_body(Socket, Length)
+    end.
+
+hits(Name) ->
+    receive {gateway_hit, Name, _} -> 1 + hits(Name) after 200 -> 0 end.
+
+stop_stubs(Pids) -> [ begin unlink(P), exit(P, kill) end || P <- Pids ].
+
+%% A gateway that rate-limits is not asked again before its `Retry-After' and
+%% the read neither crashes nor changes the windows (they fail closed); each
+%% refusal in a row doubles the wait, which `Retry-After' can only lengthen.
+rate_limit_backs_off_test_() ->
+    {timeout, 30, fun rate_limit_backs_off/0}.
+rate_limit_backs_off() ->
+    Limited = fun(_, _) -> {429, [{<<"retry-after">>, <<"120">>}], <<"Too Many Requests">>} end,
+    {URL, Pid} = stub_gateway(limited, Limited, self()),
+    F = archive_state([URL]),
+    Now = now_ms(),
+    F1 = with_windows(F, Now),
+    ?assertEqual(1, hits(limited)),
+    ?assertEqual([], maps:get(windows, F1)),
+    [G1] = maps:get(gateways, F1),
+    ?assertEqual(Now + 120000, maps:get(not_before, G1)),
+    ?assertEqual(Now + 120000, maps:get(archive_at, F1)),
+    % Asked again before Retry-After: no request at all.
+    ?assertEqual(F1, with_windows(F1, Now + 60000)),
+    ?assertEqual(0, hits(limited)),
+    Later = Now + 120000,
+    F2 = with_windows(F1, Later),
+    ?assertEqual(1, hits(limited)),
+    [G2] = maps:get(gateways, F2),
+    ?assertEqual(2 * maps:get(backoff, G1), maps:get(backoff, G2)),
+    ?assertEqual(Later + 120000, maps:get(not_before, G2)),
+    % The index waits on the archive rather than failing.
+    ?assertEqual(not_yet, archived(0, <<"a">>, F2)),
+    % A short Retry-After never shortens the backoff below its floor.
+    ?assertEqual(Now + ?MIN_GATEWAY_BACKOFF,
+        maps:get(not_before, back_off(#{ backoff => 0, not_before => Now }, 7000, Now))),
+    ?assertEqual(7000, retry_after_ms([{"retry-after", "7"}])),
+    ?assertEqual(0, retry_after_ms([{"retry-after", "Wed, 21 Oct 2015 07:28:00 GMT"}])),
+    ?assertEqual(?MAX_GATEWAY_BACKOFF,
+        maps:get(backoff, back_off(#{ backoff => ?MAX_GATEWAY_BACKOFF, not_before => Now }, 0, Now))),
+    stop_stubs([Pid]).
+
+%% A gateway that refuses (429 or 5xx) hands the read to the next one, which is
+%% then asked first; the refusing one is backed off.
+gateway_failover_test_() ->
+    {timeout, 30, fun gateway_failover/0}.
+gateway_failover() ->
+    W = ar_wallet:new(),
+    Assignment = ar_bundles:sign_item(#tx{ format = ans104, data = <<"a">>,
+        data_size = 1, tags = [] }, W),
+    AssignmentID = hb_util:human_id(ar_bundles:id(Assignment, signed)),
+    {undefined, Data} = ar_bundles:serialize_bundle(list, [Assignment], false),
+    WindowID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Edges = hb_json:encode(#{ <<"data">> => #{ <<"transactions">> => #{
+        <<"pageInfo">> => #{ <<"hasNextPage">> => false },
+        <<"edges">> => [#{ <<"cursor">> => <<"c">>, <<"node">> => #{
+            <<"id">> => WindowID,
+            <<"tags">> => [#{ <<"name">> => <<"From-Slot">>, <<"value">> => <<"0">> },
+                           #{ <<"name">> => <<"To-Slot">>, <<"value">> => <<"0">> }],
+            <<"block">> => #{ <<"height">> => 98 } } }] } } }),
+    WindowPath = <<"/", WindowID/binary>>,
+    Good =
+        fun('GET', <<"/height">>) -> {200, [], <<"100">>};
+           ('POST', <<"/graphql">>) -> {200, [], Edges};
+           ('GET', Path) when Path =:= WindowPath -> {200, [], Data};
+           (_, _) -> {404, [], <<>>}
+        end,
+    {Down, DownPid} = stub_gateway(down, fun(_, _) -> {503, [], <<>>} end, self()),
+    {Limited, LimitedPid} = stub_gateway(limited,
+        fun(_, _) -> {429, [{<<"retry-after">>, <<"7">>}], <<>>} end, self()),
+    {Up, UpPid} = stub_gateway(up, Good, self()),
+    F = archive_state(<<Down/binary, ",", Limited/binary, ",", Up/binary>>),
+    Now = now_ms(),
+    F1 = with_windows(F, Now),
+    ?assertEqual(1, hits(down)),
+    ?assertEqual(1, hits(limited)),
+    ?assertEqual(3, hits(up)),
+    ?assertMatch([#{ id := WindowID, from := 0, to := 0 }], maps:get(windows, F1)),
+    ?assertEqual(ok, archived(0, AssignmentID, F1)),
+    ?assertEqual([Up, Down, Limited], [ U || #{ url := U } <- maps:get(gateways, F1) ]),
+    [_, #{ not_before := DownAt }, #{ not_before := LimitedAt }] = maps:get(gateways, F1),
+    ?assert(DownAt >= Now + ?MIN_GATEWAY_BACKOFF),
+    ?assert(LimitedAt >= Now + ?MIN_GATEWAY_BACKOFF),
+    ?assertEqual(Now + ?DEFAULT_ARCHIVE_POLL_MS, maps:get(archive_at, F1)),
+    % The next read goes to the gateway that answered, and a window already
+    % held is not fetched again.
+    F2 = with_windows(F1, Now + ?DEFAULT_ARCHIVE_POLL_MS),
+    ?assertEqual(0, hits(down)),
+    ?assertEqual(0, hits(limited)),
+    ?assertEqual(2, hits(up)),
+    ?assertEqual(maps:get(windows, F1), maps:get(windows, F2)),
+    stop_stubs([DownPid, LimitedPid, UpPid]).
+
+%% With no push waiting the follower polls at the idle interval; a push
+%% refused for a slot not yet indexed brings the next pass to `poll-ms', and
+%% it falls back to idle once that slot is indexed. Arweave is not read
+%% between archive polls.
+no_polling_when_nothing_pending_test() ->
+    F = (archive_state([<<"http://localhost:1">>]))#{ indexed => 4, wanted => 4 },
+    ?assertEqual(?DEFAULT_IDLE_POLL_MS, interval(F)),
+    Now = now_ms(),
+    Waiting = wanted(F#{ next_at => Now + ?DEFAULT_IDLE_POLL_MS }, 6, Now),
+    ?assertEqual(Now + 5000, maps:get(next_at, Waiting)),
+    ?assertEqual(5000, interval(Waiting)),
+    % A push for a slot already indexed is not a reason to poll fast.
+    ?assertEqual(?DEFAULT_IDLE_POLL_MS, interval(wanted(F#{ next_at => Now }, 3, Now))),
+    ?assertEqual(?DEFAULT_IDLE_POLL_MS, interval(Waiting#{ indexed := 6 })),
+    Read = Waiting#{ archive_at := Now + 1000 },
+    ?assertEqual(Read, with_windows(Read, Now)).

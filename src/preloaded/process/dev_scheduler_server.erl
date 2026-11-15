@@ -155,14 +155,18 @@ start(ProcID, Proc, Opts) ->
                     unwritten => #{},
                     appender => undefined,
                     % Publishes each confirmed slot to Arweave, off this
-                    % loop (`dev_scheduler_uploader').
+                    % loop (`dev_scheduler_uploader'), for a process on the
+                    % node's upload list.
                     uploader =>
                         case hb_opts:get(scheduler_publish_remote, true, Opts) of
                             false -> undefined;
                             _ ->
-                                Uploader = dev_scheduler_uploader:start(ProcID, Opts),
-                                Uploader ! {durable, CurrentSlot, none},
-                                Uploader
+                                case dev_scheduler_uploader:start(ProcID, Opts) of
+                                    undefined -> undefined;
+                                    Uploader ->
+                                        Uploader ! {durable, CurrentSlot, none},
+                                        Uploader
+                                end
                         end
                 }
             )
