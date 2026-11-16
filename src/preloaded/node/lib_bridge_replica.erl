@@ -26,14 +26,27 @@
 %%% replica's own, and PUSD is computed there with options that read nothing
 %%% computed elsewhere on the node (no workers, no shared hot cache, no
 %%% look-ahead, no joining another request's computation) and with the
-%%% result-affecting options pinned to what our nodes run. The cursor (slot,
-%%% chain, last assignment, build) is kept beside the store; a cursor that
-%%% cannot be read or does not match the store means starting over from slot 0.
-%%% The store also holds every slot's computed state, and that is the work of
-%%% the build that computed it: a cursor written by another build (or by one
-%%% from before cursors named their build) drops the store and replays from
-%%% slot 0, so a node upgrade that changes a result is never hidden behind a
-%%% result the old code cached.
+%%% result-affecting options pinned to what our nodes run.
+%%%
+%%% Caught up means at the schedule's head, and nothing else. The head is
+%%% what the schedule's source says it holds: for an Arweave-scheduled process
+%%% the slots THIS node's `~arweave-scheduler@1.0' materialized (it already
+%%% follows PUSD, from blocks it verified; the replica reads that schedule and
+%%% builds no second one), for `scheduler@1.0' what the scheduler served. Until
+%%% the replica's slot is the head, `stopped' says how far behind it is, and
+%%% an attestor endorses nothing (`dev_bridge_attestor:endorse/2'). An empty
+%%% read is not the head: the replica of the root sat at slot 7 for twenty
+%%% minutes with `stopped: null' while its node held 207 slots (2026-11-16).
+%%%
+%%% Two stores, kept beside a cursor (slot, chain, last assignment, build):
+%%% `<pusd>' holds what was verified (the process, its module, each accepted
+%%% assignment), which no build changes; `<pusd>.computed' holds every slot's
+%%% computed state, the work of the build that computed it. A cursor another
+%%% build wrote drops only the computed store, and the replica recomputes from
+%%% the assignments it keeps, a slice at a time, so a node upgrade that changes
+%%% a result is never hidden behind a result the old code cached, and never
+%%% fetches or verifies the schedule again. A cursor that cannot be read, or
+%%% from before the two stores, drops both and starts over from slot 0.
 -module(lib_bridge_replica).
 -export([view/3]).
 %% For `dev_scheduler_follower', which follows any process this way.
@@ -47,10 +60,15 @@
 -define(MAX_SLOTS, 5000).
 %% Slots `view/3' verifies and computes between looks at its deadline.
 -define(SLICE_SLOTS, 25).
+%% The cursor's layout: 2 is the verified and computed stores apart.
+-define(LAYOUT, 2).
+%% Confirmations below which this node's Arweave index is not believed.
+-define(MIN_DEPTH, 2).
 
-%% @doc `{ok, State, Opts, Info}' with PUSD's state after the last verified
-%% slot, the options to read it with, and `#{slot, stopped}'; or
-%% `{not_yet, Why}' when no slot has verified yet.
+%% @doc `{ok, State, Opts, Info}' with PUSD's state at the last slot this
+%% build computed, the options to read it with, and `#{slot, head, stopped}';
+%% or `{not_yet, Why}' when no slot has been computed yet. `stopped' is null
+%% only when `slot' is the schedule's `head'.
 %%
 %% `deadline' (monotonic ms, default `infinity') bounds the call: the replica
 %% is verified and computed `slice' slots at a time, and no slice after the
@@ -63,13 +81,14 @@
 view(Pusd, Url, Args = #{ opts := NodeOpts, dir := Dir }) ->
     R = catch_up(load(Pusd, Url, NodeOpts, Dir),
         maps:get(slice, Args, ?SLICE_SLOTS), maps:get(deadline, Args, infinity)),
-    Info = #{ slot => maps:get(slot, R), stopped => maps:get(stopped, R) },
     case R of
-        #{ slot := -1 } -> {not_yet, maps:get(stopped, R)};
-        #{ slot := Slot, opts := ROpts } ->
-            case compute(R) of
+        #{ computed := -1 } -> {not_yet, maps:get(stopped, R)};
+        #{ computed := Slot, opts := ROpts } ->
+            Info = #{ slot => Slot, stopped => maps:get(stopped, R),
+                head => case maps:get(head, R) of undefined -> null; H -> H end },
+            case compute(R, Slot) of
                 {ok, State} -> {ok, State, ROpts, Info};
-                error -> {not_yet, <<"PUSD did not compute at slot ", (integer_to_binary(Slot))/binary>>}
+                error -> {not_yet, did_not_compute(Slot)}
             end
     end.
 
@@ -78,25 +97,64 @@ view(Pusd, Url, Args = #{ opts := NodeOpts, dir := Dir }) ->
 %% state, so the next slice, or the next call, starts from it.
 catch_up(R = #{ proc := undefined }, _Slice, _Deadline) -> R;
 catch_up(R, Slice, Deadline) ->
-    case advance(R, Slice) of
-        {R1, 0} ->
-            % The slice was used up: the schedule may hold more.
-            case compute(R1) =/= error andalso before(Deadline) of
+    case slice(R, Slice) of
+        {more, R1} ->
+            case before(Deadline) of
                 true -> catch_up(R1, Slice, Deadline);
                 false -> R1#{ stopped := catching_up(R1) }
             end;
-        {R1, _} -> R1
+        {done, R1} -> R1
     end.
+
+%% One slice: recompute what this build has not computed of what is verified;
+%% else verify up to `Slice' more assignments and compute them. `more' when
+%% there may be more to do.
+slice(R = #{ computed := Computed, slot := Slot }, Slice) when Computed < Slot ->
+    computed(R, min(Slot, Computed + Slice));
+slice(R, Slice) ->
+    case advance(R, Slice) of
+        {R1, 0} -> computed(R1, maps:get(slot, R1));
+        {R1 = #{ computed := C, slot := S }, _} when C < S ->
+            {_, R2} = computed(R1, S),
+            {done, R2};
+        {R1, _} -> {done, R1}
+    end.
+
+%% Compute `Slot' and record it, durably, as this build's.
+computed(R, Slot) ->
+    case compute(R, Slot) of
+        {ok, _} ->
+            R1 = R#{ computed := Slot },
+            ok = write_cursor(R1),
+            {more, R1};
+        error -> {done, R#{ stopped := did_not_compute(Slot) }}
+    end.
+
+did_not_compute(Slot) ->
+    <<"PUSD did not compute at slot ", (integer_to_binary(Slot))/binary>>.
 
 before(infinity) -> true;
 before(Deadline) -> erlang:monotonic_time(millisecond) < Deadline.
 
-catching_up(#{ scheduler_device := <<"arweave-scheduler@1.0">> }) ->
-    <<"catching up to the canonical Arweave schedule">>;
-catching_up(_) -> <<"catching up to the schedule">>.
+%% Why a replica is not caught up: recomputing what it verified, or behind the
+%% schedule's head.
+catching_up(#{ computed := Computed, slot := Slot }) when Computed < Slot ->
+    <<"catching up: recomputing on this build, slot ", (integer_to_binary(Computed))/binary,
+        " of ", (integer_to_binary(Slot))/binary>>;
+catching_up(R = #{ slot := Slot }) ->
+    Of = case maps:get(head, R) of
+        Head when is_integer(Head), Head > Slot -> <<" of ", (integer_to_binary(Head))/binary>>;
+        _ -> <<>>
+    end,
+    <<"catching up to the ", (schedule_name(R))/binary, ": slot ",
+        (integer_to_binary(Slot))/binary, Of/binary>>.
 
-%% PUSD's state at the replica's slot, or `error'.
-compute(#{ proc := Proc, slot := Slot, opts := ROpts }) ->
+schedule_name(#{ scheduler_device := <<"arweave-scheduler@1.0">> }) ->
+    <<"canonical Arweave schedule">>;
+schedule_name(_) -> <<"schedule">>.
+
+%% PUSD's state at `Slot', or `error'.
+compute(#{ proc := Proc, opts := ROpts }, Slot) ->
     case hb_ao:resolve(Proc, #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, ROpts) of
         {ok, State} -> {ok, State};
         _ ->
@@ -151,19 +209,24 @@ body(_, _) -> false.
 
 load(Pusd, Url, NodeOpts, Dir) ->
     Base = <<Dir/binary, "/", Pusd/binary>>,
-    Store = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => Base },
+    Verified = lmdb(Base),
+    Computed = lmdb(<<Base/binary, ".computed">>),
     Cursor = <<Base/binary, ".cursor.json">>,
     Build = build(NodeOpts),
     ok = filelib:ensure_dir(binary_to_list(<<Base/binary, "/">>)),
-    ok = same_build(Cursor, Build, Store),
-    ok = hb_store:start([Store]),
-    ROpts = execution_opts(NodeOpts, Store),
+    ok = filelib:ensure_dir(binary_to_list(<<Base/binary, ".computed/">>)),
+    ComputedTo = same_build(Cursor, Build, Verified, Computed),
+    ok = hb_store:start([Verified, Computed]),
+    ROpts = execution_opts(NodeOpts, Verified, Computed),
     R = #{ pusd => Pusd, url => Url, opts => ROpts, http => NodeOpts,
-        cursor => Cursor, build => Build,
+        verified => Verified, cursor => Cursor, build => Build,
         proc => undefined, schedulers => [], scheduler_device => <<"scheduler@1.0">>,
-        slot => -1, chain => Pusd, last => none,
+        slot => -1, chain => Pusd, last => none, computed => -1, head => undefined,
         stopped => null },
-    resume(process(R)).
+    R1 = #{ slot := Slot } = resume(process(R)),
+    R1#{ computed := min(Slot, ComputedTo) }.
+
+lmdb(Name) -> #{ <<"store-module">> => hb_store_lmdb, <<"name">> => Name }.
 
 %% This node's build: its source commit and when it was built.
 build(Opts) ->
@@ -171,33 +234,49 @@ build(Opts) ->
     <<(hb_util:bin(hb_maps:get(<<"source">>, B, <<"unknown">>, Opts)))/binary, "@",
         (hb_util:bin(hb_maps:get(<<"build-time">>, B, 0, Opts)))/binary>>.
 
-%% A store another build computed is dropped before it is opened: the store
-%% first, then the cursor, so a halt between them drops it again next time.
-same_build(Cursor, Build, Store) ->
+%% The last slot this build computed (-1: none), before the stores are opened.
+%% A cursor of this layout that another build wrote drops the computed store
+%% and keeps what was verified; the cursor then names this build, so a halt
+%% after that recomputes from what the computed store holds. Any other cursor
+%% drops both stores, then the cursor, so a halt between drops again.
+same_build(Cursor, Build, Verified, Computed) ->
     case file:read_file(Cursor) of
-        {error, enoent} -> ok;
+        {error, enoent} -> -1;
         {ok, Bin} ->
             case catch hb_json:decode(Bin) of
-                #{ <<"build">> := Build } -> ok;
-                _ -> drop(Cursor, Store)
+                C = #{ <<"layout">> := ?LAYOUT, <<"build">> := Build } ->
+                    hb_util:int(maps:get(<<"computed">>, C, -1));
+                C = #{ <<"layout">> := ?LAYOUT } ->
+                    ok = hb_store:reset([Computed]),
+                    ok = write_durably(Cursor,
+                        hb_json:encode(C#{ <<"build">> => Build, <<"computed">> => -1 })),
+                    -1;
+                _ -> drop(Cursor, [Verified, Computed])
             end;
-        _ -> drop(Cursor, Store)
+        _ -> drop(Cursor, [Verified, Computed])
     end.
 
-drop(Cursor, Store) ->
-    ok = hb_store:reset([Store]),
-    ok = file:delete(Cursor).
+drop(Cursor, Stores) ->
+    ok = hb_store:reset(Stores),
+    ok = file:delete(Cursor),
+    -1.
 
 %% @doc Replayed code gets the same key isolation as public HTTP execution.
 %% The attestor retains its signing keys outside the foreign Lua environment.
-execution_opts(NodeOpts, Store) ->
+%% Computing writes to the computed store; what was verified is read beneath
+%% it. An Arweave schedule is read from this node's own index (`index_stores/1').
+execution_opts(NodeOpts, Verified, Computed) ->
     (maps:without(?NODE_KEY_OPTS ++ [<<"hashpath">>, <<"lua-device-preload">>], NodeOpts))#{
-        <<"store">> => [Store],
-        <<"scheduler-store">> => [Store],
-        <<"arweave-scheduler-store">> => [Store],
-        <<"arweave-scheduler-confirmation-depth">> => max(2,
-            hb_util:int(hb_opts:get(arweave_scheduler_confirmation_depth, 2, NodeOpts))),
-        <<"process-store">> => [Store],
+        <<"store">> => [Computed, Verified],
+        <<"scheduler-store">> => [Verified],
+        <<"arweave-scheduler-store">> => index_stores(NodeOpts),
+        <<"process-store">> => [Computed],
+        % A replica is computed by calls for one slot, with no worker to hold
+        % the VM between them, so a call resumes from the newest stored VM
+        % snapshot. Without one at the slot each call computed, every slice
+        % replayed from the last interval snapshot (`process-snapshot-slots'
+        % 1000 on our nodes): from slot 0, for any process younger than that.
+        <<"process-snapshot-target">> => true,
         <<"process-workers">> => false,
         <<"spawn-worker">> => false,
         <<"process-worker-spawn">> => false,
@@ -212,13 +291,28 @@ execution_opts(NodeOpts, Store) ->
         <<"lua-device-sandbox">> => []
     }.
 
+%% The stores this node's `~arweave-scheduler@1.0' keeps its index in: the
+%% blocks it verified and the schedules it materialized from them.
+index_stores(NodeOpts) ->
+    stores(hb_opts:get(store, [], lib_arweave_scheduler_blocks:opts(NodeOpts))).
+
+stores(Store) when is_map(Store) -> [Store];
+stores(Stores) when is_list(Stores) -> Stores;
+stores(_) -> [].
+
+%% Options to read an Arweave assignment with: the replica's stores, then the
+%% node's index, which holds the transaction headers it verified.
+index_read_opts(ROpts) ->
+    ROpts#{ <<"store">> => stores(hb_opts:get(store, [], ROpts))
+        ++ stores(hb_opts:get(arweave_scheduler_store, [], ROpts)) }.
+
 replica_does_not_lend_its_validator_key_test() ->
     hb:init(),
     Store = hb_test_utils:test_store(),
     Privileged = #{<<"priv-wallet">> => ar_wallet:new(), <<"store">> => [Store],
         <<"cache-control">> => [<<"no-cache">>, <<"no-store">>],
         <<"identities">> => #{<<"validator">> => ar_wallet:new()}},
-    Restricted = execution_opts(Privileged, Store),
+    Restricted = execution_opts(Privileged, Store, Store),
     ?assertNot(maps:is_key(<<"priv-wallet">>, Restricted)),
     ?assertNot(maps:is_key(<<"identities">>, Restricted)),
     Script = <<
@@ -250,7 +344,7 @@ replica_does_not_lend_its_validator_key_test() ->
 
 %% The process, stored or fetched, as far as a real signature vouches for it,
 %% and only if that is PUSD.
-process(R = #{ pusd := Pusd, url := Url, opts := ROpts, http := Opts }) ->
+process(R = #{ pusd := Pusd, url := Url, opts := ROpts, http := Opts, verified := Verified }) ->
     Candidates = [
         fun() -> {ok, P} = hb_cache:read(Pusd, ROpts), hb_cache:ensure_all_loaded(P, ROpts) end,
         fun() -> {ok, P} = hb_cache:read(Pusd, Opts), hb_cache:ensure_all_loaded(P, Opts) end,
@@ -262,9 +356,10 @@ process(R = #{ pusd := Pusd, url := Url, opts := ROpts, http := Opts }) ->
     case first_process(Candidates, Pusd, Opts) of
         undefined -> R#{ stopped := <<"PUSD's process is not available yet">> };
         Proc ->
-            case copy_module(Proc, Opts, ROpts) of
+            VOpts = ROpts#{ <<"store">> => [Verified] },
+            case copy_module(Proc, Opts, VOpts) of
                 ok ->
-                    {ok, _} = hb_cache:write(Proc, ROpts),
+                    {ok, _} = hb_cache:write(Proc, VOpts),
                     SchedulerDevice = hb_maps:get(
                         <<"scheduler-device">>, Proc, <<"scheduler@1.0">>, ROpts),
                     R#{ proc := replica_process(Proc, SchedulerDevice),
@@ -331,19 +426,23 @@ resume(R = #{ cursor := File, pusd := Pusd, opts := ROpts,
 forward(R = #{ proc := undefined }) -> R;
 forward(R) ->
     case advance(R, ?MAX_SLOTS) of
-        {R1 = #{ scheduler_device := <<"arweave-scheduler@1.0">> }, 0} ->
-            R1#{ stopped := catching_up(R1) };
+        {R1, 0} -> R1#{ stopped := catching_up(R1#{ computed := maps:get(slot, R1) }) };
         {R1, _} -> R1
     end.
 
 %% Accept up to `Left' assignments: `{R, LeftOver}', and a left-over of 0
-%% means the share was used up before the schedule was.
+%% means the share was used up before the schedule was. Left over, `stopped'
+%% says why: null only when the replica is at the schedule's head.
 advance(R, 0) -> {R, 0};
 advance(R = #{ slot := Slot }, Left) ->
-    case fetch(R, Slot + 1) of
+    case fetch(R, Slot + 1, Left) of
         {error, Why} -> {R#{ stopped := Why }, Left};
-        [] -> {R, Left};
-        As -> advance_each(As, R, Left)
+        {Head, []} when Slot >= Head -> {R#{ head := Head, stopped := null }, Left};
+        {Head, []} ->
+            % The source holds slots it did not hand over: behind, not done.
+            R1 = R#{ head := Head },
+            {R1#{ stopped := catching_up(R1#{ computed := Slot }) }, Left};
+        {Head, As} -> advance_each(As, R#{ head := Head }, Left)
     end.
 
 advance_each([], R, Left) -> advance(R, Left);
@@ -356,33 +455,59 @@ advance_each([A | Rest], R = #{ slot := Slot }, Left) ->
             {R#{ stopped := <<Why/binary, " at slot ", (integer_to_binary(Slot + 1))/binary>> }, Left}
     end.
 
-%% @doc Arweave ordering is constructed locally from confirmed blocks. A peer's
+%% @doc `{Head, Assignments}': the schedule's head as its source states it, and
+%% up to `Max' of its assignments from `From' on; or `{error, Why}'.
+%%
+%% Arweave ordering is constructed locally from confirmed blocks. A peer's
 %% unsigned assignment metadata is never proof of inclusion, finality or order.
-fetch(#{pusd := Pusd, scheduler_device := <<"arweave-scheduler@1.0">>, opts := Opts}, From) ->
-    case catch hb_ao:resolve(#{<<"device">> => <<"arweave-scheduler@1.0">>},
-            #{<<"path">> => <<"schedule">>, <<"target">> => Pusd,
-                <<"from">> => From}, Opts) of
-        {ok, Res} ->
-            try
-                As = hb_maps:get(<<"assignments">>, Res, #{}, Opts),
-                Ordered = lists:keysort(1, [{hb_util:int(K), V} || {K, V} <- hb_maps:to_list(As, Opts)]),
-                [{canonical_arweave, hb_cache:ensure_loaded(A, Opts)} || {N, A} <- Ordered, N >= From]
-            catch _:_ -> {error, <<"Canonical Arweave assignments are unavailable">>}
-            end;
-        _ -> {error, <<"Canonical Arweave synchronization is unavailable">>}
+%% This node's `~arweave-scheduler@1.0' already builds that order for PUSD
+%% (`arweave-scheduler-follow-processes'), from blocks it verified: the
+%% replica reads it, and checks each assignment against the verified block it
+%% names (`step/3'). It used to sync a second index into its own store, from
+%% the rollout height on, through the same rate-limited gateway as the first:
+%% after every store drop the root's replica took hours to reach slots the
+%% node had materialized long before (2026-11-16: slot 55 an hour after a
+%% restart, against 216; slot 55 sat 929 blocks below slot 56).
+fetch(#{pusd := Pusd, scheduler_device := <<"arweave-scheduler@1.0">>, opts := Opts,
+        http := NodeOpts}, From, Max) ->
+    Depth = hb_util:int(hb_opts:get(arweave_scheduler_confirmation_depth, ?MIN_DEPTH, NodeOpts)),
+    case Depth >= ?MIN_DEPTH andalso lib_arweave_scheduler_blocks:read_head(Pusd, Opts) of
+        false -> {error, <<"this node's Arweave index confirms too few blocks">>};
+        {ok, Head} -> {Head, canonical(Pusd, From, min(Head, From + Max - 1), Opts)};
+        _ -> {error, <<"PUSD's Arweave schedule is not materialized on this node">>}
     end;
-%% The signed assignments a conventional scheduler serves from `From' on.
-fetch(#{ pusd := Pusd, url := Url, http := Opts }, From) ->
-    Path = <<"/", Pusd/binary, "~process@1.0/schedule?from=", (integer_to_binary(From))/binary>>,
+%% The signed assignments a conventional scheduler serves from `From' on, at
+%% most `Max': asking for all of them re-sent the whole rest of the schedule
+%% for every slice. Its head is the last it served, or past it while it says
+%% the schedule continues or it filled the page asked for.
+fetch(#{ pusd := Pusd, url := Url, http := Opts }, From, Max) ->
+    Path = <<"/", Pusd/binary, "~process@1.0/schedule?from=", (integer_to_binary(From))/binary,
+        "&to=", (integer_to_binary(From + Max - 1))/binary>>,
+    Unavailable = {error, <<"PUSD's schedule is unavailable">>},
     case catch hb_http:get(Url, Path, Opts#{ <<"http-client">> => httpc, <<"protocol">> => http2 }) of
         {ok, Res} ->
+            GetOpts = Opts#{ <<"hashpath">> => ignore },
             case catch hb_cache:ensure_all_loaded(
-                    hb_ao:get(<<"assignments">>, Res, #{}, Opts#{ <<"hashpath">> => ignore }), Opts) of
+                    hb_ao:get(<<"assignments">>, Res, #{}, GetOpts), Opts) of
                 As when is_map(As) ->
-                    [A || {N, A} <- lists:keysort(1, [{catch hb_util:int(K), V} || {K, V} <- maps:to_list(As)]),
-                        is_integer(N), N >= From];
-                _ -> []
+                    Served = [{N, A} || {N, A} <- lists:keysort(1,
+                            [{catch hb_util:int(K), V} || {K, V} <- maps:to_list(As)]),
+                        is_integer(N), N >= From],
+                    Last = lists:max([From - 1 | [N || {N, _} <- Served]]),
+                    More = length(Served) >= Max orelse
+                        hb_util:atom(hb_ao:get(<<"continues">>, Res, false, GetOpts)) =:= true,
+                    {case More of true -> Last + 1; false -> Last end, [A || {_, A} <- Served]};
+                _ -> Unavailable
             end;
+        _ -> Unavailable
+    end.
+
+%% This node's materialized assignments `From'..`To', up to the first it does
+%% not hold.
+canonical(_Pusd, From, To, _Opts) when From > To -> [];
+canonical(Pusd, From, To, Opts) ->
+    case lib_arweave_scheduler_blocks:read_assignment(Pusd, From, Opts) of
+        {ok, A} -> [{canonical_arweave, A} | canonical(Pusd, From + 1, To, Opts)];
         _ -> []
     end.
 
@@ -397,7 +522,7 @@ step(A, R) -> step(A, R, signed_scheduler).
 step(A, #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers,
         scheduler_device := SchedulerDevice, http := HTTPOpts, opts := ReplicaOpts }, Origin) ->
     Opts = case Origin of
-        canonical_arweave -> ReplicaOpts;
+        canonical_arweave -> index_read_opts(ReplicaOpts);
         signed_scheduler -> maps:without(?NODE_KEY_OPTS, HTTPOpts)
     end,
     try
@@ -545,40 +670,67 @@ replica_failure_is_scrubbed_test() ->
     ?assertMatch(<<"malformed assignment: ", _/binary>>, Why),
     ?assertEqual(nomatch, binary:match(Why, <<"KEY">>)).
 
-canonical_schedule_is_read_locally_test_() ->
-    {timeout, 60, fun canonical_schedule_is_read_locally/0}.
+%% The replica reads PUSD's schedule from this node's own Arweave index, the
+%% one its `~arweave-scheduler@1.0' materialized, and never from a gateway:
+%% the node here has none it could reach.
+canonical_schedule_is_read_locally_test() ->
+    #{ r := R, put := Put, pusd := Pusd, opts := ROpts } = index_fixture(<<"local">>, 2),
+    Put(<<"~arweave-scheduler@1.0/assignments/", Pusd/binary, "/1">>,
+        #{<<"process">> => Pusd, <<"slot">> => 1, <<"type">> => <<"Assignment">>,
+            <<"body">> => #{<<"source">> => <<"local-index">>}}),
+    {2, [{canonical_arweave, Read}]} = fetch(R, 1, 25),
+    RO = index_read_opts(ROpts),
+    Body = hb_cache:ensure_loaded(hb_maps:get(<<"body">>, Read, RO), RO),
+    ?assertEqual(<<"local-index">>, hb_maps:get(<<"source">>, Body, RO)),
+    % One read, never past what was asked for.
+    ?assertMatch({2, []}, fetch(R, 2, 25)),
+    ?assertMatch({2, [_]}, fetch(R, 1, 1)).
 
-canonical_schedule_is_read_locally() ->
+%% An empty read is not the head. The node holds slots 0..2 of PUSD; the
+%% replica, at slot 1, can read none past it: it is behind, and says so,
+%% until its slot is the head. Before, an empty read was "caught up"
+%% (`stopped' null), and every attestor endorsed against a root view hours
+%% old (2026-11-16: slot 7 of 207 for twenty minutes).
+empty_read_is_not_the_head_test() ->
+    #{ r := R, put := Put, pusd := Pusd } = index_fixture(<<"head">>, 2),
+    {R1, 25} = advance(R#{ slot := 1, computed := 1 }, 25),
+    ?assertEqual(<<"catching up to the canonical Arweave schedule: slot 1 of 2">>,
+        maps:get(stopped, R1)),
+    ?assertEqual(2, maps:get(head, R1)),
+    % At the head, and only there, nothing stops it.
+    Put(<<"~arweave-scheduler@1.0/sync/process/", Pusd/binary>>, #{<<"next-slot">> => 2}),
+    {R2, 25} = advance(R#{ slot := 1, computed := 1 }, 25),
+    ?assertMatch(#{ head := 1, stopped := null }, R2),
+    % A schedule this node has not materialized, or an index confirming too
+    % little, is no head at all.
+    ?assertMatch({R3, 25} when is_binary(map_get(stopped, R3)),
+        advance(R#{ pusd := hb_util:human_id(crypto:strong_rand_bytes(32)) }, 25)),
+    ?assertMatch({error, _},
+        fetch(R#{ http := #{ <<"arweave-scheduler-confirmation-depth">> => 1 } }, 1, 25)).
+
+%% A node's Arweave index (blocks to 18, PUSD materialized to `Head'), in a
+%% store of its own, and a replica reading it.
+index_fixture(Name, Head) ->
     hb:init(),
-    Store = hb_test_utils:test_store(),
-    Hook = fun(_, Request, _) ->
-        {ok, Request#{<<"body">> => #{<<"status">> => 200,
-            <<"content-type">> => <<"application/json">>, <<"body">> => <<"{\"height\":20}">>}}}
-    end,
-    Node = hb_http_server:start_node(#{<<"port">> => 0,
-        <<"on">> => #{<<"response">> => #{<<"device">> => #{<<"response">> => Hook}}}}),
-    % The scheduler reads Arweave only from the node's `gateway'.
-    Opts = (execution_opts(#{}, Store))#{<<"arweave-scheduler-from">> => 10,
-        <<"arweave-scheduler-from-hash">> => <<"anchor">>,
-        <<"gateway">> => hb_util:bin(Node)},
+    Index = hb_test_utils:test_store(hb_store_volatile, <<"index-", Name/binary>>),
+    Verified = hb_test_utils:test_store(hb_store_volatile, <<"verified-", Name/binary>>),
+    Computed = hb_test_utils:test_store(hb_store_volatile, <<"computed-", Name/binary>>),
+    ok = hb_store:start([Index, Verified, Computed]),
+    NodeOpts = #{ <<"store">> => [Index], <<"arweave-scheduler-store">> => [Index],
+        <<"gateway">> => <<"http://127.0.0.1:1">> },
+    ROpts = execution_opts(NodeOpts, Verified, Computed),
     Pusd = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Put = fun(Path, Value) ->
-        {ok, ID} = hb_cache:write(Value, Opts),
-        ok = hb_cache:link(ID, Path, Opts)
+        {ok, ID} = hb_cache:write(Value, NodeOpts),
+        ok = hb_cache:link(ID, Path, NodeOpts)
     end,
-    Put(<<"~arweave-scheduler@1.0/sync/global">>,
-        #{<<"from">> => 10, <<"to">> => 18, <<"from-hash">> => <<"anchor">>}),
     Put(<<"~arweave-scheduler@1.0/sync/process/", Pusd/binary>>,
         #{<<"process">> => Pusd, <<"spawn-ordinate">> => <<"10-0">>,
-            <<"synced-to">> => 18, <<"next-slot">> => 2}),
-    Canonical = #{<<"process">> => Pusd, <<"slot">> => 1,
-        <<"type">> => <<"Assignment">>, <<"body">> => #{<<"source">> => <<"local-index">>}},
-    Put(<<"~arweave-scheduler@1.0/assignments/", Pusd/binary, "/1">>, Canonical),
-    [{canonical_arweave, Read}] = fetch(#{pusd => Pusd,
-        scheduler_device => <<"arweave-scheduler@1.0">>, opts => Opts,
-        url => <<"http://127.0.0.1:1">>, http => Opts}, 1),
-    Body = hb_cache:ensure_loaded(hb_maps:get(<<"body">>, Read, Opts), Opts),
-    ?assertEqual(<<"local-index">>, hb_maps:get(<<"source">>, Body, Opts)).
+            <<"synced-to">> => 18, <<"next-slot">> => Head + 1}),
+    R = #{ pusd => Pusd, scheduler_device => <<"arweave-scheduler@1.0">>, opts => ROpts,
+        http => NodeOpts, url => <<"http://127.0.0.1:1">>, slot => 0, computed => 0,
+        head => undefined, stopped => null },
+    #{ r => R, put => Put, pusd => Pusd, opts => ROpts }.
 
 message_for_process(Body, Pusd, Slot, Opts) ->
     Target = hb_maps:get(<<"target">>, Body, none, Opts),
@@ -600,21 +752,28 @@ need(true, _) -> true;
 need(Value, _) -> Value.
 
 accept(Kept, Id, R = #{ pusd := Pusd, slot := Slot, chain := Chain, proc := Proc, opts := ROpts,
-        scheduler_device := SchedulerDevice, http := Opts, cursor := File, build := Build }) ->
-    % Kept where the scheduler cache keeps a slot, so PUSD computes from it.
-    {ok, _} = hb_cache:write(Kept, ROpts),
-    Stored = hb_message:id(Kept, signed, ROpts),
-    ok = hb_cache:link(Stored, slot_path(Pusd, Slot + 1, SchedulerDevice), ROpts),
-    ok = hb_store:flush(hb_opts:get(store, [], ROpts), ROpts),
+        scheduler_device := SchedulerDevice, http := Opts, verified := Verified }) ->
+    % Kept where the scheduler cache keeps a slot, so PUSD computes from it:
+    % with what was verified, which no build changes.
+    VOpts = ROpts#{ <<"store">> => [Verified] },
+    {ok, _} = hb_cache:write(Kept, VOpts),
+    Stored = hb_message:id(Kept, signed, VOpts),
+    ok = hb_cache:link(Stored, slot_path(Pusd, Slot + 1, SchedulerDevice), VOpts),
+    ok = hb_store:flush([Verified], VOpts),
     NextChain =
         case SchedulerDevice of
             <<"arweave-scheduler@1.0">> -> Chain;
             _ -> hb_path:hashpath(Chain, Id, hb_path:hashpath_alg(Proc, Opts), Opts)
         end,
     Next = R#{ slot := Slot + 1, last := Stored, chain := NextChain },
-    ok = write_durably(File, hb_json:encode(#{ <<"slot">> => Slot + 1,
-        <<"chain">> => maps:get(chain, Next), <<"last">> => Stored, <<"build">> => Build })),
+    ok = write_cursor(Next),
     Next.
+
+write_cursor(#{ cursor := File, slot := Slot, chain := Chain, last := Last,
+        build := Build, computed := Computed }) ->
+    write_durably(File, hb_json:encode(#{ <<"layout">> => ?LAYOUT, <<"slot">> => Slot,
+        <<"chain">> => Chain, <<"last">> => Last, <<"build">> => Build,
+        <<"computed">> => Computed })).
 
 %% The cursor reaches the disk before it replaces the old one.
 write_durably(File, Bin) ->
