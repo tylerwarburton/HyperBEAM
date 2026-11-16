@@ -318,7 +318,7 @@ loop(St) ->
                     Next = case Result of
                         {ok, _} -> Cleared#{sent := (maps:get(sent, St))#{Key => os:system_time(millisecond)},
                             root_publication_error => null};
-                        _ -> Cleared#{root_publication_error => <<"Root certificate publication failed; retained for retry">>}
+                        _ -> Cleared#{root_publication_error => publication_error(Result)}
                     end,
                     loop(Next);
                 _ -> loop(St)
@@ -1263,13 +1263,24 @@ committee_plan(Key, Tags, St) ->
 %% next pass plans it afresh; plans take turns, so one this member's peers
 %% will not endorse yet (a deposit they have not scanned) never blocks the
 %% rest.
+%%
+%% Every member plans the same records, and each used to land its own carrier
+%% for each: every prod mint of 2026-11-16 was carried three times (one
+%% executes, two decide nothing at the root and still pay Arweave and take a
+%% root slot each). One member is the record's author (`author/2'); the
+%% others publish it only once it has stayed open in their own view for a
+%% resend window, so a member that is down delays a record, never loses it.
 committee_certificate(Epoch, St0 = #{ cfg := Cfg, sent := Sent }) ->
     Now = os:system_time(millisecond),
     Key = fun(Plan) -> <<"root-cert:", (integer_to_binary(Epoch))/binary, ":", Plan/binary>> end,
-    St = lists:foldl(fun({Plan, _}, S) -> planned(Key(Plan), S) end, St0,
+    St1 = lists:foldl(fun({Plan, _}, S) -> planned(Key(Plan), S) end, St0,
         maps:get(committee, St0, [])),
+    Since = maps:from_list([{K, maps:get(K, maps:get(open_since, St1, #{}), Now)}
+        || {Plan, _} <- maps:get(committee, St1, []), K <- [Key(Plan)]]),
+    St = St1#{ open_since => Since },
     Due = [P || P = {Plan, _} <- maps:get(committee, St, []),
-        Now - maps:get(Key(Plan), Sent, 0) >= resend_ms(Cfg)],
+        Now - maps:get(Key(Plan), Sent, 0) >= resend_ms(Cfg),
+        author(Key(Plan), St) orelse Now - maps:get(Key(Plan), Since) >= resend_ms(Cfg)],
     case Due of
         [] -> St;
         _ ->
@@ -1277,6 +1288,13 @@ committee_certificate(Epoch, St0 = #{ cfg := Cfg, sent := Sent }) ->
             {Plan, Tags} = lists:nth(Turn rem length(Due) + 1, Due),
             start_root_publication(Key(Plan), Tags, St#{ committee_turn => Turn + 1 })
     end.
+
+%% @doc Is this member the author of the record `Key' names? One member per
+%% record, the same on every member: the key's hash over the member count,
+%% against this member's place in the set its view holds.
+author(Key, #{ index := Index, root_certificate_info := Info }) ->
+    erlang:phash2(Key, max(1, length(maps:get(<<"attestors">>, Info, [])))) =:= Index;
+author(_, _) -> true.
 
 %% @doc The root's channel decisions this node would certify: open, settle and
 %% close requests from the lanes it relays, each certified only against both
@@ -1713,9 +1731,16 @@ join_moves(Reversed) -> iolist_to_binary(lists:join(<<",">>, lists:reverse(Rever
 %% @doc One publisher per loop leaves the loop free to endorse requests from
 %% its own worker and from peers. Only a successful POST starts the resend
 %% delay; the canonical root receipt, not that POST, settles the source move.
+%%
+%% Nothing is published from a root view that is not at the root's head. A
+%% view behind it still holds records the root has decided: this member's own
+%% endorsement is refused (`endorse/2') and a journalled carrier would be
+%% POSTed again, long after it landed. Behind by an hour, every member
+%% kept re-planning three mints that had landed, and every publication status
+%% read "publication failed; retained for retry" (2026-11-16).
 start_root_publication(Key, Tags, St0 = #{cfg := Cfg, sent := Sent}) ->
     St = planned(Key, St0),
-    case maps:is_key(root_publication, St) orelse
+    case maps:is_key(root_publication, St) orelse not at_head(St) orelse
             os:system_time(millisecond) - maps:get(Key, Sent, 0) < resend_ms(Cfg) of
         true -> St;
         false ->
@@ -1723,12 +1748,30 @@ start_root_publication(Key, Tags, St0 = #{cfg := Cfg, sent := Sent}) ->
             {Pid, Ref} = spawn_monitor(fun() ->
                 watch_root_publisher_parent(Parent),
                 Result = try publish_root_certificate(Key, Tags, St)
-                    catch _:_ -> {error, root_publication_failed}
+                    catch
+                        error:{not_endorsed, _} -> {error, not_endorsed};
+                        Class:Reason ->
+                            ?event(bridge, {root_publication_crashed, Key,
+                                element(2, failure(Class, Reason, []))}),
+                            {error, root_publication_failed}
                 end,
                 Parent ! {root_publication_done, self(), Result}
             end),
             St#{root_publication => {Pid, Ref, Key}}
     end.
+
+%% Is the root view this pass acts on at the root's head?
+at_head(St) -> maps:get(stopped, maps:get(replica, St, #{}), null) =:= null.
+
+%% What the status says of a failed publication: a fixed text, never a
+%% response body.
+publication_error({error, not_endorsed}) ->
+    <<"Root certificate not endorsed by a majority yet; planned again next pass">>;
+publication_error({error, #{ <<"status">> := Status }}) when is_integer(Status) ->
+    <<"Arweave refused the root certificate carrier (status ",
+        (integer_to_binary(Status))/binary, "); retained for retry">>;
+publication_error(_) ->
+    <<"Root certificate publication failed; retained for retry">>.
 
 %% @doc Stop the worker when its attestor stops without linking worker failures
 %% back into the attestor. The watcher exits when the worker exits, including a
@@ -3121,7 +3164,10 @@ start_hook_test_() ->
                 <<"scheduler-url">> => <<"http://127.0.0.1:1">> }
         }),
         try
-            {ok, Res} = hb_http:get(Node, <<"/~bridge-attestor@1.0/keys">>, Opts),
+            % The loop serves its keys once it has made them: `start' only
+            % spawns it, so the first GET can beat it.
+            {ok, Res} = until_ok(fun() ->
+                hb_http:get(Node, <<"/~bridge-attestor@1.0/keys">>, Opts) end, 50),
             Keys = hb_json:decode(hb_maps:get(<<"body">>, Res, Res, Opts)),
             Me = hb_util:human_id(ar_wallet:to_address(hb_opts:get(<<"priv-wallet">>, none, Opts))),
             ?assertMatch(#{ <<"ao">> := Me, <<"base">> := <<"0x", _:40/binary>>,
@@ -3131,6 +3177,13 @@ start_hook_test_() ->
             stop_loop()
         end
     end}.
+
+until_ok(Fun, 0) -> Fun();
+until_ok(Fun, N) ->
+    case Fun() of
+        {ok, _} = Ok -> Ok;
+        _ -> timer:sleep(200), until_ok(Fun, N - 1)
+    end.
 
 stop_loop() ->
     case hb_name:lookup(?NAME) of
@@ -3330,7 +3383,7 @@ replica_catches_up_in_slices_test_() ->
         ?assertMatch(#{ slot := 1, stopped := <<"catching up", _/binary>> }, Info(Args)),
         #{ slot := Head, stopped := null } = Info(Args#{ deadline => infinity }),
         % Caught up, a deadline that has passed cuts nothing short.
-        ?assertEqual(#{ slot => Head, stopped => null }, Info(Args)),
+        ?assertEqual(#{ slot => Head, head => Head, stopped => null }, Info(Args)),
         St1 = pass(St),
         ?assertMatch(#{ member := true, last_error := null }, St1),
         ?assertEqual(<<"1=", (true_signature(St1))/binary, ";">>, signs(St1))
@@ -3605,37 +3658,113 @@ unreadable_cursor_starts_over_test_() ->
         ?assertMatch(#{ member := true, last_error := null }, St2)
     end}.
 
-%% A replica's store holds every slot's computed state, the work of the build
+%% A replica's computed store holds every slot's state, the work of the build
 %% that computed it. The prod root's replicas computed its two Attestor-Approve
 %% slots on a build that refused them, and kept that result across the
 %% upgrade that fixed it: no node ever saw the approvals, so none authored the
-%% Attestor-Apply. A cursor another build wrote, or one from before cursors
-%% named their build, drops the store and replays; this build's own keeps it.
-replica_of_another_build_replays_test_() ->
+%% Attestor-Apply. A cursor another build wrote drops the computed store, and
+%% only it: the assignments it verified are kept, so the replica recomputes
+%% from them and fetches nothing again (an upgrade used to replay every root
+%% slot from the network, for hours). A cursor from before the two stores
+%% drops both and replays; this build's own keeps everything.
+replica_of_another_build_recomputes_test_() ->
     {timeout, 120, fun() ->
-        St = #{ cfg := Cfg } = replica_setup(<<"build">>, fun honest/1),
+        St = #{ cfg := Cfg, opts := Opts } = replica_setup(<<"build">>, fun honest/1),
         ?assertMatch(#{ member := true, last_error := null }, pass(St)),
-        Base = <<(maps:get(<<"replica-dir">>, Cfg))/binary, "/", (maps:get(<<"pusd">>, Cfg))/binary>>,
+        Pusd = maps:get(<<"pusd">>, Cfg),
+        Dir = maps:get(<<"replica-dir">>, Cfg),
+        Base = <<Dir/binary, "/", Pusd/binary>>,
         Cursor = <<Base/binary, ".cursor.json">>,
-        ROpts = #{ <<"store">> => [#{ <<"store-module">> => hb_store_lmdb, <<"name">> => Base }] },
+        Store = fun(Name) -> #{ <<"store">> => [#{ <<"store-module">> => hb_store_lmdb,
+            <<"name">> => Name }] } end,
+        Verified = Store(Base),
+        Computed = Store(<<Base/binary, ".computed">>),
         {ok, Bin} = file:read_file(Cursor),
-        Written = #{ <<"build">> := _ } = hb_json:decode(Bin),
-        Cached = fun() ->
-            {ok, Id} = hb_cache:write(#{ <<"computed">> => hb_util:encode(crypto:strong_rand_bytes(8)) }, ROpts),
+        Written = #{ <<"build">> := _, <<"slot">> := Head, <<"computed">> := Head } =
+            hb_json:decode(Bin),
+        Cached = fun(S) ->
+            {ok, Id} = hb_cache:write(#{ <<"computed">> => hb_util:encode(crypto:strong_rand_bytes(8)) }, S),
             Id
         end,
-        Kept = Cached(),
+        Kept = Cached(Computed),
         ?assertMatch(#{ member := true, last_error := null }, pass(St)),
-        ?assertMatch({ok, _}, hb_cache:read(Kept, ROpts)),
-        lists:foreach(fun(Foreign) ->
-            Stale = Cached(),
-            ok = file:write_file(Cursor, hb_json:encode(Foreign)),
-            ?assertMatch(#{ member := true, last_error := null }, pass(St)),
-            ?assertEqual({error, not_found}, hb_cache:read(Stale, ROpts)),
-            {ok, Rewritten} = file:read_file(Cursor),
-            ?assertEqual(Written, hb_json:decode(Rewritten))
-        end, [Written#{ <<"build">> => <<"another@1">> }, maps:remove(<<"build">>, Written)])
+        ?assertMatch({ok, _}, hb_cache:read(Kept, Computed)),
+        % Another build: the computed store goes, the verified slots stay,
+        % and the replica stands at its slot with nothing computed yet.
+        Stale = Cached(Computed),
+        Assignment = Cached(Verified),
+        ok = file:write_file(Cursor, hb_json:encode(Written#{ <<"build">> => <<"another@1">> })),
+        R = lib_bridge_replica:load(Pusd, maps:get(<<"scheduler-url">>, Cfg), Opts, Dir),
+        ?assertMatch(#{ slot := Head, computed := -1 }, R),
+        ?assertEqual({error, not_found}, hb_cache:read(Stale, Computed)),
+        ?assertMatch({ok, _}, hb_cache:read(Assignment, Verified)),
+        ?assertMatch(#{ member := true, last_error := null, replica := #{ stopped := null } },
+            pass(St)),
+        {ok, Rewritten} = file:read_file(Cursor),
+        ?assertEqual(Written, hb_json:decode(Rewritten)),
+        % A cursor from before the two stores: both go, and it replays.
+        ok = file:write_file(Cursor, hb_json:encode(maps:remove(<<"layout">>, Written))),
+        ?assertMatch(#{ member := true, last_error := null }, pass(St)),
+        ?assertEqual({error, not_found}, hb_cache:read(Assignment, Verified)),
+        {ok, Replayed} = file:read_file(Cursor),
+        ?assertEqual(Written, hb_json:decode(Replayed))
     end}.
+
+%% A ~200-slot root, the size of prod's on 2026-11-16, caught up from nothing
+%% and recomputed after a build change, each in seconds: no slice replays
+%% the slots before it (`process-snapshot-target'), and the recompute reads
+%% the assignments it kept.
+replica_catches_up_in_seconds_test_() ->
+    {timeout, 300, fun() ->
+        #{ cfg := Cfg, opts := Opts } = replica_setup(<<"speed">>, fun honest/1),
+        Pusd = maps:get(<<"pusd">>, Cfg),
+        Url = maps:get(<<"scheduler-url">>, Cfg),
+        Dir = maps:get(<<"replica-dir">>, Cfg),
+        Wallet = ar_wallet:new(),
+        lists:foreach(fun(N) ->
+            schedule_as(Wallet, #{ <<"action">> => <<"Ping">>,
+                <<"n">> => integer_to_binary(N) }, Pusd, Opts)
+        end, lists:seq(1, 200)),
+        Args = #{ opts => Opts, dir => Dir },
+        Timed = fun() ->
+            T0 = erlang:monotonic_time(millisecond),
+            {ok, _, _, Info} = lib_bridge_replica:view(Pusd, Url, Args),
+            {erlang:monotonic_time(millisecond) - T0, Info}
+        end,
+        {Fresh, #{ slot := Head, head := Head, stopped := null }} = Timed(),
+        ?assert(Head >= 200),
+        Cursor = <<Dir/binary, "/", Pusd/binary, ".cursor.json">>,
+        {ok, Bin} = file:read_file(Cursor),
+        ok = file:write_file(Cursor,
+            hb_json:encode((hb_json:decode(Bin))#{ <<"build">> => <<"another@1">> })),
+        {Recomputed, #{ slot := Head, stopped := null }} = Timed(),
+        ?debugFmt("~p slots: caught up in ~p ms, recomputed in ~p ms",
+            [Head, Fresh, Recomputed]),
+        ?assert(Fresh < 30000),
+        ?assert(Recomputed < 15000)
+    end}.
+
+%% A root view that is not at the root's head is endorsed for nobody, and this
+%% member publishes nothing from it.
+behind_the_head_endorses_and_publishes_nothing_test() ->
+    Behind = #{ slot => 7, head => 207, stopped => <<"catching up to the canonical ",
+        "Arweave schedule: slot 7 of 207">> },
+    ?assertEqual({error, <<"Verified root state is still catching up">>},
+        endorse(#{}, #{ root_view => {#{}, #{}}, replica => Behind })),
+    St = #{ cfg => #{}, sent => #{}, replica => Behind },
+    St1 = start_root_publication(<<"root-cert:2:mint:base:2">>, #{}, St),
+    ?assertNot(maps:is_key(root_publication, St1)),
+    ?assertEqual([<<"root-cert:2:mint:base:2">>], maps:get(planned, St1)).
+
+%% Each record has one author among the members, the same on every member.
+one_author_per_record_test() ->
+    Info = #{ <<"attestors">> => [#{}, #{}, #{}] },
+    lists:foreach(fun(N) ->
+        Key = <<"root-cert:2:mint:base:", (integer_to_binary(N))/binary>>,
+        Authors = [I || I <- [0, 1, 2],
+            author(Key, #{ index => I, root_certificate_info => Info })],
+        ?assertEqual(1, length(Authors))
+    end, lists:seq(1, 50)).
 
 %% The bound on a root-endorse request is twice the largest real one: an
 %% ANS-104 intent whose operation fills what bridge-root accepts (2,048

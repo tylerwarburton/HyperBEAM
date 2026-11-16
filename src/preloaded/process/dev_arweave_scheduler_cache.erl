@@ -224,8 +224,10 @@ global_path() ->
 process_root() ->
     hb_path:to_binary([?CACHE_PREFIX, <<"sync">>, <<"process">>]).
 
+%% The bridge replica reads these two (`lib_arweave_scheduler_blocks'), so
+%% the library holds their layout.
 process_path(ProcessID) ->
-    hb_path:to_binary([process_root(), hb_util:human_id(ProcessID)]).
+    lib_arweave_scheduler_blocks:process_path(ProcessID).
 
 target_root(Address) ->
     hb_path:to_binary(
@@ -236,14 +238,7 @@ target_path(Address, Ordinate) ->
     hb_path:to_binary([target_root(Address), Ordinate]).
 
 assignment_path(ProcessID, Slot) ->
-    hb_path:to_binary(
-        [
-            ?CACHE_PREFIX,
-            <<"assignments">>,
-            hb_util:human_id(ProcessID),
-            hb_ao:normalize_key(Slot)
-        ]
-    ).
+    lib_arweave_scheduler_blocks:assignment_path(ProcessID, Slot).
 
 %%% Tests
 
