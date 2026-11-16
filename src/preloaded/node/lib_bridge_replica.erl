@@ -41,31 +41,73 @@
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
-%% Assignments verified per call, at most: a replica far behind catches up
-%% over several passes, acting meanwhile on the verified state it has.
+%% Assignments verified per call of `forward/1', at most: a replica far
+%% behind catches up over several calls, acting meanwhile on the verified
+%% state it has.
 -define(MAX_SLOTS, 5000).
+%% Slots `view/3' verifies and computes between looks at its deadline.
+-define(SLICE_SLOTS, 25).
 
 %% @doc `{ok, State, Opts, Info}' with PUSD's state after the last verified
 %% slot, the options to read it with, and `#{slot, stopped}'; or
 %% `{not_yet, Why}' when no slot has verified yet.
-view(Pusd, Url, #{ opts := NodeOpts, dir := Dir }) ->
-    R = forward(load(Pusd, Url, NodeOpts, Dir)),
+%%
+%% `deadline' (monotonic ms, default `infinity') bounds the call: the replica
+%% is verified and computed `slice' slots at a time, and no slice after the
+%% first starts once the deadline has passed, so a call costs the deadline
+%% plus one slice at most, however far behind the replica is. A replica cut short says so in
+%% `stopped' and picks up there next call. Without that bound a replica
+%% dropped by a new build replayed thousands of slots inside one call, and
+%% the attestor whose loop made the call passed nothing for an hour
+%% (2026-11-16: every node, after the efbce1663 restart).
+view(Pusd, Url, Args = #{ opts := NodeOpts, dir := Dir }) ->
+    R = catch_up(load(Pusd, Url, NodeOpts, Dir),
+        maps:get(slice, Args, ?SLICE_SLOTS), maps:get(deadline, Args, infinity)),
     Info = #{ slot => maps:get(slot, R), stopped => maps:get(stopped, R) },
     case R of
         #{ slot := -1 } -> {not_yet, maps:get(stopped, R)};
-        #{ proc := Proc, slot := Slot, opts := ROpts } ->
-            case hb_ao:resolve(Proc, #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, ROpts) of
+        #{ slot := Slot, opts := ROpts } ->
+            case compute(R) of
                 {ok, State} -> {ok, State, ROpts, Info};
-                _ ->
-                    %% Remote Arweave-root nodes expose the slot route as
-                    %% compute&slot=N. Keep the original resolver first for
-                    %% local processes, then use the canonical HTTP-shaped
-                    %% route before declaring the replica unavailable.
-                    Path = <<"compute&slot=", (integer_to_binary(Slot))/binary>>,
-                    case hb_ao:resolve(Proc, #{ <<"path">> => Path }, ROpts) of
-                        {ok, State2} -> {ok, State2, ROpts, Info};
-                        _ -> {not_yet, <<"PUSD did not compute at slot ", (integer_to_binary(Slot))/binary>>}
-                    end
+                error -> {not_yet, <<"PUSD did not compute at slot ", (integer_to_binary(Slot))/binary>>}
+            end
+    end.
+
+%% Verify and compute `Slice' slots at a time until the replica is caught up
+%% or stopped, or `Deadline' has passed. Computing each slice caches its
+%% state, so the next slice, or the next call, starts from it.
+catch_up(R = #{ proc := undefined }, _Slice, _Deadline) -> R;
+catch_up(R, Slice, Deadline) ->
+    case advance(R, Slice) of
+        {R1, 0} ->
+            % The slice was used up: the schedule may hold more.
+            case compute(R1) =/= error andalso before(Deadline) of
+                true -> catch_up(R1, Slice, Deadline);
+                false -> R1#{ stopped := catching_up(R1) }
+            end;
+        {R1, _} -> R1
+    end.
+
+before(infinity) -> true;
+before(Deadline) -> erlang:monotonic_time(millisecond) < Deadline.
+
+catching_up(#{ scheduler_device := <<"arweave-scheduler@1.0">> }) ->
+    <<"catching up to the canonical Arweave schedule">>;
+catching_up(_) -> <<"catching up to the schedule">>.
+
+%% PUSD's state at the replica's slot, or `error'.
+compute(#{ proc := Proc, slot := Slot, opts := ROpts }) ->
+    case hb_ao:resolve(Proc, #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, ROpts) of
+        {ok, State} -> {ok, State};
+        _ ->
+            %% Remote Arweave-root nodes expose the slot route as
+            %% compute&slot=N. Keep the original resolver first for
+            %% local processes, then use the canonical HTTP-shaped
+            %% route before declaring the replica unavailable.
+            Path = <<"compute&slot=", (integer_to_binary(Slot))/binary>>,
+            case hb_ao:resolve(Proc, #{ <<"path">> => Path }, ROpts) of
+                {ok, State2} -> {ok, State2};
+                _ -> error
             end
     end.
 
@@ -287,26 +329,31 @@ resume(R = #{ cursor := File, pusd := Pusd, opts := ROpts,
 %% Accept assignments until one fails, the scheduler has no more, or this
 %% call's share is used.
 forward(R = #{ proc := undefined }) -> R;
-forward(R) -> forward(R, ?MAX_SLOTS).
-
-forward(R = #{scheduler_device := <<"arweave-scheduler@1.0">>}, 0) ->
-    R#{stopped := <<"catching up to the canonical Arweave schedule">>};
-forward(R, 0) -> R;
-forward(R = #{ slot := Slot }, Left) ->
-    case fetch(R, Slot + 1) of
-        {error, Why} -> R#{stopped := Why};
-        [] -> R;
-        As -> forward_each(As, R, Left)
+forward(R) ->
+    case advance(R, ?MAX_SLOTS) of
+        {R1 = #{ scheduler_device := <<"arweave-scheduler@1.0">> }, 0} ->
+            R1#{ stopped := catching_up(R1) };
+        {R1, _} -> R1
     end.
 
-forward_each([], R, Left) -> forward(R, Left);
-forward_each(_, R, 0) -> forward(R, 0);
-forward_each([A | Rest], R = #{ slot := Slot }, Left) ->
+%% Accept up to `Left' assignments: `{R, LeftOver}', and a left-over of 0
+%% means the share was used up before the schedule was.
+advance(R, 0) -> {R, 0};
+advance(R = #{ slot := Slot }, Left) ->
+    case fetch(R, Slot + 1) of
+        {error, Why} -> {R#{ stopped := Why }, Left};
+        [] -> {R, Left};
+        As -> advance_each(As, R, Left)
+    end.
+
+advance_each([], R, Left) -> advance(R, Left);
+advance_each(_, R, 0) -> {R, 0};
+advance_each([A | Rest], R = #{ slot := Slot }, Left) ->
     case step(A, R) of
-        {ok, Kept, Id} -> forward_each(Rest, accept(Kept, Id, R), Left - 1);
+        {ok, Kept, Id} -> advance_each(Rest, accept(Kept, Id, R), Left - 1);
         {refused, Why} ->
             ?event(bridge, {replica_stopped, Slot + 1, Why}),
-            R#{ stopped := <<Why/binary, " at slot ", (integer_to_binary(Slot + 1))/binary>> }
+            {R#{ stopped := <<Why/binary, " at slot ", (integer_to_binary(Slot + 1))/binary>> }, Left}
     end.
 
 %% @doc Arweave ordering is constructed locally from confirmed blocks. A peer's

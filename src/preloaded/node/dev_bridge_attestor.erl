@@ -79,6 +79,7 @@
 %%%   fast-ledgers => #{ LedgerProcess => #{ node => SchedulerURL } },
 %%%   scheduler-device (`scheduler@1.0' or `arweave-scheduler@1.0'),
 %%%   arweave-resend-ms (default 30 minutes),
+%%%   replica-budget-ms (default 20 s: what one pass spends catching replicas up),
 %%%   base => #{ rpc | rpc-file, contract, chain-id, from-block, log-range },
 %%%   solana => #{ rpc | rpc-file, program, commitment }, sui => #{ rpc, package, bridge }
 %%% `rpc-file' names a file holding the RPC URL. Use it: a URL carries its
@@ -989,7 +990,12 @@ pass_done(Now, St = #{ cfg := Cfg, nudge := Nudge }) ->
     end }.
 
 %% Everything a pass does, it does on `View': PUSD as this node computed it.
-pass(St = #{ cfg := Cfg }) ->
+%% A pass spends at most `replica-budget-ms' (plus one slice per replica)
+%% bringing replicas forward: one far behind catches up over several passes,
+%% and the loop keeps passing meanwhile, on the verified state it has.
+pass(St0 = #{ cfg := Cfg }) ->
+    St = St0#{ replica_deadline => erlang:monotonic_time(millisecond)
+        + cfg_ms(Cfg, <<"replica-budget-ms">>, 20000) },
     case view(maps:get(<<"pusd">>, Cfg), St) of
         {ok, View, Replica} -> act(View, St#{ replica => Replica, root_view => View });
         {not_yet, Why} -> St#{ last_error => Why, last_pass => os:system_time(millisecond) }
@@ -2332,21 +2338,25 @@ l1_unsigned(Process, Tags) ->
 %% PUSD (`Pusd', the configured one or a successor) as this node computed it:
 %% `{ok, View, Replica}' with the replica's slot and where it stopped, if it
 %% did; `{not_yet, Why}' while no slot has verified.
-view(Pusd, #{ cfg := Cfg, opts := Opts }) ->
+view(Pusd, St = #{ cfg := Cfg, opts := Opts }) ->
     Dir = hb_util:bin(maps:get(<<"replica-dir">>, Cfg, <<"bridge-replica">>)),
     case lib_bridge_replica:view(Pusd, maps:get(<<"scheduler-url">>, Cfg),
-            #{ opts => Opts, dir => Dir }) of
+            replica_args(Opts, Dir, St)) of
         {ok, State, ROpts, Replica} -> {ok, {State, ROpts}, Replica};
         {not_yet, Why} -> {not_yet, Why}
     end.
 
-lane_view(Ledger, Node, #{ cfg := Cfg, opts := Opts }) ->
+lane_view(Ledger, Node, St = #{ cfg := Cfg, opts := Opts }) ->
     BaseDir = hb_util:bin(maps:get(<<"replica-dir">>, Cfg, <<"bridge-replica">>)),
     Dir = <<BaseDir/binary, "/lane-", Ledger/binary>>,
-    case lib_bridge_replica:view(Ledger, Node, #{ opts => Opts, dir => Dir }) of
+    case lib_bridge_replica:view(Ledger, Node, replica_args(Opts, Dir, St)) of
         {ok, State, ROpts, Replica} -> {ok, {State, ROpts}, Replica};
         {not_yet, Why} -> {not_yet, Why}
     end.
+
+%% A replica is brought forward only until this pass's deadline (`pass/1').
+replica_args(Opts, Dir, St) ->
+    #{ opts => Opts, dir => Dir, deadline => maps:get(replica_deadline, St, infinity) }.
 
 %% One key of a view, as decoded JSON; #{} when absent.
 key(Key, {State, ROpts}) -> json_value(hb_ao:get(Key, State, not_found, ROpts)).
@@ -3296,6 +3306,31 @@ true_signature(St = #{ cfg := Cfg, keys := Keys }) ->
 replica_signs_its_own_withdrawal_test_() ->
     {timeout, 120, fun() ->
         St = replica_setup(<<"honest">>, fun honest/1),
+        St1 = pass(St),
+        ?assertMatch(#{ member := true, last_error := null }, St1),
+        ?assertEqual(<<"1=", (true_signature(St1))/binary, ";">>, signs(St1))
+    end}.
+
+%% A replica far behind is brought forward a slice at a time, and no slice
+%% after the first starts once its deadline has passed; the pass that cut it
+%% short acts on what it has, and the next picks up there. Before, one call
+%% replayed the whole schedule however long that took: after the efbce1663
+%% restart (2026-11-16) every node's attestor spent an hour replaying a fast
+%% ledger from slot 0 inside one pass, and passed nothing meanwhile.
+replica_catches_up_in_slices_test_() ->
+    {timeout, 120, fun() ->
+        St = #{ cfg := Cfg, opts := Opts } = replica_setup(<<"slices">>, fun honest/1),
+        Pusd = maps:get(<<"pusd">>, Cfg),
+        Url = maps:get(<<"scheduler-url">>, Cfg),
+        Passed = erlang:monotonic_time(millisecond) - 1,
+        Args = #{ opts => Opts, dir => maps:get(<<"replica-dir">>, Cfg),
+            slice => 1, deadline => Passed },
+        Info = fun(A) -> {ok, _, _, I} = lib_bridge_replica:view(Pusd, Url, A), I end,
+        ?assertMatch(#{ slot := 0, stopped := <<"catching up", _/binary>> }, Info(Args)),
+        ?assertMatch(#{ slot := 1, stopped := <<"catching up", _/binary>> }, Info(Args)),
+        #{ slot := Head, stopped := null } = Info(Args#{ deadline => infinity }),
+        % Caught up, a deadline that has passed cuts nothing short.
+        ?assertEqual(#{ slot => Head, stopped => null }, Info(Args)),
         St1 = pass(St),
         ?assertMatch(#{ member := true, last_error := null }, St1),
         ?assertEqual(<<"1=", (true_signature(St1))/binary, ";">>, signs(St1))
