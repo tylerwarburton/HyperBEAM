@@ -162,7 +162,11 @@ slot_process(#{ <<"pid">> := Pid, <<"last_slot">> := Computed } = Proc, Labelled
                        ensure_loaded, compute_cache_read, delivery_flush]) ])
     }.
 
-%% The node's delivery backlog (`lib_process_delivery:metrics/0').
+%% The node's delivery backlog (`lib_process_delivery:metrics/0'), read
+%% through `process@1.0' as the metrics collector reads it. A preloaded device
+%% is packaged under a name of its own, so a direct call to the library from
+%% here was undefined, caught, and reported 0 for every gauge (public,
+%% 2026-11-16: `pending_entries' 0 while `/~push@1.0/pending' listed 17).
 delivery() ->
     Names = #{
         hb_delivery_pending_entries => <<"pending_entries">>,
@@ -170,7 +174,14 @@ delivery() ->
         hb_worker_mailbox_len => <<"worker_mailbox">>,
         hb_worker_waiter_rows => <<"waiter_rows">>
     },
-    Metrics = try lib_process_delivery:metrics() catch _:_ -> [] end,
+    Metrics =
+        try
+            {ok, Gauges} =
+                hb_ao:raw(<<"process@1.0">>, #{}, #{ <<"path">> => <<"deliveries">> },
+                    #{ <<"process-delivery-metrics">> => true }),
+            Gauges
+        catch _:_ -> []
+        end,
     maps:merge(
         maps:from_list([ {K, 0} || K <- maps:values(Names) ]),
         maps:from_list(
@@ -375,6 +386,33 @@ slots_endpoint_test() ->
     ?assertEqual(60, maps:get(<<"window_s">>, Read(#{ <<"window">> => <<"soon">> }))),
     ?assertEqual([], maps:get(<<"processes">>, Read(#{ <<"pid">> => <<"unknown">> }))),
     hb_phase_timer:reset().
+
+%% The slots endpoint reports the same delivery backlog as the metrics
+%% endpoint: a live deliverer's row of entries is counted.
+delivery_backlog_is_reported_test() ->
+    Table = lib_process_delivery_backlog,
+    Owner =
+        case ets:whereis(Table) of
+            undefined ->
+                Self = self(),
+                Pid = spawn(fun() ->
+                    ets:new(Table, [named_table, public, set]),
+                    Self ! {self(), ready},
+                    receive stop -> ok end
+                end),
+                receive {Pid, ready} -> Pid end;
+            _ -> none
+        end,
+    Proc = <<"delivery-backlog-test-proc">>,
+    ets:insert(Table, {Proc, self(), 17, erlang:monotonic_time(second) - 5}),
+    try
+        #{ <<"pending_entries">> := Pending, <<"oldest_pending_s">> := Oldest } = delivery(),
+        ?assert(Pending >= 17),
+        ?assert(Oldest >= 5)
+    after
+        ets:delete(Table, Proc),
+        Owner =:= none orelse (Owner ! stop)
+    end.
 
 node_format_requires_debug_test() ->
     Base = #{ <<"device">> => <<"hyperbuddy@1.0">>, <<"body">> => <<"base">> },

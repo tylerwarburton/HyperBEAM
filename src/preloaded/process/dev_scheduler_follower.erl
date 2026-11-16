@@ -40,7 +40,15 @@
 %%% parse) is not asked again before its `Retry-After', nor sooner than a
 %%% backoff that doubles per refusal in a row; the next gateway of
 %%% `scheduler-follower-gateways' is asked instead. A refusal is never a
-%%% crash: the windows stay as they were, so the slot waits (fail closed).
+%%% crash: the slot waits (fail closed). Windows fetched before a refusal are
+%%% kept, so a read of hundreds of windows advances even when the gateway
+%%% rate-limits part-way; only windows over slots not indexed yet are fetched.
+%%%
+%%% The gateways are asked in the order listed, every read: answering once
+%%% does not promote a fallback above the first. A gateway that answers but
+%%% reports no block for an item (turbo-gateway.com, for every archive item)
+%%% confirms nothing, and promoting it once froze every follower on 11-16:
+%%% arweave.net 429'd one read and was never asked again.
 -module(dev_scheduler_follower).
 -device_libraries([lib_bridge_replica, lib_process_cache, lib_process_delivery,
     lib_arweave_scheduler_blocks]).
@@ -262,35 +270,37 @@ archived(N, AssignmentID, #{ windows := Windows }) ->
 
 %% The archive windows of P that S signed and that are mined deep enough, read
 %% from the first gateway that may be asked and answers, once `archive-poll-ms'
-%% has passed since the last read. A read is all from one gateway; one that
-%% fails leaves the windows as they were.
+%% has passed since the last read. Every window fetched is kept, also from a
+%% gateway that refused part-way.
 with_windows(F = #{ archive_at := At }, Now) when Now < At -> F;
 with_windows(F = #{ gateways := Gateways, archive_poll := Every }, Now) ->
     case read_archive(Gateways, Now, F, []) of
-        {{ok, New}, Gateways2} ->
-            F#{ windows := maps:get(windows, F) ++ New, gateways := Gateways2,
-                archive_at := Now + Every };
-        {none, Gateways2} ->
+        {ok, F2, Gateways2} ->
+            F2#{ gateways := Gateways2, archive_at := Now + Every };
+        {none, F2, Gateways2} ->
             % Every gateway is cooling down: ask again when the first may be.
             Next = lists:min([ NB || #{ not_before := NB } <- Gateways2 ]),
-            F#{ gateways := Gateways2, archive_at := max(Next, Now + 1000) }
+            F2#{ gateways := Gateways2, archive_at := max(Next, Now + 1000) }
     end.
 
-%% Try each gateway in order, skipping one not to be asked yet; a gateway that
-%% fails is backed off and the next one tried. The gateways come back in the
-%% order to try them next time: the one that answered first.
-read_archive([], _Now, _F, Tried) -> {none, lists:reverse(Tried)};
+%% Try each gateway in the order listed, skipping one not to be asked yet; a
+%% gateway that fails is backed off and the next one tried, starting from the
+%% windows the failed one did fetch. The order never changes.
+read_archive([], _Now, F, Tried) -> {none, F, lists:reverse(Tried)};
 read_archive([G = #{ not_before := NB } | Rest], Now, F, Tried) when NB > Now ->
     read_archive(Rest, Now, F, [G | Tried]);
-read_archive([G = #{ url := URL } | Rest], Now, F = #{ p := P }, Tried) ->
-    try new_windows(hb_util:list(URL), F) of
-        New -> {{ok, New}, [G#{ backoff := 0 } | Rest] ++ lists:reverse(Tried)}
-    catch Class:Reason ->
-        G2 = back_off(G, retry_after(Reason), Now),
-        ?event(warning, {foreign_follower_gateway_refused,
-            {p, P}, {gateway, URL}, {reason, refusal(Class, Reason)},
-            {retry_in_ms, maps:get(not_before, G2) - Now}}),
-        read_archive(Rest, Now, F, [G2 | Tried])
+read_archive([G = #{ url := URL } | Rest], Now, F = #{ p := P, windows := Have }, Tried) ->
+    case new_windows(hb_util:list(URL), F) of
+        {ok, New} ->
+            {ok, F#{ windows := Have ++ New },
+                lists:reverse(Tried) ++ [G#{ backoff := 0 } | Rest]};
+        {refused, New, Class, Reason} ->
+            G2 = back_off(G, retry_after(Reason), Now),
+            ?event(warning, {foreign_follower_gateway_refused,
+                {p, P}, {gateway, URL}, {reason, refusal(Class, Reason)},
+                {windows_kept, length(New)},
+                {retry_in_ms, maps:get(not_before, G2) - Now}}),
+            read_archive(Rest, Now, F#{ windows := Have ++ New }, [G2 | Tried])
     end.
 
 %% Not before the gateway's `Retry-After', nor sooner than double the last
@@ -305,19 +315,37 @@ retry_after(_) -> 0.
 refusal(_, {gateway_status, Status, _}) -> {status, Status};
 refusal(Class, Reason) -> {Class, Reason}.
 
-new_windows(Gateway, #{ p := P, s := S, depth := Depth, windows := Have }) ->
+%% `{ok, Windows}', or `{refused, Fetched, Class, Reason}' with the windows
+%% fetched before the gateway refused.
+new_windows(Gateway, F) ->
+    try wanted_windows(Gateway, F) of
+        Wanted -> fetch_windows(Gateway, Wanted, [])
+    catch Class:Reason -> {refused, [], Class, Reason}
+    end.
+
+%% The confirmed windows not held yet that reach past the indexed slot, once
+%% each (arweave.net lists every archive item twice, once with its block and
+%% once without), lowest slots first: those are what indexing waits on.
+wanted_windows(Gateway, #{ p := P, s := S, depth := Depth, windows := Have,
+        indexed := Indexed }) ->
     Height = binary_to_integer(string:trim(gateway(get, Gateway, "/height", none, 15000))),
     Edges = archive_edges(Gateway, S, P, #{}),
     Known = [ maps:get(id, W) || W <- Have ],
-    [ begin
-          Data = gateway(get, Gateway, "/" ++ hb_util:list(ID), none, 60000),
-          #{ id => ID, from => hb_util:int(tag(<<"From-Slot">>, Tags)),
-             to => hb_util:int(tag(<<"To-Slot">>, Tags)), ids => archived_ids(Data) }
-      end
-    || #{ <<"node">> := #{ <<"id">> := ID, <<"tags">> := Tags,
-            <<"block">> := Block } } <- Edges,
-       not lists:member(ID, Known),
-       window_confirmed(Block, Height, Depth, true) ].
+    lists:keysort(2, lists:ukeysort(1,
+        [ {ID, hb_util:int(tag(<<"From-Slot">>, Tags)), To}
+        || #{ <<"node">> := #{ <<"id">> := ID, <<"tags">> := Tags,
+                <<"block">> := Block } } <- Edges,
+           not lists:member(ID, Known),
+           window_confirmed(Block, Height, Depth, true),
+           To <- [hb_util:int(tag(<<"To-Slot">>, Tags))],
+           To > Indexed ])).
+
+fetch_windows(_Gateway, [], Got) -> {ok, lists:reverse(Got)};
+fetch_windows(Gateway, [{ID, From, To} | Rest], Got) ->
+    try archived_ids(gateway(get, Gateway, "/raw/" ++ hb_util:list(ID), none, 60000)) of
+        IDs -> fetch_windows(Gateway, Rest, [#{ id => ID, from => From, to => To, ids => IDs } | Got])
+    catch Class:Reason -> {refused, lists:reverse(Got), Class, Reason}
+    end.
 
 %% Every archive transaction of P that S signed, page by page.
 archive_edges(Gateway, S, P, After) ->
@@ -649,7 +677,7 @@ gateway_failover() ->
             <<"tags">> => [#{ <<"name">> => <<"From-Slot">>, <<"value">> => <<"0">> },
                            #{ <<"name">> => <<"To-Slot">>, <<"value">> => <<"0">> }],
             <<"block">> => #{ <<"height">> => 98 } } }] } } }),
-    WindowPath = <<"/", WindowID/binary>>,
+    WindowPath = <<"/raw/", WindowID/binary>>,
     Good =
         fun('GET', <<"/height">>) -> {200, [], <<"100">>};
            ('POST', <<"/graphql">>) -> {200, [], Edges};
@@ -668,19 +696,131 @@ gateway_failover() ->
     ?assertEqual(3, hits(up)),
     ?assertMatch([#{ id := WindowID, from := 0, to := 0 }], maps:get(windows, F1)),
     ?assertEqual(ok, archived(0, AssignmentID, F1)),
-    ?assertEqual([Up, Down, Limited], [ U || #{ url := U } <- maps:get(gateways, F1) ]),
-    [_, #{ not_before := DownAt }, #{ not_before := LimitedAt }] = maps:get(gateways, F1),
+    % The order stays as listed: answering does not promote a fallback.
+    ?assertEqual([Down, Limited, Up], [ U || #{ url := U } <- maps:get(gateways, F1) ]),
+    [#{ not_before := DownAt }, #{ not_before := LimitedAt }, _] = maps:get(gateways, F1),
     ?assert(DownAt >= Now + ?MIN_GATEWAY_BACKOFF),
     ?assert(LimitedAt >= Now + ?MIN_GATEWAY_BACKOFF),
     ?assertEqual(Now + ?DEFAULT_ARCHIVE_POLL_MS, maps:get(archive_at, F1)),
-    % The next read goes to the gateway that answered, and a window already
-    % held is not fetched again.
+    % Once their backoff has passed the first gateways are asked again, and
+    % refuse again (each backoff doubles); a window already held is not
+    % fetched again.
     F2 = with_windows(F1, Now + ?DEFAULT_ARCHIVE_POLL_MS),
-    ?assertEqual(0, hits(down)),
-    ?assertEqual(0, hits(limited)),
+    ?assertEqual(1, hits(down)),
+    ?assertEqual(1, hits(limited)),
     ?assertEqual(2, hits(up)),
     ?assertEqual(maps:get(windows, F1), maps:get(windows, F2)),
+    [#{ backoff := DownBackoff }, _, _] = maps:get(gateways, F2),
+    ?assertEqual(2 * ?MIN_GATEWAY_BACKOFF, DownBackoff),
     stop_stubs([DownPid, LimitedPid, UpPid]).
+
+%% One archive window over `From'..`To' (one signed item per slot), mined at
+%% `Height' (`null': no block): `{WindowID, Edge, Data, AssignmentIDs}'.
+archive_window(From, To, Height) ->
+    W = ar_wallet:new(),
+    Items = [ ar_bundles:sign_item(#tx{ format = ans104, data = integer_to_binary(S),
+        data_size = byte_size(integer_to_binary(S)), tags = [] }, W)
+        || S <- lists:seq(From, To) ],
+    {undefined, Data} = ar_bundles:serialize_bundle(list, Items, false),
+    WindowID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    {WindowID, edge(WindowID, From, To, Height), Data,
+        [ hb_util:human_id(ar_bundles:id(I, signed)) || I <- Items ]}.
+
+edge(WindowID, From, To, Height) ->
+    #{ <<"cursor">> => WindowID, <<"node">> => #{ <<"id">> => WindowID,
+        <<"tags">> => [#{ <<"name">> => <<"From-Slot">>, <<"value">> => integer_to_binary(From) },
+                       #{ <<"name">> => <<"To-Slot">>, <<"value">> => integer_to_binary(To) }],
+        <<"block">> => case Height of null -> null; _ -> #{ <<"height">> => Height } end } }.
+
+edges_body(Edges) ->
+    hb_json:encode(#{ <<"data">> => #{ <<"transactions">> => #{
+        <<"pageInfo">> => #{ <<"hasNextPage">> => false }, <<"edges">> => Edges } } }).
+
+%% A gateway listing `Edges' and serving the data of `Windows'.
+archive_gateway(Edges, Windows) ->
+    fun('GET', <<"/height">>) -> {200, [], <<"100">>};
+       ('POST', <<"/graphql">>) -> {200, [], edges_body(Edges)};
+       ('GET', <<"/raw/", ID/binary>>) ->
+            case lists:keyfind(ID, 1, Windows) of
+                {ID, _, Data, _} -> {200, [], Data};
+                false -> {404, [], <<>>}
+            end;
+       (_, _) -> {404, [], <<>>}
+    end.
+
+%% 2026-11-16: arweave.net answered one read 429 and turbo-gateway.com, which
+%% reports no block for any archive item, answered instead. Promoted to first,
+%% it was the only gateway ever asked again, so no window was confirmed and
+%% every push of the verified scheduler waited 503 for good. The gateway
+%% listed first is asked again once its backoff has passed.
+blockless_fallback_does_not_displace_first_gateway_test_() ->
+    {timeout, 30, fun blockless_fallback_does_not_displace_first_gateway/0}.
+blockless_fallback_does_not_displace_first_gateway() ->
+    Mined = {WindowID, Edge, _, [AssignmentID]} = archive_window(0, 0, 98),
+    Calls = counters:new(1, []),
+    Arweave =
+        fun(M, P) ->
+            counters:add(Calls, 1, 1),
+            case counters:get(Calls, 1) of
+                1 -> {429, [], <<>>};
+                _ -> (archive_gateway([Edge], [Mined]))(M, P)
+            end
+        end,
+    {ArURL, ArPid} = stub_gateway(arweave, Arweave, self()),
+    {TurboURL, TurboPid} = stub_gateway(turbo,
+        archive_gateway([edge(WindowID, 0, 0, null)], [Mined]), self()),
+    F = archive_state(<<ArURL/binary, ",", TurboURL/binary>>),
+    Now = now_ms(),
+    F1 = with_windows(F, Now),
+    ?assertEqual(1, hits(arweave)),
+    % height and graphql: nothing confirmed, nothing fetched.
+    ?assertEqual(2, hits(turbo)),
+    ?assertEqual([], maps:get(windows, F1)),
+    ?assertEqual(not_yet, archived(0, AssignmentID, F1)),
+    F2 = with_windows(F1, Now + ?DEFAULT_ARCHIVE_POLL_MS),
+    ?assertEqual(3, hits(arweave)),
+    ?assertEqual(0, hits(turbo)),
+    ?assertMatch([#{ id := WindowID }], maps:get(windows, F2)),
+    ?assertEqual(ok, archived(0, AssignmentID, F2)),
+    stop_stubs([ArPid, TurboPid]).
+
+%% A gateway that refuses part-way through a read keeps what it fetched, and
+%% the next read asks only for the rest. Windows wholly at or below the
+%% indexed slot, and the second, blockless listing arweave.net gives every
+%% archive item, are never fetched.
+partial_read_is_kept_test_() ->
+    {timeout, 30, fun partial_read_is_kept/0}.
+partial_read_is_kept() ->
+    Old = {OldID, OldEdge, _, _} = archive_window(0, 3, 90),
+    A = {AID, AEdge, _, [A4, _]} = archive_window(4, 5, 95),
+    B = {BID, BEdge, _, [_, B7]} = archive_window(6, 7, 96),
+    Windows = [Old, A, B],
+    Edges = [OldEdge, AEdge, BEdge, edge(AID, 4, 5, null)],
+    BPath = <<"/raw/", BID/binary>>,
+    Flaky =
+        fun('GET', Path) when Path =:= BPath -> {429, [{<<"retry-after">>, <<"1">>}], <<>>};
+           (M, P) -> (archive_gateway(Edges, Windows))(M, P)
+        end,
+    {FlakyURL, FlakyPid} = stub_gateway(flaky, Flaky, self()),
+    F = (archive_state([FlakyURL]))#{ indexed => 3 },
+    Now = now_ms(),
+    F1 = with_windows(F, Now),
+    % height, graphql, A, then B refused: A is kept and Old never asked for.
+    ?assertEqual(4, hits(flaky)),
+    ?assertEqual([AID], [ maps:get(id, W) || W <- maps:get(windows, F1) ]),
+    ?assertEqual(ok, archived(4, A4, F1)),
+    ?assertEqual(not_yet, archived(7, B7, F1)),
+    stop_stubs([FlakyPid]),
+    {GoodURL, GoodPid} = stub_gateway(good, archive_gateway(Edges, Windows), self()),
+    F2 = with_windows(F1#{ gateways := gateways(
+        #{ <<"scheduler-follower-gateways">> => [GoodURL] }) }, Now + ?DEFAULT_ARCHIVE_POLL_MS),
+    % height, graphql and B only.
+    ?assertEqual(3, hits(good)),
+    ?assertEqual(lists:sort([AID, BID]),
+        lists:sort([ maps:get(id, W) || W <- maps:get(windows, F2) ])),
+    ?assertNot(lists:member(OldID, [ maps:get(id, W) || W <- maps:get(windows, F2) ])),
+    ?assertEqual(ok, archived(7, B7, F2)),
+    stop_stubs([GoodPid]).
 
 %% With no push waiting the follower polls at the idle interval; a push
 %% refused for a slot not yet indexed brings the next pass to `poll-ms', and
