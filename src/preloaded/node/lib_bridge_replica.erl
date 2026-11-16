@@ -249,7 +249,9 @@ execution_opts(NodeOpts, Store) ->
         <<"store">> => [Store],
         <<"scheduler-store">> => [Store],
         <<"arweave-scheduler-store">> =>
-            case hb_opts:get(arweave_scheduler_store, not_found, NodeOpts) of
+            % Only a store the node names for its index; never a default.
+            case maps:get(<<"arweave-scheduler-store">>, NodeOpts,
+                    maps:get(arweave_scheduler_store, NodeOpts, not_found)) of
                 Index when is_list(Index), Index =/= [] -> Index;
                 Index when is_map(Index) -> [Index];
                 _ -> [Store]
