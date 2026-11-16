@@ -1752,7 +1752,39 @@ lost_ready_is_rescanned_test_() ->
         ?assert(lists:member(1, rows(SID, <<"o">>, Opts))),
         ?assert(wait_until(fun() -> delivered(SID, [0, 1], Opts) end, 5000)),
         ?assertEqual(Deliverer, deliverer(SID)),
-        ?assertEqual(Found + 1, counter(delivery_rescan_found)),
+        % Reported at the rescan after the one that loaded it: no cast came.
+        ?assert(wait_until(fun() -> counter(delivery_rescan_found) == Found + 1 end, 5000)),
+        ?assertEqual(Before + 2, receiver_slot(A, Opts))
+    end}.
+
+%% @doc A rescan that reads a slot's `o' row before its `{ready, Slot}'
+%% arrives -- the row is written at the start of the slot's store, the cast
+%% at its end -- loads the slot early and does not report it: its cast was
+%% late, not lost. Before, every such slot was reported as found by the
+%% rescan (2026-11-16: 23 `delivery_rescan_found' on three nodes, each a slot
+%% finishing its store within 92 ms of the rescan and posted 11-109 ms after
+%% it), which read as ~30 s stalls that never happened.
+late_ready_is_not_reported_test_() ->
+    {timeout, 60, fun() ->
+        {Sender, SID, {A, AID}, _, Opts} =
+            delivery_setup(#{ <<"delivery-rescan-ms">> => 1000 }),
+        send(Sender, 1, #{ <<"sendto">> => AID }, Opts),
+        send(Sender, 2, #{ <<"sendto">> => AID }, Opts),
+        Before = receiver_slot(A, Opts),
+        {ok, _} = compute(Sender, 0, Opts),
+        ?assert(wait_until(fun() -> delivered(SID, [0], Opts) end, 15000)),
+        Deliverer = deliverer(SID),
+        Found = counter(delivery_rescan_found),
+        % The row is stored and the cast is still on its way when the rescan
+        % reads the rows ...
+        {ok, _} = compute(Sender, 1, Opts#{ <<"delivery-test-drop-ready">> => true }),
+        ?assert(wait_until(fun() -> delivered(SID, [0, 1], Opts) end, 5000)),
+        % ... and it arrives before the next one.
+        Deliverer ! {ready, 1},
+        timer:sleep(2500),
+        ?assertEqual(Deliverer, deliverer(SID)),
+        ?assertEqual(Found, counter(delivery_rescan_found)),
+        ?assert(delivered(SID, [0, 1], Opts)),
         ?assertEqual(Before + 2, receiver_slot(A, Opts))
     end}.
 

@@ -75,6 +75,15 @@
 %%% one of those periods (2026-11-14: the L1 ledger's deliverer, up since a
 %%% restart, never delivered slot 16 until it was killed by hand).
 %%%
+%%% The `o' row is written at the start of the slot's store and the cast is
+%%% sent at its end, so a rescan routinely reads a slot whose cast is still on
+%%% its way and loads it a few milliseconds early. That is not a lost cast,
+%%% and only a lost one is reported: a slot a rescan loads is reported
+%%% (`delivery_rescan_found') at the next rescan if no `{ready, Slot}' for it
+%%% arrived in between -- a slot that really waited for the rescan.
+%%% (2026-11-16: each of the 23 slots reported on three nodes was finishing
+%%% its store within 92 ms of the rescan, and was posted 11-109 ms after it.)
+%%%
 %%% That rescan lives in the deliverer's own loop, so it cannot rescue a
 %%% deliverer that never gets back to it: one stopped in a call that never
 %%% answers -- in its start, or inside a step -- still holds the name, and
@@ -447,6 +456,7 @@ start_state(ProcID, Opts) ->
 %%   done      slots finished since the last write
 %%   unpurged  slots whose `x' is written and `o'/`q' not yet deleted
 %%   rescan_at when the rows are read again (`rescan/1')
+%%   rescued   slots the last rescan loaded that no `{ready, Slot}' has woken
 %%   active_at when the last message arrived: the idle time runs from it
 fresh(State = #{ opts := Opts }) ->
     Now = now_ms(),
@@ -468,7 +478,8 @@ fresh(State = #{ opts := Opts }) ->
         signed => #{},
         rows => #{},
         done => [],
-        unpurged => []
+        unpurged => [],
+        rescued => #{}
     }.
 
 %% The deliverer, supervised by itself: whatever fails in its loop, it starts
@@ -555,16 +566,23 @@ rescan(State = #{ rescan_at := RescanAt, opts := Opts, proc_id := ProcID }) ->
                    (_, _) -> ok
                 end,
                 maps:get(helpers, State)),
-            Before = gb_trees:size(maps:get(slots, State)),
-            State2 = load_pending(State#{ rescan_at := Now + rescan_ms(Opts) }),
-            case gb_trees:size(maps:get(slots, State2)) - Before of
-                0 -> ok;
-                Found ->
+            % The slots the last rescan loaded that no cast has woken since:
+            % they waited for it.
+            case maps:keys(maps:get(rescued, State)) of
+                [] -> ok;
+                Lost ->
                     ?event(warning, {delivery_rescan_found, {process, ProcID},
-                        {slots, Found}}),
+                        {slots, length(Lost)}, {first, lists:min(Lost)}}),
                     record(delivery_rescan_found)
             end,
-            State2
+            #{ slots := Slots, store := Store } = State,
+            Unheld =
+                [ S || S <- pending_slots(ProcID, Store, Opts),
+                       not gb_trees:is_defined(S, Slots) ],
+            lists:foldl(fun load_slot/2,
+                State#{ rescan_at := Now + rescan_ms(Opts),
+                        rescued := maps:from_list([ {S, true} || S <- Unheld ]) },
+                Unheld)
     end.
 
 rescan_ms(Opts) ->
@@ -577,7 +595,8 @@ drain(State) ->
     after 0 -> State
     end.
 
-handle({ready, Slot}, State) -> load_slot(Slot, State);
+handle({ready, Slot}, State = #{ rescued := Rescued }) ->
+    load_slot(Slot, State#{ rescued := maps:remove(Slot, Rescued) });
 handle({posted, Pid, ID, Signing, Outcome}, State = #{ helpers := Helpers }) ->
     case maps:take(Pid, Helpers) of
         {{Mon, {post, Slot, Key}, Posted}, Rest} ->
