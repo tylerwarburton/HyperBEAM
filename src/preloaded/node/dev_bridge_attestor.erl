@@ -3164,7 +3164,10 @@ start_hook_test_() ->
                 <<"scheduler-url">> => <<"http://127.0.0.1:1">> }
         }),
         try
-            {ok, Res} = hb_http:get(Node, <<"/~bridge-attestor@1.0/keys">>, Opts),
+            % The loop serves its keys once it has made them: `start' only
+            % spawns it, so the first GET can beat it.
+            {ok, Res} = until_ok(fun() ->
+                hb_http:get(Node, <<"/~bridge-attestor@1.0/keys">>, Opts) end, 50),
             Keys = hb_json:decode(hb_maps:get(<<"body">>, Res, Res, Opts)),
             Me = hb_util:human_id(ar_wallet:to_address(hb_opts:get(<<"priv-wallet">>, none, Opts))),
             ?assertMatch(#{ <<"ao">> := Me, <<"base">> := <<"0x", _:40/binary>>,
@@ -3174,6 +3177,13 @@ start_hook_test_() ->
             stop_loop()
         end
     end}.
+
+until_ok(Fun, 0) -> Fun();
+until_ok(Fun, N) ->
+    case Fun() of
+        {ok, _} = Ok -> Ok;
+        _ -> timer:sleep(200), until_ok(Fun, N - 1)
+    end.
 
 stop_loop() ->
     case hb_name:lookup(?NAME) of
