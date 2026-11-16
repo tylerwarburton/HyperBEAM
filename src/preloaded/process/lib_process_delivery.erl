@@ -62,6 +62,16 @@
 %%% whether it is signed. Outbox entries and signed bytes are read from the
 %%% rows when a step needs them. If anything in it fails, it starts again from
 %%% the rows, backing off.
+%%%
+%%% A slot is owed from the moment its `o' row is written; the `{ready, Slot}'
+%%% cast only wakes the deliverer early. A running deliverer reads its pending
+%%% rows again every `delivery-rescan-ms' (default 30 s) and loads any slot it
+%%% does not hold, and kills any post or lookup helper older than
+%%% `delivery-helper-timeout-ms' (default 5 min), which backs that entry off
+%%% and posts it again with the same bytes. So neither a cast that never
+%%% arrived nor a POST that never answered holds a slot back for longer than
+%%% one of those periods (2026-11-14: the L1 ledger's deliverer, up since a
+%%% restart, never delivered slot 16 until it was killed by hand).
 -module(lib_process_delivery).
 -export([notify/3, ensure/2, await_delivered/3, sweep/1]).
 -export([pending/1, pending/2, pending_keys/3]).
@@ -102,6 +112,9 @@
 
 -define(FIRST_BACKOFF_MS, 1000).
 -define(MAX_BACKOFF_MS, 600000).
+
+-define(DEFAULT_RESCAN_MS, 30000).
+-define(DEFAULT_HELPER_TIMEOUT_MS, 300000).
 
 %%% Public API.
 
@@ -158,7 +171,8 @@ is_scheduler(Process, Opts) ->
 %% @doc A slot of `ProcID' was stored with an outbox: hand it to the process's
 %% deliverer, starting one when there is none. Never blocks the caller.
 notify(ProcID, Slot, Opts) ->
-    case hb_name:lookup({delivery, ProcID}) of
+    case drop_ready(Opts) orelse hb_name:lookup({delivery, ProcID}) of
+        true -> ok;
         Pid when is_pid(Pid) -> Pid ! {ready, Slot}, ok;
         _ ->
             ServerID = get(server_id),
@@ -374,7 +388,7 @@ start_state(ProcID, Opts) ->
 %%             | missing, while it is owed anything
 %%   hints     Target => {Codec, Location} it last asked to be signed with,
 %%             kept while the deliverer runs
-%%   helpers   Pid => {Monitor, {post, Slot, Key} | {lookup, Target}}
+%%   helpers   Pid => {Monitor, {post, Slot, Key} | {lookup, Target}, StartedMs}
 %%   lookups   targets waiting for one of the `?LOOKUPS' lookup places
 %%   timers    gb_set of {DueMs, Slot, Key}: entries backing off
 %%   touched   targets to move in the next step
@@ -382,8 +396,13 @@ start_state(ProcID, Opts) ->
 %%   rows      {Kind, Slot} => row, read during one step only
 %%   done      slots finished since the last write
 %%   unpurged  slots whose `x' is written and `o'/`q' not yet deleted
-fresh(State) ->
+%%   rescan_at when the rows are read again (`rescan/1')
+%%   active_at when the last message arrived: the idle time runs from it
+fresh(State = #{ opts := Opts }) ->
+    Now = now_ms(),
     State#{
+        rescan_at => Now + rescan_ms(Opts),
+        active_at => Now,
         slots => gb_trees:empty(),
         entries => #{},
         queues => #{},
@@ -432,28 +451,72 @@ origin(ProcID, Process, Opts) ->
 loop(State) ->
     erase(delivery_restart_backoff),
     receive
-        Msg -> loop(step(drain(handle(Msg, State))))
+        Msg -> loop(step(rescan(drain(handle(Msg, State#{ active_at := now_ms() })))))
     after timeout(State) ->
-        case idle(State) of
-            true -> idle_exit(State);
-            false -> loop(step(State))
+        State2 = rescan(State),
+        case idle(State2) andalso idle_left(State2) == 0 of
+            true -> idle_exit(State2);
+            false -> loop(step(State2))
         end
     end.
 
 %% Now when a step left work behind, at the next backoff when entries wait on
-%% one, after the idle time when nothing is owed.
+%% one, after the idle time when nothing is owed -- and never later than the
+%% next rescan.
 timeout(#{ touched := Touched }) when map_size(Touched) > 0 -> 0;
-timeout(State = #{ timers := Timers, opts := Opts }) ->
-    case idle(State) of
-        true -> hb_util:int(hb_opts:get(process_worker_max_idle, 300_000, Opts));
-        false ->
-            case gb_sets:is_empty(Timers) of
-                true -> infinity;
-                false ->
-                    {Due, _, _} = gb_sets:smallest(Timers),
-                    max(0, Due - now_ms())
-            end
+timeout(State = #{ timers := Timers, rescan_at := RescanAt }) ->
+    Work =
+        case idle(State) of
+            true -> idle_left(State);
+            false ->
+                case gb_sets:is_empty(Timers) of
+                    true -> infinity;
+                    false ->
+                        {Due, _, _} = gb_sets:smallest(Timers),
+                        max(0, Due - now_ms())
+                end
+        end,
+    min(Work, max(0, RescanAt - now_ms())).
+
+idle_left(#{ active_at := ActiveAt, opts := Opts }) ->
+    MaxIdle = hb_util:int(hb_opts:get(process_worker_max_idle, 300_000, Opts)),
+    max(0, ActiveAt + MaxIdle - now_ms()).
+
+%% Read the pending rows again and load every slot not held yet, and kill
+%% every helper past its deadline: its `DOWN' backs its entry off (a post) or
+%% asks again later (a lookup), as for one that crashed. Posting again is
+%% safe: the same signed bytes, answered 409 with their slot if they landed.
+rescan(State = #{ rescan_at := RescanAt, opts := Opts, proc_id := ProcID }) ->
+    Now = now_ms(),
+    case Now >= RescanAt of
+        false -> State;
+        true ->
+            Timeout =
+                hb_util:int(hb_opts:get(<<"delivery-helper-timeout-ms">>,
+                    ?DEFAULT_HELPER_TIMEOUT_MS, Opts)),
+            maps:foreach(
+                fun(Pid, {_Mon, What, Started}) when Now - Started >= Timeout ->
+                        ?event(warning, {delivery_helper_expired, {process, ProcID},
+                            {helper, What}, {age_ms, Now - Started}}),
+                        record(delivery_helper_expired),
+                        exit(Pid, kill);
+                   (_, _) -> ok
+                end,
+                maps:get(helpers, State)),
+            Before = gb_trees:size(maps:get(slots, State)),
+            State2 = load_pending(State#{ rescan_at := Now + rescan_ms(Opts) }),
+            case gb_trees:size(maps:get(slots, State2)) - Before of
+                0 -> ok;
+                Found ->
+                    ?event(warning, {delivery_rescan_found, {process, ProcID},
+                        {slots, Found}}),
+                    record(delivery_rescan_found)
+            end,
+            State2
     end.
+
+rescan_ms(Opts) ->
+    max(1, hb_util:int(hb_opts:get(<<"delivery-rescan-ms">>, ?DEFAULT_RESCAN_MS, Opts))).
 
 %% Everything already queued is handled before the step, so one step -- one
 %% commit -- covers all of it.
@@ -465,28 +528,28 @@ drain(State) ->
 handle({ready, Slot}, State) -> load_slot(Slot, State);
 handle({posted, Pid, ID, Signing, Outcome}, State = #{ helpers := Helpers }) ->
     case maps:take(Pid, Helpers) of
-        {{Mon, {post, Slot, Key}}, Rest} ->
+        {{Mon, {post, Slot, Key}, _}, Rest} ->
             erlang:demonitor(Mon, [flush]),
             outcome(Slot, Key, ID, Signing, Outcome, landed(Slot, Key, State#{ helpers := Rest }));
         _ -> State
     end;
 handle({looked_up, Pid, Result}, State = #{ helpers := Helpers }) ->
     case maps:take(Pid, Helpers) of
-        {{Mon, {lookup, Target}}, Rest} ->
+        {{Mon, {lookup, Target}, _}, Rest} ->
             erlang:demonitor(Mon, [flush]),
             looked_up(Target, Result, State#{ helpers := Rest });
         _ -> State
     end;
 handle({'DOWN', _Mon, process, Pid, Reason}, State = #{ helpers := Helpers, proc_id := ProcID }) ->
     case maps:take(Pid, Helpers) of
-        {{_, {post, Slot, Key}}, Rest} ->
+        {{_, {post, Slot, Key}, _}, Rest} ->
             % A post that crashed -- a failed read of its target, a store it
             % could not reach -- backs off that entry alone.
             ?event(warning, {delivery_post_crashed, {process, ProcID}, {slot, Slot},
                 {key, Key}, {reason, Reason}}),
             record(delivery_post_crash),
             backoff(Slot, Key, landed(Slot, Key, State#{ helpers := Rest }));
-        {{_, {lookup, Target}}, Rest} ->
+        {{_, {lookup, Target}, _}, Rest} ->
             looked_up(Target, {error, {lookup_crashed, Reason}}, State#{ helpers := Rest });
         _ -> State
     end;
@@ -885,7 +948,7 @@ lookup(Target, Delay, State = #{ targets := Targets, free_lookups := Free, helpe
     State#{
         targets := Targets#{ Target => {looking, Delay} },
         free_lookups := Free - 1,
-        helpers := Helpers#{ Pid => {Mon, {lookup, Target}} }
+        helpers := Helpers#{ Pid => {Mon, {lookup, Target}, now_ms()} }
     }.
 
 %% A lookup answered: its place goes to the next target waiting for one.
@@ -1019,7 +1082,7 @@ spawn_post({Slot, Key}, State = #{ opts := Opts, targets := Targets, helpers := 
             Outcome = classify(Post(TargetProcess, Target, Location, Signed, Opts), Where, Opts),
             Self ! {posted, self(), hb_message:id(Signed, all, Opts), {Codec, Location}, Outcome}
         end),
-    State2#{ helpers := Helpers#{ Pid => {Mon, {post, Slot, Key}} } }.
+    State2#{ helpers := Helpers#{ Pid => {Mon, {post, Slot, Key}, now_ms()} } }.
 
 signed_message(Slot, Key, State = #{ signed := Signed, proc_id := ProcID, store := Store, opts := Opts }) ->
     case Signed of
@@ -1049,6 +1112,10 @@ post_fun(Opts) ->
         _ -> fun post_signed/5
     end.
 
+%% A test may lose a slot's `{ready, Slot}' cast, as a race would:
+%% `delivery-test-drop-ready' in the computing caller's options.
+drop_ready(Opts) -> hb_opts:get(<<"delivery-test-drop-ready">>, false, Opts) == true.
+
 %% A test may stop the deliverer dead at a point of its work, as a crash or a
 %% `kill -9' of the node would: `delivery-test-crash' names the point. With
 %% `{raise, Point, Counter}' the deliverer fails there once, as a bug would.
@@ -1064,6 +1131,7 @@ crash_point(Point, #{ opts := Opts }) ->
     end.
 -else.
 post_fun(_Opts) -> fun post_signed/5.
+drop_ready(_Opts) -> false.
 crash_point(_Point, _State) -> ok.
 -endif.
 

@@ -31,7 +31,7 @@
 %%% committed (older, still complete) schedule instead of waiting out a
 %%% catch-up.
 -module(dev_arweave_scheduler_sync).
--export([sync/1, process/2, from_height/1, confirmed_tip/1]).
+-export([sync/1, process/2, follow/1, from_height/1, confirmed_tip/1]).
 -export([fetch_block/2, fetch_header/2, spawn_ordinate/2]).
 -export([targets/1, ordinate/2, parse_ordinate/1]).
 -include("include/hb.hrl").
@@ -577,6 +577,111 @@ compute_on_schedule(ProcessID, _From, To, Opts) ->
                 end
             end),
             ok
+    end.
+
+%% @doc One pass of the node's background follow (`hb_http_server'): bring
+%% the global index to the confirmed tip, then materialize each process named
+%% in `arweave-scheduler-follow-processes' and have it computed to its head.
+%% A process scheduled by Arweave is pulled, not pushed: without this, its
+%% new slots are written only when somebody reads its schedule, and with
+%% `process-now-from-cache' its `/now' stays at the last slot anybody
+%% computed -- the PUSD root was kept current by a laptop calling
+%% `compute&slot=<slot/current>' on every node every 20 s (2026-11).
+%%
+%% Only the listed processes are followed. Following computes a process
+%% forever, on every new block, with this node's resources; a list the
+%% operator writes is bounded and cannot be grown by a stranger asking a
+%% public node for some process once. A process that is not Arweave-
+%% scheduled, or not spawned yet, fails its materialization and is retried
+%% the next pass; it holds back no other.
+follow(Opts) ->
+    case sync(Opts) of
+        {ok, _} = Synced ->
+            lists:foreach(
+                fun(ProcessID) -> follow_process(ProcessID, Opts) end,
+                followed(Opts)
+            ),
+            Synced;
+        Error -> Error
+    end.
+
+followed(Opts) ->
+    case hb_opts:get(<<"arweave-scheduler-follow-processes">>, [], Opts) of
+        IDs when is_list(IDs) -> lists:usort([ hb_util:bin(ID) || ID <- IDs ]);
+        ID when is_binary(ID) ->
+            lists:usort(binary:split(ID, <<",">>, [global, trim_all]));
+        _ -> []
+    end.
+
+%% Materializing the new slots computes them (`compute_on_schedule/4'). The
+%% head goes to the process's follower as well, which computes it when it is
+%% past the last head it computed: so a compute that failed, or a node that
+%% restarted between materializing and computing, is caught up by the next
+%% pass instead of waiting for the next slot.
+follow_process(ProcessID, Opts) ->
+    try process(ProcessID, Opts) of
+        {ok, #{ <<"next-slot">> := NextSlot }} when NextSlot > 0 ->
+            follower(ProcessID, Opts) ! {head, NextSlot - 1};
+        {ok, _} -> ok;
+        Error ->
+            ?event(warning, {arweave_follow_failed, {process, ProcessID},
+                {error, Error}})
+    catch Class:Reason ->
+        ?event(warning, {arweave_follow_failed, {process, ProcessID},
+            {class, Class}, {reason, Reason}})
+    end.
+
+%% One follower per followed process, for the life of the node: at most one
+%% compute of the process in flight from following, however slow it is.
+%% Heads that arrive meanwhile collapse into the newest.
+follower(ProcessID, Opts) ->
+    hb_name:singleton(
+        {?MODULE, follower, ProcessID},
+        fun() -> follower_loop(ProcessID, -1, Opts) end
+    ).
+
+follower_loop(ProcessID, Computed, Opts) ->
+    receive
+        {head, Head0} ->
+            Head = newest_head(Head0),
+            case Head > Computed of
+                false -> follower_loop(ProcessID, Computed, Opts);
+                true ->
+                    follower_loop(ProcessID,
+                        follow_compute(ProcessID, Head, Computed, Opts), Opts)
+            end
+    end.
+
+newest_head(Head) ->
+    receive {head, Next} -> newest_head(max(Head, Next))
+    after 0 -> Head
+    end.
+
+%% The compute goes through the process's worker, as every other compute
+%% does. Returns the head now computed: `Head', or the previous one when the
+%% compute failed (it is asked again next pass).
+follow_compute(ProcessID, Head, Computed, Opts) ->
+    try
+        {ok, Process} = hb_cache:read(ProcessID, Opts),
+        hb_ao:resolve(
+            Process,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => Head },
+            Opts#{
+                <<"spawn-worker">> => true,
+                <<"hashpath">> => ignore,
+                <<"cache-control">> => [<<"no-store">>]
+            }
+        )
+    of
+        {ok, _} -> Head;
+        Other ->
+            ?event(warning, {arweave_follow_compute_failed,
+                {process, ProcessID}, {slot, Head}, {result, Other}}),
+            Computed
+    catch Class:Reason ->
+        ?event(warning, {arweave_follow_compute_failed, {process, ProcessID},
+            {slot, Head}, {class, Class}, {reason, Reason}}),
+        Computed
     end.
 
 write_process_assignments(_ProcessID, [], Slot, _Opts) -> {ok, Slot};

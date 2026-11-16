@@ -1731,6 +1731,64 @@ single_deliverer_test_() ->
         ?assertEqual(Before + 1, receiver_slot(A, Opts))
     end}.
 
+%% @doc A slot whose `{ready, Slot}' never reaches the running deliverer is
+%% still delivered, by that deliverer, at its next rescan: the slot is owed
+%% from its `o' row, the cast only wakes it early. Before, a deliverer that
+%% kept running never looked at the rows again (2026-11-14: the L1 ledger's
+%% slot 16, delivered only once its deliverer was killed by hand).
+lost_ready_is_rescanned_test_() ->
+    {timeout, 60, fun() ->
+        {Sender, SID, {A, AID}, _, Opts} =
+            delivery_setup(#{ <<"delivery-rescan-ms">> => 200 }),
+        send(Sender, 1, #{ <<"sendto">> => AID }, Opts),
+        send(Sender, 2, #{ <<"sendto">> => AID }, Opts),
+        Before = receiver_slot(A, Opts),
+        {ok, _} = compute(Sender, 0, Opts),
+        ?assert(wait_until(fun() -> delivered(SID, [0], Opts) end, 15000)),
+        Deliverer = deliverer(SID),
+        ?assert(is_pid(Deliverer)),
+        Found = counter(delivery_rescan_found),
+        {ok, _} = compute(Sender, 1, Opts#{ <<"delivery-test-drop-ready">> => true }),
+        ?assert(lists:member(1, rows(SID, <<"o">>, Opts))),
+        ?assert(wait_until(fun() -> delivered(SID, [0, 1], Opts) end, 5000)),
+        ?assertEqual(Deliverer, deliverer(SID)),
+        ?assertEqual(Found + 1, counter(delivery_rescan_found)),
+        ?assertEqual(Before + 2, receiver_slot(A, Opts))
+    end}.
+
+%% @doc A POST that never answers holds its entry for at most
+%% `delivery-helper-timeout-ms': the helper is killed and the entry posted
+%% again, with the same signed bytes. Before, the entry waited forever.
+hung_post_is_retried_test_() ->
+    {timeout, 60, fun() ->
+        Calls = counters:new(1, []),
+        Self = self(),
+        Post =
+            recording_post(Self, fun(TP, T, L, S, O, Real) ->
+                counters:add(Calls, 1, 1),
+                case counters:get(Calls, 1) of
+                    1 -> receive after infinity -> ok end;
+                    _ -> Real(TP, T, L, S, O)
+                end
+            end),
+        {Sender, SID, {A, AID}, _, Opts} =
+            delivery_setup(#{
+                <<"delivery-test-post">> => Post,
+                <<"delivery-rescan-ms">> => 200,
+                <<"delivery-helper-timeout-ms">> => 500
+            }),
+        send(Sender, 1, #{ <<"sendto">> => AID }, Opts),
+        Before = receiver_slot(A, Opts),
+        Expired = counter(delivery_helper_expired),
+        {ok, _} = compute(Sender, 0, Opts),
+        ?assert(wait_until(fun() -> delivered(SID, [0], Opts) end, 15000)),
+        ?assertEqual(Expired + 1, counter(delivery_helper_expired)),
+        ?assertEqual(Before + 1, receiver_slot(A, Opts)),
+        IDs = posted_ids(),
+        ?assertEqual(2, length(IDs)),
+        ?assertEqual(1, length(lists:usort(IDs)))
+    end}.
+
 %% @doc A chain with no client at all: the sender's message reaches the
 %% replier, whose reply comes back and is computed -- every hop delivered by
 %% the node, every slot computed by the scheduler's follower.

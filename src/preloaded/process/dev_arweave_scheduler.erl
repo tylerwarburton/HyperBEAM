@@ -7,7 +7,8 @@
 -implements(<<"arweave-scheduler@1.0">>).
 -device_libraries([lib_process, lib_arweave_scheduler_blocks]).
 -export([device_info/0, router/4]).
--export([schedule/3, next/3, slot/3, status/3, sync/3, diagnose/3, checkpoint/1]).
+-export([schedule/3, next/3, slot/3, status/3, sync/3, follow/3, diagnose/3]).
+-export([checkpoint/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -20,6 +21,7 @@ device_info() ->
                 <<"status">>,
                 <<"diagnose">>,
                 <<"sync">>,
+                <<"follow">>,
                 <<"next">>,
                 <<"schedule">>,
                 <<"slot">>,
@@ -159,6 +161,12 @@ slot(Base, Req, Opts) ->
 %% particular process schedule.
 sync(_Base, _Req, Opts) ->
     dev_arweave_scheduler_sync:sync(Opts).
+
+%% @doc Advance the global index, then bring every process the node follows
+%% (`arweave-scheduler-follow-processes') to its head, computed. The node's
+%% background loop calls it (`hb_http_server').
+follow(_Base, _Req, Opts) ->
+    dev_arweave_scheduler_sync:follow(Opts).
 
 %% @doc Report the global covered interval without scanning every process.
 status(_Base, _Req, Opts) ->
@@ -318,3 +326,112 @@ slot_range_test() ->
         {0, 42},
         slot_range(#{ <<"from">> => -5, <<"to">> => 42 }, #{})
     ).
+
+%% @doc A followed process's `/now' advances when the index learns a new slot
+%% for it, with nobody computing it: the node's own background loop
+%% (`hb_http_server', every `arweave_scheduler_follow_ms') materializes the
+%% slot and computes it. The test only writes the index rows a sync would
+%% have written and reads `/now' from the cache, never computing.
+followed_process_now_advances_test_() ->
+    {timeout, 60, fun followed_process_now_advances/0}.
+
+followed_process_now_advances() ->
+    hb:init(),
+    Store = hb_test_utils:test_store(),
+    Tip = atomics:new(1, []),
+    atomics:put(Tip, 1, 20),
+    Hook = fun(_, Request, _) ->
+        Height = integer_to_binary(atomics:get(Tip, 1)),
+        {ok, Request#{<<"body">> => #{<<"status">> => 200,
+            <<"content-type">> => <<"application/json">>,
+            <<"body">> => <<"{\"height\":", Height/binary, "}">>}}}
+    end,
+    Wallet = ar_wallet:new(),
+    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Script = <<"function compute(req)\n"
+        " return {patches={{path='/n', value=req.body.n or 'spawn'}}, results={}} end">>,
+    Base = #{
+        <<"store">> => [Store],
+        <<"scheduler-store">> => [Store],
+        <<"arweave-scheduler-store">> => [Store],
+        <<"priv-wallet">> => Wallet,
+        <<"hashpath">> => ignore,
+        <<"arweave-scheduler-from">> => 10,
+        <<"arweave-scheduler-from-hash">> => <<"anchor">>,
+        <<"process-delta-cache">> => false,
+        <<"scheduler-lookahead">> => false,
+        <<"await-inprogress">> => false
+    },
+    Process = hb_message:commit(#{
+        <<"device">> => <<"process@1.0">>,
+        <<"type">> => <<"Process">>,
+        <<"scheduler-device">> => <<"arweave-scheduler@1.0">>,
+        <<"execution-device">> => <<"lua-patch@1.0">>,
+        <<"module">> => #{<<"content-type">> => <<"application/lua">>, <<"body">> => Script},
+        <<"authority">> => [Address],
+        <<"scheduler-location">> => Address,
+        <<"test-random-seed">> => rand:uniform(1000000)
+    }, Base),
+    {ok, _} = hb_cache:write(Process, Base),
+    ProcID = hb_util:human_id(hb_message:id(Process, all, Base)),
+    Put = fun(Path, Value) ->
+        {ok, ID} = hb_cache:write(Value, Base),
+        ok = hb_cache:link(ID, Path, Base)
+    end,
+    % The index as a sync leaves it: blocks to 18, the process spawned at
+    % 10-0 and materialized to 18 (slot 0 only).
+    Put(<<"~arweave-scheduler@1.0/sync/global">>,
+        #{<<"from">> => 10, <<"to">> => 18, <<"from-hash">> => <<"anchor">>}),
+    Put(<<"~arweave-scheduler@1.0/sync/process/", ProcID/binary>>,
+        #{<<"process">> => ProcID, <<"spawn-ordinate">> => <<"10-0">>,
+            <<"synced-to">> => 18, <<"next-slot">> => 1}),
+    Put(<<"~arweave-scheduler@1.0/assignments/", ProcID/binary, "/0">>,
+        #{<<"path">> => <<"compute">>, <<"data-protocol">> => <<"ao">>,
+            <<"variant">> => <<"ao.N.1">>, <<"process">> => ProcID,
+            <<"epoch">> => <<"0">>, <<"slot">> => 0,
+            <<"block-height">> => 10, <<"block-index">> => 0,
+            <<"block-hash">> => hb_util:encode(crypto:strong_rand_bytes(48)),
+            <<"timestamp">> => 1700000000, <<"body">> => Process,
+            <<"type">> => <<"Assignment">>}),
+    % The gateway: a node that answers every request with the tip height.
+    Gateway = hb_http_server:start_node(#{<<"port">> => 0,
+        <<"on">> => #{<<"response">> => #{<<"device">> => #{<<"response">> => Hook}}}}),
+    Opts = Base#{ <<"gateway">> => hb_util:bin(Gateway) },
+    _Node = hb_http_server:start_node(Opts#{
+        <<"port">> => 0,
+        <<"arweave-scheduler-follow-ms">> => 200,
+        <<"arweave-scheduler-follow-processes">> => [ProcID]
+    }),
+    Now = fun() ->
+        case hb_ao:resolve(Process, #{ <<"path">> => <<"now">> },
+                Opts#{ <<"process-now-from-cache">> => <<"always">> }) of
+            {ok, State} ->
+                {hb_util:int(hb_ao:get(<<"at-slot">>, State, Opts)),
+                    hb_ao:get(<<"n">>, State, Opts)};
+            _ -> none
+        end
+    end,
+    WaitFor = fun Wait(Want, 0) -> Now() == Want;
+                  Wait(Want, N) ->
+                      Now() == Want orelse (ok == timer:sleep(200) andalso Wait(Want, N - 1))
+              end,
+    % Following computes the head it finds, so the spawn alone is computed.
+    ?assert(WaitFor({0, <<"spawn">>}, 100)),
+    % Block 19 carries a data-free transaction to the process: the index
+    % learns it, and the tip moves past it.
+    TX = ar_tx:sign(#tx{format = 2, target = hb_util:native_id(ProcID),
+        tags = [{<<"N">>, <<"1">>}]}, Wallet),
+    Header = hb_message:convert(
+        ar_tx:json_struct_to_tx(hb_json:decode(hb_json:encode(ar_tx:tx_to_json_struct(TX)))),
+        <<"structured@1.0">>, <<"tx@1.0">>, Opts),
+    {ok, _} = dev_arweave_scheduler_cache:write_header(Header, Opts),
+    {ok, _} = hb_cache:write(Header, Opts),
+    {ok, _} = dev_arweave_scheduler_cache:write_block(19,
+        #{ <<"height">> => 19, <<"indep-hash">> => crypto:strong_rand_bytes(48),
+            <<"timestamp">> => 1700000120 }, Opts),
+    ok = dev_arweave_scheduler_cache:write_target(ProcID, <<"19-0">>,
+        hb_util:human_id(TX#tx.id), Opts),
+    atomics:put(Tip, 1, 21),
+    Put(<<"~arweave-scheduler@1.0/sync/global">>,
+        #{<<"from">> => 10, <<"to">> => 19, <<"from-hash">> => <<"anchor">>}),
+    ?assert(WaitFor({1, <<"1">>}, 100)).

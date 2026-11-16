@@ -384,7 +384,9 @@ start_delivery_sweep(NodeMsg) ->
         end
     end).
 
-%% @doc Keep the node's Arweave index at the confirmed tip in the background.
+%% @doc Keep the node's Arweave index at the confirmed tip in the background,
+%% and every process in `arweave-scheduler-follow-processes' computed to its
+%% head (`arweave-scheduler@1.0/follow').
 %% Without it the index advances only when something reads a schedule, one sync
 %% budget per read, so a node nobody happens to query falls hours behind and its
 %% `/now' serves an old state. Runs only when an anchor is pinned. It goes
@@ -405,7 +407,7 @@ arweave_follow(Interval, NodeMsg) ->
         hb_ao:raw(
             <<"arweave-scheduler@1.0">>,
             #{},
-            #{ <<"path">> => <<"sync">> },
+            #{ <<"path">> => <<"follow">> },
             NodeMsg
         )
     catch Class:Reason ->
