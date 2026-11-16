@@ -72,6 +72,26 @@
 %%% arrived nor a POST that never answered holds a slot back for longer than
 %%% one of those periods (2026-11-14: the L1 ledger's deliverer, up since a
 %%% restart, never delivered slot 16 until it was killed by hand).
+%%%
+%%% That rescan lives in the deliverer's own loop, so it cannot rescue a
+%%% deliverer that never gets back to it: one stopped in a call that never
+%%% answers -- in its start, or inside a step -- still holds the name, and
+%%% every later cast and push queues at it. So each delivery store has a
+%%% watchdog, independent of every deliverer, and one invariant:
+%%%
+%%%   Every `delivery-rescan-ms' the watchdog reads the owed rows. A process
+%%%   owed a slot has a registered deliverer that has beaten within
+%%%   `delivery-stall-ms' (default twice the rescan), or the watchdog kills
+%%%   the one it has and starts another.
+%%%
+%%% A deliverer beats when it registers and at the end of every step, and a
+%%% healthy one steps at least once per rescan. Killing one anywhere is safe:
+%%% it is what a crash does, and the next one starts from the rows. A
+%%% deliverer that fails in its loop waits at most one rescan before starting
+%%% again, beating first, so a crash loop is retried, never parked for ten
+%%% minutes (2026-11-16: the fast ledger's slots 4522-4544 owed for 15
+%%% minutes, `pending_entries' 0 throughout, all delivered within a second of
+%%% a restart).
 -module(lib_process_delivery).
 -export([notify/3, ensure/2, await_delivered/3, sweep/1]).
 -export([pending/1, pending/2, pending_keys/3]).
@@ -100,8 +120,12 @@
 -define(WAITERS, lib_process_delivery_waiters).
 %% Whether this node schedules a process: `{{ProcID, Address}, boolean()}'.
 -define(SCHEDULES, lib_process_delivery_schedules).
-%% Each deliverer's backlog: `{ProcID, Pid, Entries, OldestSince}'.
+%% Each deliverer's backlog and last beat:
+%% `{ProcID, Pid, Entries, OldestSince, BeatMs}'.
 -define(BACKLOG, lib_process_delivery_backlog).
+%% Each watchdog's last reading of the rows:
+%% `{Name, OverdueProcesses, OldestOwedSeconds}'.
+-define(WATCH, lib_process_delivery_watch).
 
 %% Posts in flight to one target, at most.
 -define(TARGET_INFLIGHT, 8).
@@ -186,6 +210,7 @@ notify(ProcID, Slot, Opts) ->
 %% @doc The deliverer of `ProcID', started if there is none. `{error, Reason}'
 %% when this node does not deliver the process or cannot read it.
 ensure(ProcID, Opts) ->
+    watch(Opts),
     case hb_name:lookup({delivery, ProcID}) of
         Pid when is_pid(Pid) -> {ok, Pid};
         _ ->
@@ -199,7 +224,12 @@ ensure(ProcID, Opts) ->
                 end),
             receive
                 {Ref, started} -> erlang:demonitor(Mon, [flush]), {ok, Pid};
-                {Ref, {exists, Other}} -> erlang:demonitor(Mon, [flush]), {ok, Other};
+                {Ref, {exists, Other}} when is_pid(Other) ->
+                    erlang:demonitor(Mon, [flush]), {ok, Other};
+                {Ref, {exists, _Gone}} ->
+                    % The name was held by a deliverer that died before the
+                    % lookup: it is free now.
+                    erlang:demonitor(Mon, [flush]), ensure(ProcID, Opts);
                 {Ref, {error, Reason}} -> erlang:demonitor(Mon, [flush]), {error, Reason};
                 {'DOWN', Mon, process, Pid, Reason} -> {error, {deliverer_failed, Reason}}
             end
@@ -247,6 +277,11 @@ await_delivered(ProcID, Slot, Ref, Store, Opts) ->
                                 {'DOWN', Mon, process, Pid, _} ->
                                     await_delivered(ProcID, Slot, Ref, Store, Opts)
                             end;
+                        {error, {deliverer_failed, _}} ->
+                            % A start that died (or was replaced): the slot
+                            % is still owed, so wait for the next one.
+                            receive after min(?FIRST_BACKOFF_MS, rescan_ms(Opts)) -> ok end,
+                            await_delivered(ProcID, Slot, Ref, Store, Opts);
                         {error, Reason} -> {error, Reason}
                     end
             end
@@ -255,6 +290,7 @@ await_delivered(ProcID, Slot, Ref, Store, Opts) ->
 %% @doc Start a deliverer for every process with an outbox this node has not
 %% delivered. Run once at boot: a slot stored before a restart is still owed.
 sweep(Opts) ->
+    watch(Opts),
     length([ ok || {P, _} <- pending(Opts), element(1, ensure(P, Opts)) == ok ]).
 
 %% @doc Every process with an outbox this node has not delivered, with those
@@ -300,12 +336,16 @@ pending_keys(ProcID, Slot, Opts) ->
 
 %% @doc The node's delivery backlog, for the metrics endpoint: every
 %% deliverer's pending entries and oldest pending slot, every process
-%% worker's mailbox, and the waiter rows of both. Node-wide sums and maxima,
-%% read when asked; nothing per process.
+%% worker's mailbox, and the waiter rows of both; and, from the watchdogs'
+%% reading of the rows themselves -- whatever any deliverer holds -- the
+%% processes owed a slot for longer than `delivery-stall-ms' and the age of
+%% the oldest owed slot. Node-wide sums and maxima, read when asked; nothing
+%% per process.
 metrics() ->
     Now = erlang:monotonic_time(second),
     Backlog =
-        [ Row || Row = {_, Pid, _, _} <- table_rows(?BACKLOG), is_process_alive(Pid) ],
+        [ Row || Row = {_, Pid, _, _, _} <- table_rows(?BACKLOG), is_process_alive(Pid) ],
+    Watch = table_rows(?WATCH),
     Mailbox =
         lists:sum(
             [ case erlang:process_info(Pid, message_queue_len) of
@@ -315,9 +355,15 @@ metrics() ->
             || {{process_worker, _}, Pid} <- hb_name:all(), is_pid(Pid) ]),
     [
         {hb_delivery_pending_entries, "Outbox entries not delivered yet.",
-            lists:sum([ N || {_, _, N, _} <- Backlog ])},
+            lists:sum([ N || {_, _, N, _, _} <- Backlog ])},
         {hb_delivery_oldest_pending_seconds, "Age of the oldest undelivered slot.",
-            lists:max([0 | [ Now - S || {_, _, _, S} <- Backlog, is_integer(S) ]])},
+            lists:max([0 | [ Now - S || {_, _, _, S, _} <- Backlog, is_integer(S) ]])},
+        {hb_delivery_overdue_processes,
+            "Processes owed a slot for longer than delivery-stall-ms.",
+            lists:sum([ N || {_, N, _} <- Watch ])},
+        {hb_delivery_oldest_owed_seconds,
+            "Age of the oldest owed slot, read from the rows.",
+            lists:max([0 | [ S || {_, _, S} <- Watch ]])},
         {hb_worker_mailbox_len, "Messages queued at process workers.", Mailbox},
         {hb_worker_waiter_rows, "Requests waiting on a slot or a delivery.",
             table_size(dev_process_worker_waiters) + table_size(?WAITERS)}
@@ -346,6 +392,8 @@ init(ProcID, Opts, {Caller, Ref}) ->
         error ->
             Caller ! {Ref, {exists, hb_name:lookup({delivery, ProcID})}};
         ok ->
+            beat(ProcID),
+            crash_point(start, #{ opts => Opts }),
             case start_state(ProcID, Opts) of
                 {ok, State} ->
                     Caller ! {Ref, started},
@@ -422,13 +470,15 @@ fresh(State = #{ opts := Opts }) ->
     }.
 
 %% The deliverer, supervised by itself: whatever fails in its loop, it starts
-%% again from the rows, after a backoff. Helpers still running from before
-%% answer with pids it no longer knows, and are ignored; an entry one of them
-%% was posting is posted again, with the same bytes.
-run(State) ->
+%% again from the rows, after a backoff of at most one rescan, beating before
+%% it waits. Helpers still running from before answer with pids it no longer
+%% knows, and are ignored; an entry one of them was posting is posted again,
+%% with the same bytes.
+run(State = #{ proc_id := ProcID, opts := Opts }) ->
     try loop(step(load_pending(fresh(State))))
     catch Class:Reason:Stack ->
-        Delay = next_backoff(get(delivery_restart_backoff)),
+        Delay = min(rescan_ms(Opts), next_backoff(get(delivery_restart_backoff))),
+        beat(ProcID),
         put(delivery_restart_backoff, Delay),
         ?event(warning, {deliverer_failed, {process, maps:get(proc_id, State)},
             {class, Class}, {reason, Reason}, {stack, {trace, Stack}}, {retry_ms, Delay}}),
@@ -577,7 +627,7 @@ idle_exit(State = #{ proc_id := ProcID, store := Store, opts := Opts, unpurged :
         [] -> ok;
         _ ->
             case hb_name:register({delivery, ProcID}) of
-                ok -> run(State);
+                ok -> beat(ProcID), run(State);
                 error -> ok
             end
     end.
@@ -1118,13 +1168,20 @@ drop_ready(Opts) -> hb_opts:get(<<"delivery-test-drop-ready">>, false, Opts) == 
 
 %% A test may stop the deliverer dead at a point of its work, as a crash or a
 %% `kill -9' of the node would: `delivery-test-crash' names the point. With
-%% `{raise, Point, Counter}' the deliverer fails there once, as a bug would.
+%% `{raise, Point, Counter}' the deliverer fails there once, as a bug would;
+%% with `{hang, Point, Counter}' it stops there once and never comes back, as
+%% a call that never answers would.
 crash_point(Point, #{ opts := Opts }) ->
     case hb_opts:get(<<"delivery-test-crash">>, undefined, Opts) of
         Point -> exit(self(), kill);
         {raise, Point, Counter} ->
             case counters:get(Counter, 1) of
                 0 -> counters:add(Counter, 1, 1), erlang:error(test_crash);
+                _ -> ok
+            end;
+        {hang, Point, Counter} ->
+            case counters:get(Counter, 1) of
+                0 -> counters:add(Counter, 1, 1), receive after infinity -> ok end;
                 _ -> ok
             end;
         _ -> ok
@@ -1258,7 +1315,8 @@ wake(ProcID, Slot, Receipts, Key = {ProcID, Slot, Ref}) ->
 wake(_ProcID, _Slot, _Receipts, _) ->
     ok.
 
-%% This deliverer's row of the node's backlog (`metrics/0').
+%% This deliverer's row of the node's backlog (`metrics/0'), and its beat: it
+%% finished a step just now (`watch/1').
 backlog(#{ proc_id := ProcID, slots := Slots, entries := Entries }) ->
     ensure_table(?BACKLOG, set),
     Oldest =
@@ -1266,7 +1324,113 @@ backlog(#{ proc_id := ProcID, slots := Slots, entries := Entries }) ->
             true -> none;
             false -> maps:get(since, element(2, gb_trees:smallest(Slots)))
         end,
-    ets:insert(?BACKLOG, {ProcID, self(), map_size(Entries), Oldest}).
+    ets:insert(?BACKLOG, {ProcID, self(), map_size(Entries), Oldest, now_ms()}).
+
+%% A beat outside a step: on registering, and before waiting to start again.
+%% The backlog it last reported, if it is this deliverer's, is kept.
+beat(ProcID) ->
+    ensure_table(?BACKLOG, set),
+    Self = self(),
+    case ets:lookup(?BACKLOG, ProcID) of
+        [{_, Self, N, Oldest, _}] -> ets:insert(?BACKLOG, {ProcID, Self, N, Oldest, now_ms()});
+        _ -> ets:insert(?BACKLOG, {ProcID, Self, 0, none, now_ms()})
+    end.
+
+%%% The watchdog.
+
+%% @doc Make sure the delivery store of `Opts' has its watchdog: one process
+%% per store, outside every deliverer, that keeps the invariant in the module
+%% header. Started by the boot sweep and by every `ensure/2', so the node
+%% always has one once anything has been owed.
+watch(Opts) ->
+    case store(Opts) of
+        none -> ok;
+        Store ->
+            Name = {delivery_watchdog, maps:get(<<"name">>, Store, Store)},
+            case hb_name:lookup(Name) of
+                Pid when is_pid(Pid) -> ok;
+                _ ->
+                    ServerID = get(server_id),
+                    WOpts = deliverer_opts(Opts),
+                    _ = hb_name:singleton(Name, fun() ->
+                        put(server_id, ServerID),
+                        watchdog(Name, WOpts, #{})
+                    end),
+                    ok
+            end
+    end.
+
+%% `Seen' is `{ProcID, Slot} => FirstSeenMs' for every slot owed at the last
+%% reading: how long a slot has been owed, whoever holds it.
+watchdog(Name, Opts, Seen) ->
+    receive after rescan_ms(Opts) -> ok end,
+    Seen2 =
+        try watch_once(Name, Opts, Seen)
+        catch Class:Reason:Stack ->
+            ?event(warning, {delivery_watchdog_failed, {class, Class},
+                {reason, Reason}, {stack, {trace, Stack}}}),
+            Seen
+        end,
+    watchdog(Name, Opts, Seen2).
+
+watch_once(Name, Opts, Seen) ->
+    ensure_table(?BACKLOG, set),
+    Now = now_ms(),
+    StallMs = stall_ms(Opts),
+    Owed = pending(Opts),
+    lists:foreach(fun({ProcID, _}) -> keep_alive(ProcID, Now, StallMs, Opts) end, Owed),
+    Seen2 =
+        maps:from_list(
+            [ {{P, S}, maps:get({P, S}, Seen, Now)} || {P, Slots} <- Owed, S <- Slots ]),
+    Overdue = lists:usort([ P || {{P, _}, T} <- maps:to_list(Seen2), Now - T >= StallMs ]),
+    ensure_table(?WATCH, set),
+    ets:insert(?WATCH,
+        {Name, length(Overdue), lists:max([0 | [ Now - T || T <- maps:values(Seen2) ]]) div 1000}),
+    Seen2.
+
+%% A process owed a slot has a deliverer that beat within `StallMs', or gets
+%% a new one. One that is stopped is killed first, and waited for, so two
+%% never run at once; one that will not die by the next reading is tried
+%% again then.
+keep_alive(ProcID, Now, StallMs, Opts) ->
+    case hb_name:lookup({delivery, ProcID}) of
+        Pid when is_pid(Pid) ->
+            case ets:lookup(?BACKLOG, ProcID) of
+                [{_, Pid, _, _, Beat}] when Now - Beat < StallMs -> ok;
+                [{_, Pid, _, _, Beat}] ->
+                    ?event(warning, {deliverer_stalled, {process, ProcID},
+                        {since_beat_ms, Now - Beat},
+                        {at, erlang:process_info(Pid, current_stacktrace)}}),
+                    record(delivery_stalled),
+                    Mon = erlang:monitor(process, Pid),
+                    exit(Pid, kill),
+                    receive {'DOWN', Mon, process, Pid, _} -> start(ProcID, Opts)
+                    after 5000 -> erlang:demonitor(Mon, [flush])
+                    end;
+                _ ->
+                    % No beat of its own on record: it is judged from now.
+                    ets:insert(?BACKLOG, {ProcID, Pid, 0, none, Now})
+            end;
+        _ -> start(ProcID, Opts)
+    end.
+
+%% Start a deliverer without waiting for its start: the watchdog never waits
+%% on one, and a start that stops is the next reading's to replace.
+start(ProcID, Opts) ->
+    ServerID = get(server_id),
+    spawn(fun() ->
+        put(server_id, ServerID),
+        case ensure(ProcID, Opts) of
+            {ok, _} -> ok;
+            {error, Reason} ->
+                record(delivery_refused),
+                ?event(delivery, {deliverer_refused, {process, ProcID}, {reason, Reason}})
+        end
+    end),
+    ok.
+
+stall_ms(Opts) ->
+    max(1, hb_util:int(hb_opts:get(<<"delivery-stall-ms">>, 2 * rescan_ms(Opts), Opts))).
 
 %%% Rows.
 

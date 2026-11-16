@@ -404,7 +404,8 @@ delivery_backlog_is_reported_test() ->
             _ -> none
         end,
     Proc = <<"delivery-backlog-test-proc">>,
-    ets:insert(Table, {Proc, self(), 17, erlang:monotonic_time(second) - 5}),
+    ets:insert(Table, {Proc, self(), 17, erlang:monotonic_time(second) - 5,
+        erlang:monotonic_time(millisecond)}),
     try
         #{ <<"pending_entries">> := Pending, <<"oldest_pending_s">> := Oldest } = delivery(),
         ?assert(Pending >= 17),

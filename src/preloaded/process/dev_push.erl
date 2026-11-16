@@ -1756,6 +1756,47 @@ lost_ready_is_rescanned_test_() ->
         ?assertEqual(Before + 2, receiver_slot(A, Opts))
     end}.
 
+%% @doc A deliverer that stops dead -- a call in its start or in one of its
+%% steps that never answers -- is replaced within `delivery-stall-ms', and the
+%% next one delivers its slots from the rows. A push waiting on the stopped
+%% one gets its receipt. Before, the stopped deliverer kept its name: every
+%% later cast and push queued at it, its rescan lived in the loop it never
+%% reached again, and nothing was delivered until the node restarted
+%% (2026-11-16: the fast ledger's slots 4522-4544, held 15 minutes and
+%% delivered in a second by the boot sweep, `pending_entries' 0 throughout).
+stalled_deliverer_is_replaced_test_() ->
+    [ {timeout, 60, fun() -> stalled_deliverer_is_replaced(Point) end}
+    || Point <- [start, sign] ].
+
+stalled_deliverer_is_replaced(Point) ->
+    {Sender, SID, {A, AID}, _, Opts} =
+        delivery_setup(#{
+            <<"delivery-rescan-ms">> => 200,
+            <<"delivery-test-crash">> => {hang, Point, counters:new(1, [])}
+        }),
+    send(Sender, 1, #{ <<"sendto">> => AID }, Opts),
+    Before = receiver_slot(A, Opts),
+    Stalled = counter(delivery_stalled),
+    {ok, _} = compute(Sender, 0, Opts),
+    ?assert(wait_until(fun() -> is_pid(deliverer(SID)) end, 5000)),
+    Hung = deliverer(SID),
+    Self = self(),
+    spawn(fun() ->
+        Self ! {pushed, hb_ao:resolve(Sender, #{ <<"path">> => <<"push">>, <<"slot">> => 0 }, Opts)}
+    end),
+    ?assert(wait_until(fun() -> delivered(SID, [0], Opts) end, 10000)),
+    ?assertNot(is_process_alive(Hung)),
+    ?assertEqual(Stalled + 1, counter(delivery_stalled)),
+    ?assertEqual(Before + 1, receiver_slot(A, Opts)),
+    Gauges = maps:from_list([ {G, V} || {G, _, V} <- lib_process_delivery:metrics() ]),
+    ?assert(is_integer(maps:get(hb_delivery_overdue_processes, Gauges))),
+    ?assert(is_integer(maps:get(hb_delivery_oldest_owed_seconds, Gauges))),
+    receive
+        {pushed, {ok, Pushed}} ->
+            ?assertEqual(Before + 1, hb_util:int(hb_util:deep_get(<<"1/slot">>, Pushed, Opts)))
+    after 10000 -> erlang:error(push_never_returned)
+    end.
+
 %% @doc A POST that never answers holds its entry for at most
 %% `delivery-helper-timeout-ms': the helper is killed and the entry posted
 %% again, with the same signed bytes. Before, the entry waited forever.
