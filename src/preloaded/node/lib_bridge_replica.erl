@@ -205,6 +205,50 @@ body(Msg, Opts) when is_map(Msg) ->
     end;
 body(_, _) -> false.
 
+%% A served body as `body/2' vouches for it, or, when a signed ANS-104 item
+%% does not verify as served, the same item fetched again from the scheduler
+%% as its raw bytes. A HyperBEAM scheduler serves a stored ANS-104 item's
+%% `original-tags' (and a nested item's) as `ao:' links inside its
+%% commitment, where the codec decodes no link, so the served form of a
+%% signed spawn can never verify (2026-11-16: every lane replica stopped at
+%% slot 0 after a rebuild, and no lane move reached the root). The raw item
+%% is the bytes its signer signed; it is believed only if its own signature
+%% verifies and its signed ID is the one the scheduler served, which the
+%% scheduler's signature on the assignment already covers.
+served_body(RawBody, canonical_arweave, _R, Opts) -> body(RawBody, Opts);
+served_body(RawBody, signed_scheduler, #{ url := Url }, Opts) ->
+    case body(RawBody, Opts) of
+        false -> raw_item(RawBody, Url, Opts);
+        Body -> Body
+    end.
+
+raw_item(RawBody, Url, Opts) when is_map(RawBody) ->
+    Comms = case hb_maps:get(<<"commitments">>, RawBody, #{}, Opts) of
+        M when is_map(M) -> M;
+        _ -> #{}
+    end,
+    IDs = [ID || {ID, C} <- maps:to_list(Comms), real(C, any), ?IS_ID(ID),
+        maps:get(<<"commitment-device">>, C, none) =:= <<"ans104@1.0">>],
+    case IDs of
+        [ID] ->
+            try
+                {ok, Item} = hb_http:get(Url,
+                    #{ <<"path">> => <<"/", ID/binary>>, <<"accept">> => <<"application/ans104">> },
+                    Opts#{ <<"http-client">> => httpc, <<"protocol">> => http2 }),
+                case vouched(hb_cache:ensure_all_loaded(Item, Opts), any, Opts) of
+                    false -> false;
+                    Vouched ->
+                        case hb_message:id(Vouched, signed, Opts) of
+                            ID -> Vouched;
+                            _ -> false
+                        end
+                end
+            catch _:_ -> false
+            end;
+        _ -> false
+    end;
+raw_item(_, _, _) -> false.
+
 %%% The replica -----------------------------------------------------------------
 
 load(Pusd, Url, NodeOpts, Dir) ->
@@ -282,12 +326,12 @@ drop(Cursor, Stores) ->
 %% @doc Replayed code gets the same key isolation as public HTTP execution.
 %% The attestor retains its signing keys outside the foreign Lua environment.
 %% Computing writes to the computed store; what was verified is read beneath
-%% it. An Arweave schedule is read from this node's own index (`index_stores/1').
+%% it. An Arweave schedule is read from this node's own index (`index_stores/2').
 execution_opts(NodeOpts, Verified, Computed) ->
     (maps:without(?NODE_KEY_OPTS ++ [<<"hashpath">>, <<"lua-device-preload">>], NodeOpts))#{
         <<"store">> => [Computed, Verified],
         <<"scheduler-store">> => [Verified],
-        <<"arweave-scheduler-store">> => index_stores(NodeOpts),
+        <<"arweave-scheduler-store">> => index_stores(NodeOpts, Verified),
         <<"process-store">> => [Computed],
         % A replica is computed by calls for one slot, with no worker to hold
         % the VM between them, so a call resumes from the newest stored VM
@@ -312,9 +356,24 @@ execution_opts(NodeOpts, Verified, Computed) ->
     }.
 
 %% The stores this node's `~arweave-scheduler@1.0' keeps its index in: the
-%% blocks it verified and the schedules it materialized from them.
-index_stores(NodeOpts) ->
-    stores(hb_opts:get(store, [], lib_arweave_scheduler_blocks:opts(NodeOpts))).
+%% blocks it verified and the schedules it materialized from them. That index
+%% is the one exception to the replica's own stores: it is chain data this
+%% node's sync verified (recomputed `indep_hash' and `tx_root'), not PUSD
+%% state any build computed, so a new build has nothing to recompute in it.
+%% Kept in the replica's store it was dropped with every build and re-walked
+%% from the anchor through a rate-limited gateway: the root replica sat at
+%% slot 7 of 207 for hours after each upgrade (2026-11-16). Only a store the
+%% node names for its index, either spelling, is shared; never a default,
+%% which `hb_opts:get' fell through to and killed the start hook's attestor
+%% loop (start_hook_test). A node that names none keeps it in the replica's
+%% verified store.
+index_stores(NodeOpts, Verified) ->
+    case maps:get(<<"arweave-scheduler-store">>, NodeOpts,
+            maps:get(arweave_scheduler_store, NodeOpts, not_found)) of
+        Index when is_list(Index), Index =/= [] -> Index;
+        Index when is_map(Index) -> [Index];
+        _ -> [Verified]
+    end.
 
 stores(Store) when is_map(Store) -> [Store];
 stores(Stores) when is_list(Stores) -> Stores;
@@ -539,7 +598,7 @@ step(_A, #{scheduler_device := <<"arweave-scheduler@1.0">>}) ->
     {refused, <<"Arweave assignments must come from local canonical synchronization">>};
 step(A, R) -> step(A, R, signed_scheduler).
 
-step(A, #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers,
+step(A, R = #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers,
         scheduler_device := SchedulerDevice, http := HTTPOpts, opts := ReplicaOpts }, Origin) ->
     Opts = case Origin of
         canonical_arweave -> index_read_opts(ReplicaOpts);
@@ -568,7 +627,8 @@ step(A, #{ pusd := Pusd, slot := Slot, chain := Chain, schedulers := Schedulers,
                 hb_cache:ensure_loaded(Get(<<"body">>), Opts), Opts);
             signed_scheduler -> hb_cache:ensure_all_loaded(Get(<<"body">>), Opts)
         end,
-        Body = need(body(RawBody, Opts), <<"message signature does not verify">>),
+        Body = need(served_body(RawBody, Origin, R, Opts),
+            <<"message signature does not verify">>),
         % The vouched assignment says whose slot this is; a message that names
         % a process at all must name PUSD.
         need(message_for_process(Body, Pusd, Slot + 1, Opts),
@@ -632,6 +692,63 @@ body_is_what_pusd_receives_test() ->
     Rsa = hb_message:commit(Unsigned, #{ <<"priv-wallet">> => ar_wallet:new() }),
     ?assertMatch(#{ <<"quantity">> := <<"1">> }, body(Rsa, #{})),
     ?assertEqual(false, body(Rsa#{ <<"quantity">> => <<"2">> }, #{})).
+
+%% The replica computes in its own store but reads the node's verified
+%% Arweave index, which survives a new build; without one it keeps its own.
+replica_reads_the_nodes_arweave_index_test() ->
+    Replica = #{ <<"store-module">> => hb_store_volatile, <<"name">> => <<"replica">> },
+    Index = #{ <<"store-module">> => hb_store_volatile, <<"name">> => <<"index">> },
+    Computed = #{ <<"store-module">> => hb_store_volatile, <<"name">> => <<"replica.computed">> },
+    Shared = execution_opts(#{ <<"arweave-scheduler-store">> => [Index] }, Replica, Computed),
+    ?assertEqual([Index], maps:get(<<"arweave-scheduler-store">>, Shared)),
+    ?assertEqual([Computed, Replica], maps:get(<<"store">>, Shared)),
+    ?assertEqual([Replica], maps:get(<<"scheduler-store">>, Shared)),
+    ?assertEqual([Computed], maps:get(<<"process-store">>, Shared)),
+    ?assertEqual([Index], maps:get(<<"arweave-scheduler-store">>,
+        execution_opts(#{ arweave_scheduler_store => Index }, Replica, Computed))),
+    % A default the node did not name is never shared.
+    ?assertEqual([Replica], maps:get(<<"arweave-scheduler-store">>,
+        execution_opts(#{ <<"store">> => [Index] }, Replica, Computed))).
+
+%% A signed ANS-104 body whose `original-tags' arrive as links (as a node
+%% serves a stored item) does not verify; the raw item, fetched by its signed
+%% ID, does. A raw item under another ID, or none, is not believed.
+served_ans104_body_is_refetched_raw_test_() ->
+    {timeout, 60, fun served_ans104_body_is_refetched_raw/0}.
+
+served_ans104_body_is_refetched_raw() ->
+    hb:init(),
+    Store = hb_test_utils:test_store(),
+    NodeOpts = #{ <<"store">> => [Store], <<"priv-wallet">> => ar_wallet:new() },
+    Node = hb_http_server:start_node(NodeOpts),
+    Signed = hb_message:commit(#{ <<"type">> => <<"Process">>, <<"name">> => <<"lane">>,
+        <<"device">> => <<"process@1.0">>, <<"variant">> => <<"ao.N.1">> },
+        #{ <<"priv-wallet">> => ar_wallet:new() }, <<"ans104@1.0">>),
+    % As a node holds it: parsed from the raw item, with its `original-tags'.
+    Item = hb_message:convert(
+        hb_message:convert(Signed, <<"ans104@1.0">>, <<"structured@1.0">>, #{}),
+        <<"structured@1.0">>, <<"ans104@1.0">>, #{}),
+    {ok, _} = hb_cache:write(Item, NodeOpts),
+    [{ID, C}] = maps:to_list(maps:get(<<"commitments">>, Item)),
+    Tags = maps:get(<<"original-tags">>, C, [1, 2, 3, 4]),
+    Served = Item#{ <<"commitments">> => #{ ID => C#{ <<"original-tags">> =>
+        [<<"ao:", (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary>> || _ <- Tags] } } },
+    Opts = #{},
+    ?assertEqual(false, body(Served, Opts)),
+    R = #{ url => hb_util:bin(Node) },
+    Body = served_body(Served, signed_scheduler, R, Opts),
+    ?assertNotEqual(false, Body),
+    ?assertEqual(ID, hb_message:id(Body, signed, Opts)),
+    ?assertEqual(<<"lane">>, hb_maps:get(<<"name">>, Body, Opts)),
+    % Canonical Arweave input is never fetched from a peer.
+    ?assertEqual(false, served_body(Served, canonical_arweave, R, Opts)),
+    % An ID the scheduler does not hold is not believed.
+    Other = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ?assertEqual(false, served_body(Served#{ <<"commitments">> => #{ Other => C } },
+        signed_scheduler, R, Opts)),
+    % An item that verifies as served is never refetched.
+    ?assertEqual(ID, hb_message:id(served_body(Item, signed_scheduler,
+        #{ url => <<"http://127.0.0.1:1">> }, Opts), signed, Opts)).
 
 arweave_assignment_names_a_validated_block_test() ->
     Store = hb_test_utils:test_store(hb_store_volatile, <<"replica-validated">>),
