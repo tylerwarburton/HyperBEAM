@@ -45,7 +45,9 @@
 %%%   following a successor), on the token pinned from that beacon, and for a
 %%%   `stake' of at most 10^7 RNG; otherwise the `bond' command is logged).
 %%% Endpoint, read-only:
-%%%   GET /~rng-validator@1.0/status   address, round, phase, last error
+%%%   GET /~rng-validator@1.0/status   address, round, phase, last error, and
+%%%   `owed' (rounds still owed) and `drained' (pause file set, not ready,
+%%%   nothing owed: safe to stop the node)
 -module(dev_rng_validator).
 -implements(<<"rng-validator@1.0">>).
 -export([device_info/1, start/3, status/3]).
@@ -63,6 +65,10 @@
 -define(HOLD_MS, 500).
 -define(HOLD_MAX_MS, 500).
 -define(REVEAL_MARGIN_MS, 10000).
+%% How long a commit round trip counts towards Ready. Only fresh samples say
+%% whether this node can work NOW: a slow commit (the one that faulted it)
+%% keeps it out for at most this long, not ten minutes.
+-define(FRESH_MS, 60000).
 
 device_info(_) ->
     #{ exports => [<<"start">>, <<"status">>] }.
@@ -132,8 +138,7 @@ initial_state(Cfg, Opts) ->
         beacon => followed(Dir, maps:get(<<"beacon">>, Cfg)),
         token => pinned(Dir, maps:get(<<"beacon">>, Cfg)), registry => {undefined, #{}},
         sent => #{}, status => #{ <<"address">> => Me }, last_error => null, last_pass => 0,
-        probe => probe0(), health => null,
-        backoff => #{ faults => undefined, n => 0, until => 0, ready_since => 0 } }.
+        probe => probe0(), health => null }.
 
 loop(St = #{ cfg := Cfg }) ->
     receive
@@ -141,7 +146,10 @@ loop(St = #{ cfg := Cfg }) ->
             St1 = try pass(St)
                   catch C:R:T ->
                       ?event(rng_validator, {pass_failed, C, R, lists:sublist(T, 3)}),
-                      St#{ last_error => iolist_to_binary(io_lib:format("~0p:~0P", [C, R, 12])) }
+                      % The beacon could not be read: what was being timed
+                      % measures the outage, not this node.
+                      St#{ last_error => iolist_to_binary(io_lib:format("~0p:~0P", [C, R, 12])),
+                           probe => void(maps:get(probe, St)) }
                   end,
             erlang:send_after(hb_util:int(maps:get(<<"interval">>, Cfg, 100)), self(), pass),
             loop(St1);
@@ -171,7 +179,6 @@ pass(StIn = #{ me := Me, sent := Sent0, dir := Dir, probe := Probe0 }) ->
     St = (pin_token(Info, StIn))#{ registry => Registry },
     Probe1 = probe(Info, Me, Now, Probe0#{ reads := sample(Now - T0, maps:get(reads, Probe0)) }),
     Offset = offset(Probe1),
-    Backoff = backoff(Mine, obj(<<"params">>, Info), Now, maps:get(backoff, St)),
     RoundTrip = round_trip(Probe1, Now),
     Health = health(Info, maps:get(health, St, null)),
     Successor = successor(Info, St),
@@ -181,19 +188,25 @@ pass(StIn = #{ me := Me, sent := Sent0, dir := Dir, probe := Probe0 }) ->
         pause => filelib:is_regular(filename:join(Dir, "pause")),
         top_up => maps:get(<<"top-up">>, Cfg, false) =:= true, mine => Mine,
         followed => maps:get(beacon, St) =/= maps:get(<<"beacon">>, Cfg),
-        token => maps:get(token, St, undefined),
-        backoff_until => maps:get(until, Backoff), round_trip => RoundTrip }, Dir),
-    % A commit's round trip is timed from its first send until it shows.
+        token => maps:get(token, St, undefined), round_trip => RoundTrip }, Dir),
+    % A commit's round trip is timed from its first send until it shows. A
+    % send that failed is not timed: it measured an unreachable beacon.
     {Sent, Pending} = lists:foldl(fun(A = {_, Keys, _}, {S, P}) ->
             T1 = os:system_time(millisecond),
-            P1 = lists:foldl(fun({<<"Commit">>, R}, PAcc) -> maps:merge(#{ R => T1 }, PAcc);
+            S1 = act(A, S, St#{ now => Now }),
+            P1 = lists:foldl(fun({<<"Commit">>, R} = K, PAcc) ->
+                                     case maps:get(K, S1) of
+                                         {_, Slot} when Slot >= 0 -> maps:merge(#{ R => T1 }, PAcc);
+                                         _ -> PAcc
+                                     end;
                                 (_, PAcc) -> PAcc end, P, Keys),
-            {act(A, S, St#{ now => Now }), P1}
+            {S1, P1}
         end, {Sent0, maps:get(pending, Probe1)}, batch(Actions, Info)),
     prune(Dir, Oldest),
-    St1 = follow(Successor, obligations(Info, Me),
-        St#{ sent => Sent, probe => Probe1#{ pending := Pending }, backoff => Backoff,
-             health => Health }),
+    Owed = obligations(Info, Me),
+    Paused = filelib:is_regular(filename:join(Dir, "pause")),
+    St1 = follow(Successor, Owed,
+        St#{ sent => Sent, probe => Probe1#{ pending := Pending }, health => Health }),
     % What was sent is only remembered for ten minutes.
     St1#{ sent => maps:filter(fun(_, {At, _}) -> Now - At < 600000 end, maps:get(sent, St1)),
          last_pass => Now, last_error => null,
@@ -203,8 +216,12 @@ pass(StIn = #{ me := Me, sent := Sent0, dir := Dir, probe := Probe0 }) ->
             <<"ready">> => maps:get(<<"ready">>, Mine, null), <<"paused">> => maps:get(<<"paused">>, Mine, null),
             <<"stake">> => maps:get(<<"stake">>, Mine, null), <<"faults">> => maps:get(<<"faults">>, Mine, null),
             <<"exiting">> => maps:get(<<"exiting">>, Mine, null), <<"at-slot">> => AtSlot,
-            % Local clock: the beacon's cooldown moved by the clock offset.
-            <<"rejoin-at">> => max(to_int(maps:get(<<"rejoinAt">>, Mine, 0), 0) + Offset, maps:get(until, Backoff)),
+            % Local clock: an older beacon's cooldown moved by the clock offset.
+            <<"rejoin-at">> => to_int(maps:get(<<"rejoinAt">>, Mine, 0), 0) + Offset,
+            % What a planned stop waits for: the pause file set, no longer
+            % ready, and every round it was given done (`owed' empty).
+            <<"owed">> => Owed, <<"pause-file">> => Paused,
+            <<"drained">> => Paused andalso not truthy(<<"ready">>, Mine) andalso Owed =:= [],
             <<"round-trip">> => case RoundTrip of infinity -> null; _ -> RoundTrip end,
             <<"clock-offset">> => Offset,
             <<"stake-short">> => stake_short(Mine, Info, stake_required(Info)),
@@ -220,13 +237,15 @@ pass(StIn = #{ me := Me, sent := Sent0, dir := Dir, probe := Probe0 }) ->
 %% it can work: a member in good standing, not leaving, not following a
 %% successor, and no `pause' file in `secrets-dir'. It says Pause when one of
 %% those stops being true, then still does every round it was already given.
-%% Ready never goes straight back into the rounds just failed: not before the
-%% beacon's cooldown (`rejoinAt'), nor this node's own backoff
-%% (`backoff_until'), nor unless the worst recent round trip (`round_trip') is
-%% under half the commit window, and at most once every 30 s. No waiver on
-%% quorum loss: rejoining at once turned slow commits into 108 slashes per
-%% validator (2026-11-06). Ready also needs the full stake: the bond plus
-%% unclaimed earnings (the beacon refills from those) must reach `stake'.
+%% Ready as soon as it can do the work again, and no later: the worst FRESH
+%% round trip (`round_trip', see `round_trip/2') under half the commit window,
+%% at most once every 30 s, and the full stake (the bond plus unclaimed
+%% earnings, which the beacon refills from, must reach `stake'). There is no
+%% time-based wait of this node's own: a fault is paid for by its slash, and a
+%% node that measures healthy is back within about a minute (2026-11-16: a
+%% doubling backoff kept a working validator out for an hour). An older
+%% beacon's cooldown (`rejoinAt') is still waited out, since it refuses Ready
+%% before it.
 %% With `top_up', a registered validator's short bond is topped up to `stake'
 %% from the wallet: one `X-Bond' Transfer on the beacon's token, at most once
 %% per bond value every 10 minutes. Never for a validator found in neither
@@ -288,7 +307,6 @@ plan(Info, Ctx = #{ me := Me, now := Now }, Dir) ->
                 || Member, not Ready, not Exiting, not Stopping, not truthy(<<"overdue">>, Mine),
                    stake_short(Mine, Info, stake_required(Info)) =:= 0,
                    BNow >= to_int(maps:get(<<"rejoinAt">>, Mine, 0), 0),
-                   Now >= maps:get(backoff_until, Ctx, 0),
                    maps:get(round_trip, Ctx, infinity)
                        < to_int(maps:get(<<"commitWindowMs">>, Params, 5000), 5000) div 2,
                    Due(<<"Ready">>, 0, 30000) ] ++
@@ -483,12 +501,33 @@ act({Action, Keys, Data}, Sent, St = #{ now := Now, beacon := Beacon }) ->
 %%   pending  `#{Round => LocalSentAt}', commits not yet seen;
 %%   offsets  local read time minus the beacon's `at' (its slot's scheduler
 %%            time), once per new `at'. The smallest is the clock offset.
-probe0() -> #{ reads => [], commits => [], pending => #{}, offsets => [], last_at => undefined }.
+%% Samples are only ever fresh: an outage (a pass that could not read the
+%% beacon, or one the beacon itself reports in `lastOutage') voids them, so
+%% the round trip after it is measured from scratch (2026-11-16: 30 s commits
+%% timed across a beacon host restart blocked Ready for ten minutes).
+probe0() -> #{ reads => [], commits => [], pending => #{}, offsets => [], last_at => undefined,
+               outage => undefined }.
+
+%% @doc Forget every sample taken up to now; the clock offset stays.
+void(Probe) -> Probe#{ reads := [], commits := [], pending := #{} }.
 
 %% The last 20 samples (newest first).
 sample(Ms, List) -> lists:sublist([Ms | List], 20).
 
-probe(Info, Me, Now, Probe = #{ commits := Commits, pending := Pending, offsets := Offsets, last_at := LastAt }) ->
+probe(Info, Me, Now, Probe0) ->
+    % A beacon outage not seen before (the beacon forgave a gap in its
+    % messages): every sample spanning it is void.
+    Outage = maps:get(<<"lastOutage">>, Info, undefined),
+    Probe = case maps:get(outage, Probe0, undefined) of
+        Outage -> Probe0;
+        Seen ->
+            P = Probe0#{ outage => Outage },
+            case Seen =/= undefined orelse maps:get(last_at, Probe0) =/= undefined of
+                true -> (void(P))#{ reads := maps:get(reads, Probe0) };
+                false -> P
+            end
+    end,
+    #{ commits := Commits, pending := Pending, offsets := Offsets, last_at := LastAt } = Probe,
     Shown = maps:from_list([{to_int(maps:get(<<"round">>, X, 0), 0), maps:is_key(Me, obj(<<"committed">>, X))}
         || X <- list(<<"revealing">>, Info) ++ [obj(<<"open">>, Info)]]),
     {Done, Left} = lists:partition(fun({R, At}) ->
@@ -508,10 +547,10 @@ probe(Info, Me, Now, Probe = #{ commits := Commits, pending := Pending, offsets 
 offset(#{ offsets := [] }) -> 0;
 offset(#{ offsets := Offsets }) -> lists:min(Offsets).
 
-%% @doc The worst commit round trip of the last 10 minutes; with none, twice
+%% @doc The worst commit round trip of the last FRESH_MS; with none, twice
 %% the worst read (a send costs about a read). `infinity' until 20 reads.
 round_trip(#{ reads := Reads, commits := Commits }, Now) when length(Reads) >= 20 ->
-    case [Ms || {At, Ms} <- Commits, Now - At < 600000] of
+    case [Ms || {At, Ms} <- Commits, Now - At < ?FRESH_MS] of
         [] -> 2 * lists:max(Reads);
         Fresh -> max(lists:max(Reads), lists:max(Fresh))
     end;
@@ -545,27 +584,6 @@ stake_short(Mine, Info, Required) ->
 
 %% Atoms per RNG.
 unit(Info) -> max(1, to_int(maps:get(<<"unit">>, Info, 1000000), 1000000)).
-
-%% @doc This node's own backoff after a fault, on top of the beacon's cooldown:
-%% `rejoinBaseMs' doubled per incident, up to `rejoinCapMs'. A fault while
-%% ready starts an incident; later faults of the same incident (rounds already
-%% held) do not escalate it. Ready for a cap or longer starts the count over.
-backoff(Mine, _Params, _Now, B) when Mine =:= #{} -> B;
-backoff(Mine, Params, Now, B = #{ faults := Prev, n := N0, until := Until0, ready_since := Since0 }) ->
-    Faults = to_int(maps:get(<<"faults">>, Mine, 0), 0),
-    Base = to_int(maps:get(<<"rejoinBaseMs">>, Params, 60000), 60000),
-    Cap = to_int(maps:get(<<"rejoinCapMs">>, Params, 3600000), 3600000),
-    {N, Until} =
-        case is_integer(Prev) andalso Faults > Prev andalso Since0 > 0 of
-            true ->
-                N1 = case Now - Since0 < Cap of true -> N0 + 1; false -> 1 end,
-                ?event(rng_validator, {fault, Faults, {backing_off, N1}}),
-                {N1, Now + min(Cap, Base bsl min(N1 - 1, 32))};
-            false -> {N0, Until0}
-        end,
-    Ready = truthy(<<"ready">>, Mine),
-    Since = if not Ready -> 0; Since0 =:= 0 -> Now; true -> Since0 end,
-    B#{ faults := Faults, n := N, until := Until, ready_since := Since }.
 
 %%% Following a successor -----------------------------------------------------
 
@@ -916,17 +934,17 @@ ready_when_it_can_work_test() ->
     {C, _} = plan(ready_info(Open, NotReady, #{}), (ctx(#{}))#{ pause => true }, tmp_dir()),
     ?assertEqual([], kinds(C)).
 
-ready_waits_out_cooldown_backoff_and_health_test() ->
+ready_waits_for_health_not_time_test() ->
     Open = #{ <<"round">> => 3, <<"phase">> => <<"collecting">> },
     NotReady = #{ <<"address">> => ?ME, <<"ready">> => false },
     Plan = fun(Me, Ctx) ->
         kinds(element(1, plan(ready_info(Open, Me, #{}), maps:merge(ctx(#{}), Ctx), tmp_dir())))
     end,
-    % The beacon's cooldown: not before `rejoinAt'.
+    % An older beacon's cooldown: not before `rejoinAt'.
     ?assertEqual([], Plan(NotReady#{ <<"rejoinAt">> => 100001 }, #{})),
     ?assertEqual([<<"Ready">>], Plan(NotReady#{ <<"rejoinAt">> => 100000 }, #{})),
-    % This node's own backoff.
-    ?assertEqual([], Plan(NotReady, #{ backoff_until => 100001 })),
+    % Just faulted, no wait of its own: Ready as soon as the round trip is fresh.
+    ?assertEqual([<<"Ready">>], Plan(NotReady#{ <<"faults">> => 7, <<"suspended">> => true }, #{})),
     % Round trip under half the commit window (5000 by default), and known.
     ?assertEqual([], Plan(NotReady, #{ round_trip => 2500 })),
     ?assertEqual([<<"Ready">>], Plan(NotReady, #{ round_trip => 2499 })),
@@ -941,9 +959,9 @@ round_trip_needs_full_sample_test() ->
     % No commit seen yet: twice the worst read.
     Reads = [30 | lists:duplicate(19, 10)],
     ?assertEqual(60, round_trip(P0#{ reads := Reads }, 0)),
-    % A recent commit round trip counts; one older than 10 minutes does not.
-    ?assertEqual(700, round_trip(P0#{ reads := Reads, commits := [{1000, 700}] }, 1000 + 599999)),
-    ?assertEqual(60, round_trip(P0#{ reads := Reads, commits := [{1000, 700}] }, 1000 + 600000)),
+    % A fresh commit round trip counts; one a minute old does not.
+    ?assertEqual(700, round_trip(P0#{ reads := Reads, commits := [{1000, 700}] }, 1000 + 59999)),
+    ?assertEqual(60, round_trip(P0#{ reads := Reads, commits := [{1000, 700}] }, 1000 + 60000)),
     ?assertEqual(20, length(sample(1, lists:duplicate(20, 0)))).
 
 %% The probe never compares local time with a beacon timestamp: a beacon clock
@@ -1139,23 +1157,31 @@ successor_needs_ack_test() ->
     ?assertEqual(none, named_successor(#{ <<"successor">> => <<>> }, B)),
     ?assertEqual(none, named_successor(#{ <<"successor">> => B, <<"successorAck">> => true }, B)).
 
-backoff_doubles_per_incident_test() ->
-    Params = #{ <<"rejoinBaseMs">> => 1000, <<"rejoinCapMs">> => 10000 },
-    B0 = #{ faults => undefined, n => 0, until => 0, ready_since => 0 },
-    Ready = fun(F) -> #{ <<"ready">> => true, <<"faults">> => F } end,
-    Down = fun(F) -> #{ <<"ready">> => false, <<"faults">> => F } end,
-    B1 = backoff(Ready(0), Params, 100, B0),
-    % First fault while ready: wait the base.
-    B2 = backoff(Down(1), Params, 200, B1),
-    ?assertMatch(#{ n := 1, until := 1200 }, B2),
-    % More faults of the same incident (not ready since): no escalation.
-    B3 = backoff(Down(2), Params, 300, B2),
-    ?assertMatch(#{ n := 1, until := 1200 }, B3),
-    % Back, then a fault within the cap: doubled.
-    B4 = backoff(Ready(2), Params, 2000, B3),
-    ?assertMatch(#{ n := 2, until := 4500 }, backoff(Down(3), Params, 2500, B4)),
-    % Ready for the cap or longer: the count starts over.
-    ?assertMatch(#{ n := 1, until := 21000 }, backoff(Down(3), Params, 20000, B4)).
+%% An outage voids the samples taken across it: the 30 s commits timed while
+%% the beacon host restarted must not hold Ready back afterwards.
+outage_voids_samples_test() ->
+    Reads = lists:duplicate(20, 10),
+    Stale = (probe0())#{ reads := Reads, commits := [{1000, 30000}], pending := #{ 4 => 900 },
+                         offsets := [5], last_at := 800 },
+    ?assertEqual(30000, round_trip(Stale, 2000)),
+    % A pass that could not read the beacon: nothing timed survives, so the
+    % round trip is unknown until 20 fresh reads, then measured afresh.
+    V = void(Stale),
+    ?assertMatch(#{ reads := [], commits := [], pending := #{}, offsets := [5] }, V),
+    ?assertEqual(infinity, round_trip(V, 2000)),
+    ?assertEqual(20, round_trip(V#{ reads := Reads }, 2000)),
+    % The beacon reports an outage this node had not seen: commits and
+    % pending sends void, the reads (taken after it) kept.
+    Info = #{ <<"open">> => #{ <<"round">> => 5 }, <<"lastOutage">> => #{ <<"at">> => 1500, <<"gapMs">> => 24000 } },
+    P1 = probe(Info, ?ME, 2000, Stale),
+    ?assertMatch(#{ commits := [], pending := #{} }, P1),
+    ?assertEqual(20, round_trip(P1, 2000)),
+    % The same outage read again voids nothing more.
+    P2 = probe(Info, ?ME, 2100, P1#{ commits := [{2050, 300}] }),
+    ?assertEqual(300, round_trip(P2, 2100)),
+    % The first read after a start only learns the last outage.
+    P3 = probe(Info, ?ME, 2000, (probe0())#{ commits := [{1990, 300}], reads := Reads }),
+    ?assertEqual(300, round_trip(P3, 2000)).
 
 pause_still_owes_its_rounds_test() ->
     Me = #{ <<"address">> => ?ME, <<"ready">> => true },
