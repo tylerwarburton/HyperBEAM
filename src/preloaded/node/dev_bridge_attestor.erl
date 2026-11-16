@@ -101,6 +101,8 @@
 -define(SERVED, dev_bridge_attestor_served).
 -define(RESEND_MS, 60000).
 -define(ARWEAVE_RESEND_MS, 1800000).
+%% Root move certificates planned per lane per pass (`move_root_plans/5').
+-define(MOVE_PLAN_LIMIT, 64).
 %% How long a caller waits for the loop, and so how long a queued request
 %% stays worth answering: the loop drops one older than this unanswered.
 -define(CALL_MS, 60000).
@@ -1551,15 +1553,24 @@ move_receipts(Receipts) ->
 %% @doc Root certificates for pending locks whose exact source and destination
 %% are both in this node's registered/configured ledger intersection. The
 %% certificate carries the epoch.
+%%
+%% Only the oldest `?MOVE_PLAN_LIMIT' per lane, each with the lane's lock time
+%% (`move-at') so the root can expire it. Every move is its own Arweave
+%% carrier, one in flight per member; planning all of them (2,641 on L1,
+%% 2026-11-16) scattered carriers across the whole backlog, held the root's
+%% move watermark still and sent ids past its 1,000-id window, which the root
+%% refuses without a receipt. Every member plans the same oldest set from its
+%% own replica, so endorsements still match.
 move_root_plans(_Epoch, Ledger, LaneMoves, Receipts, Allowed) ->
     ReceiptMap = move_receipts(Receipts),
-    lists:filtermap(
+    Due = lists:filtermap(
         fun(M) ->
             MoveId = maps:get(<<"id">>, M, <<>>),
             Destination = maps:get(<<"destination">>, M, <<>>),
             Account = maps:get(<<"account">>, M, <<>>),
             Quantity = maps:get(<<"quantity">>, M, <<>>),
             Eligible = is_binary(MoveId) andalso MoveId =/= <<>>
+                andalso decimal(MoveId)
                 andalso is_binary(Destination) andalso is_binary(Account)
                 andalso is_binary(Quantity)
                 andalso maps:get(<<"status">>, M, <<>>) =:= <<"pending">>
@@ -1572,19 +1583,27 @@ move_root_plans(_Epoch, Ledger, LaneMoves, Receipts, Allowed) ->
                     case maps:is_key(Key, ReceiptMap) of
                         true -> false;
                         false ->
-                            {true, {root,
-                                <<"ledger-move-root:", Key/binary>>,
-                                #{ <<"action">> => <<"Ledger-Move-Root">>,
+                            Tags = #{ <<"action">> => <<"Ledger-Move-Root">>,
                                    <<"source">> => Ledger,
                                    <<"destination">> => Destination,
                                    <<"move-id">> => MoveId,
                                    <<"account">> => Account,
-                                   <<"quantity">> => Quantity }}}
+                                   <<"quantity">> => Quantity },
+                            {true, {binary_to_integer(MoveId), {root,
+                                <<"ledger-move-root:", Key/binary>>,
+                                case maps:get(<<"at">>, M, undefined) of
+                                    At when is_integer(At), At > 0 ->
+                                        Tags#{ <<"move-at">> => integer_to_binary(At) };
+                                    _ -> Tags
+                                end}}}
                     end
             end
         end,
         [M || M <- LaneMoves, is_map(M)]
-    ).
+    ),
+    [Plan || {_, Plan} <- lists:sublist(lists:keysort(1, Due), ?MOVE_PLAN_LIMIT)].
+
+decimal(Bin) -> re:run(Bin, <<"^[0-9]{1,18}$">>, [{capture, none}]) =:= match.
 
 %% @doc A durable root receipt drives both destinations independently. This
 %% remains retryable after the source lane has finalized and stopped publishing
@@ -2528,6 +2547,29 @@ rpc_files_test() ->
     ?assertEqual(<<"https://rpc.example/v2/KEY">>, maps:get(<<"rpc">>, maps:get(<<"base">>, Cfg))),
     ?assertEqual(#{ <<"package">> => <<"x">> }, maps:get(<<"sui">>, Cfg)),
     ?assertEqual(<<"p">>, maps:get(<<"pusd">>, Cfg)).
+
+%% A backlog is certified oldest first, a bounded number per pass, each with
+%% the lane's lock time; settled and ineligible moves are skipped first.
+move_root_plans_are_oldest_first_and_bounded_test() ->
+    Lane = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Lane2 = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Holder = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Row = fun(Id) -> #{<<"id">> => integer_to_binary(Id), <<"status">> => <<"pending">>,
+        <<"source">> => Lane, <<"destination">> => Lane2, <<"account">> => Holder,
+        <<"quantity">> => <<"1">>, <<"at">> => 1794768759000 + Id} end,
+    Allowed = #{Lane => #{}, Lane2 => #{}},
+    Backlog = [Row(Id) || Id <- lists:reverse(lists:seq(1, 300))],
+    Settled = [#{<<"key">> => <<Lane/binary, "|1">>}],
+    Plans = move_root_plans(7, Lane, [#{<<"id">> => <<"x">>} | Backlog], Settled, Allowed),
+    ?assertEqual(?MOVE_PLAN_LIMIT, length(Plans)),
+    Ids = [maps:get(<<"move-id">>, T) || {root, _, T} <- Plans],
+    ?assertEqual([integer_to_binary(I) || I <- lists:seq(2, ?MOVE_PLAN_LIMIT + 1)], Ids),
+    {root, Key, First} = hd(Plans),
+    ?assertEqual(<<"ledger-move-root:", Lane/binary, "|2">>, Key),
+    ?assertEqual(<<"1794768759002">>, maps:get(<<"move-at">>, First)),
+    % A row without a lock time plans as before, without one.
+    [{root, _, Bare}] = move_root_plans(7, Lane, [maps:remove(<<"at">>, Row(5))], [], Allowed),
+    ?assertNot(maps:is_key(<<"move-at">>, Bare)).
 
 next_interval_test() ->
     Cfg = #{ <<"interval">> => 15000, <<"fast-interval">> => 1000 },
