@@ -31,12 +31,15 @@
 %%% at most once per process however often it is signed again: its admission
 %%% ID joins the message's signature IDs in the scheduler's dedup index.
 %%%
-%%% Stamps that can never be admitted (a stamp missing, spelled twice or
-%%% unreadable, another process's message, a sender no policy signer
-%%% schedules) admit nothing either. The door refuses only with 403, when a
-%%% commitment does not verify or a verified entry mismatches or forked, and
-%%% 503, while a verified entry or a peer sender's definition is not available
-%%% yet; a remote deliverer retries both.
+%%% A sender no policy signer schedules admits nothing either. A policy
+%%% signer's stamps that can never be admitted (a stamp missing, spelled
+%%% twice or unreadable, another process's message, a sender unknown here)
+%%% are refused with 400 at the door, never scheduled unadmitted: that was an
+%%% assignment the deliverer finished and the contract ignored. The door also
+%%% refuses with 403, when a commitment does not verify or a verified entry
+%%% mismatches or forked, and 503, while a verified entry or a peer sender's
+%%% definition is not available yet, with the follower's `retry-after' when
+%%% it has one; a remote deliverer retries all three.
 -module(dev_scheduler_admission).
 -export([admit/3, check/3, ids/2, keys/2, peer/2, policy/2]).
 -include("include/hb.hrl").
@@ -56,7 +59,7 @@
 %% it claims a process origin), or `{error, Response}'.
 admit(ProcID, Req, Opts) ->
     try
-        case check(ProcID, Req, Opts) of
+        case check(ProcID, Req, Opts, door) of
             none -> {ok, Req};
             {Stamps, Policy, Epoch} ->
                 Admission =
@@ -66,7 +69,9 @@ admit(ProcID, Req, Opts) ->
                     },
                 {ok, hb_private:set(Req, ?PRIV_KEY, Admission, Opts)}
         end
-    catch throw:{refused, Status, Why} -> refused(ProcID, Status, Why)
+    catch
+        throw:{refused, Status, Why} -> refused(ProcID, Status, Why, #{});
+        throw:{refused, Status, Why, Extra} -> refused(ProcID, Status, Why, Extra)
     end.
 
 %% @doc The door's whole judgement of `Req' as an input of `ProcID', without
@@ -74,7 +79,12 @@ admit(ProcID, Req, Opts) ->
 %% `{Stamps, Policy, Epoch}' for one this node admits, and a thrown
 %% `{refused, Status, Why}' otherwise. The follower runs the same function on
 %% every input of a schedule it recomputes (`dev_scheduler_follower').
-check(ProcID, Req, Opts) ->
+check(ProcID, Req, Opts) -> check(ProcID, Req, Opts, judge).
+
+%% `door' when the message is being scheduled here, `judge' when the follower
+%% asks what the door would have made of an input of another node's schedule
+%% (`admit_from/5').
+check(ProcID, Req, Opts, Mode) ->
     case has_stamp(Req, Opts) of
         false -> none;
         true ->
@@ -84,15 +94,24 @@ check(ProcID, Req, Opts) ->
                 <<"a commitment does not verify">>),
             case [ {S, P} || S <- signers(Req, Opts), {P, _} <- [policy(S, Opts)], P =/= none ] of
                 [] -> none;
-                Candidates -> admit_from(ProcID, Req, Candidates, Opts)
+                Candidates -> admit_from(ProcID, Req, Candidates, Opts, Mode)
             end
     end.
 
 %% The stamps of a message a policy signer signed, admitted under a candidate
-%% the sender's definition names as its scheduler. Stamps that can never be
-%% admitted (missing, spelled twice, unreadable, for another process, a sender
-%% no candidate schedules) admit nothing: the message is scheduled as sent.
-admit_from(ProcID, Req, Candidates, Opts) ->
+%% the sender's definition names as its scheduler. A sender no candidate
+%% schedules admits nothing: the message is scheduled as sent.
+%%
+%% Stamps that can never be admitted (missing, spelled twice, unreadable, for
+%% another process) are refused 400 at the door. They used to admit nothing
+%% too, and that lost the entry: the message was assigned, the deliverer was
+%% answered 200 with a slot and finished it, and the contract, which believes
+%% a `from-process' only off `admit-*', ignored it. A refusal is retried by a
+%% remote deliverer and finishes a local one as a counted terminal. As an
+%% input of another node's schedule (`judge') such a message was put there
+%% by that node and admits nothing, as before: the follower must not stop on
+%% a message anyone could have replayed into a schedule.
+admit_from(ProcID, Req, Candidates, Opts, Mode) ->
     try
         Stamps = #{ <<"admit-process">> := Sender } = stamps(Req, Opts),
         need(for_process(Req, ProcID, Opts), 400, <<"message is for another process">>),
@@ -106,7 +125,7 @@ admit_from(ProcID, Req, Candidates, Opts) ->
                 {Stamps#{ <<"admit-scheduler">> => S }, Policy, Epoch};
             [] -> none
         end
-    catch throw:{refused, 400, Why} ->
+    catch throw:{refused, 400, Why} when Mode =:= judge ->
         ?event(scheduling, {admits_nothing, {proc_id, ProcID}, {why, Why}}),
         none
     end.
@@ -263,9 +282,11 @@ vouched([Get | Rest], Sender, Opts) ->
 need(true, _, _) -> ok;
 need(_, Status, Why) -> throw({refused, Status, Why}).
 
-refused(ProcID, Status, Why) ->
+%% `Extra' rides on the response: the follower's `retry-after' (seconds) on a
+%% 503 for an entry it has not verified yet.
+refused(ProcID, Status, Why, Extra) ->
     ?event(scheduling, {admission_refused, {proc_id, ProcID}, {status, Status}, {why, Why}}),
-    {error, #{ <<"status">> => Status, <<"body">> => Why,
+    {error, Extra#{ <<"status">> => Status, <<"body">> => Why,
         <<"process">> => hb_util:human_id(ProcID) }}.
 
 %%% Tests ---------------------------------------------------------------------
@@ -385,14 +406,15 @@ trusted_peer_cannot_speak_for_another_schedulers_process_test() ->
         [Elsewhere, Ours]).
 
 %% A sender whose definition this node cannot find yet waits while its
-%% scheduler has a location to fetch it from, and is unknown without one.
+%% scheduler has a location to fetch it from, and is unknown without one:
+%% refused, never assigned unadmitted, at the door.
 unknown_sender_waits_test() ->
     Peer = ar_wallet:new(),
     Opts = with_peer(test_opts(), Peer, <<"trusted">>),
     Target = target(),
     Unknown = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Msg = push(Peer, Target, #{ <<"from-process">> => Unknown }, Opts),
-    ?assert(unadmitted(Msg, admit(Target, Msg, Opts), Opts)),
+    ?assertEqual(400, status(admit(Target, Msg, Opts))),
     Located = Opts#{ <<"scheduler-admission">> => #{ <<"peers">> => [
         #{ <<"address">> => addr(Peer), <<"policy">> => <<"trusted">>,
            <<"location">> => <<"http://127.0.0.1:1">> }] } },
@@ -445,17 +467,31 @@ tampered_commitment_refused_test() ->
     Msg = push(Peer, Target, #{}, Opts),
     ?assertEqual(403, status(admit(Target, Msg#{ <<"action">> => <<"Mint">> }, Opts))).
 
-retargeted_admits_nothing_test() ->
+%% A policy signer's push that can never be admitted is refused at the
+%% door. Assigned unadmitted, it was a 200 with a slot to its deliverer,
+%% which finished the entry, and an input its contract ignored: the entry
+%% was lost. As an input of another node's schedule (`check/3', the
+%% follower's judgement) it admits nothing, as anyone could have put it
+%% there.
+retargeted_refused_test() ->
     Peer = ar_wallet:new(),
     Opts = with_peer(test_opts(), Peer, <<"trusted">>),
     Msg = push(Peer, target(), #{}, Opts),
-    ?assert(unadmitted(Msg, admit(target(), Msg, Opts), Opts)).
+    Elsewhere = target(),
+    ?assertEqual(400, status(admit(Elsewhere, Msg, Opts))),
+    ?assertEqual(none, check(Elsewhere, Msg, Opts)).
 
-ambiguous_stamp_admits_nothing_test() ->
+ambiguous_stamp_refused_test() ->
     Opts = #{ <<"priv-wallet">> := W } = test_opts(),
     Target = target(),
     Msg = push(W, Target, #{ <<"from_slot">> => 8 }, Opts),
-    ?assert(unadmitted(Msg, admit(Target, Msg, Opts), Opts)).
+    ?assertEqual(400, status(admit(Target, Msg, Opts))),
+    ?assertEqual(none, check(Target, Msg, Opts)).
+
+%% The follower's `retry-after' rides on the door's 503.
+refusal_carries_retry_after_test() ->
+    ?assertMatch({error, #{ <<"status">> := 503, <<"retry-after">> := 30 }},
+        refused(target(), 503, <<"entry not verified yet">>, #{ <<"retry-after">> => 30 })).
 
 %% The scheduler is the signer, not a stamp: a push with no
 %% `from-scheduler' (a sender defined by `scheduler-location') is admitted.

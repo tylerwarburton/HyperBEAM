@@ -65,6 +65,16 @@
 -define(MAX_GATEWAY_BACKOFF, 600000).
 -define(DEFAULT_DEPTH, 3).
 -define(DEFAULT_GATEWAY, <<"https://arweave.net">>).
+%% Slots judged, then computed by one call, per batch of the index.
+-define(INDEX_BATCH, 500).
+%% The deliverer's longest backoff (`lib_process_delivery').
+-define(MAX_RETRY_AFTER_MS, 600000).
+-define(PROGRESS, dev_scheduler_follower_progress).
+%% A listing of the archive asks only for windows mined at most this many
+%% blocks below the highest it holds (about 100 minutes), so a late-indexed
+%% item still shows; every `?FULL_LISTING_EVERY'-th listing is whole.
+-define(RELIST_BLOCKS, 50).
+-define(FULL_LISTING_EVERY, 10).
 
 %%% The door ------------------------------------------------------------------
 
@@ -83,9 +93,14 @@ check(Signer, Stamps, Req, ProcID, Opts) ->
     case entry(P, Slot, Key, Opts) of
         not_found ->
             % A push is waiting for this slot: the follower polls fast until
-            % it is indexed.
+            % it is indexed, and the deliverer is told when to ask again.
             ensure(P, S, Opts) ! {wanted, hb_util:int(Slot)},
-            throw({refused, 503, <<"entry not verified yet">>});
+            case retry_after(P, hb_util:int(Slot), Opts) of
+                undefined -> throw({refused, 503, <<"entry not verified yet">>});
+                Secs ->
+                    throw({refused, 503, <<"entry not verified yet">>,
+                        #{ <<"retry-after">> => Secs }})
+            end;
         {ok, #{ <<"entry">> := Entry, <<"origin">> := Origin }} ->
             need(hb_message:id(Entry, all, Opts) =:= EntryID, <<"entry ID does not match">>),
             Expected =
@@ -149,7 +164,8 @@ follow(P, S, Opts) ->
         archive_poll => Ms(<<"archive-poll-ms">>, ?DEFAULT_ARCHIVE_POLL_MS),
         depth => Ms(<<"confirmations">>, ?DEFAULT_DEPTH),
         gateways => gateways(Opts), archive_at => now_ms(),
-        indexed => Indexed, wanted => Indexed, windows => [] }).
+        indexed => Indexed, wanted => Indexed, windows => [],
+        progress => {now_ms(), Indexed, undefined} }).
 
 %% @doc The gateways the follower reads Arweave from, in order of preference:
 %% `scheduler-follower-gateways', else `scheduler-upload-gateway', else
@@ -198,41 +214,139 @@ interval(#{ idle_poll := Idle }) -> Idle.
 %% Monotonic, and possibly negative: every deadline starts at `now_ms()', never 0.
 now_ms() -> erlang:monotonic_time(millisecond).
 
+%%% Progress ------------------------------------------------------------------
+
+%% @doc When, in whole seconds, a push of slot `Slot' of P is worth posting
+%% again: the follower's estimate of when it indexes the slot, from its
+%% measured rate, between `poll-ms' and ten minutes (the deliverer's longest
+%% backoff). `undefined' when there is no estimate: the follower has indexed
+%% nothing since it started, or has already indexed the slot (the entry is
+%% not in its outbox, and waiting will not change that). A deliverer told
+%% nothing backs off from 1 s to 10 min, so a push whose slot was indexed
+%% just after its 10-minute backoff began waited 10 minutes for nothing.
+retry_after(P, Slot, Opts) ->
+    Poll = hb_util:int(hb_maps:get(<<"poll-ms">>,
+        hb_opts:get(<<"scheduler-admission">>, #{}, Opts), ?DEFAULT_POLL_MS, Opts)),
+    case progress_of(hb_util:human_id(P)) of
+        {Indexed, Rate} when Slot > Indexed, Rate > 0 ->
+            Ms = min(?MAX_RETRY_AFTER_MS, max(Poll, round((Slot - Indexed) * 1000 / Rate))),
+            (Ms + 999) div 1000;
+        _ -> undefined
+    end.
+
+%% Record the follower's indexed slot and its rate in slots per second,
+%% smoothed over batches.
+progress(F = #{ p := P, indexed := Indexed }) ->
+    Now = now_ms(),
+    Rate =
+        case maps:get(progress, F, undefined) of
+            {At, From, Old} when Now > At ->
+                New = (Indexed - From) * 1000 / (Now - At),
+                case Old of
+                    undefined -> New;
+                    _ -> 0.5 * Old + 0.5 * New
+                end;
+            {_, _, Old} -> Old;
+            undefined -> undefined
+        end,
+    ensure_progress_table(),
+    case Rate of
+        undefined -> ok;
+        _ -> ets:insert(?PROGRESS, {P, Indexed, Rate})
+    end,
+    F#{ progress => {Now, Indexed, Rate} }.
+
+progress_of(P) ->
+    try ets:lookup(?PROGRESS, P) of
+        [{_, Indexed, Rate}] -> {Indexed, Rate};
+        [] -> undefined
+    catch error:badarg -> undefined
+    end.
+
+%% Owned by a process that never exits: a table dies with its owner.
+ensure_progress_table() ->
+    case ets:whereis(?PROGRESS) of
+        undefined ->
+            Parent = self(),
+            Ref = make_ref(),
+            spawn(fun() ->
+                try ets:new(?PROGRESS, [named_table, public, set]) of
+                    _ -> Parent ! {Ref, ok}, receive after infinity -> ok end
+                catch error:badarg -> Parent ! {Ref, ok}
+                end
+            end),
+            receive {Ref, ok} -> ok after 5000 -> ok end;
+        _ -> ok
+    end.
+
 %% One pass: bring the replica forward, then index every slot that is
 %% verified, archived deep enough and whose inputs we re-admit.
 pass(F = #{ p := P, url := Url, dir := Dir, opts := Opts, indexed := Indexed }) ->
     R = lib_bridge_replica:forward(
-        lib_bridge_replica:load(P, Url, Opts, Dir)),
+        lib_bridge_replica:load(P, Url, Opts, Dir, keep)),
     case R of
         #{ slot := Top } when Top > Indexed ->
-            index(lists:seq(Indexed + 1, Top), R, with_windows(F, now_ms()));
+            prune(index(Indexed + 1, Top, R, with_windows(F, now_ms())));
         _ -> F
     end.
 
-index([], _R, F) -> F;
-index([N | Rest], R = #{ proc := Proc, opts := ROpts }, F = #{ p := P, opts := Opts }) ->
+%% Index `From'..`Top', `?INDEX_BATCH' slots at a time. Each batch is judged
+%% slot by slot first (archived, re-admitted); the slots that pass are then
+%% computed by ONE call for the last of them, which computes and stores every
+%% slot before it on the way, and their entries are written in one write.
+%% Computing slot by slot replayed from the last VM snapshot on every call
+%% (`lib_bridge_replica:execution_opts/2'). A slot that does not pass ends
+%% the batch after the slots before it are indexed.
+index(From, Top, _R, F) when From > Top -> F;
+index(From, Top, R, F) ->
+    Last = min(Top, From + ?INDEX_BATCH - 1),
+    {Ready, Halt} = judge(lists:seq(From, Last), R, F, []),
+    F2 = index_batch(lists:reverse(Ready), R, F),
+    case Halt of
+        none -> index(Last + 1, Top, R, F2);
+        not_yet -> F2;
+        {fork, N, Archived, A} -> freeze(F2, N, Archived, A);
+        {refused, N, Why} -> stop(F2, N, Why)
+    end.
+
+%% `{Ready, Halt}': the slots from the first of `Slots' on that may be
+%% indexed, newest first, each with the entries its input took, and why the
+%% run stopped (`none' when every slot passed).
+judge([], _R, _F, Ready) -> {Ready, none};
+judge([N | Rest], R = #{ opts := ROpts }, F = #{ p := P, opts := Opts }, Ready) ->
     {ok, A0} = hb_cache:read(lib_bridge_replica:slot_path(P, N, none), ROpts),
     A = hb_cache:ensure_all_loaded(A0, ROpts),
     case archived(N, hb_message:id(A, signed, ROpts), F) of
-        not_yet -> F;
-        {fork, Archived} -> freeze(F, N, Archived, A);
+        not_yet -> {Ready, not_yet};
+        {fork, Archived} -> {Ready, {fork, N, Archived, A}};
         ok ->
-            case readmit(A, P, ROpts, Opts) of
-                not_yet -> F;
-                {refused, Why} -> stop(F, N, Why);
-                {ok, Taken} ->
-                    {ok, State} =
-                        hb_ao:resolve(Proc,
-                            #{ <<"path">> => <<"compute">>, <<"slot">> => N }, ROpts),
-                    ok = write_entries(P, N, Proc, State, Taken, ROpts, Opts),
-                    index(Rest, R, F#{ indexed := N })
+            TakenHere = lists:append([ T || {_, T} <- Ready ]),
+            case readmit(A, P, ROpts, Opts, TakenHere) of
+                not_yet -> {Ready, not_yet};
+                {refused, Why} -> {Ready, {refused, N, Why}};
+                {ok, Taken} -> judge(Rest, R, F, [{N, Taken} | Ready])
             end
     end.
 
+index_batch([], _R, F) -> F;
+index_batch(Ready, #{ proc := Proc, opts := ROpts }, F = #{ p := P, opts := Opts }) ->
+    {Last, _} = lists:last(Ready),
+    {ok, _} =
+        hb_ao:resolve(Proc, #{ <<"path">> => <<"compute">>, <<"slot">> => Last }, ROpts),
+    ok = write_entries(P, Ready, Proc, ROpts, Opts),
+    progress(F#{ indexed := Last }).
+
+%% Windows wholly at or below the indexed slot can no longer hold back or
+%% fork a slot to index: `archived/3' scans the rest for every slot.
+prune(F = #{ windows := Windows, indexed := Indexed }) ->
+    F#{ windows := [ W || W = #{ to := To } <- Windows, To > Indexed ] }.
+
 %% The slot's input as an input of P at THIS node's door: `{ok, Taken}' with
 %% the outbox entry it names (`[]' for one that claims no origin), `not_yet'
-%% while the door would answer 503, `{refused, Why}' otherwise.
-readmit(A, P, ROpts, Opts) ->
+%% while the door would answer 503, `{refused, Why}' otherwise. `TakenHere'
+%% are the entries earlier slots of the same batch took, not written yet.
+readmit(A, P, ROpts, Opts) -> readmit(A, P, ROpts, Opts, []).
+readmit(A, P, ROpts, Opts, TakenHere) ->
     Body = hb_cache:ensure_all_loaded(hb_maps:get(<<"body">>, A, #{}, ROpts), ROpts),
     try dev_scheduler_admission:check(P, Body, Opts) of
         none ->
@@ -244,12 +358,13 @@ readmit(A, P, ROpts, Opts) ->
             end;
         {Stamps, _Policy, _Epoch} ->
             Taken = dev_scheduler_admission:ids(Stamps, Opts),
-            case [ ID || ID <- Taken, taken(P, ID, Opts) ] of
+            case [ ID || ID <- Taken, lists:member(ID, TakenHere) orelse taken(P, ID, Opts) ] of
                 [] -> {ok, Taken};
                 _ -> {refused, <<"an outbox entry is an input of the process twice">>}
             end
     catch
         throw:{refused, 503, _} -> not_yet;
+        throw:{refused, 503, _, _} -> not_yet;
         throw:{refused, _, Why} -> {refused, Why}
     end.
 
@@ -276,12 +391,31 @@ with_windows(F = #{ archive_at := At }, Now) when Now < At -> F;
 with_windows(F = #{ gateways := Gateways, archive_poll := Every }, Now) ->
     case read_archive(Gateways, Now, F, []) of
         {ok, F2, Gateways2} ->
-            F2#{ gateways := Gateways2, archive_at := Now + Every };
+            (listed(F2))#{ gateways := Gateways2, archive_at := Now + Every };
         {none, F2, Gateways2} ->
             % Every gateway is cooling down: ask again when the first may be.
             Next = lists:min([ NB || #{ not_before := NB } <- Gateways2 ]),
-            F2#{ gateways := Gateways2, archive_at := max(Next, Now + 1000) }
+            (listed(F2))#{ gateways := Gateways2, archive_at := max(Next, Now + 1000) }
     end.
+
+%% Count a read, and keep the highest block any window held was mined in.
+listed(F = #{ windows := Windows }) ->
+    Heights = [ H || #{ height := H } <- Windows, is_integer(H) ],
+    F#{ listings => maps:get(listings, F, 0) + 1,
+        top_height => lists:max([maps:get(top_height, F, -1) | Heights]) }.
+
+%% The lowest block a listing asks for windows from: none on the first read
+%% and every `?FULL_LISTING_EVERY'-th, else `?RELIST_BLOCKS' below the
+%% highest block a held window was mined in. A whole listing is 100 windows a
+%% request: 124 requests a read for one process of 10,000 slots archived a
+%% few slots a window, every `archive-poll-ms' (2026-11-16), which is what
+%% the gateway rate-limited.
+floor_height(F = #{ top_height := Top }) when is_integer(Top), Top >= 0 ->
+    case maps:get(listings, F, 0) rem ?FULL_LISTING_EVERY of
+        0 -> undefined;
+        _ -> max(0, Top - ?RELIST_BLOCKS)
+    end;
+floor_height(_) -> undefined.
 
 %% Try each gateway in the order listed, skipping one not to be asked yet; a
 %% gateway that fails is backed off and the next one tried, starting from the
@@ -326,13 +460,13 @@ new_windows(Gateway, F) ->
 %% The confirmed windows not held yet that reach past the indexed slot, once
 %% each (arweave.net lists every archive item twice, once with its block and
 %% once without), lowest slots first: those are what indexing waits on.
-wanted_windows(Gateway, #{ p := P, s := S, depth := Depth, windows := Have,
+wanted_windows(Gateway, F = #{ p := P, s := S, depth := Depth, windows := Have,
         indexed := Indexed }) ->
     Height = binary_to_integer(string:trim(gateway(get, Gateway, "/height", none, 15000))),
-    Edges = archive_edges(Gateway, S, P, #{}),
+    Edges = archive_edges(Gateway, S, P, floor_height(F), #{}),
     Known = [ maps:get(id, W) || W <- Have ],
     lists:keysort(2, lists:ukeysort(1,
-        [ {ID, hb_util:int(tag(<<"From-Slot">>, Tags)), To}
+        [ {ID, hb_util:int(tag(<<"From-Slot">>, Tags)), To, maps:get(<<"height">>, Block)}
         || #{ <<"node">> := #{ <<"id">> := ID, <<"tags">> := Tags,
                 <<"block">> := Block } } <- Edges,
            not lists:member(ID, Known),
@@ -341,27 +475,37 @@ wanted_windows(Gateway, #{ p := P, s := S, depth := Depth, windows := Have,
            To > Indexed ])).
 
 fetch_windows(_Gateway, [], Got) -> {ok, lists:reverse(Got)};
-fetch_windows(Gateway, [{ID, From, To} | Rest], Got) ->
+fetch_windows(Gateway, [{ID, From, To, Height} | Rest], Got) ->
     try archived_ids(gateway(get, Gateway, "/raw/" ++ hb_util:list(ID), none, 60000)) of
-        IDs -> fetch_windows(Gateway, Rest, [#{ id => ID, from => From, to => To, ids => IDs } | Got])
+        IDs ->
+            fetch_windows(Gateway, Rest,
+                [#{ id => ID, from => From, to => To, ids => IDs, height => Height } | Got])
     catch Class:Reason -> {refused, lists:reverse(Got), Class, Reason}
     end.
 
-%% Every archive transaction of P that S signed, page by page.
-archive_edges(Gateway, S, P, After) ->
-    Query = <<"query($o:[String!],$p:[String!]!,$a:String){transactions(owners:$o,",
+%% Every archive transaction of P that S signed, mined at or above `Floor'
+%% (`undefined': at any height), page by page.
+archive_edges(Gateway, S, P, Floor, After) ->
+    {Params, BlockArg, Vars} =
+        case Floor of
+            undefined -> {<<>>, <<>>, After};
+            _ -> {<<",$m:Int">>, <<"block:{min:$m},">>, After#{ <<"m">> => Floor }}
+        end,
+    Query = <<"query($o:[String!],$p:[String!]!,$a:String", Params/binary,
+        "){transactions(owners:$o,",
         "tags:[{name:\"Data-Protocol\",values:[\"ao-schedule-archive\"]},",
-        "{name:\"Process\",values:$p}],first:100,after:$a,sort:HEIGHT_ASC)",
+        "{name:\"Process\",values:$p}],", BlockArg/binary,
+        "first:100,after:$a,sort:HEIGHT_ASC)",
         "{pageInfo{hasNextPage} edges{cursor node{id tags{name value} block{height}}}}}">>,
     Body = hb_json:encode(#{ <<"query">> => Query, <<"variables">> =>
-        After#{ <<"o">> => [hb_util:human_id(S)], <<"p">> => [P] } }),
+        Vars#{ <<"o">> => [hb_util:human_id(S)], <<"p">> => [P] } }),
     Res = gateway(post, Gateway, "/graphql", Body, 15000),
     #{ <<"data">> := #{ <<"transactions">> := #{
         <<"pageInfo">> := #{ <<"hasNextPage">> := More }, <<"edges">> := Edges } } } =
         hb_json:decode(Res),
     case {More, lists:reverse(Edges)} of
         {true, [#{ <<"cursor">> := Cursor } | _]} ->
-            Edges ++ archive_edges(Gateway, S, P, #{ <<"a">> => Cursor });
+            Edges ++ archive_edges(Gateway, S, P, Floor, #{ <<"a">> => Cursor });
         _ -> Edges
     end.
 
@@ -417,20 +561,28 @@ archived_ids([{Size, ID} | Rest], Items) ->
 
 %%% Index and markers ---------------------------------------------------------
 
-%% Slot N's outbox entries, the entries its input took, and the new
-%% `indexed' mark: one write, one flush.
-write_entries(P, N, Proc, State, Taken, ROpts, Opts) ->
-    Results = hb_maps:get(<<"results">>, hb_private:reset(State), #{}, ROpts),
+%% The outbox entries of each `{N, Taken}' slot, read from the replica's
+%% stored results of the slot, the entries its input took, and the new
+%% `indexed' mark (the last slot): one write, one flush.
+write_entries(P, Ready, Proc, ROpts, Opts) ->
     Origin = lib_process_delivery:origin(P, Proc, ROpts),
+    ProcID = lib_process:process_id(Proc, #{}, ROpts),
     Rows =
-        maps:from_list(
-            [ {entry_path(P, N, K),
-               term_to_binary(#{ <<"entry">> => E, <<"origin">> => Origin })}
-            || {K, E} <- maps:to_list(outbox(Results, ROpts)) ]
-            ++ [ {taken_path(P, ID), integer_to_binary(N)} || ID <- Taken ]),
+        maps:from_list(lists:append(
+            [ [ {entry_path(P, N, K),
+                 term_to_binary(#{ <<"entry">> => E, <<"origin">> => Origin })}
+              || {K, E} <- maps:to_list(outbox(results(ProcID, N, ROpts), ROpts)) ]
+              ++ [ {taken_path(P, ID), integer_to_binary(N)} || ID <- Taken ]
+            || {N, Taken} <- Ready ])),
+    {Last, _} = lists:last(Ready),
     Store = store(Opts),
-    ok = hb_store:write(Store, Rows#{ indexed_path(P) => integer_to_binary(N) }, Opts),
+    ok = hb_store:write(Store, Rows#{ indexed_path(P) => integer_to_binary(Last) }, Opts),
     hb_store:flush(Store, Opts).
+
+%% A computed slot's results, as stored: without materializing its state.
+results(ProcID, N, ROpts) ->
+    {ok, Results} = lib_process_cache:read_results(ProcID, N, ROpts),
+    Results.
 
 outbox(Results, Opts) ->
     Entries = lib_process_cache:outbox_entries(
@@ -564,6 +716,8 @@ entry_taken_once_test() ->
         <<"from-entry">> => hb_util:human_id(crypto:strong_rand_bytes(32)),
         <<"from-scheduler">> => PeerAddr }, #{ <<"priv-wallet">> => Peer }, <<"httpsig@1.0">>),
     {ok, [ID]} = readmit(#{ <<"body">> => Body }, P, Opts, Opts),
+    % Taken by an earlier slot of the same batch, not written yet.
+    ?assertMatch({refused, _}, readmit(#{ <<"body">> => Body }, P, Opts, Opts, [ID])),
     ok = hb_store:write(store(Opts), #{ taken_path(P, ID) => <<"4">> }, Opts),
     ?assertMatch({refused, _}, readmit(#{ <<"body">> => Body }, P, Opts, Opts)).
 
@@ -838,3 +992,134 @@ no_polling_when_nothing_pending_test() ->
     ?assertEqual(?DEFAULT_IDLE_POLL_MS, interval(Waiting#{ indexed := 6 })),
     Read = Waiting#{ archive_at := Now + 1000 },
     ?assertEqual(Read, with_windows(Read, Now)).
+
+%%% Batches and progress -------------------------------------------------------
+
+%% A Lua process that sends one message a slot, its data the slot's count.
+counting_sender(Opts) ->
+    Script = <<
+        "Count = Count or 0\n"
+        "function compute(req)\n"
+        "  Count = Count + 1\n"
+        "  local value = tostring(Count)\n"
+        "  return {\n"
+        "    patches = { { path = '/count', value = value } },\n"
+        "    results = { output = { data = value },\n"
+        "      outbox = { { target = 'x', data = 'ping-' .. value } } }\n"
+        "  }\n"
+        "end\n"
+    >>,
+    Process = hb_process_test_vectors:lua_patch_process(Script, Opts),
+    {ok, _} = hb_cache:write(Process, Opts),
+    Process.
+
+%% The options a replica computes under (`lib_bridge_replica:execution_opts/2'),
+%% with `Target' as its `process-snapshot-target'.
+replica_like_opts(Target) ->
+    #{ <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+       <<"priv-wallet">> => ar_wallet:new(),
+       <<"process-state-blobs">> => true, <<"process-delta-cache">> => false,
+       <<"process-snapshot-slots">> => 1000, <<"process-snapshot-time">> => false,
+       <<"process-snapshot-target">> => Target,
+       <<"process-compute-on-schedule">> => false, <<"process-workers">> => false,
+       <<"spawn-worker">> => false, <<"process-worker-spawn">> => false,
+       <<"await-inprogress">> => false }.
+
+executions() ->
+    lists:sum([ N || {slot_execution, _, N, _} <- hb_phase_timer:read() ]).
+
+compute(Process, Slot, Opts) ->
+    {ok, _} = hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, Opts).
+
+%% 2026-11-16: the follower computed its replica one call per slot, and a
+%% call resumes from the newest VM snapshot, which with interval snapshots
+%% alone was up to 1,000 slots back: 0.07 slots/s. With the target slot
+%% snapshotted every slot executes once, slot by slot or in a batch.
+replica_slot_executes_once_test_() ->
+    {timeout, 120, fun replica_slot_executes_once/0}.
+replica_slot_executes_once() ->
+    application:ensure_all_started(hb),
+    Slots = 8,
+    Run =
+        fun(Target) ->
+            Opts = replica_like_opts(Target),
+            Process = counting_sender(Opts),
+            [ hb_process_test_vectors:schedule_test_message(Process, <<"go">>, #{}, Opts)
+            || _ <- lists:seq(1, Slots) ],
+            Before = executions(),
+            [ compute(Process, N, Opts) || N <- lists:seq(0, Slots - 1) ],
+            executions() - Before
+        end,
+    ?assertEqual(Slots, Run(true)),
+    % Without it, each call replays the slots before it again (29 executions
+    % for 8 slots here; slot 0 is a checkpoint).
+    ?assert(Run(false) > 3 * Slots).
+
+%% One call computes a batch, and each slot's outbox is read back from its
+%% stored results, as the follower indexes it.
+batch_outboxes_read_from_stored_results_test_() ->
+    {timeout, 120, fun batch_outboxes_read_from_stored_results/0}.
+batch_outboxes_read_from_stored_results() ->
+    application:ensure_all_started(hb),
+    Opts = replica_like_opts(true),
+    Process = counting_sender(Opts),
+    ProcID = lib_process:process_id(Process, #{}, Opts),
+    [ hb_process_test_vectors:schedule_test_message(Process, <<"go">>, #{}, Opts)
+    || _ <- lists:seq(1, 6) ],
+    Before = executions(),
+    compute(Process, 5, Opts),
+    ?assertEqual(6, executions() - Before),
+    lists:foreach(
+        fun(N) ->
+            [Entry] = maps:values(outbox(results(ProcID, N, Opts), Opts)),
+            ?assertEqual(<<"ping-", (integer_to_binary(N + 1))/binary>>,
+                hb_maps:get(<<"data">>, Entry, undefined, Opts))
+        end,
+        lists:seq(0, 5)),
+    % The next batch resumes from the last one's snapshot.
+    [ hb_process_test_vectors:schedule_test_message(Process, <<"go">>, #{}, Opts)
+    || _ <- lists:seq(1, 3) ],
+    compute(Process, 8, Opts),
+    ?assertEqual(9, executions() - Before).
+
+%% The deliverer is told to post again when the follower should have indexed
+%% the slot, at its measured rate, between `poll-ms' and ten minutes; told
+%% nothing without a rate or for a slot already indexed.
+retry_after_follows_progress_test() ->
+    P = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ?assertEqual(undefined, retry_after(P, 50, #{})),
+    F = progress(#{ p => P, indexed => 100, progress => {now_ms() - 10000, 0, undefined} }),
+    {100, Rate} = progress_of(P),
+    ?assert(Rate > 9 andalso Rate =< 10),
+    % 100 slots ahead at ~10 slots/s.
+    Ahead = retry_after(P, 200, #{}),
+    ?assert(Ahead >= 10 andalso Ahead =< 12),
+    ?assertEqual(5, retry_after(P, 101, #{})),
+    ?assertEqual(600, retry_after(P, 1000000, #{})),
+    ?assertEqual(undefined, retry_after(P, 100, #{})),
+    ?assertEqual(undefined, retry_after(P, 3, #{})),
+    % The rate is smoothed over batches.
+    timer:sleep(5),
+    _ = progress(F#{ indexed := 100 }),
+    {100, Slower} = progress_of(P),
+    ?assert(Slower < Rate).
+
+%% Windows the index has passed are dropped.
+windows_pruned_test() ->
+    F = #{ windows => [#{ id => <<"a">>, from => 0, to => 4, ids => [] },
+                       #{ id => <<"b">>, from => 5, to => 9, ids => [] }], indexed => 4 },
+    ?assertEqual([<<"b">>], [ maps:get(id, W) || W <- maps:get(windows, prune(F)) ]).
+
+%% A listing is whole the first time and every `?FULL_LISTING_EVERY'-th
+%% time, and otherwise starts `?RELIST_BLOCKS' below the highest block held.
+listing_floor_test() ->
+    ?assertEqual(undefined, floor_height(#{})),
+    Held = listed(#{ windows => [#{ id => <<"a">>, from => 0, to => 1, ids => [],
+        height => 1000 }] }),
+    ?assertEqual(1000, maps:get(top_height, Held)),
+    ?assertEqual(1000 - ?RELIST_BLOCKS, floor_height(Held)),
+    % Pruned windows leave the highest block as it was.
+    Pruned = listed(Held#{ windows := [] }),
+    ?assertEqual(1000, maps:get(top_height, Pruned)),
+    ?assertEqual(undefined,
+        floor_height(Pruned#{ listings := ?FULL_LISTING_EVERY })).

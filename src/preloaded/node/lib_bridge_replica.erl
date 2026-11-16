@@ -37,7 +37,7 @@
 -module(lib_bridge_replica).
 -export([view/3]).
 %% For `dev_scheduler_follower', which follows any process this way.
--export([load/4, forward/1, slot_path/3]).
+-export([load/4, load/5, forward/1, slot_path/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -150,12 +150,26 @@ body(_, _) -> false.
 %%% The replica -----------------------------------------------------------------
 
 load(Pusd, Url, NodeOpts, Dir) ->
+    load(Pusd, Url, NodeOpts, Dir, drop).
+
+%% @doc `load/4', saying what becomes of a store another build computed:
+%% `drop' it and replay from slot 0 (the attestor), or `keep' it.
+%% `dev_scheduler_follower' keeps it: the outbox entries it indexed from that
+%% store are kept in the node's own store across builds and believed as they
+%% are, so a replay from slot 0 re-derives nothing the index acts on. It only
+%% held back every push of the followed process until the replay of its
+%% whole history ended, after every node upgrade (2026-11-16).
+load(Pusd, Url, NodeOpts, Dir, OnOtherBuild) ->
     Base = <<Dir/binary, "/", Pusd/binary>>,
     Store = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => Base },
     Cursor = <<Base/binary, ".cursor.json">>,
     Build = build(NodeOpts),
     ok = filelib:ensure_dir(binary_to_list(<<Base/binary, "/">>)),
-    ok = same_build(Cursor, Build, Store),
+    ok =
+        case OnOtherBuild of
+            keep -> ok;
+            drop -> same_build(Cursor, Build, Store)
+        end,
     ok = hb_store:start([Store]),
     ROpts = execution_opts(NodeOpts, Store),
     R = #{ pusd => Pusd, url => Url, opts => ROpts, http => NodeOpts,
@@ -206,6 +220,13 @@ execution_opts(NodeOpts, Store) ->
         <<"scheduler-lookahead">> => false,
         <<"scheduler-follow-redirects">> => false,
         <<"await-inprogress">> => false,
+        % A replica is computed by calls for one slot, with no worker to hold
+        % the VM between them, so a call resumes from the newest stored VM
+        % snapshot. Without one at the slot each call computed, the next
+        % call replays from the last interval snapshot: with
+        % `process-snapshot-slots' 1000, indexing slot N replayed N mod 1000
+        % slots, 0.07 slots/s at 140 ms a slot (2026-11-16).
+        <<"process-snapshot-target">> => true,
         % Result-affecting options, pinned to what our nodes run
         % (paralith-mono infra/nodes/node-config.v011.json).
         <<"lua-patch-invalid-patches">> => <<"drop">>,
@@ -523,6 +544,35 @@ peer_arweave_metadata_is_not_authority_test() ->
 
 %% A slot that crashes a check is refused with the same scrubbed text as a
 %% failed pass: the public status never shows a call's arguments.
+%% A replica stored by another build is dropped by `load/4' (the attestor's)
+%% and kept by `load/5' with `keep' (the follower's); both snapshot the slot
+%% each call computes.
+other_build_kept_only_when_asked_test_() ->
+    {timeout, 60, fun other_build_kept_only_when_asked/0}.
+other_build_kept_only_when_asked() ->
+    hb:init(),
+    Dir = <<"/tmp/replica-build-", (integer_to_binary(erlang:unique_integer([positive])))/binary>>,
+    Pusd = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Base = <<Dir/binary, "/", Pusd/binary>>,
+    Store = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => Base },
+    Unreachable = <<"http://127.0.0.1:1">>,
+    Seed =
+        fun() ->
+            ok = filelib:ensure_dir(binary_to_list(<<Base/binary, "/">>)),
+            ok = hb_store:start([Store]),
+            ok = hb_store:write([Store], #{ <<"marker">> => <<"kept">> }, #{}),
+            ok = hb_store:flush([Store], #{}),
+            ok = file:write_file(<<Base/binary, ".cursor.json">>,
+                hb_json:encode(#{ <<"slot">> => 3, <<"build">> => <<"another@0">> }))
+        end,
+    Marker = fun() -> hb_store:read([Store], #{ <<"read">> => <<"marker">>, <<"exact">> => true }, #{}) end,
+    Seed(),
+    #{ opts := ROpts } = load(Pusd, Unreachable, #{}, Dir, keep),
+    ?assertEqual({ok, <<"kept">>}, Marker()),
+    ?assertEqual(true, maps:get(<<"process-snapshot-target">>, ROpts)),
+    _ = load(Pusd, Unreachable, #{}, Dir),
+    ?assertNotEqual({ok, <<"kept">>}, Marker()).
+
 replica_failure_is_scrubbed_test() ->
     Store = hb_test_utils:test_store(hb_store_volatile, <<"replica-scrubbed">>),
     ok = hb_store:start(Store),

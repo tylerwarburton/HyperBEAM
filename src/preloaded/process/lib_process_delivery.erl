@@ -31,7 +31,9 @@
 %%% Anything else -- any other answer of a remote scheduler, a 404, a throttle,
 %%% a timeout, a network error, an unreachable gateway, a signing, lookup or
 %%% post that crashed -- is retried, backing off from 1 s to 10 min, with no
-%%% cap on attempts: an entry is never given up. A 307 or a 422 says the
+%%% cap on attempts: an entry is never given up. A 503 with a `retry-after'
+%%% (a door verifying the sender, `dev_scheduler_admission') is retried that
+%%% many seconds later instead, within the same bounds. A 307 or a 422 says the
 %%% message was not assigned, so the entry is signed again (for the new
 %%% location, or as `ans104@1.0') like a new one, and the target remembers it:
 %%% its later entries are signed that way from the start.
@@ -1042,9 +1044,17 @@ next_backoff(undefined) -> ?FIRST_BACKOFF_MS;
 next_backoff(Prev) -> min(?MAX_BACKOFF_MS, Prev * 2).
 
 %% An entry backs off on its own, from its own last delay.
-backoff(Slot, Key, State = #{ entries := Entries, timers := Timers }) ->
+backoff(Slot, Key, State = #{ entries := Entries }) ->
     Entry = maps:get({Slot, Key}, Entries),
-    Delay = next_backoff(maps:get(delay, Entry, undefined)),
+    backoff_for(Slot, Key, next_backoff(maps:get(delay, Entry, undefined)), State).
+
+%% An entry whose target said when to post it again waits that long, between
+%% the first and the longest backoff, instead of doubling its last delay.
+backoff(Slot, Key, AfterMs, State) ->
+    backoff_for(Slot, Key, min(?MAX_BACKOFF_MS, max(?FIRST_BACKOFF_MS, AfterMs)), State).
+
+backoff_for(Slot, Key, Delay, State = #{ entries := Entries, timers := Timers }) ->
+    Entry = maps:get({Slot, Key}, Entries),
     State#{
         entries := Entries#{ {Slot, Key} := Entry#{ delay => Delay } },
         timers := gb_sets:add({now_ms() + Delay, Slot, Key}, Timers)
@@ -1238,6 +1248,13 @@ by_status(307, _Where, Res, Opts) ->
     end;
 by_status(422, _Where, _Res, _Opts) -> downgrade;
 by_status(S, local, _Res, _Opts) when S == 400; S == 413 -> {terminal, S};
+by_status(503, _Where, Res, Opts) ->
+    % A verifying door names when the entry is worth posting again
+    % (`dev_scheduler_follower:retry_after/3').
+    case hb_util:safe_int(hb_ao:get(<<"retry-after">>, Res, undefined, Opts)) of
+        {ok, Secs} when Secs > 0 -> {retry, Secs * 1000};
+        _ -> retry
+    end;
 by_status(_, _Where, _Res, _Opts) -> retry.
 
 %% A receipt carries the slot the target gave, as an integer, or there is no
@@ -1284,6 +1301,8 @@ outcome(Slot, Key, ID, {Codec, Location}, Outcome, State = #{ proc_id := ProcID,
         downgrade when Codec =/= <<"ans104@1.0">> ->
             Signing = {<<"ans104@1.0">>, Location},
             resign(Slot, Key, Signing, State#{ hints := Hints#{ Target => Signing } });
+        {retry, AfterMs} ->
+            backoff(Slot, Key, AfterMs, State);
         _ ->
             backoff(Slot, Key, State)
     end.
@@ -1300,6 +1319,7 @@ trace(Slot, Key, ID, Outcome, Posted, State = #{ proc_id := ProcID }) ->
         case Outcome of
             {K, S} when K == assigned; K == already; K == terminal; K == redirect -> {K, S};
             K when is_atom(K) -> {K, null};
+            {retry, _} -> {retry, null};
             _ -> {other, null}
         end,
     hb_msg_trace:delivered(ProcID, Slot, target_of(Slot, Key, State), Kind,
@@ -1310,7 +1330,8 @@ outcome_counter({already, _}) -> delivery_already;
 outcome_counter({terminal, _}) -> delivery_terminal;
 outcome_counter({redirect, _}) -> delivery_resign;
 outcome_counter(downgrade) -> delivery_resign;
-outcome_counter(retry) -> delivery_retry.
+outcome_counter(retry) -> delivery_retry;
+outcome_counter({retry, _}) -> delivery_retry.
 
 wake(ProcID, Slot, Receipts) ->
     ensure_table(?WAITERS, ordered_set),
@@ -1813,7 +1834,27 @@ classify_test() ->
     ?assertEqual(retry, L({ok, #{ <<"status">> => 202, <<"slot">> => 1 }})),
     ?assertEqual(retry, L({error, timeout})),
     ?assertEqual(retry, Rm({error, scheduler_timeout})),
-    ?assertEqual(retry, Rm({failure, econnrefused})).
+    ?assertEqual(retry, Rm({failure, econnrefused})),
+    % A verifying door's 503 says when to post again, in seconds, as a
+    % header does; a missing or unreadable one is an ordinary retry.
+    ?assertEqual({retry, 30000},
+        Rm({error, #{ <<"status">> => 503, <<"retry-after">> => <<"30">> }})),
+    ?assertEqual({retry, 7000},
+        L({error, #{ <<"status">> => 503, <<"retry-after">> => 7 }})),
+    ?assertEqual(retry, Rm({error, #{ <<"status">> => 503 }})),
+    ?assertEqual(retry, Rm({error, #{ <<"status">> => 503, <<"retry-after">> => <<"soon">> }})),
+    ?assertEqual(delivery_retry, outcome_counter({retry, 30000})).
+
+%% An entry told when to post again waits that long, within the backoff's
+%% bounds, and an entry told nothing doubles from there.
+told_backoff_test() ->
+    Key = <<"1">>,
+    State = #{ entries => #{ {3, Key} => #{} }, timers => gb_sets:new() },
+    Delay = fun(S) -> maps:get(delay, maps:get({3, Key}, maps:get(entries, S))) end,
+    ?assertEqual(30000, Delay(backoff(3, Key, 30000, State))),
+    ?assertEqual(?FIRST_BACKOFF_MS, Delay(backoff(3, Key, 10, State))),
+    ?assertEqual(?MAX_BACKOFF_MS, Delay(backoff(3, Key, 86400000, State))),
+    ?assertEqual(60000, Delay(backoff(3, Key, backoff(3, Key, 30000, State)))).
 
 missing_target_memory_test() ->
     ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
