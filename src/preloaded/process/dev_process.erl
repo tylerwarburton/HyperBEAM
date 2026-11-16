@@ -487,9 +487,12 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
         CurrentSlot when CurrentSlot < TargetSlot ->
             % Compute the next state transition.
             NextSlot = CurrentSlot + 1,
-            % Get the next input message from the scheduler device.
+            % Get the next input message from the scheduler device. The
+            % message trace's row for the slot starts here (`hb_msg_trace').
+            hb_msg_trace:open(ProcID, NextSlot),
             case hb_phase_timer:time(slot_next, ProcID, fun() -> next(Base, Req, Opts) end) of
                 {error, Res} ->
+                    hb_msg_trace:abandon(),
                     % If the scheduler device cannot provide a next message,
                     % we return its error details, along with the current slot.
                     ?event(compute_short,
@@ -541,6 +544,7 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
 
 %% @doc Compute a single slot for a process, given an initialized state.
 compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
+    hb_msg_trace:opened(),
     {PrepTimeMicroSecs, {ok, Slot, PreparedState, Req}} =
         timer:tc(
             fun() ->
@@ -591,8 +595,9 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
             % Force a snapshot of the target slot so the terminal state is
             % restorable; intermediate slots snapshot per the configured interval.
             % See `snapshot_target/3' for turning the forced snapshot off.
-            {StoreTimeMicroSecs, ProcStateWithSnapshot} =
-                timer:tc(
+            % The store's LMDB phases are noted apart from the execution's.
+            {StoreTimeMicroSecs, ProcStateWithSnapshot, StoreNotes} =
+                hb_slot_log:run(
                     fun() ->
                         store_result(
                             snapshot_target(Slot, TargetSlot, Opts),
@@ -605,7 +610,10 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                     end
                 ),
             hb_slot_log:end_slot(ProcID, Slot, Action, ok, PrepTimeMicroSecs,
-                RuntimeMicroSecs, StoreTimeMicroSecs, Notes),
+                RuntimeMicroSecs, StoreTimeMicroSecs, merge_notes(Notes, StoreNotes)),
+            % The slot is readable from here: its trace row ends now.
+            hb_msg_trace:close(ProcID, Slot, Req, Action, ok, PrepTimeMicroSecs,
+                RuntimeMicroSecs, StoreTimeMicroSecs, Notes, StoreNotes),
             ?event(compute_short,
                 {computed_slot,
                     {proc_id, ProcID},
@@ -684,8 +692,8 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                     Opts
                 ),
 
-            {StoreTimeMicroSecs, _} =
-                timer:tc(
+            {StoreTimeMicroSecs, _, StoreNotes} =
+                hb_slot_log:run(
                     fun() ->
                         store_result(
                             snapshot_target(Slot, TargetSlot, Opts),
@@ -698,7 +706,9 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                     end
                 ),
             hb_slot_log:end_slot(ProcID, Slot, Action, error, PrepTimeMicroSecs,
-                RuntimeMicroSecs, StoreTimeMicroSecs, Notes),
+                RuntimeMicroSecs, StoreTimeMicroSecs, merge_notes(Notes, StoreNotes)),
+            hb_msg_trace:close(ProcID, Slot, Req, Action, error, PrepTimeMicroSecs,
+                RuntimeMicroSecs, StoreTimeMicroSecs, Notes, StoreNotes),
             {ok, ErrState};
         {failure, Failure} ->
             % A failure of this node -- a failed read or fetch -- is not a
@@ -707,6 +717,8 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
             % it arrived.
             hb_slot_log:end_slot(ProcID, Slot, Action, failure, PrepTimeMicroSecs,
                 RuntimeMicroSecs, 0, Notes),
+            hb_msg_trace:close(ProcID, Slot, Req, Action, failure, PrepTimeMicroSecs,
+                RuntimeMicroSecs, 0, Notes, #{}),
             hb_hook:on(
                 <<"process-failure">>,
                 #{
@@ -718,6 +730,9 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
             ),
             {failure, Failure}
     end.
+
+%% A slot's notes from its execution and its store, summed per phase.
+merge_notes(A, B) -> maps:merge_with(fun(_, X, Y) -> X + Y end, A, B).
 
 %% The slot message's `action', for the event log and `hb_slot_log'. Reading
 %% it never fails a slot.

@@ -57,7 +57,8 @@ configure(Opts) ->
         Max -> ok;
         _ -> persistent_term:put(?MAX_KEY, Max)
     end,
-    hb_slot_log:configure(Opts).
+    hb_slot_log:configure(Opts),
+    hb_msg_trace:configure(Opts).
 
 %% @doc Whether recording is on.
 enabled() -> persistent_term:get(?ENABLED_KEY, true).
@@ -194,15 +195,18 @@ reset() ->
     try ets:delete_all_objects(?TABLE) catch error:badarg -> true end,
     try ets:delete_all_objects(?PROCS) catch error:badarg -> true end,
     erase(?LABEL_KEY),
-    hb_slot_log:reset().
+    hb_slot_log:reset(),
+    hb_msg_trace:reset().
 
 %% The tables are owned by a process that never exits: a table dies with its
 %% owner, and the first recorder is usually a short-lived request. The slot
 %% log's table is created first, so finding this module's tables means it
-%% exists too; the owner that created it sweeps it every minute.
+%% exists too; the owner that created it sweeps it every minute. The message
+%% trace's tables (`hb_msg_trace') are created by the same owner.
 ensure_table() ->
     case ets:whereis(?TABLE) =/= undefined andalso
-            ets:whereis(hb_slot_log) =/= undefined of
+            ets:whereis(hb_slot_log) =/= undefined andalso
+            ets:whereis(hb_msg_trace) =/= undefined of
         false ->
             Parent = self(),
             Ref = make_ref(),
@@ -210,6 +214,7 @@ ensure_table() ->
                 spawn_monitor(
                     fun() ->
                         SlotLog = create(fun hb_slot_log:new_table/0),
+                        Trace = create(fun hb_msg_trace:new_tables/0),
                         Timers =
                             create(fun() ->
                                 ets:new(?PROCS, [named_table, public, set,
@@ -218,10 +223,9 @@ ensure_table() ->
                                     {write_concurrency, true}])
                             end),
                         Parent ! {Ref, done},
-                        case {SlotLog, Timers} of
-                            {false, false} -> ok;
-                            {true, _} -> sweep_loop();
-                            {false, true} -> receive after infinity -> ok end
+                        case SlotLog orelse Timers orelse Trace of
+                            false -> ok;
+                            true -> sweep_loop()
                         end
                     end
                 ),
@@ -243,6 +247,7 @@ create(Fun) ->
 sweep_loop() ->
     receive after 60000 -> ok end,
     catch hb_slot_log:sweep(),
+    catch hb_msg_trace:sweep(),
     sweep_loop().
 
 record_and_read_test() ->

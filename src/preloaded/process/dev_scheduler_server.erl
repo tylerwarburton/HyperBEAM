@@ -371,6 +371,7 @@ flushed(State = #{ inflight := Inflight, flushing := Flushing }, Ref, ok) ->
             {Done, Rest, Flushing1} = take_through(Seq, Inflight, Flushing, []),
             {_, _, Slot, _, _} = lists:last(Done),
             ok = dev_scheduler_cache:set_durable(maps:get(id, State), Slot),
+            hb_msg_trace:durable(hb_util:human_id(maps:get(id, State)), Slot),
             lists:foreach(
                 fun({_, _, _, Written, _}) ->
                     lists:foreach(
@@ -538,6 +539,10 @@ assign_batch(State = #{ current := First, opts := Opts, unwritten := Unwritten }
                                     {S, [{refused, Reply, Message, Error} | Acc],
                                         Pending};
                                 {S2, Assignment, Pending2} ->
+                                    % Queued when the client asked:
+                                    % its deadline less the timeout.
+                                    hb_msg_trace:scheduled(Assignment,
+                                        {Message, AbortTime - ?DEFAULT_TIMEOUT}),
                                     {S2, [{Reply, Message, Assignment} | Acc],
                                         Pending2}
                             catch

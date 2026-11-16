@@ -48,6 +48,13 @@ log(Topic, X, Mod, Func, undefined, Opts) -> log(Topic, X, Mod, Func, "", Opts);
 log(Topic, X, Mod, Func, Line, Opts) ->
     debug_print(Topic, X, Mod, Func, Line, Opts),
     try record(Topic, X, Mod, Func, Line, Opts) catch _:_ -> ok end,
+    % Warnings and errors are rows of the message trace too, joined to the
+    % process and slot they name (`hb_msg_trace:event/4').
+    case Topic of
+        warning -> hb_msg_trace:event(Topic, X, Mod, Line);
+        error -> hb_msg_trace:event(Topic, X, Mod, Line);
+        _ -> ok
+    end,
     % Return the logged value to the caller. This allows callers to insert 
     % `?event(...)' macros into the flow of other executions, without having to
     % break functional style.

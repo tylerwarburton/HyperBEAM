@@ -776,6 +776,8 @@ start_http2(ServerID, ProtoOpts, NodeMsg, TLSOpts) ->
 %% and the dispatch state: the server ID, which looks up the node message, and
 %% the body bound that the listener read when it started.
 init(Req, {ServerID, MaxBody}) ->
+    % When the request arrived, for the message trace (`hb_msg_trace').
+    hb_msg_trace:arrived(),
     case {cowboy_req:method(Req), ServerID} of
         {<<"OPTIONS">>, {tls_http_01, _}} ->
             request_body(Req, ServerID, MaxBody);
@@ -790,7 +792,9 @@ init(Req, {ServerID, MaxBody}) ->
 %% @doc Read and handle a request body within the node's limits.
 request_body(Req, ServerID, MaxBody) ->
     case read_body(Req, MaxBody) of
-        {ok, Body} -> handle_request(Req, Body, ServerID);
+        {ok, Body} ->
+            hb_msg_trace:body_read(),
+            handle_request(Req, Body, ServerID);
         {too_large, Req2} ->
             {ok, cowboy_req:reply(
                 413, #{}, <<"Request body too large.">>, Req2
@@ -946,7 +950,11 @@ handle_request(RawReq, Body, ServerID) ->
                         ReqSingleton,
                         NodeMsg
                     ),
-                reply(Req, Request, Res, NodeMsg)
+                Replied = reply(Req, Request, Res, NodeMsg),
+                % A signed request is a row of the message trace: arrival,
+                % body read, reply sent (`hb_msg_trace:replied/1').
+                hb_msg_trace:replied(ReqSingleton),
+                Replied
             catch
                 Type:Details:Stacktrace ->
                     handle_error(

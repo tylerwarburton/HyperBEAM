@@ -146,7 +146,10 @@ write(Opts, Req, _NodeOpts) ->
             [],
             Req
         ),
-    case elmdb:put_batch(DBInstance, Pairs) of
+    T0 = erlang:monotonic_time(microsecond),
+    PutResult = elmdb:put_batch(DBInstance, Pairs),
+    hb_slot_log:note(lmdb_put, erlang:monotonic_time(microsecond) - T0),
+    case PutResult of
         ok -> ok;
         {error, Type, Description} ->
             ?event(
@@ -334,14 +337,20 @@ list_children(Opts, ResolvedPath, Req) ->
         [ {limit, Limit} || Limit =/= all ] ++
         [ {direction, case Direction of asc -> forward; desc -> backward end} ],
     Prefix = hb_store_utils:child_prefix(ResolvedPath),
-    case elmdb:list(DBInstance, Prefix, Options) of
+    T0 = erlang:monotonic_time(microsecond),
+    Listed = elmdb:list(DBInstance, Prefix, Options),
+    hb_slot_log:note(lmdb_scan, erlang:monotonic_time(microsecond) - T0),
+    case Listed of
         {ok, Children} -> {ok, Children};
         {error, Type, Description} -> {error, {Type, Description}}
     end.
 
 read_prefix_rows(Opts, Path) ->
     #{ <<"db">> := DBInstance } = find_env(Opts),
-    case elmdb:read_prefix(DBInstance, Path) of
+    T0 = erlang:monotonic_time(microsecond),
+    Read = elmdb:read_prefix(DBInstance, Path),
+    hb_slot_log:note(lmdb_scan, erlang:monotonic_time(microsecond) - T0),
+    case Read of
         {ok, Rows} -> {ok, Rows};
         {error, not_found} -> not_found;
         not_found -> not_found;
@@ -412,14 +421,22 @@ flush(Opts, _Req, _NodeOpts) ->
             Instance = #{ <<"env">> := Env } = find_env(Opts),
             maybe
                 ok ?= commit(Instance),
-                lmdb_result(elmdb:env_sync(Env))
+                T0 = erlang:monotonic_time(microsecond),
+                Synced = elmdb:env_sync(Env),
+                hb_slot_log:note(lmdb_commit, erlang:monotonic_time(microsecond) - T0),
+                lmdb_result(Synced)
             end;
         _ -> commit(find_env(Opts))
     end.
 
 %% @doc Commit the writes that `elmdb' holds in memory.
+%% Timed as `lmdb_commit': inside a slot against the slot (`hb_slot_log'),
+%% elsewhere -- the flusher, the scheduler's flush -- node-wide.
 commit(#{ <<"db">> := DBInstance }) ->
-    lmdb_result(elmdb:flush(DBInstance)).
+    T0 = erlang:monotonic_time(microsecond),
+    Result = elmdb:flush(DBInstance),
+    hb_slot_log:note(lmdb_commit, erlang:monotonic_time(microsecond) - T0),
+    lmdb_result(Result).
 
 %% @doc Normalize the result of an `elmdb' call. `ok' is returned as is. An
 %% error is logged and returned as `{error, Type}'.

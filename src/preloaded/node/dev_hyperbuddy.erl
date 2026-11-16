@@ -1,7 +1,7 @@
 %%% @doc A device that renders a REPL-like interface for AO-Core via HTML.
 -module(dev_hyperbuddy).
 -export([device_info/1, format/3, return_file/2]).
--export([metrics/3, events/3, slots/3]).
+-export([metrics/3, events/3, slots/3, trace/3]).
 -export([throw/3]).
 -include_lib("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -103,6 +103,25 @@ slots(_, Req, _Opts) ->
         <<"body">> => Encoded
     }}.
 
+%% @doc The message trace (`hb_msg_trace') as JSON: the rows after cursor
+%% `since' (default 0), oldest first, at most `limit' (1-5000, default
+%% 1000), with `next', the cursor to ask from next time. Reads ETS only.
+-spec trace(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, #{ _ => _ }}.
+trace(_, Req, _Opts) ->
+    Int =
+        fun(Key, Default) ->
+            case catch hb_util:int(maps:get(Key, Req, Default)) of
+                N when is_integer(N), N >= 0 -> N;
+                _ -> Default
+            end
+        end,
+    {ok, #{
+        <<"content-type">> => <<"application/json">>,
+        <<"cache-control">> => <<"no-store">>,
+        <<"body">> =>
+            hb_json:encode(hb_msg_trace:report(Int(<<"since">>, 0), Int(<<"limit">>, 1000)))
+    }}.
+
 slots_body(Window, Named) ->
     #{ ring := Ring, slot_log := SlotLog, unassigned := Unassigned,
         processes := Procs } = hb_slot_log:report(#{ window => Window, pid => Named }),
@@ -120,7 +139,8 @@ slots_body(Window, Named) ->
                 maps:from_list(
                     [ {atom_to_binary(P), count_us(maps:get(P, Phases, {0, 0}))}
                     || P <- [schedule, push, now_cache_latest, slot_next,
-                            slot_execution, slot_store] ]),
+                            slot_execution, slot_store, lmdb_put, lmdb_commit,
+                            lmdb_scan] ]),
             <<"delivery">> => delivery(),
             <<"unassigned">> => #{ <<"slot_execution">> => Unassigned }
         },
@@ -385,6 +405,31 @@ slots_endpoint_test() ->
         maps:get(<<"processes">>, Two)),
     ?assertEqual(60, maps:get(<<"window_s">>, Read(#{ <<"window">> => <<"soon">> }))),
     ?assertEqual([], maps:get(<<"processes">>, Read(#{ <<"pid">> => <<"unknown">> }))),
+    hb_phase_timer:reset().
+
+trace_endpoint_test() ->
+    hb_phase_timer:record(trace_endpoint_test, 0),
+    hb_phase_timer:configure(#{}),
+    hb_phase_timer:reset(),
+    Read =
+        fun(Params) ->
+            {ok, Res} = hb_ao:resolve(
+                #{ <<"device">> => <<"hyperbuddy@1.0">> },
+                Params#{ <<"path">> => <<"trace">> },
+                #{}
+            ),
+            ?assertEqual(<<"application/json">>, maps:get(<<"content-type">>, Res)),
+            hb_json:decode(maps:get(<<"body">>, Res))
+        end,
+    ?assertMatch(#{ <<"head">> := 0, <<"rows">> := [] }, Read(#{})),
+    [ begin
+        hb_msg_trace:open(<<"p">>, S),
+        hb_msg_trace:close(<<"p">>, S, #{}, <<"A">>, ok, 1, 2, 3, #{}, #{})
+      end || S <- [1, 2, 3] ],
+    #{ <<"rows">> := [_, _], <<"next">> := 2, <<"head">> := 3 } =
+        Read(#{ <<"limit">> => <<"2">> }),
+    #{ <<"rows">> := [#{ <<"slot">> := 3, <<"k">> := <<"c">> }], <<"next">> := 3 } =
+        Read(#{ <<"since">> => <<"2">>, <<"limit">> => <<"bad">> }),
     hb_phase_timer:reset().
 
 %% The slots endpoint reports the same delivery backlog as the metrics

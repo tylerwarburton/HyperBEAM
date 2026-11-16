@@ -578,8 +578,9 @@ drain(State) ->
 handle({ready, Slot}, State) -> load_slot(Slot, State);
 handle({posted, Pid, ID, Signing, Outcome}, State = #{ helpers := Helpers }) ->
     case maps:take(Pid, Helpers) of
-        {{Mon, {post, Slot, Key}, _}, Rest} ->
+        {{Mon, {post, Slot, Key}, Posted}, Rest} ->
             erlang:demonitor(Mon, [flush]),
+            trace(Slot, Key, ID, Outcome, Posted, State),
             outcome(Slot, Key, ID, Signing, Outcome, landed(Slot, Key, State#{ helpers := Rest }));
         _ -> State
     end;
@@ -1291,6 +1292,18 @@ resign(Slot, Key, {Codec, Location}, State = #{ entries := Entries }) ->
     enqueue(Slot, Key,
         State#{ entries := maps:update_with({Slot, Key},
             fun(E) -> E#{ q := {resign, Codec, Location} } end, Entries) }).
+
+%% Every answered post is a row of the message trace (`hb_msg_trace'): the
+%% target's slot, when it gave one, is the child of this slot.
+trace(Slot, Key, ID, Outcome, Posted, State = #{ proc_id := ProcID }) ->
+    {Kind, TSlot} =
+        case Outcome of
+            {K, S} when K == assigned; K == already; K == terminal; K == redirect -> {K, S};
+            K when is_atom(K) -> {K, null};
+            _ -> {other, null}
+        end,
+    hb_msg_trace:delivered(ProcID, Slot, target_of(Slot, Key, State), Kind,
+        case is_integer(TSlot) of true -> TSlot; false -> null end, Posted, ID).
 
 outcome_counter({assigned, _}) -> delivery_assigned;
 outcome_counter({already, _}) -> delivery_already;

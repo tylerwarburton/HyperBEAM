@@ -978,6 +978,57 @@ Still to measure before it ships (Tyler, on hb-test with one image):
 once a second, p95 within 5%. On prod `/~hyperbuddy@1.0/` needs the nginx
 allow-list, since the endpoint lists action names.
 
+## Per-message trace (`/~hyperbuddy@1.0/trace`, 2026-11-16)
+
+`hb_msg_trace` keeps a ring of rows, one per event of a message on this node,
+so a collector can rebuild where every millisecond of one message went and
+join it to the client that signed it. `GET /~hyperbuddy@1.0/trace?since=<cursor>&limit=N`
+(1-5,000, default 1,000) returns the rows after `since`, oldest first, and
+`next`, the cursor for the next call; `dropped` counts rows the ring
+overwrote before they were read, and a cursor past `head` (a restart) starts
+again at the oldest row. `computing` lists the slots being computed now.
+
+| Kind | Written by | Fields |
+|---|---|---|
+| `h` | HTTP handler (`hb_http_server`), signed requests only | `mid`, `arrived`, `body` (read), `replied` |
+| `s` | scheduler server, when the batch is durable | `pid`, `slot`, `mid`, `enq` (queued), `assigned`, `held`, `durable`, `batch`, `queue` |
+| `c` | `dev_process:compute_slot` | `pid`, `slot`, `mid`, `act`, `st`, `sched`, `start` (assignment read begins), `end` (stored, readable), `us` (below), `backlog`, `mailbox`, `inflight`, `runq` |
+| `d` | deliverer, per answered POST | `pid`, `slot`, `target`, `tslot` (the child slot), `out`, `post`, `done`, `mid` (of the child message) |
+| `e` | `hb_event` warning/error | `pid`/`slot` it names, `topic`, `mod`, `line`, `at`, `text` (400 bytes) |
+
+`c.us`: `next` (assignment read), `prep`, `exec`, inside it `lua_prep`,
+`lua`, `decode`, `apply`, `gc` and `exec_lmdb`; `store`, inside it
+`store_put` (LMDB overlay puts), `store_commit` (an LMDB commit+fsync the
+store waited on inline) and `store_scan` (prefix scans and lists, which
+commit pending writes first). The store's LMDB phases are new: `hb_store_lmdb`
+notes `lmdb_put`, `lmdb_commit` and `lmdb_scan` around each `elmdb` call,
+against the running slot when there is one (`hb_slot_log:note/2`), else
+node-wide (`hb_phase_timer`: the flusher's and the scheduler's commits show as
+the node phase `lmdb_commit`). `mid` is the signed id read from the
+message's commitments (no hashing): the base64url SHA-256 of the signature,
+which a client computes itself.
+
+Options (read with the phase timers): `msg-trace` (default `true`) and
+`msg-trace-size` (rows, default 32,768, 1,024-262,144). A row is under 700
+bytes: the default ring stays under ~22 MB. Off with `phase-timers` false.
+
+Trade-offs, measured in Docker (`hbnode:gate-dbab761b9`, 3 CPUs):
+
+| Measure | Effect |
+|---|---|
+| Speed | game slot bench (300 players, 200 slots), trace on vs off alternating, 3 runs each: worker 15.8 / 15.3 / 17.2 ms vs 16.6 / 15.1 / 18.1 ms per slot; compute median 15.0 / 15.0 / 14.9 vs 15.6 / 14.5 / 16.7 ms. No difference above run-to-run noise (`bench/trace-overhead.sh`). Recording one slot is ~6 us in a release build (open 1.5, close 3.7). |
+| Memory | the ring: <= 22 MB at the default size; a live-compute table of one row per computing process |
+| Storage | none; ETS only, lost on restart |
+| Atoms | none; ids and actions are binaries, kinds and statuses fixed atoms |
+| Reliability | no new process (the `hb_phase_timer` owner owns the tables and sweeps dead computes every minute); the endpoint reads ETS only |
+| Atomicity | none; observational only |
+
+Needs a restart, like the slot log: the tables are created by the owner.
+The endpoint lists process ids, message ids and event text: the collector on
+the swarm box reads it over the public domain, as it reads `/slots`.
+`bench/trace_local_node.erl` serves a local node with one seeded game-sized
+process for a stress run (`backend/native/obs/experiment.mjs` in the monorepo).
+
 ## Where the real game spends a slot
 
 Old fork on the bench node, game on `lua@5.3b`, 28 fixture players, node's own

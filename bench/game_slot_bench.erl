@@ -36,6 +36,25 @@ bench_test_() ->
             {timeout, 3600, fun() -> run(Players, N, Dir, Max) end}
     end.
 
+%% `GAME_BENCH_BURST=<n>' then schedules n more messages before computing
+%% any, so the worker starts with a backlog of n, and `GAME_BENCH_DUMP=<file>'
+%% writes the message trace (`/~hyperbuddy@1.0/trace') to a file.
+burst(Process, Last, Opts) ->
+    case os:getenv("GAME_BENCH_BURST") of
+        false -> ok;
+        B ->
+            Burst = list_to_integer(B),
+            [ schedule(Process, <<"Play">>, I, Opts)
+            || I <- lists:seq(Last + 1, Last + Burst) ],
+            compute(Process, Last + Burst, Opts)
+    end,
+    case os:getenv("GAME_BENCH_DUMP") of
+        false -> ok;
+        File ->
+            ok = file:write_file(File,
+                hb_json:encode(hb_msg_trace:report(0, 5000)))
+    end.
+
 opts(Dir) ->
     #{
         <<"store">> => [#{ <<"store-module">> => hb_store_lmdb,
@@ -129,6 +148,10 @@ compute(Process, Slot, Opts) ->
 
 run(Players, N, Dir0, MaxWorkerMs) ->
     hb:init(),
+    % `GAME_BENCH_TRACE=false' measures the same build with the message
+    % trace off (`hb_msg_trace'), for its overhead.
+    hb_phase_timer:configure(
+        #{ <<"msg-trace">> => os:getenv("GAME_BENCH_TRACE") =/= "false" }),
     Dir = Dir0 ++ "/game",
     os:cmd("rm -rf " ++ Dir),
     Opts = opts(Dir),
@@ -166,6 +189,7 @@ run(Players, N, Dir0, MaxWorkerMs) ->
         "compute_p95=~.1f ms schedule_med=~.1f ms count=~s | phase means ms ~p~n",
         [Players, N, WorkerMs, MaxWorkerMs, Med(Comp), P95(Comp), Med(Sched),
          Count, Phases]),
+    burst(Process, 11 + N, Opts),
     ?assertEqual(integer_to_binary(11 + N), Count),
     ?assert(WorkerMs > 0),
     ?assert(WorkerMs =< MaxWorkerMs).
