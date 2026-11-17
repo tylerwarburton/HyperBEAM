@@ -113,6 +113,8 @@
 %% (root_endorse_bound_test), so twice that refuses nothing legitimate.
 -define(ENDORSE_MAX_BYTES, 16384).
 -define(AUTHOR_SIGNATURES, [<<"rsa-pss-sha256">>, <<"rsa-pss-sha512">>]).
+%% pusd.lua MAX_FAST_LEDGERS: active ledgers, and peers one ledger accepts.
+-define(MAX_FAST_LEDGERS, 16).
 
 device_info(_) ->
     #{ exports => [<<"start">>, <<"status">>, <<"keys">>, <<"nudge">>,
@@ -183,11 +185,36 @@ root_endorse(_Base, Req, Opts) ->
     end,
     case Signed of
         {ok, Committed} ->
-            case call({root_endorse, Committed}) of
+            case call({root_endorse, Committed, ledger_spawns(Committed, Opts)}) of
                 {ok, Endorsement} -> {ok, json(Endorsement)};
                 Error -> Error
             end;
         _ -> {error, <<"A signed root operation is required">>}
+    end.
+
+%% @doc A registration is endorsed on the registering ledger's own spawn, read
+%% by this node, here and not in the loop (a read may wait on the network):
+%% from its store, else from the ledger's node as this node's `fast-ledgers'
+%% configures it. Only for a `Ledger-Register' whose author is the scheduler
+%% it names, and only a ledger this node is configured to read. What comes
+%% back is what the spawn's signature vouches for, never the request's.
+ledger_spawns(Message, Opts) ->
+    try
+        Payload = hb_private:reset(hb_message:uncommitted(Message)),
+        <<"Ledger-Register">> = root_field(<<"action">>, Payload),
+        Ledger = root_field(<<"ledger">>, Payload),
+        true = valid_root_address(Ledger),
+        Author = root_field(<<"author">>, Payload),
+        Author = root_field(<<"ledgerscheduler">>, Payload),
+        Cfg = config(Opts),
+        [Spec] = [S || {K, S} <- maps:to_list(maps:get(<<"fast-ledgers">>, Cfg, #{})),
+            hb_util:to_lower(K) =:= hb_util:to_lower(Ledger)],
+        Proc = #{} = lib_bridge_replica:spawned(Ledger, fast_ledger_node(Spec, Cfg), Opts),
+        #{Ledger => #{
+            root => hb_ao:get(<<"root-token">>, Proc, undefined, Opts),
+            module => hb_ao:get(<<"module-commitment">>, Proc, undefined, Opts),
+            schedulers => lib_bridge_replica:schedulers(Proc, Opts)}}
+    catch _:_ -> #{}
     end.
 
 %% @doc What may queue on the loop at all: a request no larger than a real
@@ -306,11 +333,10 @@ loop(St) ->
                     end
             end;
         {{root_endorse, Message}, From, Ref, Deadline} ->
-            case erlang:monotonic_time(millisecond) > Deadline of
-                % Its caller has stopped waiting: no answer, and no work.
-                true -> ok;
-                false -> From ! {Ref, endorse(Message, St)}
-            end,
+            endorse_reply(Message, #{}, From, Ref, Deadline, St),
+            loop(St);
+        {{root_endorse, Message, Spawns}, From, Ref, Deadline} ->
+            endorse_reply(Message, Spawns, From, Ref, Deadline, St),
             loop(St);
         {root_publication_done, Pid, Result} ->
             case maps:get(root_publication, St, undefined) of
@@ -331,6 +357,13 @@ loop(St) ->
                     root_publication_error => <<"Root certificate publisher stopped; retained for retry">>});
                 _ -> loop(St)
             end
+    end.
+
+endorse_reply(Message, Spawns, From, Ref, Deadline, St) ->
+    case erlang:monotonic_time(millisecond) > Deadline of
+        % Its caller has stopped waiting: no answer, and no work.
+        true -> ok;
+        false -> From ! {Ref, endorse(Message, St#{ ledger_spawns => Spawns })}
     end.
 
 %% Only the view the last pass verified: a request never moves the replica,
@@ -388,8 +421,8 @@ root_certificate_approval(Message, View, St = #{cfg := Cfg, opts := Opts, me := 
         Action = maps:get(<<"action">>, Payload),
         By = root_action_author(Action),
         Account = root_certificate_actor(By, Author, Payload, Info, Addresses),
-        % A holder or lane runs at its account's next sequence; a committee
-        % action is keyed by the record it decides and carries none.
+        % A holder, lane or registrant runs at its account's next sequence; a
+        % committee action is keyed by the record it decides and carries none.
         true = case By of
             member -> not maps:is_key(<<"root-sequence">>, Payload);
             _ ->
@@ -398,10 +431,12 @@ root_certificate_approval(Message, View, St = #{cfg := Cfg, opts := Opts, me := 
                 Sequence =:= hb_util:int(maps:get(<<"sequence">>, Previous, 0)) + 1
         end,
         % A holder spends what it holds; a lane release is escrow the root
-        % checks; a committee action is what THIS member saw for itself.
+        % checks; a lane's peers and a registration are what THIS member can
+        % read for itself; a committee action is what THIS member saw itself.
         true = case By of
             holder -> root_amount(Action, Payload) =< root_balance(Account, View);
-            lane -> root_amount(Action, Payload) > 0;
+            lane -> lane_evidence(Action, Payload, Info);
+            registrant -> registration_evidence(Payload, Info, St);
             member -> committee_evidence(Action, Payload, Info, View, St)
         end,
         % The endorsement is this member's BLS signature over the root
@@ -473,12 +508,15 @@ valid_root_address(Address) when is_binary(Address), byte_size(Address) =:= 43 -
 valid_root_address(_) -> false.
 
 %% @doc Who authors each root action, as pusd.lua's ROOT_ACTIONS says: a
-%% holder, a lane's registered authority, or a committee member. Anything
-%% else has no certificate path and is never endorsed.
+%% holder, a lane's registered authority, the scheduler a registration names,
+%% or a committee member. Anything else has no certificate path and is never
+%% endorsed.
 root_action_author(<<"Transfer">>) -> holder;
 root_action_author(<<"Ledger-Enter">>) -> holder;
 root_action_author(<<"Bridge-Redeem">>) -> holder;
 root_action_author(<<"Ledger-Release">>) -> lane;
+root_action_author(<<"Ledger-Accepts">>) -> lane;
+root_action_author(<<"Ledger-Register">>) -> registrant;
 root_action_author(<<"Bridge-Mint">>) -> member;
 root_action_author(<<"Ledger-Exit">>) -> member;
 root_action_author(<<"Ledger-Move-Root">>) -> member;
@@ -498,8 +536,17 @@ root_certificate_actor(lane, Author, Payload, Info, _Members) ->
     Lane = maps:get(<<"ledger">>, Payload),
     Ledger = maps:get(Lane, maps:get(<<"ledgers">>, Info)),
     Author = maps:get(<<"scheduler">>, Ledger),
-    true = maps:get(<<"status">>, Ledger) =/= <<"disabled">>,
+    % pusd.lua ledgerLive: disabled and retired lanes take no certificate.
+    true = lists:member(maps:get(<<"status">>, Ledger), [<<"active">>, <<"draining">>]),
     Lane;
+%% A registration runs under the ledger it registers, signed by the scheduler
+%% it names (pusd.lua rootAccount, by = "registrant").
+root_certificate_actor(registrant, Author, Payload, _Info, _Members) ->
+    [] = root_delivery_stamps(Payload),
+    Ledger = root_field(<<"ledger">>, Payload),
+    true = valid_root_address(Ledger),
+    Author = root_field(<<"ledgerscheduler">>, Payload),
+    Ledger;
 root_certificate_actor(member, Author, Payload, _Info, Members) ->
     [] = root_delivery_stamps(Payload),
     true = lists:member(Author, Members),
@@ -537,6 +584,73 @@ committee_fields(M) ->
     maps:from_list([{root_name(K), V} || {K, V} <- maps:to_list(M),
         not lists:member(root_name(K), [<<"author">>, <<"target">>, <<"certificateversion">>,
             <<"attestorepoch">>, <<"rootsequence">>])]).
+
+%% @doc A lane's own operation, beyond its author (`root_certificate_actor'):
+%% a release names escrow the root checks; an acceptance names a peer the
+%% root holds (pusd.lua Ledger-Accepts). Adding takes a registered, unretired
+%% ledger not yet accepted, while the list has room; removing takes one the
+%% list holds. Nothing the root would not change is endorsed.
+lane_evidence(<<"Ledger-Release">> = Action, Payload, _Info) ->
+    root_amount(Action, Payload) > 0;
+lane_evidence(<<"Ledger-Accepts">>, Payload, Info) ->
+    true = only_fields(Payload, [<<"action">>, <<"ledger">>, <<"op">>, <<"peer">>]),
+    Ledgers = maps:get(<<"ledgers">>, Info),
+    Ledger = maps:get(<<"ledger">>, Payload),
+    Accepts = maps:get(<<"accepts">>, maps:get(Ledger, Ledgers), []),
+    Peer = root_field(<<"peer">>, Payload),
+    true = valid_root_address(Peer) andalso Peer =/= Ledger,
+    case root_field(<<"op">>, Payload) of
+        <<"add">> ->
+            PeerRow = maps:get(Peer, Ledgers),
+            maps:get(<<"status">>, PeerRow) =/= <<"retired">>
+                andalso not lists:member(Peer, Accepts)
+                andalso length(Accepts) < ?MAX_FAST_LEDGERS;
+        <<"remove">> -> lists:member(Peer, Accepts)
+    end.
+
+%% @doc A ledger's self-registration (pusd.lua Ledger-Register), endorsed only
+%% on this node's own reading of that ledger's spawn (`ledger_spawns/2'): it
+%% names this root as its `root-token', the payload's module as its
+%% `module-commitment', and the payload's scheduler as its scheduler. A ledger
+%% id the root already holds (registered or retired) is never registered
+%% again through us, and a name another scheduler holds is not taken. Fields
+%% are exactly ledgerPayload's, in its bounds.
+registration_evidence(Payload, Info, St = #{ cfg := Cfg }) ->
+    Root = maps:get(<<"pusd">>, Cfg),
+    true = only_fields(Payload, [<<"action">>, <<"ledger">>, <<"name">>, <<"module">>,
+        <<"ledgerscheduler">>, <<"schedulerpolicy">>, <<"accepts">>, <<"root">>]),
+    Ledger = root_field(<<"ledger">>, Payload),
+    Scheduler = root_field(<<"ledgerscheduler">>, Payload),
+    Module = root_field(<<"module">>, Payload),
+    Name = root_field(<<"name">>, Payload),
+    Policy = root_field(<<"schedulerpolicy">>, Payload),
+    true = valid_root_address(Module) andalso valid_root_address(Scheduler),
+    true = is_binary(Name) andalso byte_size(Name) >= 1 andalso byte_size(Name) =< 64,
+    true = is_binary(Policy) andalso byte_size(Policy) >= 1 andalso byte_size(Policy) =< 128,
+    true = lists:member(root_field(<<"root">>, Payload), [absent, Root]),
+    Accepts = case root_field(<<"accepts">>, Payload) of
+        absent -> [];
+        <<>> -> [];
+        List -> binary:split(List, <<",">>, [global])
+    end,
+    true = lists:all(fun(Peer) -> valid_root_address(Peer) andalso Peer =/= Ledger end, Accepts),
+    true = length(lists:usort(Accepts)) =< ?MAX_FAST_LEDGERS,
+    Ledgers = maps:get(<<"ledgers">>, Info, #{}),
+    false = maps:is_key(Ledger, Ledgers),
+    true = lists:all(fun(Row) ->
+        maps:get(<<"name">>, Row, undefined) =/= Name
+            orelse maps:get(<<"scheduler">>, Row, undefined) =:= Scheduler
+    end, maps:values(Ledgers)),
+    true = length([R || R <- maps:values(Ledgers),
+        maps:get(<<"status">>, R, undefined) =/= <<"retired">>]) < ?MAX_FAST_LEDGERS,
+    #{ Ledger := #{ root := Root, module := Module, schedulers := Schedulers } } =
+        maps:get(ledger_spawns, St, #{}),
+    lists:member(hb_committer:uri(Scheduler), Schedulers).
+
+%% @doc Every field of an operation, names normalised, is one of `Names' or
+%% the certificate's own envelope.
+only_fields(Payload, Names) ->
+    lists:all(fun(K) -> lists:member(K, Names) end, maps:keys(committee_fields(Payload))).
 
 root_delivery_stamps(Payload) ->
     [{N, V} || {K, V} <- maps:to_list(Payload),
@@ -721,6 +835,138 @@ committee_certificate_approval_test() ->
     Approved = apply_proposals(Info#{<<"proposals">> => [Proposal#{<<"approvals">> => #{Me => true}}]}, St0),
     ?assertMatch({ok, _}, root_certificate_approval(Sign(Apply, PeerWallet), View,
         St#{committee => maps:get(committee, Approved)})).
+
+%% @doc A ledger registers itself (author: the scheduler it names) and names
+%% its own peers (author: its registered scheduler). Endorsed only on this
+%% node's own reading of the ledger's spawn and of the verified root.
+ledger_registration_approval_test() ->
+    [MeWallet, SchedWallet, PeerWallet, StrangerWallet] = [ar_wallet:new() || _ <- lists:seq(1, 4)],
+    Address = fun(W) -> hb_util:human_id(ar_wallet:to_address(W)) end,
+    Me = Address(MeWallet), Sched = Address(SchedWallet),
+    PeerSched = Address(PeerWallet), Stranger = Address(StrangerWallet),
+    Id = fun() -> hb_util:human_id(crypto:strong_rand_bytes(32)) end,
+    Root = Id(), L1 = Id(), L2 = Id(), Module = Id(),
+    Opts = #{<<"priv-wallet">> => MeWallet, <<"store">> => hb_test_utils:test_store()},
+    BlsKey = blst_nif:keygen(<<42:256>>),
+    Registered = <<"0x", (binary:encode_hex(element(2, BlsKey), lowercase))/binary>>,
+    L1Row = #{<<"name">> => <<"1">>, <<"scheduler">> => PeerSched, <<"status">> => <<"active">>,
+        <<"accepts">> => []},
+    Info = #{<<"epoch">> => 7, <<"attestors">> => [#{<<"ao">> => Me, <<"bls">> => Registered}],
+        <<"ledgers">> => #{L1 => L1Row}},
+    ViewOf = fun(I, Intents) -> {#{<<"bridgeinfo">> => hb_json:encode(I),
+        <<"balances">> => <<"{}">>, <<"rootintents">> => hb_json:encode(Intents)}, Opts} end,
+    View = ViewOf(Info, #{}),
+    Spawn = #{root => Root, module => Module, schedulers => [hb_committer:uri(Sched)]},
+    St = #{cfg => #{<<"pusd">> => Root}, opts => Opts, me => Me, keys => #{bls => BlsKey},
+        ledger_spawns => #{L2 => Spawn}},
+    Sign = fun(P, W) -> hb_message:commit(P, #{<<"priv-wallet">> => W}, <<"ans104@1.0">>) end,
+    Base = #{<<"certificate-version">> => <<"pusd-root/v1">>, <<"target">> => Root,
+        <<"attestor-epoch">> => <<"7">>},
+    % Spelled as pusd-carriers.mjs registerLedgerOperation emits it.
+    Register = Base#{<<"author">> => Sched, <<"action">> => <<"Ledger-Register">>,
+        <<"ledger">> => L2, <<"name">> => <<"2">>, <<"module">> => Module,
+        <<"ledger-scheduler">> => Sched, <<"scheduler-policy">> => <<"scheduler@1.0">>,
+        <<"accepts">> => L1, <<"root-sequence">> => <<"1">>},
+    Approve = fun(P, W, V, S) -> root_certificate_approval(Sign(P, W), V, S) end,
+    ?assertMatch({ok, #{<<"signer">> := Me}}, Approve(Register, SchedWallet, View, St)),
+    ?assertMatch({ok, _}, Approve(maps:remove(<<"accepts">>, Register), SchedWallet, View, St)),
+    ?assertMatch({ok, _}, Approve(Register#{<<"root">> => Root}, SchedWallet, View, St)),
+    RefusedReg = fun(P, W, V, S) -> ?assertMatch({error, _}, Approve(P, W, V, S), P) end,
+    % Wrong author: a stranger, or a scheduler the payload does not name.
+    RefusedReg(Register#{<<"author">> => Stranger}, StrangerWallet, View, St),
+    RefusedReg(Register#{<<"author">> => Stranger, <<"ledger-scheduler">> => Stranger},
+        StrangerWallet, View, St),
+    RefusedReg(Register, StrangerWallet, View, St),
+    % Not what the spawn says: unknown module, another root, another scheduler,
+    % or no spawn this node could read at all.
+    RefusedReg(Register#{<<"module">> => Id()}, SchedWallet, View, St),
+    RefusedReg(Register, SchedWallet, View, St#{ledger_spawns => #{L2 => Spawn#{root => Id()}}}),
+    RefusedReg(Register, SchedWallet, View,
+        St#{ledger_spawns => #{L2 => Spawn#{schedulers => [hb_committer:uri(PeerSched)]}}}),
+    RefusedReg(Register, SchedWallet, View, St#{ledger_spawns => #{}}),
+    RefusedReg(Register, SchedWallet, View, maps:remove(ledger_spawns, St)),
+    % Squatting: an id the root holds, under any scheduler or retired; a name
+    % another scheduler holds.
+    lists:foreach(fun(Row) ->
+        RefusedReg(Register, SchedWallet, ViewOf(Info#{<<"ledgers">> => #{L1 => L1Row, L2 => Row}}, #{}), St)
+    end, [L1Row#{<<"scheduler">> => Sched}, L1Row#{<<"scheduler">> => PeerSched},
+        L1Row#{<<"scheduler">> => Sched, <<"status">> => <<"retired">>}]),
+    RefusedReg(Register#{<<"name">> => <<"1">>}, SchedWallet, View, St),
+    % Stamps, sequence, envelope and field bounds.
+    RefusedReg(Register#{<<"from-process">> => L1, <<"from-slot">> => <<"1">>}, SchedWallet, View, St),
+    RefusedReg(Register#{<<"root-sequence">> => <<"2">>}, SchedWallet, View, St),
+    RefusedReg(maps:remove(<<"root-sequence">>, Register), SchedWallet, View, St),
+    RefusedReg(Register#{<<"attestor-epoch">> => <<"6">>}, SchedWallet, View, St),
+    RefusedReg(Register#{<<"root">> => Id()}, SchedWallet, View, St),
+    RefusedReg(Register#{<<"status">> => <<"active">>}, SchedWallet, View, St),
+    RefusedReg(Register#{<<"accepts">> => <<L1/binary, ",", L2/binary>>}, SchedWallet, View, St),
+    RefusedReg(Register#{<<"accepts">> => <<L1/binary, ",">>}, SchedWallet, View, St),
+    RefusedReg(Register#{<<"name">> => binary:copy(<<"x">>, 65)}, SchedWallet, View, St),
+    RefusedReg(Register#{<<"scheduler-policy">> => <<>>}, SchedWallet, View, St),
+    % Its next sequence after the registration landed.
+    ?assertMatch({ok, _}, Approve(Register#{<<"root-sequence">> => <<"2">>}, SchedWallet,
+        ViewOf(Info, #{L2 => #{<<"sequence">> => 1}}), St)),
+    % Ledger-Accepts: L2, registered under Sched, opts in to L1.
+    L2Row = #{<<"name">> => <<"2">>, <<"scheduler">> => Sched, <<"status">> => <<"active">>,
+        <<"accepts">> => []},
+    Both = fun(Row2) -> Info#{<<"ledgers">> => #{L1 => L1Row, L2 => Row2}} end,
+    AView = fun(Row2) -> ViewOf(Both(Row2), #{L2 => #{<<"sequence">> => 1}}) end,
+    Accept = Base#{<<"author">> => Sched, <<"action">> => <<"Ledger-Accepts">>, <<"ledger">> => L2,
+        <<"op">> => <<"add">>, <<"peer">> => L1, <<"root-sequence">> => <<"2">>},
+    NoSpawn = maps:remove(ledger_spawns, St),
+    ?assertMatch({ok, _}, Approve(Accept, SchedWallet, AView(L2Row), NoSpawn)),
+    ?assertMatch({ok, _}, Approve(Accept#{<<"op">> => <<"remove">>}, SchedWallet,
+        AView(L2Row#{<<"accepts">> => [L1]}), NoSpawn)),
+    ?assertMatch({ok, _}, Approve(Accept, SchedWallet, AView(L2Row#{<<"status">> => <<"draining">>}), NoSpawn)),
+    RefusedAcc = fun(P, W, V) -> ?assertMatch({error, _}, Approve(P, W, V, NoSpawn), P) end,
+    % Only the lane's registered scheduler, of a live lane.
+    RefusedAcc(Accept#{<<"author">> => PeerSched}, PeerWallet, AView(L2Row)),
+    RefusedAcc(Accept, StrangerWallet, AView(L2Row)),
+    RefusedAcc(Accept, SchedWallet, AView(L2Row#{<<"status">> => <<"disabled">>})),
+    RefusedAcc(Accept, SchedWallet, AView(L2Row#{<<"status">> => <<"retired">>})),
+    RefusedAcc(Accept, SchedWallet, ViewOf(Info, #{L2 => #{<<"sequence">> => 1}})),
+    % The peer: registered, unretired, another ledger, not yet accepted.
+    RefusedAcc(Accept#{<<"peer">> => Id()}, SchedWallet, AView(L2Row)),
+    RefusedAcc(Accept#{<<"peer">> => L2}, SchedWallet, AView(L2Row)),
+    RefusedAcc(Accept, SchedWallet, ViewOf((Both(L2Row))#{<<"ledgers">> => #{L2 => L2Row,
+        L1 => L1Row#{<<"status">> => <<"retired">>}}}, #{L2 => #{<<"sequence">> => 1}})),
+    RefusedAcc(Accept, SchedWallet, AView(L2Row#{<<"accepts">> => [L1]})),
+    RefusedAcc(Accept#{<<"op">> => <<"remove">>}, SchedWallet, AView(L2Row)),
+    RefusedAcc(Accept#{<<"op">> => <<"replace">>}, SchedWallet, AView(L2Row)),
+    RefusedAcc(Accept#{<<"from-process">> => L1, <<"from-slot">> => <<"1">>}, SchedWallet, AView(L2Row)),
+    RefusedAcc(Accept#{<<"root-sequence">> => <<"1">>}, SchedWallet, AView(L2Row)),
+    RefusedAcc(Accept#{<<"quantity">> => <<"1">>}, SchedWallet, AView(L2Row)).
+
+%% @doc The spawn evidence is read from the ledger's own signed spawn, for a
+%% configured ledger only (its config key lowercased, as node config arrives),
+%% and only for a registration whose author is the scheduler it names.
+ledger_spawns_test() ->
+    [OwnerWallet, SchedWallet] = [ar_wallet:new(), ar_wallet:new()],
+    Sched = hb_util:human_id(ar_wallet:to_address(SchedWallet)),
+    Root = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Module = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Store = hb_test_utils:test_store(),
+    Opts0 = #{<<"priv-wallet">> => OwnerWallet, <<"store">> => Store},
+    Proc = hb_message:commit(#{<<"type">> => <<"Process">>, <<"scheduler">> => Sched,
+        <<"root-token">> => Root, <<"module-commitment">> => Module,
+        <<"pusd-kind">> => <<"fast-ledger">>}, Opts0, <<"ans104@1.0">>),
+    {ok, _} = hb_cache:write(Proc, Opts0),
+    Ledger = hb_message:id(Proc, all, Opts0),
+    Opts = Opts0#{<<"bridge">> => #{<<"pusd">> => Root, <<"scheduler-url">> => <<"http://127.0.0.1:1">>,
+        <<"fast-ledgers">> => #{hb_util:to_lower(Ledger) => #{<<"node">> => <<"http://127.0.0.1:1">>}}}},
+    Sign = fun(P, W) -> hb_message:commit(P, #{<<"priv-wallet">> => W}, <<"ans104@1.0">>) end,
+    Register = #{<<"author">> => Sched, <<"action">> => <<"Ledger-Register">>, <<"ledger">> => Ledger,
+        <<"ledger-scheduler">> => Sched},
+    ?assertEqual(#{Ledger => #{root => Root, module => Module, schedulers => [hb_committer:uri(Sched)]}},
+        ledger_spawns(Sign(Register, SchedWallet), Opts)),
+    ?assertEqual(#{}, ledger_spawns(Sign(Register#{<<"author">> => Root}, SchedWallet), Opts)),
+    ?assertEqual(#{}, ledger_spawns(Sign(Register#{<<"action">> => <<"Ledger-Accepts">>}, SchedWallet), Opts)),
+    ?assertEqual(#{}, ledger_spawns(Sign(Register, SchedWallet),
+        Opts#{<<"bridge">> => #{<<"pusd">> => Root, <<"fast-ledgers">> => #{}}})),
+    Unknown = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ?assertEqual(#{}, ledger_spawns(Sign(Register#{<<"ledger">> => Unknown}, SchedWallet),
+        Opts#{<<"bridge">> => #{<<"pusd">> => Root, <<"scheduler-url">> => <<"http://127.0.0.1:1">>,
+            <<"fast-ledgers">> => #{Unknown => #{<<"node">> => <<"http://127.0.0.1:1">>}}}})).
 
 root_endorse_endpoint_test_() ->
     {timeout, 120, fun root_endorse_endpoint/0}.

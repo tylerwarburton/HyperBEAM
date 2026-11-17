@@ -51,6 +51,9 @@
 -export([view/3]).
 %% For `dev_scheduler_follower', which follows any process this way.
 -export([load/4, load/5, forward/1, slot_path/3]).
+%% For `dev_bridge_attestor', which reads a ledger's spawn before it endorses
+%% that ledger's registration.
+-export([spawned/3, schedulers/2]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -477,6 +480,18 @@ replica_process(Proc, <<"arweave-scheduler@1.0">>) ->
         <<"scheduler-device">> => <<"scheduler@1.0">>
     };
 replica_process(Proc, _) -> Proc.
+
+%% @doc Process `Pid' as its spawn's own signature vouches for it: from this
+%% node's store, else as `Url' serves it; `undefined' when neither verifies
+%% as that id.
+spawned(Pid, Url, Opts) ->
+    first_process([
+        fun() -> {ok, P} = hb_cache:read(Pid, Opts), hb_cache:ensure_all_loaded(P, Opts) end,
+        fun() ->
+            {ok, P} = hb_http:get(Url, <<"/", Pid/binary>>, Opts),
+            hb_cache:ensure_all_loaded(P, Opts)
+        end
+    ], Pid, Opts).
 
 first_process([], _Pusd, _Opts) -> undefined;
 first_process([Get | Rest], Pusd, Opts) ->
