@@ -408,6 +408,38 @@ admin_messages_test() ->
           "000201">>,
         hex(sui_admin(Bridge, ?ROOT_ID, 4, 7, 2, <<>>, true))).
 
+%% paralith-mono products/bridge/admin-vectors.json, the set change (epoch
+%% 4 -> 5): every chain's message binds the PUSD root, byte for byte what
+%% ParaBridge.attestorsDigest, the Solana program's attestors_message and the
+%% Move package check.
+attestors_set_change_vectors_test() ->
+    ?assertEqual(
+        <<"e634b90a355d997eb8658c96c6899fb0ae297dcdbfaf5ed89a6aaffb9c6d51eb">>,
+        hex(base_attestors(8453, ?BRIDGE, ?ROOT_ID, 4, 5,
+            [<<"0x3333333333333333333333333333333333333333">>,
+             <<"0x4444444444444444444444444444444444444444">>]))),
+    B58 = fun(Byte) -> base58_encode(binary:copy(<<Byte>>, 32)) end,
+    ?assertEqual(
+        <<"504152414c4954485f4154544553544f52535f563278bbb94031494ec59412b8",
+          "ce2d0811afb95bec36756c1b21f1fe48d0fe5e6abcaaaaaaaaaaaaaaaaaaaaaa",
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0400000000000000050000",
+          "0000000000020303030303030303030303030303030303030303030303030303",
+          "0303030303030404040404040404040404040404040404040404040404040404",
+          "040404040404">>,
+        hex(solana_attestors(<<"98HwxH5HhiosRX5VDMR4NW1uxL4wrndjF46p6XE58UVZ">>,
+            ?ROOT_ID, 4, 5, [B58(3), B58(4)]))),
+    ?assertEqual(
+        <<"504152414c4954485f4154544553544f52535f5632034401905bebdf8c04f3cd",
+          "5f04f442a39372c8dc321c29edfb4f9cb30b23ab96aaaaaaaaaaaaaaaaaaaaaa",
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0400000000000000050000",
+          "0000000000020303030303030303030303030303030303030303030303030303",
+          "0303030303030404040404040404040404040404040404040404040404040404",
+          "040404040404">>,
+        hex(sui_attestors(<<"0x034401905bebdf8c04f3cd5f04f442a39372c8dc321c29edfb4f9cb30b23ab96">>,
+            ?ROOT_ID, 4, 5,
+            [<<"0x0303030303030303030303030303030303030303030303030303030303030303">>,
+             <<"0x0404040404040404040404040404040404040404040404040404040404040404">>]))).
+
 %% Each chain's one form, and nothing else: a 32-character base58 text (32
 %% '1's) is not 32 raw bytes, and a short or raw form is refused, not guessed.
 address_forms_test() ->

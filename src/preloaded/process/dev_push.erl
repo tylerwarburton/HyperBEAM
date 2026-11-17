@@ -1479,7 +1479,14 @@ worker_delivers_without_push_test_() ->
 %% waits leaves nothing behind, and delivery goes on without it.
 push_is_read_test_() ->
     {timeout, 60, fun() ->
-        {Sender, SID, {A, AID}, {B, BID}, Opts} = delivery_setup(#{}),
+        Self = self(),
+        Post =
+            fun(TP, T, L, S, O, Real) ->
+                Self ! posting,
+                Real(TP, T, L, S, O)
+            end,
+        {Sender, SID, {A, AID}, {B, BID}, Opts} =
+            delivery_setup(#{ <<"delivery-test-post">> => Post }),
         send(Sender, 1, #{ <<"sendto">> => AID, <<"sendto2">> => BID }, Opts),
         {BeforeA, BeforeB} = {receiver_slot(A, Opts), receiver_slot(B, Opts)},
         Procs = length(erlang:processes()),
@@ -1487,12 +1494,12 @@ push_is_read_test_() ->
             spawn(fun() ->
                 hb_ao:resolve(Sender, #{ <<"path">> => <<"push">>, <<"slot">> => 0 }, Opts)
             end),
-        % Killed once it waits: the slot is computed (its `o' row, or already
-        % its `x', is written). A fixed sleep killed a push still computing on
-        % a loaded host, and nothing else computes the slot here.
-        ?assert(wait_until(fun() ->
-            lists:member(0, rows(SID, <<"o">>, Opts) ++ rows(SID, <<"x">>, Opts))
-        end, 15000)),
+        % Killed once it waits: its slot is with the deliverer, which is
+        % posting it. A fixed sleep could kill the push while it still
+        % computed the slot -- even between its `o' row and its `{ready}'
+        % cast, which leaves the slot to the 30 s rescan -- and nothing else
+        % computes the slot here.
+        receive posting -> ok after 15000 -> error(never_posted) end,
         exit(Caller, kill),
         ?assert(wait_until(fun() -> delivered(SID, [0], Opts) end, 15000)),
         ?assertEqual(BeforeA + 1, receiver_slot(A, Opts)),
