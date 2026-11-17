@@ -36,7 +36,7 @@ request(Args, Opts) ->
     Opts1 = hb_opts:mimic_default_types(Opts, existing, Opts),
     redirect(Args, 0, Opts1).
 request(Args, RemainingRetries, Opts) ->
-    Response = do_request(Args, Opts),
+    Response = gated_request(Args, Opts),
     case Response of
         {error, _Details} -> maybe_retry(RemainingRetries, Args, Response, Opts);
         {ok, Status, _Headers, _Body} ->
@@ -121,6 +121,18 @@ location({ok, Status, Headers, _Body}) when Status == 307; Status == 308 ->
     Lower = [{hb_util:to_lower(Key), Value} || {Key, Value} <- Headers],
     proplists:get_value(<<"location">>, Lower, <<>>);
 location(_Response) -> <<>>.
+
+%% @doc Send a request through its host's gate (`hb_http_gate'): a host that
+%% is cooling down after a `429' is answered locally, and every real answer is
+%% shown to the gate.
+gated_request(Args = #{ peer := Peer }, Opts) ->
+    case hb_http_gate:check(Peer, Opts) of
+        {refuse, Secs} -> hb_http_gate:refusal(Secs);
+        ok ->
+            Response = do_request(Args, Opts),
+            hb_http_gate:observe(Peer, Response, Opts),
+            Response
+    end.
 
 %% @doc Record one receipt per transport attempt, including failures and retries.
 do_request(Args, Opts) ->

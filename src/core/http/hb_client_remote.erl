@@ -75,7 +75,8 @@ add_route(Node, Route, Opts) ->
 %% used to stamp every assignment with block 0.
 arweave_timestamp() ->
     URL = binary_to_list(<<(hb_opts:get(gateway))/binary, "/block/current">>),
-    try httpc:request(get, {URL, []}, [{timeout, 5000}], [{body_format, binary}]) of
+    try hb_http_gate:httpc_request(get, {URL, []}, [{timeout, 5000}],
+            [{body_format, binary}], #{}) of
         {ok, {{_, 200, _}, _, Body}} ->
             Fields = hb_json:decode(Body),
             {ok,

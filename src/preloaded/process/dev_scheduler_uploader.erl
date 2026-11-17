@@ -426,11 +426,12 @@ item(Msg, Opts) ->
 
 post(Serialized, Opts) ->
     URL = upload_url(Opts),
-    case httpc:request(
+    case hb_http_gate:httpc_request(
             post,
             {URL, [], "application/octet-stream", Serialized},
             [{timeout, 60000}],
-            [{body_format, binary}]) of
+            [{body_format, binary}],
+            Opts) of
         {ok, {{_, Status, _}, _, _}} when Status >= 200, Status < 300 -> ok;
         {ok, {{_, Status, _}, Headers, Body}} ->
             {error,
@@ -548,26 +549,27 @@ retry_pending(ProcID, First, Bytes, Opts) ->
 mined(IDs, Opts) ->
     Gateway = hb_util:list(hb_opts:get(scheduler_upload_gateway,
         <<"https://arweave.net">>, Opts)),
-    {ok, {{_, 200, _}, _, HeightBody}} = httpc:request(get,
-        {Gateway ++ "/height", []}, [{timeout, 15000}], [{body_format, binary}]),
+    {ok, {{_, 200, _}, _, HeightBody}} = hb_http_gate:httpc_request(get,
+        {Gateway ++ "/height", []}, [{timeout, 15000}], [{body_format, binary}],
+        Opts),
     Height = binary_to_integer(string:trim(HeightBody)),
     Depth = hb_opts:get(scheduler_upload_confirmations, 3, Opts),
     true = is_integer(Depth) andalso Depth >= 1,
-    mined_batches(IDs, Height, Depth, Gateway).
+    mined_batches(IDs, Height, Depth, Gateway, Opts).
 
-mined_batches([], _Height, _Depth, _Gateway) -> true;
-mined_batches(IDs, Height, Depth, Gateway) ->
+mined_batches([], _Height, _Depth, _Gateway, _Opts) -> true;
+mined_batches(IDs, Height, Depth, Gateway, Opts) ->
     {Batch, Rest} = lists:split(min(100, length(IDs)), IDs),
     Query = <<"query($ids:[ID!]){transactions(ids:$ids,first:100){edges{node{id block{height}}}}}">>,
     Body = hb_json:encode(#{<<"query">> => Query,
         <<"variables">> => #{<<"ids">> => Batch}}),
-    {ok, {{_, 200, _}, _, Response}} = httpc:request(post,
+    {ok, {{_, 200, _}, _, Response}} = hb_http_gate:httpc_request(post,
         {Gateway ++ "/graphql", [], "application/json", Body},
-        [{timeout, 15000}], [{body_format, binary}]),
+        [{timeout, 15000}], [{body_format, binary}], Opts),
     #{<<"data">> := #{<<"transactions">> := #{<<"edges">> := Edges}}} =
         hb_json:decode(Response),
     window_confirmed(Batch, Edges, Height, Depth)
-        andalso mined_batches(Rest, Height, Depth, Gateway).
+        andalso mined_batches(Rest, Height, Depth, Gateway, Opts).
 
 window_confirmed(IDs, Edges, Height, Depth) ->
     Found = [ID || #{<<"node">> := #{<<"id">> := ID,

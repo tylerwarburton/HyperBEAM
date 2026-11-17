@@ -1120,23 +1120,39 @@ retry_after({error, Response}) when is_map(Response) ->
 retry_after(_) -> undefined.
 
 %% @doc Every Arweave read of the scheduler goes to the node's `gateway'
-%% (HTTPS in our nodes' config). What it returns is verified, not trusted.
+%% (HTTPS in our nodes' config). What it returns is verified, not trusted, so
+%% any gateway will do: `arweave-scheduler-gateways' lists several, asked in
+%% order until one answers 200. A gateway cooling down after a `429' answers
+%% locally at once (`hb_http_gate'), so the next one is asked immediately.
 fetch_opts(Opts) ->
-    Gateway = hb_opts:get(gateway, <<"https://arweave.net">>, Opts),
     Opts#{
         <<"arweave-index-blocks">> => false,
-        <<"routes">> =>
-            [
-                #{
-                    <<"template">> => <<"^/arweave">>,
-                    <<"node">> =>
-                        #{
-                            <<"match">> => <<"^/arweave">>,
-                            <<"with">> => Gateway
-                        }
-                }
-            ]
+        <<"routes">> => [gateway_route(gateways(Opts))]
     }.
+
+gateways(Opts) ->
+    case hb_opts:get(arweave_scheduler_gateways, [], Opts) of
+        [_ | _] = Gateways -> [hb_util:bin(G) || G <- Gateways];
+        _ -> [hb_opts:get(gateway, <<"https://arweave.net">>, Opts)]
+    end.
+
+gateway_route([Gateway]) ->
+    #{
+        <<"template">> => <<"^/arweave">>,
+        <<"node">> => gateway_node(Gateway)
+    };
+gateway_route(Gateways) ->
+    #{
+        <<"template">> => <<"^/arweave">>,
+        <<"nodes">> => [gateway_node(G) || G <- Gateways],
+        <<"parallel">> => false,
+        <<"responses">> => 1,
+        <<"stop-after">> => true,
+        <<"admissible-status">> => 200
+    }.
+
+gateway_node(Gateway) ->
+    #{ <<"match">> => <<"^/arweave">>, <<"with">> => Gateway }.
 
 validate_header(TXID, Header, Opts) ->
     try
@@ -2340,3 +2356,58 @@ retry_after_honoured() ->
         hb_store:stop(Store),
         hb_mock_server:stop(Handle)
     end.
+
+%% A gateway that refuses with `retry-after' is skipped for the next gateway at
+%% once, and is not asked again, by any fetch, until its refusal has passed.
+gateway_fallback_test_() ->
+    {timeout, 60, fun gateway_fallback/0}.
+
+gateway_fallback() ->
+    [Header, Second | _] = fixture_headers(),
+    Counter =
+        fun(Calls, Reply) ->
+            fun(_) -> counters:add(Calls, 1, 1), Reply() end
+        end,
+    Busy = counters:new(1, []),
+    Good = counters:new(1, []),
+    {ok, BusyURL, BusyHandle} =
+        hb_mock_server:start([{"/[...]", busy,
+            Counter(Busy, fun() -> {429, #{ <<"retry-after">> => <<"60">> }, <<>>} end)}]),
+    Headers = #{ maps:get(<<"id">>, H) => H || H <- [Header, Second] },
+    {ok, GoodURL, GoodHandle} =
+        hb_mock_server:start([{"/[...]", good,
+            fun(Req) ->
+                counters:add(Good, 1, 1),
+                Path = maps:get(<<"path">>, Req, <<>>),
+                [ID | _] = lists:reverse(binary:split(Path, <<"/">>, [global])),
+                {200, hb_json:encode(maps:get(ID, Headers))}
+            end}]),
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"ar-sched-fallback">>),
+    ok = hb_store:start(Store),
+    Opts = #{
+        <<"store">> => [Store],
+        <<"arweave-scheduler-gateways">> => [BusyURL, GoodURL],
+        <<"arweave-scheduler-fetch-attempts">> => 1
+    },
+    try
+        Start = erlang:monotonic_time(millisecond),
+        ?assertMatch({ok, #tx{}}, fetch_header_remote(maps:get(<<"id">>, Header), Opts)),
+        ?assertMatch({ok, #tx{}}, fetch_header_remote(maps:get(<<"id">>, Second), Opts)),
+        ?assert(erlang:monotonic_time(millisecond) - Start < 30000),
+        ?assertEqual(1, counters:get(Busy, 1)),
+        ?assertEqual(2, counters:get(Good, 1))
+    after
+        hb_store:stop(Store),
+        hb_mock_server:stop(BusyHandle),
+        hb_mock_server:stop(GoodHandle)
+    end.
+
+gateways_test() ->
+    ?assertEqual([<<"https://a">>],
+        gateways(#{ <<"gateway">> => <<"https://a">> })),
+    ?assertEqual([<<"https://b">>, <<"https://c">>],
+        gateways(#{ <<"gateway">> => <<"https://a">>,
+            <<"arweave-scheduler-gateways">> => [<<"https://b">>, "https://c"] })),
+    ?assertMatch(#{ <<"node">> := _ }, gateway_route([<<"https://a">>])),
+    ?assertMatch(#{ <<"nodes">> := [_, _], <<"parallel">> := false },
+        gateway_route([<<"https://a">>, <<"https://b">>])).

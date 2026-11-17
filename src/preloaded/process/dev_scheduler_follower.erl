@@ -563,7 +563,8 @@ gateway(Method, Gateway, Path, Body, Timeout) ->
             get -> {Gateway ++ Path, []};
             post -> {Gateway ++ Path, [], "application/json", Body}
         end,
-    case httpc:request(Method, Request, [{timeout, Timeout}], [{body_format, binary}]) of
+    case hb_http_gate:httpc_request(Method, Request, [{timeout, Timeout}],
+            [{body_format, binary}], #{}) of
         {ok, {{_, 200, _}, _, Res}} -> Res;
         {ok, {{_, Status, _}, Headers, _}} ->
             throw({gateway_status, Status, retry_after_ms(Headers)});
@@ -849,6 +850,8 @@ rate_limit_backs_off() ->
     ?assertEqual(F1, with_windows(F1, Now + 60000)),
     ?assertEqual(0, hits(limited)),
     Later = Now + 120000,
+    % The test's clock jumps past the refusal; the node-wide gate's cannot.
+    hb_http_gate:reset(),
     F2 = with_windows(F1, Later),
     ?assertEqual(1, hits(limited)),
     [G2] = maps:get(gateways, F2),
@@ -910,7 +913,9 @@ gateway_failover() ->
     ?assertEqual(Now + ?DEFAULT_ARCHIVE_POLL_MS, maps:get(archive_at, F1)),
     % Once their backoff has passed the first gateways are asked again, and
     % refuse again (each backoff doubles); a window already held is not
-    % fetched again.
+    % fetched again. The test's clock jumps past the refusals; the node-wide
+    % gate's (`hb_http_gate') cannot, so it is cleared.
+    hb_http_gate:reset(),
     F2 = with_windows(F1, Now + ?DEFAULT_ARCHIVE_POLL_MS),
     ?assertEqual(1, hits(down)),
     ?assertEqual(1, hits(limited)),
@@ -983,6 +988,7 @@ blockless_fallback_does_not_displace_first_gateway() ->
     ?assertEqual(2, hits(turbo)),
     ?assertEqual([], maps:get(windows, F1)),
     ?assertEqual(not_yet, archived(0, AssignmentID, F1)),
+    hb_http_gate:reset(),
     F2 = with_windows(F1, Now + ?DEFAULT_ARCHIVE_POLL_MS),
     ?assertEqual(3, hits(arweave)),
     ?assertEqual(0, hits(turbo)),
