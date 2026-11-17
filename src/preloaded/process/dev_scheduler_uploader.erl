@@ -3,9 +3,10 @@
 %%%
 %%% One uploader runs beside each scheduling server whose node publishes
 %%% (`scheduler-publish-remote'). The server tells it each slot it confirms;
-%%% the uploader reads that slot back from the scheduler's store and posts the
-%%% assignment and its body, `?WINDOW' slots to a signed bundle (see
-%%% `post_bundle/3' for its shape). Signed windows are flushed before POST.
+%%% the uploader reads that slot back from the scheduler's store and posts a
+%%% window of slots as ONE signed archive item (see `prepare_window/6' for its
+%%% shape): once `window-slots' slots are waiting, or the oldest has waited
+%%% `latency-ms'. Signed windows are flushed before POST.
 %%% `posted/<pid>' tracks bundler acceptance; `confirmed/<pid>' tracks only
 %%% contiguous windows whose payloads and archive are mined to the configured
 %%% depth. Legacy `uploaded/<pid>' is a replay target, never confirmation
@@ -16,34 +17,63 @@
 %%% `remote_confirmation' is answered by the uploader, once its slot is up.
 %%%
 %%% Uploading costs the node's bundler credit, so only the processes the
-%%% operator lists in `scheduler-upload-processes' are archived. Anyone may
-%%% schedule on a public node; nobody else's schedule is paid for. With no
-%%% list nothing is uploaded, and a process off the list is not verifiable from
-%%% Arweave by another node's follower (`dev_scheduler_follower').
+%%% operator lists are archived. Anyone may schedule on a public node; nobody
+%%% else's schedule is paid for. A process on `scheduler-upload-processes' is
+%%% archived whole (every signed message, compressed); one on
+%%% `scheduler-fingerprint-processes' only by the ID of each window's last
+%%% assignment, which commits to every slot before it through the assignments'
+%%% `base-hashpath' chain. Either lets another node's follower
+%%% (`dev_scheduler_follower') verify the process; only the first lets anyone
+%%% rebuild it from Arweave alone. Off both lists nothing is uploaded.
+%%%
+%%% Format 2 (`Archive-Format: 2'), the only one written: tags `Process',
+%%% `From-Slot', `To-Slot', `Last-Assignment' (the signed ID of slot
+%%% `To-Slot''s assignment) and `Archive-Data'. `full': the data is the window's
+%%% ANS-104 bundle (bodies, assignments, linked messages: exact signed bytes),
+%%% zlib-compressed at level 9 (`Archive-Encoding: zlib'); `fingerprint': the
+%%% data is the 32 raw bytes of `Last-Assignment'. Format 1 (no
+%%% `Archive-Format') was an outer bundle of link-free items plus an
+%%% uncompressed archive item; windows persisted in it still post and confirm.
 -module(dev_scheduler_uploader).
--export([start/2, cursor/2, posted/2, allowed/2, list_option/2]).
+-export([start/2, cursor/2, posted/2, allowed/2, mode/2, list_option/2]).
+-export([archive_bundle/2, prepare_window/6]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
--define(WINDOW, 32).
+-define(FORMAT, 2).
+-define(DEFAULT_WINDOW_SLOTS, 1000).
+%% Uncompressed bytes a full window may carry before it is cut (at least one
+%% slot always goes).
+-define(DEFAULT_WINDOW_BYTES, 8 * 1024 * 1024).
+-define(DEFAULT_LATENCY_MS, 60000).
 -define(MIN_BACKOFF, 1000).
 -define(MAX_BACKOFF, 60000).
 
 %% @doc Start the uploader of `ProcID', linked to the caller, or `undefined'
-%% for a process that is not on `scheduler-upload-processes'.
+%% for a process on neither upload list.
 start(ProcID, Opts) ->
-    case allowed(ProcID, Opts) of
-        true -> start_uploader(ProcID, Opts);
-        false ->
+    case mode(ProcID, Opts) of
+        none ->
             ?event(warning, {schedule_upload_skipped, {proc_id, ProcID},
                 {reason, not_in_scheduler_upload_processes}}),
-            undefined
+            undefined;
+        Mode -> start_uploader(ProcID, Mode, Opts)
     end.
 
-%% @doc Whether this node pays to archive `ProcID'.
-allowed(ProcID, Opts) ->
-    lists:member(hb_util:human_id(ProcID),
-        list_option(hb_opts:get(scheduler_upload_processes, [], Opts), Opts)).
+%% @doc Whether this node pays to archive `ProcID' whole.
+allowed(ProcID, Opts) -> mode(ProcID, Opts) =:= full.
+
+%% @doc `full', `fingerprint' or `none': how this node archives `ProcID'.
+%% A process on both lists is archived whole.
+mode(ProcID, Opts) ->
+    Listed = fun(Key) ->
+        lists:member(hb_util:human_id(ProcID), list_option(hb_opts:get(Key, [], Opts), Opts))
+    end,
+    case {Listed(scheduler_upload_processes), Listed(scheduler_fingerprint_processes)} of
+        {true, _} -> full;
+        {false, true} -> fingerprint;
+        _ -> none
+    end.
 
 %% @doc A list-valued node option as a list of binaries, however it arrived:
 %% a list, a numbered message, a JSON array or a comma-separated binary.
@@ -60,18 +90,25 @@ list_option(Value, Opts) when is_binary(Value) ->
     list_option(binary:split(Value, <<",">>, [global]), Opts);
 list_option(_, _Opts) -> [].
 
-start_uploader(ProcID, Opts) ->
+start_uploader(ProcID, Mode, Opts) ->
+    Int = fun(Key, Default) -> hb_util:int(hb_opts:get(Key, Default, Opts)) end,
     spawn_link(
         fun() ->
             loop(#{
                 id => ProcID,
+                mode => Mode,
                 opts => Opts,
                 cursor => posted(ProcID, Opts),
                 confirmed => cursor(ProcID, Opts),
                 target => read_cursor(ProcID, <<"uploaded">>, Opts),
                 check_at => 0,
                 waiting => [],
-                backoff => ?MIN_BACKOFF
+                backoff => ?MIN_BACKOFF,
+                pending_since => undefined,
+                window_slots =>
+                    max(1, Int(scheduler_upload_window_slots, ?DEFAULT_WINDOW_SLOTS)),
+                window_bytes => Int(scheduler_upload_window_bytes, ?DEFAULT_WINDOW_BYTES),
+                latency => Int(scheduler_upload_latency_ms, ?DEFAULT_LATENCY_MS)
             })
         end
     ).
@@ -94,14 +131,41 @@ read_cursor(ProcID, Kind, Opts) ->
     end.
 
 loop(State0) ->
-    State = confirm_window(take(State0, 0)),
-    #{cursor := Cursor, target := Target, confirmed := Confirmed} = State,
-    case Cursor < Target of
+    State = pending(confirm_window(take(State0, 0)), now_ms()),
+    case due(State, now_ms()) of
         true -> loop(upload_window(State));
-        false ->
-            Timeout = case Confirmed < Cursor of true -> 1000; false -> infinity end,
-            loop(take(answer(State), Timeout))
+        false -> loop(take(answer(State), wake_after(State, now_ms())))
     end.
+
+%% Since when the oldest slot not posted yet has waited: set when one first
+%% waits, kept while any does.
+pending(State = #{ cursor := C, target := T }, _Now) when C >= T ->
+    State#{ pending_since => undefined };
+pending(State = #{ pending_since := undefined }, Now) ->
+    State#{ pending_since => Now };
+pending(State, _Now) -> State.
+
+%% A window goes up once it is full or its oldest slot has waited `latency'.
+due(#{ cursor := C, target := T }, _Now) when C >= T -> false;
+due(#{ cursor := C, target := T, window_slots := Slots }, _Now) when T - C >= Slots -> true;
+due(#{ pending_since := Since, latency := Latency }, Now) -> Now - Since >= Latency.
+
+%% Wake for the next confirmation check or the next window, whichever is
+%% first. Not `erlang:min/2' over `infinity': OTP's range analysis of it
+%% folded `wake_after(...) =:= 3000' to false although the value was 3000.
+wake_after(State = #{ confirmed := Confirmed, cursor := Cursor }, Now) ->
+    Check = [ 1000 || Confirmed < Cursor ],
+    Flush =
+        case State of
+            #{ pending_since := undefined } -> [];
+            #{ pending_since := Since, latency := Latency } -> [max(0, Since + Latency - Now)]
+        end,
+    case Check ++ Flush of
+        [] -> infinity;
+        Waits -> lists:min(Waits)
+    end.
+
+now_ms() -> erlang:monotonic_time(millisecond).
 
 %% @doc Take every slot the server has sent, waiting up to `Timeout' for the
 %% first.
@@ -122,12 +186,12 @@ take(State = #{ target := Target, waiting := Waiting }, Timeout) ->
     after Timeout -> State
     end.
 
-%% @doc Post the next `?WINDOW' slots as one bundle, and move the cursor past
-%% them. If the bundler does not take it, wait and try again.
+%% @doc Post the next window, and move the cursor past it. If the bundler does
+%% not take it, wait and try again.
 upload_window(State = #{ id := ProcID, opts := Opts, cursor := Cursor,
-        target := Target, backoff := Backoff }) ->
-    Last = min(Target, Cursor + ?WINDOW),
-    case post_bundle(ProcID, lists:seq(Cursor + 1, Last), Opts) of
+        target := Target, backoff := Backoff, window_slots := Slots }) ->
+    Last = min(Target, Cursor + Slots),
+    case post_window(ProcID, Cursor + 1, Last, State) of
         {ok, PostedLast} ->
             ok = hb_store:write(
                 store(Opts),
@@ -160,32 +224,23 @@ answer(State = #{ confirmed := Cursor, waiting := Waiting }) ->
     ),
     State#{ waiting => Rest }.
 
-%% @doc Sign a bundle and post it: `{ok, LastSlot}', or the reason it was
+%% @doc Sign a window and post it: `{ok, LastSlot}', or the reason it was
 %% not taken. One request carries the whole window, which keeps a busy node
-%% under the bundler's request limit.
-%%
-%% The bundler parses every item and refuses one that names another message
-%% by a link (`ao:<id>') it cannot resolve. Every assignment does (its
-%% `body'), and so does a process naming its `module'. So an item goes in
-%% under its own ID, indexed by the gateway, only if it carries no link; the
-%% rest go in, exact signed bytes, as one archive item signed by the node: an
-%% ANS-104 bundle of them, untagged as a bundle so the bundler leaves it
-%% whole, found by its `Process', `From-Slot' and `To-Slot' tags. Every
-%% message the window links to that this node holds (a process's module, say)
-%% goes up with it, so the schedule can be rebuilt from Arweave alone.
-post_bundle(ProcID, Slots = [First | _], Opts) ->
+%% under the bundler's request limit. A window already signed for `First'
+%% (in either format) is posted again byte for byte.
+post_window(ProcID, First, Max, #{ mode := Mode, window_bytes := Bytes, opts := Opts }) ->
     try
         Path = window_path(ProcID, First),
         {Last, Serialized} =
             case hb_store:read(store(Opts),
                     #{ <<"read">> => Path, <<"exact">> => true }, Opts) of
-                {ok, Saved} -> binary_to_term(Saved, [safe]);
+                {ok, Saved} -> saved_window(binary_to_term(Saved, [safe]));
                 {error, not_found} ->
-                    Prepared = prepare_bundle(ProcID, Slots, Opts),
+                    Prepared = prepare_window(ProcID, First, Max, Mode, Bytes, Opts),
                     ok = hb_store:write(store(Opts),
                         #{ Path => term_to_binary(Prepared) }, Opts),
                     ok = hb_store:flush(store(Opts), Opts),
-                    Prepared;
+                    saved_window(Prepared);
                 ReadError -> throw({upload_window_read_failed, ReadError})
             end,
         case post(Serialized, Opts) of
@@ -197,37 +252,101 @@ post_bundle(ProcID, Slots = [First | _], Opts) ->
     catch Class:Reason -> {error, {Class, Reason}}
     end.
 
+%% A persisted window as `{LastSlot, Bytes}': format 2 is tagged, format 1
+%% (written before compression) is the bare pair.
+saved_window({?FORMAT, Last, Bytes}) -> {Last, Bytes};
+saved_window({Last, Bytes}) -> {Last, Bytes}.
+
 %% @doc Freeze the signed bytes and slot range before the first POST. Retries
 %% reuse this record even when the scheduling head advances or the node restarts.
-prepare_bundle(ProcID, Slots = [First | _], Opts) ->
+%%
+%% One item signed by the node, found by its `Process', `From-Slot' and
+%% `To-Slot' tags and carrying no link (`ao:<id>'), which a bundler would
+%% refuse to take unresolved. In a full window every message the window links
+%% to that this node holds (a process's module, say) goes in with it, so the
+%% schedule can be rebuilt from Arweave alone. The item's ID is not
+%% reproducible (RSA-PSS signatures are salted); its data is, for the same
+%% window.
+prepare_window(ProcID, First, Max, Mode, MaxBytes, Opts) ->
+    {Read, Items, LastSlot} =
+        case Mode of
+            full ->
+                {R, I} = read_window(ProcID, First, Max, MaxBytes, Opts),
+                {R, I, First + length(R) - 1};
+            fingerprint -> {[read_slot(ProcID, Max, Opts)], [], Max}
+        end,
+    {_, LastAssignment} = lists:last(Read),
+    LastID = hb_util:human_id(hb_message:id(LastAssignment, signed, Opts)),
+    Tags = [
+        {<<"Data-Protocol">>, <<"ao-schedule-archive">>},
+        {<<"Archive-Format">>, integer_to_binary(?FORMAT)},
+        {<<"Process">>, hb_util:human_id(ProcID)},
+        {<<"From-Slot">>, hb_util:bin(First)},
+        {<<"To-Slot">>, hb_util:bin(LastSlot)},
+        {<<"Last-Assignment">>, LastID}
+    ],
+    Item =
+        case Mode of
+            full ->
+                sign(compress(bundle_data(Items ++ linked(Items, Opts))),
+                    Tags ++ [
+                        {<<"Archive-Data">>, <<"full">>},
+                        {<<"Archive-Encoding">>, <<"zlib">>},
+                        {<<"Content-Type">>, <<"application/octet-stream">>}
+                    ],
+                    Opts);
+            fingerprint ->
+                sign(hb_util:native_id(LastID),
+                    Tags ++ [{<<"Archive-Data">>, <<"fingerprint">>}], Opts)
+        end,
+    {?FORMAT, LastSlot, ar_bundles:serialize(Item)}.
+
+%% The slots `First'..`Max' and their items, bodies first then assignments
+%% (format 1's order), cut before the slot that would take the window past
+%% `MaxBytes' uncompressed; the first slot always goes.
+read_window(ProcID, First, Max, MaxBytes, Opts) ->
+    read_window(ProcID, First, Max, MaxBytes, Opts, 0, []).
+read_window(_ProcID, Slot, Max, _MaxBytes, _Opts, _Size, Acc) when Slot > Max ->
+    window_items(lists:reverse(Acc));
+read_window(ProcID, Slot, Max, MaxBytes, Opts, Size, Acc) ->
+    {Body, Assignment} = read_slot(ProcID, Slot, Opts),
+    BodyItem = item(Body, Opts),
+    AssignmentItem = item(Assignment, Opts),
+    Next = Size + byte_size(ar_bundles:serialize(BodyItem))
+        + byte_size(ar_bundles:serialize(AssignmentItem)),
+    case Acc =/= [] andalso Next > MaxBytes of
+        true -> window_items(lists:reverse(Acc));
+        false ->
+            read_window(ProcID, Slot + 1, Max, MaxBytes, Opts, Next,
+                [{{Body, Assignment}, BodyItem, AssignmentItem} | Acc])
+    end.
+
+window_items(Slots) ->
+    {[ R || {R, _, _} <- Slots ],
+        [ B || {_, B, _} <- Slots ] ++ [ A || {_, _, A} <- Slots ]}.
+
+%% Deterministic for the same input and zlib build: level 9, zlib framing.
+compress(Data) ->
+    Z = zlib:open(),
     try
-        Read = [ read_slot(ProcID, Slot, Opts) || Slot <- Slots ],
-        Window =
-            [ item(Body, Opts) || {Body, _} <- Read ] ++
-            [ item(Assignment, Opts) || {_, Assignment} <- Read ],
-        Items = Window ++ linked(Window, Opts),
-        {Linking, Plain} = lists:partition(fun(I) -> links(I) =/= [] end, Items),
-        Archive = sign(
-            bundle_data(Linking),
-            [
-                {<<"Data-Protocol">>, <<"ao-schedule-archive">>},
-                {<<"Content-Type">>, <<"application/octet-stream">>},
-                {<<"Process">>, hb_util:human_id(ProcID)},
-                {<<"From-Slot">>, hb_util:bin(First)},
-                {<<"To-Slot">>, hb_util:bin(lists:last(Slots))}
-            ],
-            Opts
-        ),
-        Bundle = sign(
-            bundle_data(Plain ++ [Archive]),
-            [
-                {<<"Bundle-Format">>, <<"binary">>},
-                {<<"Bundle-Version">>, <<"2.0.0">>}
-            ],
-            Opts
-        ),
-        {lists:last(Slots), ar_bundles:serialize(Bundle)}
-    catch Class:Reason -> erlang:raise(Class, Reason, [])
+        ok = zlib:deflateInit(Z, 9, deflated, 15, 9, default),
+        Out = iolist_to_binary(zlib:deflate(Z, Data, finish)),
+        ok = zlib:deflateEnd(Z),
+        Out
+    after zlib:close(Z)
+    end.
+
+%% @doc The ANS-104 bundle of signed items a format 2 `full' archive carries,
+%% from its tags and data; `{error, Why}' for a window that carries none.
+%% Format 1 data is already that bundle. For offline readers: the follower
+%% needs only the tags.
+archive_bundle(Tags, Data) ->
+    Get = fun(Name) -> proplists:get_value(Name, Tags) end,
+    case {Get(<<"Archive-Format">>), Get(<<"Archive-Data">>), Get(<<"Archive-Encoding">>)} of
+        {undefined, _, _} -> {ok, Data};
+        {<<"2">>, <<"full">>, <<"zlib">>} -> {ok, zlib:uncompress(Data)};
+        {<<"2">>, <<"fingerprint">>, _} -> {error, fingerprint_only};
+        Other -> {error, {unknown_archive_format, Other}}
     end.
 
 %% @doc The IDs an item names by link.
@@ -380,9 +499,9 @@ check_window(State = #{id := ProcID, opts := Opts, confirmed := C}) ->
         Path = window_path(ProcID, C + 1),
         {ok, Saved} = hb_store:read(store(Opts),
             #{<<"read">> => Path, <<"exact">> => true}, Opts),
-        {Last, Bytes} = binary_to_term(Saved, [safe]),
-        Bundle = ar_bundles:deserialize_item_wrapper(Bytes),
-        IDs = lists:usort([hb_util:human_id(I#tx.id) || I <- items(Bundle#tx.data)]),
+        Record = binary_to_term(Saved, [safe]),
+        {Last, Bytes} = saved_window(Record),
+        IDs = posted_ids(Record),
         case mined(IDs, Opts) of
             true ->
                 ok = hb_store:write(store(Opts),
@@ -397,6 +516,14 @@ check_window(State = #{id := ProcID, opts := Opts, confirmed := C}) ->
         ?event(warning, {schedule_confirmation_retrying, ProcID, Class, Reason}),
         Next
     end.
+
+%% The items a persisted window must have mined: the archive item itself in
+%% format 2; every item of the outer bundle in format 1.
+posted_ids({?FORMAT, _Last, Bytes}) ->
+    [hb_util:human_id((ar_bundles:deserialize_item_wrapper(Bytes))#tx.id)];
+posted_ids({_Last, Bytes}) ->
+    Bundle = ar_bundles:deserialize_item_wrapper(Bytes),
+    lists:usort([hb_util:human_id(I#tx.id) || I <- items(Bundle#tx.data)]).
 
 %% @doc Repost the identical persisted bundle after the pending timeout.
 retry_pending(ProcID, First, Bytes, Opts) ->
@@ -467,9 +594,10 @@ confirmation_coverage_test() ->
 
 %% @doc With no bundler the cursor stays where it is, and a bundler that
 %% refuses (429) is asked again. Once one takes it, the window goes up as one
-%% signed bundle: each slot's message under its own ID, in slot order, then an
-%% archive of the assignments; the cursor reaches the last slot and the
-%% waiting client is answered.
+%% signed format 2 item: every slot's message then its assignment, exact
+%% signed bytes, compressed, tagged with the last assignment's ID; the cursor
+%% reaches the last slot and the waiting client is answered once that one
+%% item is mined.
 retries_until_bundler_answers_test_() ->
     {timeout, 120, fun retries_until_bundler_answers/0}.
 retries_until_bundler_answers() ->
@@ -486,6 +614,7 @@ retries_until_bundler_answers() ->
         <<"scheduler-upload-poll-ms">> => 10,
         <<"scheduler-upload-retry-seconds">> => 0,
         <<"scheduler-upload-processes">> => [ProcID],
+        <<"scheduler-upload-latency-ms">> => 0,
         <<"bundler-ans104">> =>
             <<"http://localhost:", (integer_to_binary(Port))/binary>>
     },
@@ -522,20 +651,25 @@ retries_until_bundler_answers() ->
     Posted = receive {posted, 200, Bin} -> Bin after 90000 -> error(no_post) end,
     receive {posted, 429, Retried} -> ?assertEqual(Posted, Retried)
     after 0 -> error(no_refusal) end,
-    Bundle = ar_bundles:deserialize_item_wrapper(Posted),
-    ?assert(ar_bundles:verify_item(Bundle)),
-    {MessageIDs, AssignmentIDs} = lists:unzip(IDs),
-    [Archive | Messages] = lists:reverse(items(Bundle#tx.data)),
-    ?assertEqual(MessageIDs, [ hb_util:human_id(M#tx.id) || M <- lists:reverse(Messages) ]),
+    Archive = ar_bundles:deserialize_item_wrapper(Posted),
     ?assert(ar_bundles:verify_item(Archive)),
-    ?assertEqual(<<"0">>, proplists:get_value(<<"From-Slot">>, Archive#tx.tags)),
-    ?assertEqual(<<"4">>, proplists:get_value(<<"To-Slot">>, Archive#tx.tags)),
-    Archived = items(Archive#tx.data),
-    ?assertEqual(AssignmentIDs, [ hb_util:human_id(A#tx.id) || A <- Archived ]),
+    {MessageIDs, AssignmentIDs} = lists:unzip(IDs),
+    Tag = fun(Name) -> proplists:get_value(Name, Archive#tx.tags) end,
+    ?assertEqual(<<"ao-schedule-archive">>, Tag(<<"Data-Protocol">>)),
+    ?assertEqual(<<"2">>, Tag(<<"Archive-Format">>)),
+    ?assertEqual(<<"full">>, Tag(<<"Archive-Data">>)),
+    ?assertEqual(<<"0">>, Tag(<<"From-Slot">>)),
+    ?assertEqual(<<"4">>, Tag(<<"To-Slot">>)),
+    ?assertEqual(hb_util:human_id(lists:last(AssignmentIDs)), Tag(<<"Last-Assignment">>)),
+    {ok, Inflated} = archive_bundle(Archive#tx.tags, Archive#tx.data),
+    ?assert(byte_size(Archive#tx.data) < byte_size(Inflated)),
+    Archived = items(Inflated),
+    ?assertEqual(MessageIDs ++ AssignmentIDs,
+        [ hb_util:human_id(I#tx.id) || I <- Archived ]),
     ?assert(lists:all(fun ar_bundles:verify_item/1, Archived)),
     gateway_reply(<<"100">>),
-    PendingEdges = [#{<<"node">> => #{<<"id">> => hb_util:human_id(I#tx.id),
-        <<"block">> => null}} || I <- items(Bundle#tx.data)],
+    PendingEdges = [#{<<"node">> => #{<<"id">> => hb_util:human_id(Archive#tx.id),
+        <<"block">> => null}}],
     gateway_reply(hb_json:encode(#{<<"data">> => #{<<"transactions">> =>
         #{<<"edges">> => PendingEdges}}})),
     receive {posted, 200, Reposted} -> ?assertEqual(Posted, Reposted)
@@ -549,8 +683,8 @@ retries_until_bundler_answers() ->
     Restarted = start(ProcID, Opts),
     Restarted ! {durable, 4, {Self, msg, assignment}},
     gateway_reply(<<"100">>),
-    Edges = [#{<<"node">> => #{<<"id">> => hb_util:human_id(I#tx.id),
-        <<"block">> => #{<<"height">> => 98}}} || I <- items(Bundle#tx.data)],
+    Edges = [#{<<"node">> => #{<<"id">> => hb_util:human_id(Archive#tx.id),
+        <<"block">> => #{<<"height">> => 98}}}],
     gateway_reply(hb_json:encode(#{<<"data">> => #{<<"transactions">> =>
         #{<<"edges">> => Edges}}})),
     receive {scheduled, msg, assignment} -> ok after 10000 -> error(no_answer) end,
@@ -793,3 +927,114 @@ unlisted_is_never_uploaded() ->
         #{ <<"read">> => window_path(ProcID, 0), <<"exact">> => true }, Base)),
     unlink(Bundler),
     exit(Bundler, kill).
+
+%% Write `Slots' of `ProcID' as ANS-104 bodies and assignments; their
+%% `{BodyID, AssignmentID}'s.
+write_slots(ProcID, Slots, Opts) ->
+    IDs =
+        [ begin
+            Body = hb_message:commit(
+                #{ <<"data">> => integer_to_binary(Slot) }, Opts, <<"ans104@1.0">>),
+            Assignment = hb_message:commit(
+                #{ <<"process">> => ProcID, <<"slot">> => Slot, <<"body">> => Body,
+                   <<"type">> => <<"Assignment">>, <<"variant">> => <<"ao.N.1">> },
+                Opts, <<"ans104@1.0">>),
+            ok = dev_scheduler_cache:write(ProcID, Assignment, Opts),
+            {hb_message:id(Body, signed, Opts), hb_message:id(Assignment, signed, Opts)}
+          end
+        || Slot <- Slots ],
+    ok = dev_scheduler_cache:flush(Opts),
+    IDs.
+
+test_opts() ->
+    #{ <<"store">> => [hb_test_utils:test_store()], <<"priv-wallet">> => hb:wallet() }.
+
+%% @doc A full window's data is the same bytes every time it is prepared (the
+%% signature, and so the item's ID, is salted), and smaller than what it
+%% carries; a fingerprint window carries only the last assignment's ID.
+window_shapes_test() ->
+    Opts = test_opts(),
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    IDs = write_slots(ProcID, lists:seq(0, 9), Opts),
+    {_, LastID} = lists:last(IDs),
+    {2, 9, A} = prepare_window(ProcID, 0, 9, full, ?DEFAULT_WINDOW_BYTES, Opts),
+    {2, 9, B} = prepare_window(ProcID, 0, 9, full, ?DEFAULT_WINDOW_BYTES, Opts),
+    ItemA = ar_bundles:deserialize_item_wrapper(A),
+    ItemB = ar_bundles:deserialize_item_wrapper(B),
+    ?assert(ar_bundles:verify_item(ItemA)),
+    ?assertEqual(ItemA#tx.data, ItemB#tx.data),
+    ?assertNotEqual(ItemA#tx.id, ItemB#tx.id),
+    {ok, Inflated} = archive_bundle(ItemA#tx.tags, ItemA#tx.data),
+    ?assert(byte_size(ItemA#tx.data) < byte_size(Inflated)),
+    ?assertEqual(hb_util:human_id(LastID),
+        proplists:get_value(<<"Last-Assignment">>, ItemA#tx.tags)),
+    {2, 9, F} = prepare_window(ProcID, 3, 9, fingerprint, ?DEFAULT_WINDOW_BYTES, Opts),
+    Fp = ar_bundles:deserialize_item_wrapper(F),
+    ?assert(ar_bundles:verify_item(Fp)),
+    ?assertEqual(hb_util:native_id(LastID), Fp#tx.data),
+    ?assertEqual(<<"fingerprint">>, proplists:get_value(<<"Archive-Data">>, Fp#tx.tags)),
+    ?assertEqual(<<"3">>, proplists:get_value(<<"From-Slot">>, Fp#tx.tags)),
+    ?assertEqual(<<"9">>, proplists:get_value(<<"To-Slot">>, Fp#tx.tags)),
+    ?assertEqual({error, fingerprint_only}, archive_bundle(Fp#tx.tags, Fp#tx.data)),
+    ?assert(byte_size(F) < 1300).
+
+%% @doc A window is cut before the slot that takes it past the byte cap, and
+%% always carries at least one slot.
+byte_cap_cuts_window_test() ->
+    Opts = test_opts(),
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    IDs = write_slots(ProcID, lists:seq(0, 5), Opts),
+    {2, 0, One} = prepare_window(ProcID, 0, 5, full, 1, Opts),
+    Item = ar_bundles:deserialize_item_wrapper(One),
+    {ok, Inflated} = archive_bundle(Item#tx.tags, Item#tx.data),
+    [{Body0, Assignment0} | _] = IDs,
+    ?assertEqual([Body0, Assignment0],
+        [ hb_util:human_id(I#tx.id) || I <- items(Inflated) ]),
+    {2, Two, _} = prepare_window(ProcID, 0, 5, full, 2 * byte_size(Inflated), Opts),
+    ?assert(Two >= 1 andalso Two < 5).
+
+%% @doc A window persisted by the format 1 build (an outer bundle, before
+%% compression) still posts byte for byte and confirms on its own items.
+legacy_window_record_test() ->
+    Opts = test_opts(),
+    Plain = sign(<<"m">>, [], Opts),
+    Archive = sign(bundle_data([sign(<<"a">>, [], Opts)]),
+        [{<<"Data-Protocol">>, <<"ao-schedule-archive">>}], Opts),
+    Outer = ar_bundles:serialize(sign(bundle_data([Plain, Archive]),
+        [{<<"Bundle-Format">>, <<"binary">>}, {<<"Bundle-Version">>, <<"2.0.0">>}], Opts)),
+    ?assertEqual({7, Outer}, saved_window(binary_to_term(term_to_binary({7, Outer})))),
+    ?assertEqual(lists:usort([hb_util:human_id(Plain#tx.id), hb_util:human_id(Archive#tx.id)]),
+        posted_ids({7, Outer})),
+    New = ar_bundles:serialize(Archive),
+    ?assertEqual({3, New}, saved_window({2, 3, New})),
+    ?assertEqual([hb_util:human_id(Archive#tx.id)], posted_ids({2, 3, New})),
+    ?assertEqual({ok, <<"raw">>}, archive_bundle([], <<"raw">>)).
+
+%% @doc A window goes up when `window-slots' slots wait or the oldest has
+%% waited `latency'; the uploader sleeps until whichever comes first.
+batching_test() ->
+    S = #{ cursor => 10, target => 10, confirmed => 10, pending_since => undefined,
+        window_slots => 100, latency => 5000 },
+    ?assertNot(due(pending(S, 0), 0)),
+    ?assertEqual(infinity, wake_after(pending(S, 0), 0)),
+    Waiting = pending(S#{ target => 15 }, 10),
+    ?assertEqual(10, maps:get(pending_since, Waiting)),
+    ?assertNot(due(Waiting, 5009)),
+    ?assert(due(Waiting, 5010)),
+    ?assertEqual(3000, wake_after(Waiting, 2010)),
+    ?assertEqual(1000, wake_after(Waiting#{ confirmed => 5 }, 2010)),
+    % A later slot does not restart the wait; a full window goes at once.
+    ?assertEqual(10, maps:get(pending_since, pending(Waiting#{ target => 16 }, 900))),
+    ?assert(due(Waiting#{ target => 110 }, 10)),
+    ?assertEqual(undefined, maps:get(pending_since, pending(Waiting#{ cursor => 15 }, 900))).
+
+%% @doc The full list wins; the fingerprint list archives only fingerprints.
+mode_test() ->
+    A = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    B = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Opts = #{ <<"scheduler-upload-processes">> => [A],
+        <<"scheduler-fingerprint-processes">> => [A, B] },
+    ?assertEqual(full, mode(A, Opts)),
+    ?assertEqual(fingerprint, mode(B, Opts)),
+    ?assertNot(allowed(B, Opts)),
+    ?assertEqual(none, mode(hb_util:human_id(crypto:strong_rand_bytes(32)), Opts)).
