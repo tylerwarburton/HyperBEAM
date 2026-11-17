@@ -94,7 +94,7 @@ next(Base, Req, Opts) ->
     Schedule = message_cached_assignments(Base, Opts),
     LastProcessed =
         hb_util:int(
-            hb_ao:get(
+            lib_process:get_key(
                 <<"at-slot">>,
                 Base,
                 Opts#{ <<"hashpath">> => ignore }

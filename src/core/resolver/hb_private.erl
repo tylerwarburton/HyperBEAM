@@ -87,6 +87,11 @@ set_priv(Msg, PrivMap) ->
 %% @doc Check if a key is private: it starts with `priv', in any case.
 %% `structured@1.0' does not lowercase private keys, and `message@1.0' checks a
 %% requested key before it lowercases it. `bor 32' lowercases an ASCII capital.
+is_private(<<P, R, I, V, _/binary>>)
+        when P bor 32 =:= $p, R bor 32 =:= $r, I bor 32 =:= $i, V bor 32 =:= $v ->
+    true;
+is_private(Key) when is_binary(Key) ->
+    false;
 is_private(Key) ->
 	try hb_util:bin(Key) of
 		<<P, R, I, V, _/binary>>
@@ -140,20 +145,25 @@ opts(Opts) ->
 %% @doc Unset all of the private keys in a message or deep Erlang term.
 %% This function operates on all types of data, such that it can be used on
 %% any term to ensure that `priv` elements can _never_ pass through.
+%%
+%% Only what has a private key in it is rebuilt: a map changes by the keys it
+%% loses and the values that change, and a term with no private key anywhere
+%% is returned as it is. Rebuilding every map was 13.5 ms a slot for a process
+%% state of 10,000 published keys.
 reset(Msg) when is_map(Msg) ->
-    maps:map(
-        fun(<<"commitments">>, Commitments) when is_map(Commitments) ->
-            % The keys of `commitments' are IDs: only its values are reset.
-            maps:map(
-                fun(_ID, Commitment) -> reset(Commitment) end,
-                Commitments
-            );
-           (_Key, Val) -> reset(Val)
+    maps:fold(
+        fun(Key, Value, Acc) ->
+            case is_private(Key) of
+                true -> maps:remove(Key, Acc);
+                false ->
+                    case reset_value(Key, Value) of
+                        Value -> Acc;
+                        Reset -> Acc#{ Key := Reset }
+                    end
+            end
         end,
-        maps:without(
-            lists:filter(fun is_private/1, maps:keys(Msg)),
-            Msg
-        )
+        Msg,
+        Msg
     );
 reset(List) when is_list(List) ->
     lists:map(fun reset/1, List);
@@ -161,6 +171,12 @@ reset(Tuple) when is_tuple(Tuple) ->
     list_to_tuple(reset(tuple_to_list(Tuple)));
 reset(NonMapMessage) ->
     NonMapMessage.
+
+%% The keys of `commitments' are IDs: only its values are reset.
+reset_value(<<"commitments">>, Commitments) when is_map(Commitments) ->
+    maps:map(fun(_ID, Commitment) -> reset(Commitment) end, Commitments);
+reset_value(_Key, Value) ->
+    reset(Value).
 
 %%% Tests
 
@@ -242,3 +258,25 @@ priv_opts_cache_read_message_test() ->
     PrivMsgWithCommitments = hb_cache:read_all_commitments(PrivMsg, PrivOpts),
     PrivMsgLoaded = hb_cache:ensure_all_loaded(PrivMsgWithCommitments, PrivOpts),
     ?assertEqual(Msg, PrivMsgLoaded).
+
+%% @doc `reset/1' removes private keys at any depth, resets the values of
+%% `commitments' but keeps its keys, and returns a term with nothing private
+%% in it as the very same term.
+reset_test() ->
+    Public = #{
+        <<"a">> => <<"1">>,
+        <<"b">> => #{ <<"c">> => [#{ <<"d">> => 1 }, {link, <<"x">>, #{}}] },
+        <<"commitments">> => #{ <<"privID">> => #{ <<"type">> => <<"unsigned">> } }
+    },
+    ?assert(erts_debug:same(Public, reset(Public))),
+    Private = Public#{
+        <<"priv">> => #{ <<"state">> => 1 },
+        <<"b">> => #{
+            <<"c">> => [#{ <<"d">> => 1, <<"priv-x">> => 2 }, {link, <<"x">>, #{}}],
+            <<"Private">> => 3
+        },
+        <<"commitments">> =>
+            #{ <<"privID">> => #{ <<"type">> => <<"unsigned">>, <<"priv">> => 4 } }
+    },
+    ?assertEqual(Public, reset(Private)),
+    ?assertEqual([Public, {Public}], reset([Private, {Private}])).

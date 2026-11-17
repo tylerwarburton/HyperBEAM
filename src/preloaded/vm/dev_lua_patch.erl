@@ -101,11 +101,16 @@ compute(Key, RawBase, RawReq, Opts) ->
         ]
     end,
     Function =
-        hb_ao:get_first(
-            FunctionSources,
-            Key,
-            Opts#{ <<"hashpath">> => ignore }
-        ),
+        case InSlot andalso base_literal([<<"function">>], Base, Opts) of
+            {ok, Literal} -> Literal;
+            not_found -> Key;
+            _ ->
+                hb_ao:get_first(
+                    FunctionSources,
+                    Key,
+                    Opts#{ <<"hashpath">> => ignore }
+                )
+        end,
     % Scheduled messages are input to the contract, never instructions for
     % choosing another Lua entry point or replacing its execution context.
     Params = case InSlot of
@@ -153,10 +158,45 @@ compute(Key, RawBase, RawReq, Opts) ->
 %% @doc A process can consume tag values as literal URIs. This policy comes
 %% from its signed definition, not the incoming message or node defaults.
 literal_input_links(Base, Opts) ->
-    hb_ao:get_first([
-        {{as, <<"message@1.0">>, Base}, <<"process/lua-input-links">>},
-        {{as, <<"message@1.0">>, Base}, <<"lua-input-links">>}
-    ], <<"resolve">>, Opts) =:= <<"literal">>.
+    Paths = [[<<"process">>, <<"lua-input-links">>], [<<"lua-input-links">>]],
+    case first_literal(Paths, Base, Opts) of
+        {ok, Policy} -> Policy =:= <<"literal">>;
+        not_found -> false;
+        resolve ->
+            hb_ao:get_first([
+                {{as, <<"message@1.0">>, Base}, <<"process/lua-input-links">>},
+                {{as, <<"message@1.0">>, Base}, <<"lua-input-links">>}
+            ], <<"resolve">>, Opts) =:= <<"literal">>
+    end.
+
+first_literal([], _Base, _Opts) -> not_found;
+first_literal([Path | Rest], Base, Opts) ->
+    case base_literal(Path, Base, Opts) of
+        not_found -> first_literal(Rest, Base, Opts);
+        Found -> Found
+    end.
+
+%% @doc A binary at `Path' of the base, read as `message@1.0' reads it: each
+%% key lowercased, then matched exactly. The base a device function receives
+%% is already normalised (`hb_ao' resolve stage 2), so this is the value a
+%% resolution through `{as, <<"message@1.0">>, Base}' returns -- after
+%% normalising every published key of the base twice more, once to set the
+%% device and once to read. Anything but a map on the way and a binary at
+%% the end is left to that resolution (`resolve').
+base_literal([], Value, _Opts) when is_binary(Value) -> {ok, Value};
+base_literal([], _Value, _Opts) -> resolve;
+base_literal([Key | Rest], Msg, Opts) when is_map(Msg) ->
+    Lower = hb_util:lowercase_key(Key),
+    case maps:find(Lower, Msg) of
+        {ok, Value} -> base_literal(Rest, Value, Opts);
+        error ->
+            case maps:is_key(<<Lower/binary, "+link">>, Msg) of
+                true -> resolve;
+                false -> not_found
+            end
+    end;
+base_literal(_Path, _Value, _Opts) ->
+    resolve.
 
 %% @doc Load the scheduled header and its signature metadata, then preserve
 %% payload links as strings. An unknown tag must not make execution depend on

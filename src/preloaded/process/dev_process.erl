@@ -45,7 +45,7 @@
 -export([device_info/1]).
 -export([as/3, compute/3, schedule/3, slot/3, now/3, push/3, snapshot/3]).
 -export([deliveries/3]).
--export([target_slot/2, request_slot/2, is_cached_state/1]).
+-export([target_slot/2, request_slot/2, is_cached_state/1, is_live_state/1]).
 -export([default_device/3]).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("include/hb.hrl").
@@ -161,7 +161,15 @@ slot(Base, Req, Opts) ->
     lib_process:run_as(<<"scheduler">>, Base, Req, Opts).
 
 next(Base, _Req, Opts) ->
-    lib_process:run_as(<<"scheduler">>, Base, next, Opts).
+    lib_process:run_as(<<"scheduler">>, Base, next, normalized(Base, Opts)).
+
+%% @doc The options to run a device on a slot's state with. Every state this
+%% device computes or loads is normalised as the resolver gives a device its
+%% base -- a load by resolving it, a slot by `lib_process:normalize_changed/3'
+%% -- so the state is given to the resolver as its `normalized-base' and is
+%% not normalised again: each normalisation rebuilds every published key.
+normalized(State, Opts) ->
+    Opts#{ <<"normalized-base">> => State }.
 
 -spec snapshot(#{ execution => _, _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
     {ok, #{ _ => _ }}.
@@ -467,7 +475,7 @@ unwrap_slot(Slot) ->
 %% @doc Continually get and apply the next assignment from the scheduler until
 %% we reach the target slot that the user has requested.
 compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
-    case hb_ao:get(<<"at-slot">>, Base, Opts#{ <<"hashpath">> => ignore }) of
+    case lib_process:get_key(<<"at-slot">>, Base, Opts#{ <<"hashpath">> => ignore }) of
         CurrentSlot when CurrentSlot == TargetSlot ->
             % The target slot's state is written to the cache when it is
             % computed, so we only return it here. A slot result is never
@@ -479,9 +487,19 @@ compute_to_slot(ProcID, Base, Req, TargetSlot, Opts) ->
                 },
                 Opts
             ),
+            % The state here is one this device computed or loaded, so it is
+            % already normalised (`lib_process:run_as/4'): its bookkeeping
+            % keys are set without resolving it again.
             {ok,
                 set_initialized(
-                    without_snapshot(lib_process:as_process(Base, Opts), Opts),
+                    lib_process:set_keys(
+                        Base,
+                        #{
+                            <<"device">> => <<"process@1.0">>,
+                            <<"snapshot">> => unset
+                        },
+                        Opts
+                    ),
                     Opts
                 )};
         CurrentSlot when CurrentSlot < TargetSlot ->
@@ -569,7 +587,7 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                     <<"execution">>,
                     PreparedState,
                     Req,
-                    lib_process:execution_opts(Opts)
+                    normalized(PreparedState, lib_process:execution_opts(Opts))
                 )
             end
         ),
@@ -587,7 +605,7 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
         {ok, NewProcStateMsg} when is_map(NewProcStateMsg) ->
             % We have now transformed slot n -> n + 1. Increment the current slot.
             NewProcStateMsgWithSlot =
-                hb_ao:set(
+                lib_process:normalize_changed(
                     NewProcStateMsg,
                     #{ <<"device">> => <<"process@1.0">>, <<"at-slot">> => Slot },
                     Opts
@@ -767,7 +785,7 @@ prepare_next_slot(ProcID, State, RawReq, Opts) ->
     % Unset the previous results, and the previous slot's delta: a device
     % that returns the state without a delta of its own must not hand slot
     % N-1's on as this slot's (its outbox would be stored and delivered again).
-    Unset = hb_ao:set(State, #{ <<"results">> => unset }, Opts),
+    Unset = lib_process:set_keys(State, #{ <<"results">> => unset }, Opts),
     PreparedState =
         hb_private:set_priv(Unset,
             maps:remove(<<"process-cache-delta">>, hb_private:from_message(Unset))),
@@ -1051,23 +1069,44 @@ push(Base, Req, Opts) ->
     end).
 
 %% @doc Set the private `initialized' key of a state that the process device
-%% returns.
-set_initialized(State, Opts) ->
-    hb_private:set(
+%% returns: the public part of the state itself. Its ID is what tells a
+%% changed state apart, but computing an ID hashes every published key, and
+%% the worker did it twice a slot (here and in `is_initialized/2'). The public
+%% part is kept instead, sharing the state's memory, and compared by term
+%% equality first, which takes microseconds for the unchanged term.
+set_initialized(State, _Opts) ->
+    hb_private:set_priv(
         State,
-        <<"initialized">>,
-        hb_message:id(State, uncommitted, Opts),
-        Opts
+        (hb_private:from_message(State))#{ <<"initialized">> => public(State) }
     ).
 
-%% @doc Return whether the state is the one that the process device returned.
+%% @doc Return whether the state is the one that the process device returned:
+%% its public part is the one `set_initialized/2' kept, or has its ID.
 is_initialized(State, Opts) ->
     case hb_private:get(<<"initialized">>, State, Opts) of
+        Public when is_map(Public) ->
+            Now = public(State),
+            Now =:= Public orelse
+                hb_message:id(Now, uncommitted, Opts) =:=
+                    hb_message:id(Public, uncommitted, Opts);
         StateID when is_binary(StateID) ->
             StateID =:= hb_message:id(State, uncommitted, Opts);
         _ ->
             false
     end.
+
+%% @doc Whether a state is, term for term, the one the process device
+%% returned: `is_initialized/2' without its ID comparison.
+is_live_state(State) when is_map(State) ->
+    case hb_private:from_message(State) of
+        #{ <<"initialized">> := Public } when is_map(Public) ->
+            public(State) =:= Public;
+        _ -> false
+    end;
+is_live_state(_State) ->
+    false.
+
+public(State) -> maps:remove(<<"priv">>, State).
 
 %% @doc Ensure that the process message we have in memory is live and
 %% up-to-date.
@@ -1128,7 +1167,12 @@ ensure_loaded_state_inner(Base, Req, Opts) ->
     case is_initialized(Base, Opts) of
         true ->
             ?event(already_initialized),
-            {ok, Base};
+            % A state equal to the one the device returned is normalised
+            % (`normalized/2'); one that only has its ID is normalised here.
+            case is_live_state(Base) of
+                true -> {ok, Base};
+                false -> {ok, without_snapshot(Base, Opts)}
+            end;
         false ->
             ?event(not_initialized),
             % Try to load the latest complete state from disk.
@@ -1322,6 +1366,123 @@ prepare_drops_previous_delta_test() ->
         lib_process:execution_opts(Opts)),
     ?assertEqual(2, hb_ao:get(<<"results/assignment-slot">>, State2, Opts)),
     ?assertEqual(not_found, hb_private:get(<<"process-cache-delta">>, State2, not_found, Opts)).
+
+%% @doc A `lua-patch@1.0' process whose slots publish nested messages and
+%% nested results, rewriting some keys and adding others.
+nested_patch_script() ->
+    <<
+        "Count = Count or 0\n"
+        "function compute(req)\n"
+        "  Count = Count + 1\n"
+        "  return {\n"
+        "    patches = {\n"
+        "      { path = '/count', value = tostring(Count) },\n"
+        "      { path = '/player-' .. (Count % 3), value = { level = Count,\n"
+        "          name = 'p' .. Count, inner = { wins = Count * 2, tags = { 'a', 'b' } } } },\n"
+        "      { path = '/nested/deep', value = 'd' .. Count }\n"
+        "    },\n"
+        "    results = { output = { data = tostring(Count), extra = { n = Count } } }\n"
+        "  }\n"
+        "end\n"
+    >>.
+
+%% @doc Every state a slot leaves is already in the form the resolver gives a
+%% device -- decoded by `structured@1.0', stripped of unsigned commitments --
+%% so normalising the whole of it changes nothing. A slot normalises only the
+%% keys it changed (`lib_process:normalize_changed/3') and hands the state on
+%% as a `normalized-base'; this is what makes that the state that normalising
+%% every key after every slot left.
+slot_states_are_normalized_test_() ->
+    {timeout, 120, fun() ->
+        application:ensure_all_started(hb),
+        lists:foreach(
+            fun(Workers) ->
+                Opts = #{
+                    <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+                    <<"priv-wallet">> => ar_wallet:new(),
+                    <<"hashpath">> => ignore,
+                    <<"process-workers">> => Workers,
+                    <<"spawn-worker">> => Workers,
+                    <<"process-worker-spawn">> => Workers
+                },
+                Process = hb_process_test_vectors:lua_patch_process(nested_patch_script(), Opts),
+                {ok, _} = hb_cache:write(Process, Opts),
+                [ hb_process_test_vectors:schedule_test_message(
+                      Process, <<"inc">>, #{ <<"n">> => N }, Opts)
+                || N <- lists:seq(1, 5) ],
+                lists:foreach(
+                    fun(Slot) ->
+                        {ok, State} =
+                            hb_ao:resolve(
+                                Process,
+                                #{ <<"path">> => <<"compute">>, <<"slot">> => Slot },
+                                Opts
+                            ),
+                        Public = maps:remove(<<"priv">>, State),
+                        {ok, Decoded} =
+                            hb_ao:raw(<<"structured@1.0">>, <<"to">>, Public, #{}, Opts),
+                        ?assertEqual(Public, hb_ao:execution_input(Decoded, Opts)),
+                        ?assertEqual(
+                            integer_to_binary(Slot + 1),
+                            hb_ao:get(<<"count">>, State, Opts)
+                        ),
+                        ?assertEqual(
+                            Slot + 1,
+                            hb_ao:get(<<"results/output/extra/n">>, State, Opts)
+                        )
+                    end,
+                    lists:seq(0, 4)
+                )
+            end,
+            [false, true]
+        )
+    end}.
+
+%% @doc `lib_process:set_keys/3' and `get_key/3' give what `hb_ao:set/3' and
+%% `hb_ao:get/3' give on a normalised state, with or without commitments.
+set_and_get_keys_match_resolution_test() ->
+    application:ensure_all_started(hb),
+    Opts = #{ <<"hashpath">> => ignore },
+    State = #{
+        <<"device">> => <<"process@1.0">>,
+        <<"at-slot">> => 4,
+        <<"results">> => #{ <<"output">> => #{ <<"data">> => <<"x">> } },
+        <<"player-1">> => #{ <<"level">> => 2 },
+        <<"count">> => <<"7">>
+    },
+    Committed = hb_message:commit(State, #{ <<"priv-wallet">> => ar_wallet:new() }),
+    Values = #{
+        <<"device">> => <<"scheduler@1.0">>,
+        <<"at-slot">> => 5,
+        <<"results">> => unset,
+        <<"snapshot">> => unset,
+        <<"output-prefixes">> => undefined
+    },
+    lists:foreach(
+        fun(S) ->
+            ?assertEqual(hb_ao:set(S, Values, Opts), lib_process:set_keys(S, Values, Opts)),
+            ?assertEqual(
+                hb_ao:get(<<"at-slot">>, S, Opts),
+                lib_process:get_key(<<"at-slot">>, S, Opts)
+            )
+        end,
+        [State, Committed]
+    ).
+
+%% @doc The state the device returned is live by term equality, without an
+%% ID; a state with a changed key is not, and one whose public part was
+%% rebuilt with the same content still is.
+live_state_test() ->
+    State = #{ <<"a">> => <<"1">>, <<"b">> => #{ <<"c">> => 2 } },
+    Live = set_initialized(State#{ <<"priv">> => #{ <<"state">> => vm } }, #{}),
+    ?assert(is_live_state(Live)),
+    ?assert(is_initialized(Live, #{})),
+    Changed = Live#{ <<"a">> => <<"2">> },
+    ?assertNot(is_live_state(Changed)),
+    ?assertNot(is_initialized(Changed, #{})),
+    Rebuilt = maps:map(fun(_, V) -> V end, Live),
+    ?assert(is_live_state(Rebuilt)),
+    ?assertNot(is_live_state(State)).
 
 %%% A process's state only moves forward.
 
