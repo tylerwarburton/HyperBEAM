@@ -49,6 +49,14 @@
 %%% kept, so a read of hundreds of windows advances even when the gateway
 %%% rate-limits part-way; only windows over slots not indexed yet are fetched.
 %%%
+%%% A gateway that answers but holds none of the windows wanted (an empty
+%%% listing, or a 404 for a listed window's data) is not refused: it is not
+%%% backed off, and the next gateway is asked for the rest. Gateways index a
+%%% bundle's items at their own pace (arweave.net lagged ardrive.net by over
+%%% 30 minutes on 2026-11-17), and any gateway's window is verified the same
+%%% way, so a second opinion can only add windows that agree with the replica
+%%% or expose a fork. Each window keeps the gateway that answered it (`via').
+%%%
 %%% The gateways are asked in the order listed, every read: answering once
 %%% does not promote a fallback above the first. A gateway that answers but
 %%% reports no block for an item (turbo-gateway.com, for every archive item)
@@ -415,9 +423,9 @@ agrees(#{ last := Last, to := To }, _N, IdAt) ->
 agrees(#{ ids := IDs }, N, IdAt) -> lists:member(IdAt(N), IDs).
 
 %% The archive windows of P that S signed and that are mined deep enough, read
-%% from the first gateway that may be asked and answers, once `archive-poll-ms'
-%% has passed since the last read. Every window fetched is kept, also from a
-%% gateway that refused part-way.
+%% from the first gateway that may be asked and answers with a window wanted,
+%% once `archive-poll-ms' has passed since the last read. Every window fetched
+%% is kept, also from a gateway that refused or came up short part-way.
 with_windows(F = #{ archive_at := At }, Now) when Now < At -> F;
 with_windows(F = #{ gateways := Gateways, archive_poll := Every }, Now) ->
     case read_archive(Gateways, Now, F, []) of
@@ -450,22 +458,30 @@ floor_height(_) -> undefined.
 
 %% Try each gateway in the order listed, skipping one not to be asked yet; a
 %% gateway that fails is backed off and the next one tried, starting from the
-%% windows the failed one did fetch. The order never changes.
-read_archive([], _Now, F, Tried) -> {none, F, lists:reverse(Tried)};
-read_archive([G = #{ not_before := NB } | Rest], Now, F, Tried) when NB > Now ->
-    read_archive(Rest, Now, F, [G | Tried]);
-read_archive([G = #{ url := URL } | Rest], Now, F = #{ p := P, windows := Have }, Tried) ->
+%% windows the failed one did fetch. A gateway that answers without every
+%% window wanted (none listed, or a listed one's data 404) hands the rest to
+%% the next, unpunished. The order never changes.
+read_archive(Gateways, Now, F, Tried) -> read_archive(Gateways, Now, F, Tried, none).
+read_archive([], _Now, F, Tried, Answered) -> {Answered, F, lists:reverse(Tried)};
+read_archive([G = #{ not_before := NB } | Rest], Now, F, Tried, Answered) when NB > Now ->
+    read_archive(Rest, Now, F, [G | Tried], Answered);
+read_archive([G = #{ url := URL } | Rest], Now, F = #{ p := P, windows := Have }, Tried, Answered) ->
     case new_windows(hb_util:list(URL), F) of
-        {ok, New} ->
+        {ok, New, complete} when New =/= [] ->
             {ok, F#{ windows := Have ++ New },
                 lists:reverse(Tried) ++ [G#{ backoff := 0 } | Rest]};
+        {ok, New, _} ->
+            ?event(scheduler_follower, {foreign_follower_gateway_short,
+                {p, P}, {gateway, URL}, {windows, length(New)}}),
+            read_archive(Rest, Now, F#{ windows := Have ++ New },
+                [G#{ backoff := 0 } | Tried], ok);
         {refused, New, Class, Reason} ->
             G2 = back_off(G, retry_after(Reason), Now),
             ?event(warning, {foreign_follower_gateway_refused,
                 {p, P}, {gateway, URL}, {reason, refusal(Class, Reason)},
                 {windows_kept, length(New)},
                 {retry_in_ms, maps:get(not_before, G2) - Now}}),
-            read_archive(Rest, Now, F#{ windows := Have ++ New }, [G2 | Tried])
+            read_archive(Rest, Now, F#{ windows := Have ++ New }, [G2 | Tried], Answered)
     end.
 
 %% Not before the gateway's `Retry-After', nor sooner than double the last
@@ -480,11 +496,12 @@ retry_after(_) -> 0.
 refusal(_, {gateway_status, Status, _}) -> {status, Status};
 refusal(Class, Reason) -> {Class, Reason}.
 
-%% `{ok, Windows}', or `{refused, Fetched, Class, Reason}' with the windows
-%% fetched before the gateway refused.
+%% `{ok, Windows, complete | missing}' (`missing' when a listed window's data
+%% was not found here), or `{refused, Fetched, Class, Reason}' with the
+%% windows fetched before the gateway refused.
 new_windows(Gateway, F) ->
     try wanted_windows(Gateway, F) of
-        Wanted -> fetch_windows(Gateway, Wanted, [])
+        Wanted -> fetch_windows(Gateway, Wanted, [], complete)
     catch Class:Reason -> {refused, [], Class, Reason}
     end.
 
@@ -508,25 +525,32 @@ wanted_windows(Gateway, F = #{ p := P, s := S, depth := Depth, windows := Have,
 %% A format 2 window is its tags; a format 1 window is read whole, for the
 %% assignment IDs it holds. A format this build does not know fails closed:
 %% it is never a window, so the slots it covers wait.
-fetch_windows(_Gateway, [], Got) -> {ok, lists:reverse(Got)};
-fetch_windows(Gateway, [{ID, From, To, Height, Tags} | Rest], Got) ->
+fetch_windows(_Gateway, [], Got, Found) -> {ok, lists:reverse(Got), Found};
+fetch_windows(Gateway, [{ID, From, To, Height, Tags} | Rest], Got, Found) ->
+    Via = hb_util:bin(Gateway),
     case {optional_tag(<<"Archive-Format">>, Tags), optional_tag(<<"Last-Assignment">>, Tags)} of
         {<<"2">>, Last} when is_binary(Last) ->
             fetch_windows(Gateway, Rest,
-                [#{ id => ID, from => From, to => To, last => Last, height => Height } | Got]);
-        {undefined, _} -> fetch_legacy_window(Gateway, {ID, From, To, Height}, Rest, Got);
+                [#{ id => ID, from => From, to => To, last => Last, height => Height,
+                    via => Via } | Got], Found);
+        {undefined, _} -> fetch_legacy_window(Gateway, {ID, From, To, Height}, Rest, Got, Found);
         Unknown ->
             ?event(warning, {foreign_follower_unknown_archive_format, {id, ID},
                 {format, Unknown}}),
-            fetch_windows(Gateway, Rest, Got)
+            fetch_windows(Gateway, Rest, Got, Found)
     end.
 
-fetch_legacy_window(Gateway, {ID, From, To, Height}, Rest, Got) ->
+%% A 404 is this gateway not having unbundled the item yet: the window is
+%% left for the next gateway, and the rest are still fetched here.
+fetch_legacy_window(Gateway, {ID, From, To, Height}, Rest, Got, Found) ->
     try archived_ids(gateway(get, Gateway, "/raw/" ++ hb_util:list(ID), none, 60000)) of
         IDs ->
             fetch_windows(Gateway, Rest,
-                [#{ id => ID, from => From, to => To, ids => IDs, height => Height } | Got])
-    catch Class:Reason -> {refused, lists:reverse(Got), Class, Reason}
+                [#{ id => ID, from => From, to => To, ids => IDs, height => Height,
+                    via => hb_util:bin(Gateway) } | Got], Found)
+    catch
+        throw:{gateway_status, 404, _} -> fetch_windows(Gateway, Rest, Got, missing);
+        Class:Reason -> {refused, lists:reverse(Got), Class, Reason}
     end.
 
 %% Every archive transaction of P that S signed, mined at or above `Floor'
@@ -1181,6 +1205,73 @@ listing_floor_test() ->
     ?assertEqual(1000, maps:get(top_height, Pruned)),
     ?assertEqual(undefined,
         floor_height(Pruned#{ listings := ?FULL_LISTING_EVERY })).
+
+%%% Lagging gateways ----------------------------------------------------------
+
+%% 2026-11-17: arweave.net had not unbundled a Turbo bundle 30 minutes after
+%% ardrive.net had, and answered its listing empty; the follower took that as
+%% "nothing archived" and every push of the followed process waited on it.
+%% A gateway that lists nothing wanted, or 404s a listed window's data, hands
+%% the read to the next, and is not backed off for it.
+empty_gateway_falls_through_test_() ->
+    {timeout, 30, fun empty_gateway_falls_through/0}.
+empty_gateway_falls_through() ->
+    Win = {WindowID, Edge, _, [AssignmentID]} = archive_window(0, 0, 98),
+    {EmptyURL, EmptyPid} = stub_gateway(empty, archive_gateway([], []), self()),
+    {FullURL, FullPid} = stub_gateway(full, archive_gateway([Edge], [Win]), self()),
+    F = archive_state(<<EmptyURL/binary, ",", FullURL/binary>>),
+    Now = now_ms(),
+    F1 = with_windows(F, Now),
+    ?assertEqual(2, hits(empty)),
+    ?assertEqual(3, hits(full)),
+    ?assertMatch([#{ id := WindowID, via := FullURL }], maps:get(windows, F1)),
+    ?assertEqual(ok, archived(0, AssignmentID, F1)),
+    ?assertEqual([0, 0], [ B || #{ backoff := B } <- maps:get(gateways, F1) ]),
+    ?assertEqual(Now + ?DEFAULT_ARCHIVE_POLL_MS, maps:get(archive_at, F1)),
+    stop_stubs([EmptyPid, FullPid]),
+    % Listed, but its data not found: the same.
+    {ListsURL, ListsPid} = stub_gateway(lists, archive_gateway([Edge], []), self()),
+    {FullURL2, FullPid2} = stub_gateway(full2, archive_gateway([Edge], [Win]), self()),
+    F2 = with_windows(archive_state(<<ListsURL/binary, ",", FullURL2/binary>>), now_ms()),
+    ?assertEqual(3, hits(lists)),
+    ?assertEqual(3, hits(full2)),
+    ?assertMatch([#{ id := WindowID, via := FullURL2 }], maps:get(windows, F2)),
+    ?assertEqual(ok, archived(0, AssignmentID, F2)),
+    ?assertEqual([0, 0], [ B || #{ backoff := B } <- maps:get(gateways, F2) ]),
+    stop_stubs([ListsPid, FullPid2]).
+
+%% Every gateway answers empty: the slot is not archived, and waits; nobody
+%% is backed off and the next read is a whole poll away.
+all_gateways_empty_waits_test_() ->
+    {timeout, 30, fun all_gateways_empty_waits/0}.
+all_gateways_empty_waits() ->
+    {AURL, APid} = stub_gateway(a, archive_gateway([], []), self()),
+    {BURL, BPid} = stub_gateway(b, archive_gateway([], []), self()),
+    Now = now_ms(),
+    F1 = with_windows(archive_state(<<AURL/binary, ",", BURL/binary>>), Now),
+    ?assertEqual(2, hits(a)),
+    ?assertEqual(2, hits(b)),
+    ?assertEqual([], maps:get(windows, F1)),
+    ?assertEqual(not_yet, archived(0, <<"a">>, F1)),
+    ?assertEqual([0, 0], [ B || #{ backoff := B } <- maps:get(gateways, F1) ]),
+    ?assertEqual(Now + ?DEFAULT_ARCHIVE_POLL_MS, maps:get(archive_at, F1)),
+    stop_stubs([APid, BPid]).
+
+%% The second gateway is believed no more than the first: a window it serves
+%% over the slot that holds another assignment is a fork, refused.
+fallback_window_is_verified_test_() ->
+    {timeout, 30, fun fallback_window_is_verified/0}.
+fallback_window_is_verified() ->
+    Other = {OtherID, Edge, _, [OtherAssignment]} = archive_window(0, 0, 98),
+    {EmptyURL, EmptyPid} = stub_gateway(empty, archive_gateway([], []), self()),
+    {LiarURL, LiarPid} = stub_gateway(liar, archive_gateway([Edge], [Other]), self()),
+    F1 = with_windows(archive_state(<<EmptyURL/binary, ",", LiarURL/binary>>), now_ms()),
+    ?assertEqual(2, hits(empty)),
+    ?assertEqual(3, hits(liar)),
+    Ours = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ?assertNotEqual(OtherAssignment, Ours),
+    ?assertEqual({fork, [OtherID]}, archived(0, Ours, F1)),
+    stop_stubs([EmptyPid, LiarPid]).
 
 %%% Format 2 windows -----------------------------------------------------------
 
