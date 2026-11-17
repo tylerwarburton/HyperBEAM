@@ -1444,8 +1444,10 @@ recording_post(Self, Then) ->
         Then(TP, T, L, Signed, O, Real)
     end.
 
-posted_ids() ->
-    receive {posted, _, ID, _} -> [ID | posted_ids()]
+%% Only the posts to `Target': a deliverer an earlier test left running posts
+%% to its own targets, to the same test process, at any time.
+posted_ids(Target) ->
+    receive {posted, Target, ID, _} -> [ID | posted_ids(Target)]
     after 0 -> []
     end.
 
@@ -1485,7 +1487,12 @@ push_is_read_test_() ->
             spawn(fun() ->
                 hb_ao:resolve(Sender, #{ <<"path">> => <<"push">>, <<"slot">> => 0 }, Opts)
             end),
-        timer:sleep(50),
+        % Killed once it waits: the slot is computed (its `o' row, or already
+        % its `x', is written). A fixed sleep killed a push still computing on
+        % a loaded host, and nothing else computes the slot here.
+        ?assert(wait_until(fun() ->
+            lists:member(0, rows(SID, <<"o">>, Opts) ++ rows(SID, <<"x">>, Opts))
+        end, 15000)),
         exit(Caller, kill),
         ?assert(wait_until(fun() -> delivered(SID, [0], Opts) end, 15000)),
         ?assertEqual(BeforeA + 1, receiver_slot(A, Opts)),
@@ -1534,7 +1541,7 @@ failing_downstream_retried_test_() ->
         ?assert(wait_until(fun() -> delivered(SID, [0], Opts) end, 30000)),
         ?assertEqual(Before + 1, receiver_slot(A, Opts)),
         ?assert(counter(delivery_retry) - RetriesBefore >= 3),
-        IDs = posted_ids(),
+        IDs = posted_ids(AID),
         ?assert(length(IDs) >= 4),
         ?assertEqual(1, length(lists:usort(IDs)))
     end}.
@@ -1603,7 +1610,7 @@ crash_after_post_before_x_test_() ->
         ?assert(wait_until(fun() -> delivered(SID, [0], Opts) end, 15000)),
         ?assertEqual(Before + 1, receiver_slot(A, Opts)),
         ?assertEqual(Already + 1, counter(delivery_already)),
-        IDs = posted_ids(),
+        IDs = posted_ids(AID),
         ?assertEqual(2, length(IDs)),
         ?assertEqual(1, length(lists:usort(IDs))),
         {ok, Pushed} = hb_ao:resolve(Sender, #{ <<"path">> => <<"push">>, <<"slot">> => 0 }, Opts),
@@ -1661,7 +1668,9 @@ entries_are_independent_test_() ->
         ?assert(lists:member(0, rows(SID, <<"o">>, Opts))),
         ?assert(wait_until(fun() -> delivered(SID, [0, 1], Opts) end, 30000)),
         ?assertEqual(3, counters:get(Failed, 1)),
-        ?assertEqual(Crashes + 1, counter(delivery_post_crash)),
+        % At least: the counter is node-wide, and a deliverer an earlier test
+        % left behind may crash a post of its own meanwhile.
+        ?assert(counter(delivery_post_crash) >= Crashes + 1),
         ?assertEqual(
             [1, 0],
             [ hb_ao:get(<<"from-slot">>, assignment_body(A, S, Opts), Opts)
@@ -1750,7 +1759,7 @@ lost_ready_is_rescanned_test_() ->
         Found = counter(delivery_rescan_found),
         {ok, _} = compute(Sender, 1, Opts#{ <<"delivery-test-drop-ready">> => true }),
         ?assert(lists:member(1, rows(SID, <<"o">>, Opts))),
-        ?assert(wait_until(fun() -> delivered(SID, [0, 1], Opts) end, 5000)),
+        ?assert(wait_until(fun() -> delivered(SID, [0, 1], Opts) end, 15000)),
         ?assertEqual(Deliverer, deliverer(SID)),
         % Reported at the rescan after the one that loaded it: no cast came.
         ?assert(wait_until(fun() -> counter(delivery_rescan_found) == Found + 1 end, 5000)),
@@ -1766,8 +1775,15 @@ lost_ready_is_rescanned_test_() ->
 %% it), which read as ~30 s stalls that never happened.
 late_ready_is_not_reported_test_() ->
     {timeout, 60, fun() ->
+        Self = self(),
+        Post =
+            fun(TP, T, L, S, O, Real) ->
+                Self ! {posting, hb_maps:get(<<"from-slot">>, S, undefined, O)},
+                Real(TP, T, L, S, O)
+            end,
         {Sender, SID, {A, AID}, _, Opts} =
-            delivery_setup(#{ <<"delivery-rescan-ms">> => 1000 }),
+            delivery_setup(#{ <<"delivery-rescan-ms">> => 1000,
+                <<"delivery-test-post">> => Post }),
         send(Sender, 1, #{ <<"sendto">> => AID }, Opts),
         send(Sender, 2, #{ <<"sendto">> => AID }, Opts),
         Before = receiver_slot(A, Opts),
@@ -1778,9 +1794,12 @@ late_ready_is_not_reported_test_() ->
         % The row is stored and the cast is still on its way when the rescan
         % reads the rows ...
         {ok, _} = compute(Sender, 1, Opts#{ <<"delivery-test-drop-ready">> => true }),
-        ?assert(wait_until(fun() -> delivered(SID, [0, 1], Opts) end, 5000)),
-        % ... and it arrives before the next one.
+        % ... and it arrives before the next one: sent as soon as the rescan
+        % posts the slot, not once the delivery is seen, which on a loaded
+        % host can be later than the next rescan.
+        receive {posting, 1} -> ok after 5000 -> error(slot_1_not_rescanned) end,
         Deliverer ! {ready, 1},
+        ?assert(wait_until(fun() -> delivered(SID, [0, 1], Opts) end, 15000)),
         timer:sleep(2500),
         ?assertEqual(Deliverer, deliverer(SID)),
         ?assertEqual(Found, counter(delivery_rescan_found)),
@@ -1848,7 +1867,7 @@ hung_post_is_retried_test_() ->
             delivery_setup(#{
                 <<"delivery-test-post">> => Post,
                 <<"delivery-rescan-ms">> => 200,
-                <<"delivery-helper-timeout-ms">> => 500
+                <<"delivery-helper-timeout-ms">> => 2000
             }),
         send(Sender, 1, #{ <<"sendto">> => AID }, Opts),
         Before = receiver_slot(A, Opts),
@@ -1857,7 +1876,7 @@ hung_post_is_retried_test_() ->
         ?assert(wait_until(fun() -> delivered(SID, [0], Opts) end, 15000)),
         ?assertEqual(Expired + 1, counter(delivery_helper_expired)),
         ?assertEqual(Before + 1, receiver_slot(A, Opts)),
-        IDs = posted_ids(),
+        IDs = posted_ids(AID),
         ?assertEqual(2, length(IDs)),
         ?assertEqual(1, length(lists:usort(IDs)))
     end}.
@@ -2173,7 +2192,7 @@ deliverer_restarts_from_rows_test_() ->
         ?assert(wait_until(fun() -> delivered(SID, [0], Opts) end, 15000)),
         ?assertEqual(Restarts + 1, counter(delivery_restart)),
         ?assertEqual(Before + 1, receiver_slot(A, Opts)),
-        IDs = posted_ids(),
+        IDs = posted_ids(AID),
         ?assertEqual(2, length(IDs)),
         ?assertEqual(1, length(lists:usort(IDs)))
     end}.
