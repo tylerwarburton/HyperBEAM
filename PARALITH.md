@@ -1029,6 +1029,92 @@ the swarm box reads it over the public domain, as it reads `/slots`.
 `bench/trace_local_node.erl` serves a local node with one seeded game-sized
 process for a stress run (`backend/native/obs/experiment.mjs` in the monorepo).
 
+## A slot costs what it touches (2026-11-16)
+
+A `lua-patch@1.0` slot cost ~2.6 us per published key per slot, every
+process, whatever the slot touched. Profiled in-VM (stack samples of the
+process worker, and a probe counting full-state resolutions): the device
+`excludes` list was not it (`lua-patch@1.0` serves literal keys through
+`direct_message_keys`, and no atom is made per key: 0 atoms over 1,200,
+3,000, 10,000 and 30,000 seeded keys, before and after). It was ~24 resolutions of
+the whole state per slot, each normalising every key three times
+(`structured@1.0` `to` and `normalize_input` at stage 2, `normalize_input`
+again at stage 5), and two state IDs:
+
+| Phase | Where every key was walked |
+|---|---|
+| `lua_prep` | `dev_lua_patch` read `function` and `lua-input-links` through `{as, message@1.0, Base}`: a device `set` and a `get`, six resolutions |
+| exec | `run_as` resolved `set` for the device, resolved the execution, set the device back; `compute_slot` set `device` and `at-slot` with `hb_ao:set` (one resolution per key, and `message@1.0` `set` lists every key of the base) |
+| `next` | the scheduler `run_as` (three resolutions), `at-slot` read with `hb_ao:get`, `process_id` read `process` with `hb_ao:get` three times a slot |
+| worker | `set_initialized`/`is_initialized` hashed every key with httpsig (`hb_message:id/3`), twice a slot; the worker's own resolution of `compute` |
+| store | `hb_private:reset/1` rebuilt every map of the state for the hot cache: 13.5 ms at 10,000 keys |
+
+The 92 -> 189 ms "store" measured on the 8b732a73b local node is that node's
+config, not this: with no process options set a node writes the whole state
+(`hb_cache:write`) and a VM snapshot every slot. Reproduced in-VM with no
+process options: store 11.1 -> 206.6 ms from 0 to 3,000 keys before, 10.1 ->
+171.3 ms after (prep and exec went flat: lua_prep 37.5 -> 1.2 ms). With the
+prod options (delta cache, state blobs, `process-snapshot-target` off) the
+store was 2-5 ms at 3,000 keys before this change. A bench node needs the
+prod options to measure what prod pays.
+
+The fix is one invariant: every state the process device hands on is
+already normalised, so a slot normalises only what it changed.
+
+- `hb_ao` takes `normalized-base`: a resolution on exactly that term (term
+  equality), with no hashpath, does not normalise it. It is a temporary
+  option, so a nested resolution never inherits it.
+- The worker and `compute_slot`/`next` give the live state as its
+  `normalized-base`. `lib_process:normalize_changed/3` normalises only the
+  keys a `process-cache-delta` names (its patch roots and `results`, which
+  is how `lib_process_cache` replays a slot); a device without a delta still
+  goes through `hb_ao:set/3`. `slot_states_are_normalized_test_` checks
+  every slot's state is a fixed point of normalisation.
+- Bookkeeping keys (`device`, `at-slot`, `results`, `snapshot`) are set and
+  read plainly when the state's device serves them as `message@1.0` does
+  (`lib_process:set_keys/3`, `get_key/3`, on `hb_state_patch:base_set/4`).
+- `set_initialized` keeps the public part of the state; `is_initialized`
+  compares by term equality, then by ID, so a changed state is still never
+  taken as live (`changed_state_is_not_cached_test_parallel`).
+- `hb_private:reset/1` rebuilds only what has a private key in it.
+
+In-VM bench (`lua-patch@1.0`, prod store options, 1,900-byte values, 20
+slots each touching one key and `count`; worker ms per slot, mean). The box
+was shared with other runs, so two passes are shown:
+
+| Published keys | Before (pass 1 / 2) | After (pass 1 / 2) |
+|---:|---:|---:|
+| 0 | 13.9 / 13.9 | 4.9 / 19.0 |
+| 1,200 | 120.1 / 95.6 | 6.7 / 17.4 |
+| 3,000 | 156.6 / 337.0 | 6.9 / 22.9 |
+| 10,000 | - / 1,119.5 | 12.2 / 28.5 |
+| 30,000 (10-byte values, 5 slots) | 4,538.5 | 26.2 |
+
+Before, `lua_prep` was 13-151 ms and exec 20-218 ms from 1,200 to 10,000
+keys; after, both are flat (0.1-1.3 ms and 1.5-6 ms). What still grows
+with the key count, all C-speed copies: the hot cache's ETS insert of the
+public state (~2 ms at 10,000 keys), the reset walk (~1 ms), and the copy
+of the state to each waiter (~1.7 ms). A read of a computed slot through
+`hb_ao` with a hashpath still IDs the whole state in the reader.
+
+Game slot bench (`bench/game-slot-bench.sh`, 300 players, 200 slots; the
+same base image with each tree's `src`, runs alternated on the shared box,
+whose load put both well above the 2026-10-27 baseline):
+
+| Build | Worker ms/slot | Slot execution | `lua_prep` | `next` | `ensure_loaded` | Compute median |
+|---|---:|---:|---:|---:|---:|---:|
+| 6df15bc6c (before) | 80.0 / 78.7 | 16.1 / 16.4 | 8.6 / 9.1 | 12.1 / 12.5 | 7.9 / 9.0 | 67.6 / 73.3 ms |
+| this change | 16.3 / 21.9 | 4.4 / 4.8 | 1.0 / 1.0 | 6.3 / 9.3 | 0.2 / 0.1 | 45.1 / 40.1 ms |
+
+| Measure | Effect |
+|---|---|
+| Speed | above |
+| Memory | the live state keeps its public map in `priv` (`initialized`), sharing every node of it; a copy to another process never carries it (`public_result/1` strips `priv`) |
+| Storage | none |
+| Atoms | none per key, before or after |
+| Reliability | a state that is not term-equal to the one returned falls back to the ID check, then to a reload from the cache, as before |
+| Atomicity | unchanged: the state, its delta and its store rows are written as before |
+
 ## Where the real game spends a slot
 
 Old fork on the bench node, game on `lua@5.3b`, 28 fixture players, node's own
