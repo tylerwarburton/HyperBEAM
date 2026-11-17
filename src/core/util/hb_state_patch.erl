@@ -3,7 +3,7 @@
 %%% `#{ <<"path">> => Path, <<"value">> => Value }' or
 %%% `#{ <<"path">> => Path, <<"delete">> => true }'.
 -module(hb_state_patch).
--export([apply/4, apply/5, validate/2, partition/2]).
+-export([apply/4, apply/5, validate/2, partition/2, base_set/4, roots/2]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -59,6 +59,23 @@ apply(Base, Patches, RawResults, Slot, Opts)
     end;
 apply(_Base, _Patches, _Results, _Slot, _Opts) ->
     patch_error(<<"Delta requires list `patches' and message `results'.">>).
+
+%% @doc The top-level keys that a patch list writes or removes, as `apply/5'
+%% names them, or `error' if a patch has no valid path.
+roots(Patches, Opts) when is_list(Patches) ->
+    try {ok, lists:usort([ root(Patch, Opts) || Patch <- Patches ])}
+    catch throw:invalid_patch -> error
+    end;
+roots(_Patches, _Opts) ->
+    error.
+
+root(Patch, Opts) when is_map(Patch) ->
+    case patch_path(field(<<"path">>, Patch, not_found, Opts)) of
+        {ok, [Root | _]} -> Root;
+        _ -> throw(invalid_patch)
+    end;
+root(_Patch, _Opts) ->
+    throw(invalid_patch).
 
 %% @doc Validate patches without mutating a message.
 validate(Patches, Opts) when is_list(Patches) ->
@@ -606,3 +623,21 @@ lowercase_keys_test() ->
             Opts
         )
     ).
+
+roots_test() ->
+    Opts = #{},
+    ?assertEqual(
+        {ok, [<<"a">>, <<"player-1">>]},
+        roots(
+            [
+                #{ <<"path">> => <<"/Player-1">>, <<"value">> => <<"x">> },
+                #{ <<"path">> => <<"/a/b/c">>, <<"value">> => <<"y">> },
+                #{ <<"path">> => [<<"a">>, <<"d">>], <<"delete">> => true }
+            ],
+            Opts
+        )
+    ),
+    ?assertEqual({ok, []}, roots([], Opts)),
+    ?assertEqual(error, roots([#{ <<"value">> => <<"x">> }], Opts)),
+    ?assertEqual(error, roots([#{ <<"path">> => <<"/">>, <<"value">> => <<"x">> }], Opts)),
+    ?assertEqual(error, roots(not_a_list, Opts)).

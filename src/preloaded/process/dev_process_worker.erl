@@ -359,7 +359,14 @@ execute(Base, Req, TargetSlot, ExecOpts) ->
                 Carried#{ <<"path">> => <<"compute">>, <<"slot">> => Raw };
             Slot -> Carried#{ <<"path">> => <<"compute">>, <<"slot">> => Slot }
         end,
-    try hb_ao:resolve(Base, WorkReq, ExecOpts)
+    % The live state the worker holds is normalised (`dev_process:normalized/2'),
+    % so it is not normalised again: that rebuilt every published key.
+    ResolveOpts =
+        case dev_process:is_live_state(Base) of
+            true -> ExecOpts#{ <<"normalized-base">> => Base };
+            false -> ExecOpts
+        end,
+    try hb_ao:resolve(Base, WorkReq, ResolveOpts)
     catch
         throw:{error, Reason} ->
             ?event(worker, {request_failed, {slot, TargetSlot}, {error, Reason}}),

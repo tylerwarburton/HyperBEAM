@@ -15,11 +15,40 @@
     set_results/3,
     ensure_process_key/2,
     default_device/3,
-    is_pushed/2
+    is_pushed/2,
+    get_key/3,
+    set_keys/3,
+    normalize_changed/3
 ]).
 
 %% @doc Returns the process ID of the current process.
+%%
+%% Reading the definition with `hb_ao:get/3' resolves the whole state to
+%% return one key of it (`get_key/3'), and a slot asks for the ID several
+%% times. When the state's literal `process' key is the very definition whose
+%% ID was resolved last, that ID is the answer: a key that `message@1.0' serves
+%% resolves to its value normalised, and normalising a value that is already
+%% the result of a normalisation returns it unchanged.
 process_id(Base, Req, Opts) ->
+    case last_process_id(Base, Req, Opts) of
+        {ok, LastID} -> LastID;
+        not_found -> resolved_process_id(Base, Req, Opts)
+    end.
+
+last_process_id(Base = #{ <<"process">> := Process }, Req, Opts) when is_map(Req) ->
+    Spec = hb_util:atom(maps:get(<<"commitments">>, Req, <<"signed">>)),
+    case get(lib_process_last_id) of
+        {Process, Spec, LastID} ->
+            case message_key(Base, <<"process">>, Opts) of
+                true -> {ok, LastID};
+                false -> not_found
+            end;
+        _ -> not_found
+    end;
+last_process_id(_Base, _Req, _Opts) ->
+    not_found.
+
+resolved_process_id(Base, Req, Opts) ->
     case hb_ao:get(<<"process">>, Base, Opts#{ <<"hashpath">> => ignore }) of
         not_found ->
             process_id(ensure_process_key(Base, Opts), Req, Opts);
@@ -209,36 +238,56 @@ run_as(Key, Base, Req, Opts) ->
     ?event({running_as, {key, {explicit, Key}}, {req, Req}}),
     % Prepare the message with the specialized device configuration.
     % This sets up the device context for the specific operation type.
-    {ok, PreparedMsg} =
-        hb_ao:resolve(
-            ensure_process_key(Base, Opts),
-            #{
-                <<"path">> => <<"set">>,
-                <<"device">> =>
-                    DeviceSet =
-                        hb_maps:get(
-                            << Key/binary, "-device">>,
-                            Base,
-                            default_device(Base, Key, Opts),
-                            Opts
-                        ),
-                % Configure input prefix for proper message routing within the device
-                <<"input-prefix">> =>
-                    case hb_maps:get(<<"input-prefix">>, Base, not_found, Opts) of
-                        not_found -> <<"process">>;
-                        Prefix -> Prefix
-                    end,
-                % Configure output prefixes for result organization
-                <<"output-prefixes">> =>
-                    hb_maps:get(
-                        <<Key/binary, "-output-prefixes">>,
-                        Base,
-                        undefined, % Undefined in set will be ignored.
-                        Opts
-                    )
-            },
+    DeviceSet =
+        hb_maps:get(
+            << Key/binary, "-device">>,
+            Base,
+            default_device(Base, Key, Opts),
             Opts
         ),
+    Settings =
+        #{
+            <<"device">> => DeviceSet,
+            % Configure input prefix for proper message routing within the device
+            <<"input-prefix">> =>
+                case hb_maps:get(<<"input-prefix">>, Base, not_found, Opts) of
+                    not_found -> <<"process">>;
+                    Prefix -> Prefix
+                end,
+            % Configure output prefixes for result organization
+            <<"output-prefixes">> =>
+                hb_maps:get(
+                    <<Key/binary, "-output-prefixes">>,
+                    Base,
+                    undefined, % Undefined in set will be ignored.
+                    Opts
+                )
+        },
+    % A caller may give `Base' as its `normalized-base' (`hb_ao'): a state
+    % already in the form a device receives it. The device is then given the
+    % prepared state as its own, and the result is handed back as the device
+    % left it: the caller normalises what the device changed
+    % (`normalize_changed/3').
+    Normalized =
+        maps:get(<<"normalized-base">>, Opts, undefined) =:= Base
+            andalso lists:all(
+                fun(V) -> V == undefined orelse is_binary(V) end,
+                maps:values(Settings)
+            ),
+    RunOpts = maps:remove(<<"normalized-base">>, Opts),
+    % Without a hashpath to keep, resolving `set' gives the state these keys
+    % (and normalises it, as the execution below does again), which
+    % `set_keys/3' does without resolving the state.
+    {ok, PreparedMsg} =
+        case hb_opts:get(hashpath, update, RunOpts) of
+            ignore -> {ok, set_keys(ensure_process_key(Base, RunOpts), Settings, RunOpts)};
+            _ ->
+                hb_ao:resolve(
+                    ensure_process_key(Base, RunOpts),
+                    Settings#{ <<"path">> => <<"set">> },
+                    RunOpts
+                )
+        end,
     ?event(debug_prefix,
         {input_prefix, hb_maps:get(<<"output-prefixes">>, PreparedMsg, not_found, Opts)
     }),
@@ -247,13 +296,18 @@ run_as(Key, Base, Req, Opts) ->
         hb_ao:resolve(
             PreparedMsg,
             Req,
-            Opts
+            case Normalized of
+                true -> RunOpts#{ <<"normalized-base">> => PreparedMsg };
+                false -> RunOpts
+            end
         ),
     % Restore the original device context after execution.
     % This ensures the process maintains its identity after device delegation.
     case {Status, BaseResult} of
+        {ok, #{ <<"device">> := DeviceSet }} when Normalized ->
+            {ok, set_keys(BaseResult, #{ <<"device">> => BaseDevice }, RunOpts)};
         {ok, #{ <<"device">> := DeviceSet }} ->
-            {ok, hb_ao:set(BaseResult, #{ <<"device">> => BaseDevice }, Opts)};
+            {ok, hb_ao:set(BaseResult, #{ <<"device">> => BaseDevice }, RunOpts)};
         _ ->
             ?event({returning_base_result, BaseResult}),
             {Status, BaseResult}
@@ -264,6 +318,98 @@ run_as(Key, Base, Req, Opts) ->
 %% transformed device, this is useful.
 as_process(Base, Opts) ->
     hb_ao:set(Base, #{ <<"device">> => <<"process@1.0">> }, Opts).
+
+%% @doc `hb_ao:get/3' of one top-level key of a process state, without
+%% resolving the state. A resolution normalises every key of its base to
+%% return one of them: on a process with one published key per player, each
+%% read cost O(published keys), and a slot read and wrote its bookkeeping keys
+%% (`at-slot', `device', `results', `snapshot') ~20 times. An integer, which
+%% normalising returns unchanged, is read directly when the state's device
+%% serves the key as `message@1.0' does; anything else is resolved.
+get_key(Key, Base, Opts) ->
+    case is_map(Base) andalso maps:find(Key, Base) of
+        {ok, Value} when is_integer(Value) ->
+            case message_key(Base, Key, Opts) of
+                true -> Value;
+                false -> hb_ao:get(Key, Base, Opts)
+            end;
+        _ -> hb_ao:get(Key, Base, Opts)
+    end.
+
+%% @doc `hb_ao:set/3' of top-level keys of a process state, without resolving
+%% the state (`get_key/3'). When the state's device sets keys as `message@1.0'
+%% does, each key is set as `hb_state_patch' sets the keys a patch writes:
+%% plainly where the state allows it, through `hb_ao:set/4' otherwise.
+%% `undefined' values are skipped, as `message@1.0' skips them.
+set_keys(Base, Values, Opts) when is_map(Base) ->
+    case message_key(Base, <<"set">>, Opts) of
+        true ->
+            maps:fold(
+                fun(_Key, undefined, Acc) -> Acc;
+                   (Key, Value, Acc) -> hb_state_patch:base_set(Acc, Key, Value, Opts)
+                end,
+                Base,
+                Values
+            );
+        false -> hb_ao:set(Base, Values, Opts)
+    end;
+set_keys(Base, Values, Opts) ->
+    hb_ao:set(Base, Values, Opts).
+
+%% @doc Set top-level keys of a state that `run_as/4' returned from a
+%% `normalized-base', normalising it as `hb_ao:set/3' would. Every key the
+%% device left as it received it is already normalised; a device that states
+%% its change (`process-cache-delta': the state is its input with these
+%% patches and results applied, as `lib_process_cache' replays it) changed
+%% only the keys its patches root at and `results', so only those are
+%% normalised, as the resolver normalises a base (`hb_ao' resolve stage 2).
+%% Any other state is set with `hb_ao:set/3'.
+normalize_changed(State, Values, Opts) ->
+    case changed_keys(State, Opts) of
+        {ok, Keys} ->
+            Changed = maps:with(Keys, State),
+            {ok, Decoded} =
+                hb_ao:raw(<<"structured@1.0">>, <<"to">>, Changed, #{}, Opts),
+            set_keys(
+                maps:merge(State, hb_ao:execution_input(Decoded, Opts)),
+                Values,
+                Opts
+            );
+        full -> hb_ao:set(State, Values, Opts)
+    end.
+
+changed_keys(State, Opts) when is_map(State) ->
+    Delta = hb_private:get(<<"process-cache-delta">>, State, not_found, Opts),
+    Plain =
+        not is_map_key(<<"commitments">>, State)
+            andalso not is_map_key(<<"ao-types">>, State),
+    case {Plain, Delta} of
+        {true, #{ <<"patches">> := Patches, <<"results">> := _ }} when is_list(Patches) ->
+            case hb_state_patch:roots(Patches, Opts) of
+                {ok, Roots} ->
+                    Keys = [<<"results">> | Roots],
+                    case lists:any(
+                            fun(Key) -> is_map_key(<<Key/binary, "+link">>, State) end,
+                            Keys) of
+                        false -> {ok, Keys};
+                        true -> full
+                    end;
+                error -> full
+            end;
+        _ -> full
+    end;
+changed_keys(_State, _Opts) ->
+    full.
+
+%% @doc Whether the device of `Base' serves `Key' with the function that
+%% `message@1.0' serves it with.
+message_key(Base, Key, Opts) ->
+    try
+        {_, _, Fun} = hb_device:message_to_fun(Base, Key, Opts),
+        {_, _, MessageFun} = hb_device:message_to_fun(#{}, Key, Opts),
+        Fun =:= MessageFun
+    catch _:_ -> false
+    end.
 
 %% @doc Set the results of the current process.
 set_results(State, Results, Opts) ->

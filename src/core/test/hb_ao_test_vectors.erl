@@ -267,6 +267,33 @@ test_opts() ->
 
 %% @doc Cache addresses do not become receipts on the shared patch. The resolver
 %% constructs the caller's receipt from the original inputs on every return.
+%% @doc A base given as `normalized-base' is not normalised again: none of
+%% its keys is walked by `normalize_input/3', as every key of any other base
+%% is.
+normalized_base_is_not_normalized_again_test() ->
+    Base =
+        maps:from_list(
+            [ {<<"key-", (integer_to_binary(N))/binary>>, #{ <<"n">> => N }}
+            || N <- lists:seq(1, 50) ]
+        ),
+    Opts = #{ <<"hashpath">> => ignore },
+    Walks =
+        fun(ResolveOpts) ->
+            erlang:trace_pattern({hb_ao, normalize_input, 3}, true, [call_count]),
+            erlang:trace(self(), true, [call]),
+            {ok, Value} = hb_ao:resolve(Base, <<"key-7">>, ResolveOpts),
+            erlang:trace(self(), false, [call]),
+            {call_count, Count} =
+                erlang:trace_info({hb_ao, normalize_input, 3}, call_count),
+            erlang:trace_pattern({hb_ao, normalize_input, 3}, false, [call_count]),
+            ?assertEqual(#{ <<"n">> => 7 }, Value),
+            Count
+        end,
+    Normalized = Walks(Opts),
+    ?assert(Walks(Opts#{ <<"normalized-base">> => Base }) + 100 =< Normalized),
+    % Only that base: another one is normalised as usual.
+    ?assertEqual(Normalized, Walks(Opts#{ <<"normalized-base">> => #{} })).
+
 hashpath_cached_patch_test() ->
     Opts = #{
         <<"store">> => hb_test_utils:test_store(),
