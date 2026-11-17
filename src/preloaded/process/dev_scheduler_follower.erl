@@ -9,10 +9,15 @@
 %%%      message a real signature vouches for and that is for P. S's URL is
 %%%      transport only.
 %%%   2. Every confirmed window of S's Arweave schedule archive
-%%%      (`dev_scheduler_uploader') that covers the slot holds that very
-%%%      assignment, mined `confirmations' deep (default 3; inclusion is the
-%%%      first). Any window holding a DIFFERENT assignment for the slot is a
-%%%      fork: S is frozen and the IDs kept as evidence.
+%%%      (`dev_scheduler_uploader') that covers the slot agrees with the
+%%%      replica, mined `confirmations' deep (default 3; inclusion is the
+%%%      first). A format 1 window agrees when it holds that very assignment.
+%%%      A format 2 window (`Archive-Format: 2') agrees when its
+%%%      `Last-Assignment' tag is the ID of the replica's assignment at its
+%%%      `To-Slot': that assignment's `base-hashpath' chain (checked by the
+%%%      replica) commits to every slot before it, so the tags alone are read
+%%%      and the window's data never is. A window that disagrees is a fork:
+%%%      S is frozen and the IDs kept as evidence (S signed both).
 %%%   3. Every input of the slot that claims a process origin passes THIS
 %%%      node's door for P (`dev_scheduler_admission:check/3'), as if it had
 %%%      been delivered here, and names an outbox entry no earlier slot of P
@@ -313,10 +318,14 @@ index(From, Top, R, F) ->
 %% indexed, newest first, each with the entries its input took, and why the
 %% run stopped (`none' when every slot passed).
 judge([], _R, _F, Ready) -> {Ready, none};
-judge([N | Rest], R = #{ opts := ROpts }, F = #{ p := P, opts := Opts }, Ready) ->
-    {ok, A0} = hb_cache:read(lib_bridge_replica:slot_path(P, N, none), ROpts),
-    A = hb_cache:ensure_all_loaded(A0, ROpts),
-    case archived(N, hb_message:id(A, signed, ROpts), F) of
+judge([N | Rest], R = #{ opts := ROpts, slot := Top }, F = #{ p := P, opts := Opts }, Ready) ->
+    A = replica_assignment(P, N, ROpts),
+    IdAt =
+        fun(S) when S =:= N -> hb_message:id(A, signed, ROpts);
+           (S) when S > Top -> not_held;
+           (S) -> hb_message:id(replica_assignment(P, S, ROpts), signed, ROpts)
+        end,
+    case archived(N, IdAt, F) of
         not_yet -> {Ready, not_yet};
         {fork, Archived} -> {Ready, {fork, N, Archived, A}};
         ok ->
@@ -327,6 +336,10 @@ judge([N | Rest], R = #{ opts := ROpts }, F = #{ p := P, opts := Opts }, Ready) 
                 {ok, Taken} -> judge(Rest, R, F, [{N, Taken} | Ready])
             end
     end.
+
+replica_assignment(P, N, ROpts) ->
+    {ok, A} = hb_cache:read(lib_bridge_replica:slot_path(P, N, none), ROpts),
+    hb_cache:ensure_all_loaded(A, ROpts).
 
 index_batch([], _R, F) -> F;
 index_batch(Ready, #{ proc := Proc, opts := ROpts }, F = #{ p := P, opts := Opts }) ->
@@ -370,18 +383,36 @@ readmit(A, P, ROpts, Opts, TakenHere) ->
 
 %%% The archive ---------------------------------------------------------------
 
-%% `ok' when every confirmed archive window over slot N holds this
-%% assignment; `{fork, Archived}' when any holds another; `not_yet' when none
-%% covers N yet.
-archived(N, AssignmentID, #{ windows := Windows }) ->
+%% `ok' when every confirmed archive window over slot N agrees with the
+%% replica (`IdAt(Slot)': the replica's assignment ID at a slot it holds,
+%% else `not_held'; a bare ID is slot N's); `{fork, Archived}' when any
+%% disagrees; `not_yet' when none covers N, or a format 2 window over N ends
+%% at a slot the replica does not hold yet.
+archived(N, AssignmentID, F) when is_binary(AssignmentID) ->
+    archived(N, fun(S) when S =:= N -> AssignmentID; (_) -> not_held end, F);
+archived(N, IdAt, #{ windows := Windows }) ->
     case [ W || W = #{ from := From, to := To } <- Windows, From =< N, N =< To ] of
         [] -> not_yet;
         Ws ->
-            case [ W || W = #{ ids := IDs } <- Ws, not lists:member(AssignmentID, IDs) ] of
-                [] -> ok;
-                _ -> {fork, [ maps:get(id, W) || W <- Ws ]}
+            Verdicts = [ agrees(W, N, IdAt) || W <- Ws ],
+            case lists:member(false, Verdicts) of
+                true -> {fork, [ maps:get(id, W) || W <- Ws ]};
+                false ->
+                    case lists:member(not_held, Verdicts) of
+                        true -> not_yet;
+                        false -> ok
+                    end
             end
     end.
+
+%% Format 2: the window's last assignment, which commits to the slots before
+%% it. Format 1: slot N's own assignment, among those the window holds.
+agrees(#{ last := Last, to := To }, _N, IdAt) ->
+    case IdAt(To) of
+        not_held -> not_held;
+        ID -> ID =:= Last
+    end;
+agrees(#{ ids := IDs }, N, IdAt) -> lists:member(IdAt(N), IDs).
 
 %% The archive windows of P that S signed and that are mined deep enough, read
 %% from the first gateway that may be asked and answers, once `archive-poll-ms'
@@ -466,7 +497,7 @@ wanted_windows(Gateway, F = #{ p := P, s := S, depth := Depth, windows := Have,
     Edges = archive_edges(Gateway, S, P, floor_height(F), #{}),
     Known = [ maps:get(id, W) || W <- Have ],
     lists:keysort(2, lists:ukeysort(1,
-        [ {ID, hb_util:int(tag(<<"From-Slot">>, Tags)), To, maps:get(<<"height">>, Block)}
+        [ {ID, hb_util:int(tag(<<"From-Slot">>, Tags)), To, maps:get(<<"height">>, Block), Tags}
         || #{ <<"node">> := #{ <<"id">> := ID, <<"tags">> := Tags,
                 <<"block">> := Block } } <- Edges,
            not lists:member(ID, Known),
@@ -474,8 +505,23 @@ wanted_windows(Gateway, F = #{ p := P, s := S, depth := Depth, windows := Have,
            To <- [hb_util:int(tag(<<"To-Slot">>, Tags))],
            To > Indexed ])).
 
+%% A format 2 window is its tags; a format 1 window is read whole, for the
+%% assignment IDs it holds. A format this build does not know fails closed:
+%% it is never a window, so the slots it covers wait.
 fetch_windows(_Gateway, [], Got) -> {ok, lists:reverse(Got)};
-fetch_windows(Gateway, [{ID, From, To, Height} | Rest], Got) ->
+fetch_windows(Gateway, [{ID, From, To, Height, Tags} | Rest], Got) ->
+    case {optional_tag(<<"Archive-Format">>, Tags), optional_tag(<<"Last-Assignment">>, Tags)} of
+        {<<"2">>, Last} when is_binary(Last) ->
+            fetch_windows(Gateway, Rest,
+                [#{ id => ID, from => From, to => To, last => Last, height => Height } | Got]);
+        {undefined, _} -> fetch_legacy_window(Gateway, {ID, From, To, Height}, Rest, Got);
+        Unknown ->
+            ?event(warning, {foreign_follower_unknown_archive_format, {id, ID},
+                {format, Unknown}}),
+            fetch_windows(Gateway, Rest, Got)
+    end.
+
+fetch_legacy_window(Gateway, {ID, From, To, Height}, Rest, Got) ->
     try archived_ids(gateway(get, Gateway, "/raw/" ++ hb_util:list(ID), none, 60000)) of
         IDs ->
             fetch_windows(Gateway, Rest,
@@ -539,9 +585,15 @@ window_confirmed(#{ <<"height">> := H }, Height, Depth, _) when is_integer(H), H
 window_confirmed(_, _, _, _) -> false.
 
 tag(Name, Tags) ->
+    case optional_tag(Name, Tags) of
+        undefined -> throw({archive_tag_missing, Name});
+        V -> V
+    end.
+
+optional_tag(Name, Tags) ->
     case [ V || #{ <<"name">> := N, <<"value">> := V } <- Tags, N =:= Name ] of
         [V | _] -> V;
-        [] -> throw({archive_tag_missing, Name})
+        [] -> undefined
     end.
 
 %% @doc The message IDs an archive's data holds (`dev_scheduler_uploader'
@@ -1123,3 +1175,104 @@ listing_floor_test() ->
     ?assertEqual(1000, maps:get(top_height, Pruned)),
     ?assertEqual(undefined,
         floor_height(Pruned#{ listings := ?FULL_LISTING_EVERY })).
+
+%%% Format 2 windows -----------------------------------------------------------
+
+%% A GraphQL edge for a signed archive item, from its own tags.
+item_edge(Item, Height) ->
+    ID = hb_util:human_id(Item#tx.id),
+    #{ <<"cursor">> => ID, <<"node">> => #{ <<"id">> => ID,
+        <<"tags">> => [ #{ <<"name">> => N, <<"value">> => V } || {N, V} <- Item#tx.tags ],
+        <<"block">> => #{ <<"height">> => Height } } }.
+
+%% Slots `Slots' of a fresh process written as the scheduler stores them:
+%% the process and each slot's assignment ID.
+written_process(Slots, Opts) ->
+    P = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    IDs =
+        [ begin
+            Body = hb_message:commit(#{ <<"data">> => integer_to_binary(S) },
+                Opts, <<"ans104@1.0">>),
+            A = hb_message:commit(#{ <<"process">> => P, <<"slot">> => S,
+                <<"body">> => Body, <<"type">> => <<"Assignment">>,
+                <<"variant">> => <<"ao.N.1">> }, Opts, <<"ans104@1.0">>),
+            ok = dev_scheduler_cache:write(P, A, Opts),
+            hb_util:human_id(hb_message:id(A, signed, Opts))
+          end
+        || S <- Slots ],
+    ok = dev_scheduler_cache:flush(Opts),
+    {P, IDs}.
+
+%% @doc A format 2 window, full or fingerprint, as the uploader signs it: read
+%% from its listing's tags alone (the gateway is never asked for its data)
+%% and verified against the replica's assignment at its last slot, which
+%% commits to the slots before it. Another assignment there is a fork; a last
+%% slot the replica does not hold yet waits. A format 1 window of real signed
+%% assignments, read whole, verifies beside it.
+format2_windows_verify_from_tags_test_() ->
+    {timeout, 60, fun format2_windows_verify_from_tags/0}.
+format2_windows_verify_from_tags() ->
+    Opts = #{ <<"store">> => [hb_test_utils:test_store()], <<"priv-wallet">> => hb:wallet() },
+    {P, IDs} = written_process(lists:seq(0, 11), Opts),
+    Item = fun(From, To, Mode) ->
+        {2, To, Bytes} = dev_scheduler_uploader:prepare_window(P, From, To, Mode,
+            8 * 1024 * 1024, Opts),
+        I = ar_bundles:deserialize_item_wrapper(Bytes),
+        true = ar_bundles:verify_item(I),
+        I
+    end,
+    Full = Item(0, 3, full),
+    Fingerprint = Item(4, 7, fingerprint),
+    % Format 1: the assignments themselves, bundled uncompressed.
+    Legacy = [ begin {ok, A} = dev_scheduler_cache:read(P, S, Opts),
+                     dev_scheduler_uploader_item(A, Opts) end || S <- lists:seq(8, 11) ],
+    {undefined, LegacyData} = ar_bundles:serialize_bundle(list, Legacy, false),
+    LegacyID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Edges = [item_edge(Full, 98), item_edge(Fingerprint, 98), edge(LegacyID, 8, 11, 98)],
+    Raw = <<"/raw/", LegacyID/binary>>,
+    Route =
+        fun('GET', <<"/height">>) -> {200, [], <<"100">>};
+           ('POST', <<"/graphql">>) -> {200, [], edges_body(Edges)};
+           ('GET', Path) when Path =:= Raw -> {200, [], LegacyData};
+           (_, _) -> {404, [], <<>>}
+        end,
+    {URL, Pid} = stub_gateway(gw, Route, self()),
+    F = (archive_state([URL]))#{ p => P },
+    F1 = with_windows(F, now_ms()),
+    % height, graphql, and the format 1 window's data: nothing else.
+    ?assertEqual(3, hits(gw)),
+    ?assertEqual(3, length(maps:get(windows, F1))),
+    At = fun(Held) -> fun(S) when S =< Held -> lists:nth(S + 1, IDs); (_) -> not_held end end,
+    [ ?assertEqual(ok, archived(N, At(11), F1)) || N <- lists:seq(0, 11) ],
+    % The replica holds slot 5 but not 7: slots 4-7 wait, the rest pass.
+    ?assertEqual(not_yet, archived(5, At(5), F1)),
+    ?assertEqual(ok, archived(2, At(5), F1)),
+    % S served another assignment at a window's last slot: a fork, also for
+    % the slots before it, in either data mode.
+    Forged = fun(Slot) -> fun(S) when S =:= Slot -> <<"forged">>; (S) -> (At(11))(S) end end,
+    ?assertMatch({fork, [_]}, archived(1, Forged(3), F1)),
+    ?assertMatch({fork, [_]}, archived(4, Forged(7), F1)),
+    ?assertMatch({fork, [_]}, archived(9, Forged(9), F1)),
+    stop_stubs([Pid]).
+
+%% The item the uploader archives for a message (`dev_scheduler_uploader').
+dev_scheduler_uploader_item(Msg, Opts) ->
+    hb_message:convert(
+        hb_message:with_commitments(#{ <<"commitment-device">> => <<"ans104@1.0">> }, Msg, Opts),
+        <<"ans104@1.0">>, <<"structured@1.0">>, Opts).
+
+%% @doc A window in a format this build does not know is never a window: the
+%% slots it covers wait (fail closed), and it is never fetched.
+unknown_format_fails_closed_test_() ->
+    {timeout, 30, fun unknown_format_fails_closed/0}.
+unknown_format_fails_closed() ->
+    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    #{ <<"node">> := Node = #{ <<"tags">> := Tags } } = Edge = edge(ID, 0, 3, 98),
+    Future = Edge#{ <<"node">> => Node#{ <<"tags">> =>
+        [#{ <<"name">> => <<"Archive-Format">>, <<"value">> => <<"3">> } | Tags] } },
+    {URL, Pid} = stub_gateway(future, archive_gateway([Future], []), self()),
+    F1 = with_windows(archive_state([URL]), now_ms()),
+    ?assertEqual(2, hits(future)),
+    ?assertEqual([], maps:get(windows, F1)),
+    ?assertEqual(not_yet, archived(1, <<"a">>, F1)),
+    stop_stubs([Pid]).
