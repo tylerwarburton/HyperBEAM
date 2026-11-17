@@ -1565,7 +1565,10 @@ aos_authority_not_trusted_test() ->
                         <<"action">> => <<"Eval">>,
                         <<"from-process">> => <<"1234">>
                     },
-                    Opts
+                    % A stranger's: the node's own wallet is a policy signer,
+                    % and the door refuses its unreadable stamp (400) before
+                    % the process could (`dev_scheduler_admission').
+                    #{ <<"priv-wallet">> => ar_wallet:new() }
                 )
         },
         Opts
