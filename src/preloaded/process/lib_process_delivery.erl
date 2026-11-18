@@ -103,6 +103,17 @@
 %%% minutes (2026-11-16: the fast ledger's slots 4522-4544 owed for 15
 %%% minutes, `pending_entries' 0 throughout, all delivered within a second of
 %%% a restart).
+%%%
+%%% A deliverer serves the delivery store it was started with, and the name
+%%% `{delivery, ProcID}' is the node's: so a computation with no delivery
+%%% store of its own -- a bridge replica, computing in its isolated stores
+%%% (`lib_bridge_replica:execution_opts/3' sets `process-delivery' false) --
+%%% keeps no `o' row, and never notifies or starts a deliverer. And the
+%%% watchdog replaces a registered deliverer that serves another store than
+%%% its own, as it replaces one that stopped beating (2026-11-18: a replica
+%%% computing the L1 ledger started its deliverer on the replica's store; it
+%%% beat, read no owed rows, and held the name for 12 hours with 480 of the
+%%% node's slots owed).
 -module(lib_process_delivery).
 -export([notify/3, ensure/2, await_delivered/3, sweep/1]).
 -export([pending/1, pending/2, pending_keys/3]).
@@ -134,6 +145,8 @@
 %% Each deliverer's backlog and last beat:
 %% `{ProcID, Pid, Entries, OldestSince, BeatMs}'.
 -define(BACKLOG, lib_process_delivery_backlog).
+%% The store each deliverer serves: `{ProcID, Pid, StoreName}'.
+-define(SERVES, lib_process_delivery_serves).
 %% Each watchdog's last reading of the rows:
 %% `{Name, OverdueProcesses, OldestOwedSeconds}'.
 -define(WATCH, lib_process_delivery_watch).
@@ -206,7 +219,8 @@ is_scheduler(Process, Opts) ->
 %% @doc A slot of `ProcID' was stored with an outbox: hand it to the process's
 %% deliverer, starting one when there is none. Never blocks the caller.
 notify(ProcID, Slot, Opts) ->
-    case drop_ready(Opts) orelse hb_name:lookup({delivery, ProcID}) of
+    case store(Opts) == none orelse drop_ready(Opts)
+            orelse hb_name:lookup({delivery, ProcID}) of
         true -> ok;
         Pid when is_pid(Pid) -> Pid ! {ready, Slot}, ok;
         _ ->
@@ -222,7 +236,8 @@ notify(ProcID, Slot, Opts) ->
 %% when this node does not deliver the process or cannot read it.
 ensure(ProcID, Opts) ->
     watch(Opts),
-    case hb_name:lookup({delivery, ProcID}) of
+    case store(Opts) =/= none andalso hb_name:lookup({delivery, ProcID}) of
+        false -> {error, no_delivery_store};
         Pid when is_pid(Pid) -> {ok, Pid};
         _ ->
             Caller = self(),
@@ -403,6 +418,8 @@ init(ProcID, Opts, {Caller, Ref}) ->
         error ->
             Caller ! {Ref, {exists, hb_name:lookup({delivery, ProcID})}};
         ok ->
+            ensure_table(?SERVES, set),
+            ets:insert(?SERVES, {ProcID, self(), store_name(store(Opts))}),
             beat(ProcID),
             crash_point(start, #{ opts => Opts }),
             case start_state(ProcID, Opts) of
@@ -1399,7 +1416,7 @@ watch(Opts) ->
     case store(Opts) of
         none -> ok;
         Store ->
-            Name = {delivery_watchdog, maps:get(<<"name">>, Store, Store)},
+            Name = {delivery_watchdog, store_name(Store)},
             case hb_name:lookup(Name) of
                 Pid when is_pid(Pid) -> ok;
                 _ ->
@@ -1441,30 +1458,41 @@ watch_once(Name, Opts, Seen) ->
         {Name, length(Overdue), lists:max([0 | [ Now - T || T <- maps:values(Seen2) ]]) div 1000}),
     Seen2.
 
-%% A process owed a slot has a deliverer that beat within `StallMs', or gets
-%% a new one. One that is stopped is killed first, and waited for, so two
-%% never run at once; one that will not die by the next reading is tried
-%% again then.
+%% A process owed a slot has a deliverer that serves this watchdog's store
+%% and beat within `StallMs', or gets a new one. One that is stopped, or
+%% serves another store, is killed first, and waited for, so two never run
+%% at once; one that will not die by the next reading is tried again then.
 keep_alive(ProcID, Now, StallMs, Opts) ->
+    ensure_table(?SERVES, set),
+    Mine = store_name(store(Opts)),
     case hb_name:lookup({delivery, ProcID}) of
         Pid when is_pid(Pid) ->
-            case ets:lookup(?BACKLOG, ProcID) of
-                [{_, Pid, _, _, Beat}] when Now - Beat < StallMs -> ok;
-                [{_, Pid, _, _, Beat}] ->
+            case {ets:lookup(?SERVES, ProcID), ets:lookup(?BACKLOG, ProcID)} of
+                {[{_, Pid, Other}], _} when Other =/= Mine ->
+                    ?event(warning, {deliverer_wrong_store, {process, ProcID},
+                        {serves, Other}, {owed_in, Mine}}),
+                    record(delivery_wrong_store),
+                    replace(ProcID, Pid, Opts);
+                {_, [{_, Pid, _, _, Beat}]} when Now - Beat < StallMs -> ok;
+                {_, [{_, Pid, _, _, Beat}]} ->
                     ?event(warning, {deliverer_stalled, {process, ProcID},
                         {since_beat_ms, Now - Beat},
                         {at, erlang:process_info(Pid, current_stacktrace)}}),
                     record(delivery_stalled),
-                    Mon = erlang:monitor(process, Pid),
-                    exit(Pid, kill),
-                    receive {'DOWN', Mon, process, Pid, _} -> start(ProcID, Opts)
-                    after 5000 -> erlang:demonitor(Mon, [flush])
-                    end;
+                    replace(ProcID, Pid, Opts);
                 _ ->
                     % No beat of its own on record: it is judged from now.
                     ets:insert(?BACKLOG, {ProcID, Pid, 0, none, Now})
             end;
         _ -> start(ProcID, Opts)
+    end.
+
+%% Kill a deliverer and start another once it is gone.
+replace(ProcID, Pid, Opts) ->
+    Mon = erlang:monitor(process, Pid),
+    exit(Pid, kill),
+    receive {'DOWN', Mon, process, Pid, _} -> start(ProcID, Opts)
+    after 5000 -> erlang:demonitor(Mon, [flush])
     end.
 
 %% Start a deliverer without waiting for its start: the watchdog never waits
@@ -1488,6 +1516,9 @@ stall_ms(Opts) ->
 %%% Rows.
 
 store(Opts) -> lib_process_cache:delivery_store(Opts).
+
+store_name(none) -> none;
+store_name(Store) -> maps:get(<<"name">>, Store, Store).
 
 key(ProcID, Kind, Slot) -> lib_process_cache:blob_key(ProcID, Kind, Slot).
 

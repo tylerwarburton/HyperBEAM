@@ -111,9 +111,10 @@ refresh(ProcID, Slot, RawOpts) ->
             )
     end.
 
-%% @doc The store the head marker lives in: the one holding the slot rows.
+%% @doc The store the head marker lives in: the one holding the slot rows,
+%% whether or not the computation delivers.
 marker_store(Opts) ->
-    case delivery_store(Opts) of
+    case first_lmdb_store(Opts) of
         none -> hb_opts:get(store, no_viable_store, Opts);
         Store -> [Store]
     end.
@@ -996,8 +997,16 @@ outbox_entries(#{ <<"lower">> := Lower, <<"outbox">> := Raw }, Opts) ->
 %% in: the node's first writable LMDB store, whether or not slots are stored
 %% as blobs. One store, so one flush makes a slot's rows durable together
 %% and LMDB's ordered commits keep them in write order. A node with no
-%% writable LMDB store has none, and delivers nothing (`lib_process_delivery').
+%% writable LMDB store has none, and delivers nothing (`lib_process_delivery'),
+%% and so does a computation whose options say `process-delivery' false: a
+%% bridge replica's, in its own isolated stores (`lib_bridge_replica').
 delivery_store(Opts) ->
+    case hb_opts:get(<<"process-delivery">>, true, Opts) of
+        false -> none;
+        _ -> first_lmdb_store(Opts)
+    end.
+
+first_lmdb_store(Opts) ->
     Stores =
         hb_store:normalize_stores(
             case hb_opts:get(<<"store">>, [], Opts) of

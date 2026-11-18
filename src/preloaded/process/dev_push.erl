@@ -2121,6 +2121,78 @@ only_the_scheduler_delivers_test_() ->
         receive posted -> erlang:error(a_replica_posted) after 0 -> ok end
     end}.
 
+%% @doc A bridge replica computing a process this node schedules, in its own
+%% store over the node's, with the node's key, before any deliverer of the
+%% process runs, keeps no `o' row and starts no deliverer, so the slot the
+%% node owes is delivered by the node's. Before, the replica's slot started a
+%% deliverer on the replica's store under the node's name: it read none of
+%% the node's rows and held the name while the node's slots stayed owed
+%% (2026-11-18: the L1 ledger, 480 slots for 12 hours).
+replica_never_starts_the_deliverer_test_() ->
+    {timeout, 60, fun() ->
+        {Sender, SID, {A, AID}, _, Opts} =
+            delivery_setup(#{ <<"priv-wallet">> => hb:wallet(),
+                <<"delivery-rescan-ms">> => 200 }),
+        send(Sender, 1, #{ <<"sendto">> => AID }, Opts),
+        send(Sender, 2, #{ <<"sendto">> => AID }, Opts),
+        Before = receiver_slot(A, Opts),
+        % Slot 0 is owed and its cast lost: no deliverer runs.
+        {ok, _} = compute(Sender, 0, Opts#{ <<"delivery-test-drop-ready">> => true }),
+        ?assertEqual([0], rows(SID, <<"o">>, Opts)),
+        ?assertEqual(undefined, deliverer(SID)),
+        NodeStore = lib_process_cache:delivery_store(Opts),
+        Computed = hb_test_utils:test_store(hb_store_lmdb, <<"replica-computed">>),
+        ok = hb_store:start([Computed]),
+        % `lib_bridge_replica:execution_opts/3', as far as delivery reads it:
+        % the node's key left to the default wallet, its own computed store
+        % over the node's, and `process-delivery' false.
+        ROpts = (maps:without([<<"priv-wallet">>, <<"identities">>], Opts))#{
+            <<"store">> => [Computed, NodeStore],
+            <<"process-store">> => [Computed],
+            <<"process-workers">> => false,
+            <<"spawn-worker">> => false,
+            <<"process-delivery">> => false
+        },
+        ?assertEqual(none, lib_process_cache:delivery_store(ROpts)),
+        {ok, _} = compute(Sender, 1, ROpts),
+        timer:sleep(500),
+        ?assertEqual(undefined, deliverer(SID)),
+        ?assertEqual([], rows(SID, <<"o">>, ROpts)),
+        ?assertEqual({error, no_delivery_store}, lib_process_delivery:ensure(SID, ROpts)),
+        ?assertEqual(undefined, deliverer(SID)),
+        % The node's deliverer delivers what the node owes.
+        ?assertEqual(1, lib_process_delivery:sweep(Opts)),
+        ?assert(wait_until(fun() -> delivered(SID, [0], Opts) end, 15000)),
+        ?assertEqual(Before + 1, receiver_slot(A, Opts))
+    end}.
+
+%% @doc A deliverer registered for a process while serving another store
+%% than the node's -- beating, idle, reading none of the node's rows -- is
+%% replaced by the node store's watchdog, and the node's owed slot is
+%% delivered. Before, the watchdog only asked whether it beat.
+wrong_store_deliverer_is_replaced_test_() ->
+    {timeout, 60, fun() ->
+        {Sender, SID, {A, AID}, _, Opts} =
+            delivery_setup(#{ <<"delivery-rescan-ms">> => 200 }),
+        send(Sender, 1, #{ <<"sendto">> => AID }, Opts),
+        Before = receiver_slot(A, Opts),
+        Wrong = counter(delivery_wrong_store),
+        % A squatter: the node's name, another store, the node's key.
+        Other = hb_test_utils:test_store(hb_store_lmdb, <<"squatter">>),
+        ok = hb_store:start([Other]),
+        NodeStore = lib_process_cache:delivery_store(Opts),
+        {ok, Squatter} =
+            lib_process_delivery:ensure(SID, Opts#{ <<"store">> => [Other, NodeStore] }),
+        {ok, _} = compute(Sender, 0, Opts#{ <<"delivery-test-drop-ready">> => true }),
+        ?assertEqual([0], rows(SID, <<"o">>, Opts)),
+        % The node's sweep finds the name held, and starts its watchdog.
+        ?assertEqual(1, lib_process_delivery:sweep(Opts)),
+        ?assert(wait_until(fun() -> delivered(SID, [0], Opts) end, 10000)),
+        ?assertNot(is_process_alive(Squatter)),
+        ?assertEqual(Wrong + 1, counter(delivery_wrong_store)),
+        ?assertEqual(Before + 1, receiver_slot(A, Opts))
+    end}.
+
 %% @doc Whether a node delivers a process is a fact of its definition and the
 %% node's keys, true the moment the node is back: a node killed with slots
 %% assigned but not computed, and not one `o' row, delivers every one of

@@ -352,6 +352,10 @@ execution_opts(NodeOpts, Verified, Computed) ->
         <<"scheduler-lookahead">> => false,
         <<"scheduler-follow-redirects">> => false,
         <<"await-inprogress">> => false,
+        % The replica's stores are its own: what it computes is never the
+        % node's to deliver, and the node's deliverer is never started or
+        % notified from here (`lib_process_delivery').
+        <<"process-delivery">> => false,
         % Result-affecting options, pinned to what our nodes run
         % (paralith-mono infra/nodes/node-config.v011.json).
         <<"lua-patch-invalid-patches">> => <<"drop">>,
@@ -724,6 +728,17 @@ replica_reads_the_nodes_arweave_index_test() ->
     % A default the node did not name is never shared.
     ?assertEqual([Replica], maps:get(<<"arweave-scheduler-store">>,
         execution_opts(#{ <<"store">> => [Index] }, Replica, Computed))).
+
+%% What a replica computes is never the node's to deliver: its options say
+%% so, and `lib_process_cache:delivery_store/1' then gives none, so the
+%% node's deliverer is never started on, or notified from, the replica's
+%% store (2026-11-18: one squatted the L1 ledger's name for 12 hours;
+%% `dev_push:replica_never_starts_the_deliverer_test_').
+replica_does_not_deliver_test() ->
+    Verified = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => <<"replica">> },
+    Computed = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => <<"replica.computed">> },
+    ?assertEqual(false, maps:get(<<"process-delivery">>,
+        execution_opts(#{ <<"process-delivery">> => true }, Verified, Computed))).
 
 %% A signed ANS-104 body whose `original-tags' arrive as links (as a node
 %% serves a stored item) does not verify; the raw item, fetched by its signed
