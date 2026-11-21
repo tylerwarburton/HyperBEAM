@@ -261,29 +261,33 @@ status() ->
     S = persistent_term:get(?STATUS, #{}),
     Days = max(1 / 24, (now_ms() - maps:get(started_ms, S, now_ms())) / 86400000),
     Price = maps:get(usd_per_gib, S, ?DEFAULT_USD_PER_GIB),
-    Modes =
-        maps:map(
-            fun(_, #{ bytes := B, posts := N }) ->
-                PerDay = B / Days,
-                #{ bytes => B, posts => N, bytes_per_day => round(PerDay),
-                   usd_per_day => PerDay / (1 bsl 30) * Price }
-            end,
-            maps:get(posted, S, #{})),
+    Rate =
+        fun(_, Counts = #{ bytes := B }) ->
+            PerDay = B / Days,
+            Counts#{ bytes_per_day => round(PerDay), usd_per_day => PerDay / (1 bsl 30) * Price }
+        end,
     maps:merge(maps:with([unfunded_since, last_refusal], S),
-        #{ funded => not maps:get(unfunded, S, false), posted => Modes }).
+        #{ funded => not maps:get(unfunded, S, false),
+           posted => maps:map(Rate, maps:get(posted, S, #{})),
+           processes => maps:map(Rate, maps:get(processes, S, #{})) }).
 
 status_update(Fun) ->
     S = persistent_term:get(?STATUS, #{ started_ms => now_ms() }),
     persistent_term:put(?STATUS, Fun(S)).
 
-%% A post taken: its bytes, under its mode (`full', `fingerprint', `spawn').
-count_posted(Mode, Bytes, Opts) ->
+%% A post taken: its bytes, under its mode (`full', `fingerprint', `spawn')
+%% and under the process it is for.
+count_posted(Mode, ID, Bytes, Opts) ->
+    Add =
+        fun(Key, Table, Extra) ->
+            #{ bytes := B, posts := N } = maps:get(Key, Table, #{ bytes => 0, posts => 0 }),
+            Table#{ Key => Extra#{ bytes => B + Bytes, posts => N + 1 } }
+        end,
     status_update(fun(S) ->
-        Posted = maps:get(posted, S, #{}),
-        #{ bytes := B, posts := N } = maps:get(Mode, Posted, #{ bytes => 0, posts => 0 }),
         S#{ usd_per_gib =>
                 hb_opts:get(scheduler_upload_usd_per_gib, ?DEFAULT_USD_PER_GIB, Opts),
-            posted => Posted#{ Mode => #{ bytes => B + Bytes, posts => N + 1 } } }
+            posted => Add(Mode, maps:get(posted, S, #{}), #{}),
+            processes => Add(hb_util:human_id(ID), maps:get(processes, S, #{}), #{ mode => Mode }) }
     end).
 
 %% The bundler took a post: funded again, if it was not.
@@ -369,7 +373,7 @@ upload_item(ID0, Opts) ->
 post_item(ID, Serialized, Marker, Backoff, Opts) ->
     case post(Serialized, Opts) of
         ok ->
-            count_posted(spawn, byte_size(Serialized), Opts),
+            count_posted(spawn, ID, byte_size(Serialized), Opts),
             funded(true),
             ok = hb_store:write(store(Opts), #{ Marker => <<"posted">> }, Opts),
             ok = hb_store:flush(store(Opts), Opts);
@@ -413,7 +417,7 @@ post_window(ProcID, First, Max, #{ mode := Mode, window_bytes := Bytes, opts := 
         case post(Serialized, Opts) of
             ok ->
                 ok = mark_posted(ProcID, First, Opts),
-                count_posted(Mode, byte_size(Serialized), Opts),
+                count_posted(Mode, ProcID, byte_size(Serialized), Opts),
                 {ok, Last};
             Error -> Error
         end
@@ -962,9 +966,11 @@ unfunded_backs_off_test() ->
     ?assertEqual(900000, refused_wait(<<"p">>, Refusal(402, []), 1000, Opts)),
     ?assertMatch(#{ funded := false }, status()),
     ?assertEqual(7000, refused_wait(<<"p">>, Refusal(503, [{<<"Retry-After">>, <<"7">>}]), 1000, Opts)),
-    count_posted(full, 1 bsl 30, Opts),
+    P = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    count_posted(full, P, 1 bsl 30, Opts),
     funded(true),
-    #{ funded := true, posted := #{ full := #{ bytes := B, usd_per_day := Usd } } } = status(),
+    #{ funded := true, posted := #{ full := #{ bytes := B, usd_per_day := Usd } },
+       processes := #{ P := #{ bytes := B, mode := full } } } = status(),
     ?assertEqual(1 bsl 30, B),
     % A GiB taken within the first hour counts as a day's worth 24 times.
     ?assert(Usd > 47.29 * 23).
