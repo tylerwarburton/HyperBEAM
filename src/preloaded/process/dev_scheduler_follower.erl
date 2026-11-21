@@ -168,7 +168,7 @@ ensure(P, S, Opts) ->
 follow(P, S, Opts) ->
     Cfg = hb_opts:get(<<"scheduler-admission">>, #{}, Opts),
     Url = hb_maps:get(<<"location">>, dev_scheduler_admission:peer(S, Opts), undefined, Opts),
-    Dir = hb_util:bin(hb_maps:get(<<"replica-dir">>, Cfg, <<"admission-replica">>, Opts)),
+    Dir = hb_util:bin(hb_maps:get(<<"replica-dir">>, Cfg, replica_dir(Opts), Opts)),
     Ms = fun(Key, Default) -> hb_util:int(hb_maps:get(Key, Cfg, Default, Opts)) end,
     Indexed = indexed(P, Opts),
     loop(#{ p => hb_util:human_id(P), s => S, url => Url, dir => Dir, opts => Opts,
@@ -179,6 +179,23 @@ follow(P, S, Opts) ->
         gateways => gateways(Opts), archive_at => now_ms(),
         indexed => Indexed, wanted => Indexed, windows => [],
         progress => {now_ms(), Indexed, undefined} }).
+
+%% @doc Where replicas live by default: `admission-replica' beside the
+%% node's first LMDB store, on the store volume. Relative to the working
+%% directory it sat in the container's writable layer: 32 GB on paralith,
+%% recomputed from slot 0 on every container recreate (audit 2026-11-21).
+replica_dir(Opts) ->
+    Stores =
+        hb_store:normalize_stores(
+            case hb_opts:get(<<"store">>, [], Opts) of
+                M when is_map(M) -> [M];
+                L when is_list(L) -> L;
+                _ -> []
+            end),
+    case [ N || #{ <<"store-module">> := hb_store_lmdb, <<"name">> := N } <- Stores ] of
+        [Name | _] -> filename:join(filename:dirname(hb_util:bin(Name)), <<"admission-replica">>);
+        [] -> <<"admission-replica">>
+    end.
 
 %% @doc The gateways the follower reads Arweave from, in order of preference:
 %% `scheduler-follower-gateways', else `scheduler-upload-gateway', else
@@ -299,7 +316,11 @@ pass(F = #{ p := P, url := Url, dir := Dir, opts := Opts, indexed := Indexed }) 
         lib_bridge_replica:load(P, Url, Opts, Dir, keep)),
     case R of
         #{ slot := Top } when Top > Indexed ->
-            prune(index(Indexed + 1, Top, R, with_windows(F, now_ms())));
+            F2 = prune(index(Indexed + 1, Top, R, with_windows(F, now_ms()))),
+            % Every slot computed is indexed: keep only the head and the
+            % newest snapshots of the replica's computed states.
+            ok = lib_bridge_replica:prune(R),
+            F2;
         _ -> F
     end.
 
