@@ -29,10 +29,23 @@
 %%% cannot make the node keep its history. `keep-seconds' 0 is the floor of
 %%% the newest checkpoints alone.
 %%%
-%%% Every snapshot checkpoint is kept, at any age: its `s' marker and its
-%%% state row are never deleted, so every process can still be resumed from
-%%% any snapshot it ever took. Only the slots between them, which a worker
-%%% recomputes from a snapshot, age out.
+%%% A full-state process's default is `store-retention-full-keep-seconds'
+%%% (3,600: one hour, or `keep-seconds' when that is less) instead: each of
+%%% its slots is a whole state.
+%%%
+%%% Snapshot checkpoints below the floor are thinned, not kept forever:
+%%% besides the `store-retention-checkpoints' newest, a process keeps the
+%%% oldest snapshot of each of the newest N buckets of every tier in
+%%% `store-retention-checkpoint-tiers' (a list of `[BucketSeconds, N]';
+%%% default `[[3600, 24], [86400, 7], [604800, 52]]': hourly for a day,
+%%% daily for a week, weekly for a year), and every snapshot whose time
+%%% cannot be read. The oldest of a bucket stays the oldest as time passes,
+%%% so what a run keeps is never deleted by the next until its bucket ages
+%%% out. A slot whose state is gone is rebuilt on request by replay from the
+%%% nearest kept snapshot below it, or from the process's definition
+%%% (`dev_process'): a process is its definition and its ordered messages,
+%%% and those are never deleted here. An empty tier list keeps only the
+%%% newest snapshots (a bridge replica's computed store, `lib_bridge_replica').
 %%%
 %%% A delta process (`lua-patch', `lua-atomic') loses every other row below
 %%% its floor, top-down: the highest slot first, and within a slot the `s' marker
@@ -85,8 +98,13 @@
 -define(NS, <<"pstate">>).
 %% States a full-state process keeps besides its snapshot checkpoints.
 -define(RECENT, 32).
-%% How long every slot is kept by default: three days.
--define(KEEP_SECONDS, 259200).
+%% How long every slot is kept by default: a day, and an hour for a
+%% full-state process, whose every slot is a whole state.
+-define(KEEP_SECONDS, 86400).
+-define(FULL_KEEP_SECONDS, 3600).
+%% Snapshot checkpoints kept below the floor: the oldest of each hour for a
+%% day, of each day for a week, of each week for a year.
+-define(TIERS, [[3600, 24], [86400, 7], [604800, 52]]).
 %% A timestamp below this is in seconds (an Arweave block's, which the
 %% `arweave-scheduler@1.0' stamps its assignments with), not milliseconds:
 %% 10^11 is 1973 in milliseconds and the year 5138 in seconds.
@@ -195,12 +213,15 @@ safe_retain(Opts, Swept) ->
 %% the same after this run.
 retain(Opts) -> retain(Opts, #{}).
 retain(Opts, Swept0) ->
-    case {delete_supported(), policy(Opts)} of
-        {false, _} -> #{ status => no_delete_primitive, deleted => 0 };
-        {true, {error, Reason}} ->
+    case {delete_supported(), policy(Opts), tiers(Opts)} of
+        {false, _, _} -> #{ status => no_delete_primitive, deleted => 0 };
+        {true, {error, Reason}, _} ->
             ?event(error, {store_retention_refused, {invalid_policy, Reason}}),
             #{ status => invalid_policy, error => Reason, deleted => 0 };
-        {true, {ok, _}} ->
+        {true, _, {error, Reason}} ->
+            ?event(error, {store_retention_refused, {invalid_checkpoint_tiers, Reason}}),
+            #{ status => invalid_checkpoint_tiers, error => Reason, deleted => 0 };
+        {true, {ok, _}, {ok, _}} ->
             Start = erlang:monotonic_time(millisecond),
             Store = store(Opts),
             ok = hb_store:start([Store], #{}, Opts),
@@ -250,10 +271,17 @@ retain(Opts, Swept0) ->
 %% The run's settings.
 config(Opts) ->
     {ok, Policy} = policy(Opts),
+    {ok, Tiers} = tiers(Opts),
+    KeepSecs = max(0, int(<<"store-retention-keep-seconds">>, ?KEEP_SECONDS, Opts)),
     #{
         keep => max(1, int(<<"store-retention-checkpoints">>, 2, Opts)),
         recent => max(1, int(<<"store-retention-recent-slots">>, ?RECENT, Opts)),
-        keep_seconds => max(0, int(<<"store-retention-keep-seconds">>, ?KEEP_SECONDS, Opts)),
+        keep_seconds => KeepSecs,
+        % Never longer than the node's `keep-seconds' unless set.
+        full_keep_seconds =>
+            max(0, int(<<"store-retention-full-keep-seconds">>,
+                min(KeepSecs, ?FULL_KEEP_SECONDS), Opts)),
+        tiers => Tiers,
         policy => Policy,
         now => erlang:system_time(millisecond),
         opts => Opts
@@ -294,8 +322,28 @@ policy_entry(#{ <<"process">> := P, <<"keep-seconds">> := N }) when ?IS_ID(P) ->
     end;
 policy_entry(_) -> error.
 
-keep_seconds(P, #{ policy := Policy, keep_seconds := Default }) ->
+keep_seconds(P, true, #{ policy := Policy, keep_seconds := Default }) ->
+    maps:get(P, Policy, Default);
+keep_seconds(P, false, #{ policy := Policy, full_keep_seconds := Default }) ->
     maps:get(P, Policy, Default).
+
+%% @doc The snapshot tiers, `store-retention-checkpoint-tiers': a list of
+%% `[BucketSeconds, Buckets]', both positive integers. Anything else is an
+%% error, and a run with invalid tiers deletes nothing.
+tiers(Opts) ->
+    case hb_opts:get(<<"store-retention-checkpoint-tiers">>, ?TIERS, Opts) of
+        L when is_list(L) ->
+            try [ [hb_util:int(W), hb_util:int(N)] || [W, N] <- L ] of
+                Tiers when length(Tiers) =:= length(L) ->
+                    case lists:all(fun([W, N]) -> W > 0 andalso N > 0 end, Tiers) of
+                        true -> {ok, Tiers};
+                        false -> {error, {not_positive, L}}
+                    end;
+                _ -> {error, {not_pairs, L}}
+            catch _:_ -> {error, {not_integers, L}}
+            end;
+        Other -> {error, {not_a_list, Other}}
+    end.
 
 %% @doc The keys of one process to delete, in the order to delete them. With
 %% a `Keep' and `Recent' count it plans as a node with no age floor
@@ -321,21 +369,25 @@ plan(Store, P, Keep, Recent) ->
 %% snapshot markers whose time could not be read, and `{ok, Floor}' when the
 %% walk finished (`halted' when `Fun' stopped it).
 walk(Store, P, Cfg0, Fun, Acc0) ->
-    Cfg = Cfg0#{ keep_seconds := keep_seconds(P, Cfg0) },
+    Delta = list_page(Store, prefix(P, <<"d">>), none, asc, 1) =/= [],
+    Cfg = Cfg0#{ keep_seconds := keep_seconds(P, Delta, Cfg0) },
     Snaps = lists:reverse(slots(Store, P, <<"s">>)),
     {Floor, Unreadable} = floor(Store, P, Snaps, Cfg),
+    Kept = thin(Store, P, Snaps, Cfg),
+    Bottom = maps:get(P, maps:get(swept, Cfg, #{}), 0),
     Rule =
         keep_snapshots(
-            case list_page(Store, prefix(P, <<"d">>), none, asc, 1) of
-                [] -> full_rule(Store, P, Snaps, Floor, Cfg);
-                _ -> delta_rule(Store, P, Floor)
+            case Delta of
+                false -> full_rule(Store, P, Snaps, Floor, Cfg);
+                true -> delta_rule(Store, P, Floor)
             end,
-            Snaps,
-            maps:get(P, maps:get(swept, Cfg, #{}), 0)),
+            Kept,
+            Bottom),
     Newest = maps:from_list(
         [ {K, case rows_desc(Store, P, K, 1) of [N] -> N; [] -> -1 end}
         || K <- [<<"d">>, <<"f">>, <<"o">>] ]),
-    case Fun(delivered(Store, P, Rule, Newest), Acc0) of
+    case Fun(thinned(Store, P, Snaps, Kept, Bottom, Newest)
+            ++ delivered(Store, P, Rule, Newest), Acc0) of
         {halt, Acc} -> {Acc, Unreadable, halted};
         {cont, Acc} ->
             case zone(Store, P, Rule, Newest, maps:get(start, Rule), Fun, Acc) of
@@ -344,11 +396,10 @@ walk(Store, P, Cfg0, Fun, Acc0) ->
             end
     end.
 
-%% Every snapshot checkpoint stays, at any age: its marker and its state.
-%% Below `Bottom' (the floor of the last finished walk) nothing else is
-%% left, so the walk ends there.
-keep_snapshots(Rule = #{ keep := Keep }, Snaps, Bottom) ->
-    Snap = maps:from_list([ {S, true} || S <- Snaps ]),
+%% The snapshot checkpoints `thin/4' keeps stay, at any age: their markers
+%% and their states. Below `Bottom' (the floor of the last finished walk)
+%% nothing else is left, so the walk ends there.
+keep_snapshots(Rule = #{ keep := Keep }, Snap, Bottom) ->
     Rule#{
         bottom => Bottom,
         keep =>
@@ -356,6 +407,38 @@ keep_snapshots(Rule = #{ keep := Keep }, Snaps, Bottom) ->
                (K, S) -> Keep(K, S)
             end
     }.
+
+%% The snapshot checkpoints to keep below the floor, as a map of slots: the
+%% `Keep' newest, the oldest of each of the newest buckets of every tier,
+%% and any whose time cannot be read (fail closed). The rest go.
+thin(Store, P, Snaps, #{ keep := Keep, tiers := Tiers, now := Now, opts := Opts }) ->
+    {Newest, Older} = lists:split(min(Keep, length(Snaps)), Snaps),
+    Timed = [ {S, snapshot_time(Store, P, S, Opts)} || S <- Older ],
+    Dated = [ {S, Ms} || {S, {ok, Ms}} <- Timed ],
+    Picked =
+        lists:flatmap(
+            fun([Secs, N]) ->
+                Width = Secs * 1000,
+                Oldest =
+                    lists:foldl(
+                        fun({S, Ms}, M) ->
+                            maps:update_with(Ms div Width, fun(S0) -> min(S0, S) end, S, M)
+                        end,
+                        #{},
+                        [ D || D = {_, Ms} <- Dated, Ms div Width > Now div Width - N ]),
+                maps:values(Oldest)
+            end,
+            Tiers),
+    maps:from_list([ {S, true} || S <- Newest ++ [ S || {S, error} <- Timed ] ++ Picked ]).
+
+%% The rows of the snapshots below `Bottom' that `thin/4' no longer keeps,
+%% highest slot first, each slot's rows in the order `window/6' gives
+%% them. Above `Bottom' the walk itself finds them.
+thinned(Store, P, Snaps, Kept, Bottom, Newest) ->
+    Gone = #{ keep => fun(_, _) -> false end },
+    lists:flatmap(
+        fun(S) -> window(Store, P, Gone, Newest, S, S) end,
+        [ S || S <- Snaps, S < Bottom, not is_map_key(S, Kept) ]).
 
 %% The floor: the newest snapshot checkpoint whose assignment is at least
 %% `keep-seconds' old, and never above the `Keep'-th newest one, which stays
@@ -416,9 +499,11 @@ marker_time(Marker) ->
 assignment_time(P, S, Opts) ->
     Store = hb_opts:get(scheduler_store, hb_opts:get(store, no_viable_store, Opts), Opts),
     Path = <<"~scheduler@1.0/assignments/", P/binary, "/", (integer_to_binary(S))/binary>>,
-    try hb_cache:read(Path, Opts#{ <<"store">> => Store }) of
-        {ok, Assignment} -> assignment_ms(Assignment, Opts);
-        _ -> error
+    try
+        case hb_cache:read(Path, Opts#{ <<"store">> => Store }) of
+            {ok, Assignment} -> assignment_ms(Assignment, Opts);
+            _ -> error
+        end
     catch _:_ -> error
     end.
 
@@ -966,15 +1051,18 @@ blob(Term) -> term_to_binary({1, Term}, [{compressed, 1}]).
 new_pid() -> hb_util:human_id(crypto:strong_rand_bytes(32)).
 
 %% The floor a process was left with: the checkpoint below its lowest delta,
-%% after checking that every snapshot checkpoint (marker and state) is still
-%% there, at any age, and that it is one unbroken run from the floor to the
-%% head -- every delta above the floor kept, none below it.
+%% after checking that every snapshot checkpoint kept has both its marker and
+%% its state, that the floor is one of them, and that it is one unbroken run
+%% from the floor to the head -- every delta above the floor kept, none below
+%% it. Which snapshots below the floor stay is `thin/4''s (`thin_test').
 floor_of(Store, P, Head) ->
     Points = lists:seq(0, Head - 5, 10),
-    ?assertEqual(Points, slots(Store, P, <<"s">>)),
-    ?assertEqual(Points, slots(Store, P, <<"f">>)),
+    Snaps = slots(Store, P, <<"s">>),
+    ?assertEqual(Snaps, slots(Store, P, <<"f">>)),
+    ?assertEqual([], Snaps -- Points),
     [Lowest | _] = slots(Store, P, <<"d">>),
     Floor = Lowest - 1,
+    ?assert(lists:member(Floor, Snaps)),
     ?assertEqual([ S || S <- lists:seq(Floor + 1, Head), S rem 10 =/= 0 ], slots(Store, P, <<"d">>)),
     Floor.
 
@@ -989,7 +1077,7 @@ floor_after(Ages, Opts) ->
     floor_of(Store, P, Head).
 
 %% @doc The floor is the newest checkpoint at least `keep-seconds' old: every
-%% slot younger than that stays. The default is three days.
+%% slot younger than that stays. The default is a day.
 age_floor_test() ->
     Hours = [6, 5, 4, 3, 2, 1],
     Ages = [ H * ?HOUR || H <- Hours ],
@@ -998,8 +1086,62 @@ age_floor_test() ->
     % Nothing old enough: nothing goes.
     ?assertEqual(0, floor_after(Ages, #{ <<"store-retention-keep-seconds">> => 7 * ?HOUR })),
     Days = [ D * 24 * ?HOUR || D <- [5, 4, 3, 2, 1, 0] ],
-    ?assertEqual(20, floor_after(Days, #{})),
-    ?assertEqual(20, floor_after(Days ++ [0, 0], #{})).
+    ?assertEqual(40, floor_after(Days, #{})),
+    ?assertEqual(40, floor_after(Days ++ [0, 0], #{})).
+
+%% @doc Below the floor, snapshots are thinned by the checkpoint tiers: the
+%% newest `Keep', the oldest of each recent bucket of each tier, and any
+%% whose time cannot be read. Times are fixed here (12:30 on some day).
+thin_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb, <<"ret-thin">>),
+    ok = hb_store:start([Store], #{}, #{}),
+    P = new_pid(),
+    Day = 86400000, Hour = 3600000, Min = 60000,
+    Now = (1800000000000 div Day) * Day + 12 * Hour + 30 * Min,
+    At = #{ 0 => Now - 10 * Day,         % beyond every tier: goes
+            10 => Now - 3 * Day,         % oldest of its day: stays
+            20 => Now - 3 * Day + Hour,  % same day, not the oldest: goes
+            25 => legacy,                % cannot be dated: stays
+            30 => Now - 5 * Hour,        % oldest of its hour: stays
+            40 => Now - 5 * Hour + 10 * Min, % same hour: goes
+            50 => Now - Hour,            % oldest of its hour: stays
+            60 => Now - 10 * Min,        % newest two: stay
+            70 => Now - Min },
+    ok = hb_store:write([Store], maps:from_list(
+        [ {key(P, <<"s">>, S), case T of legacy -> <<>>; _ -> blob(#{ <<"timestamp">> => T }) end}
+        || {S, T} <- maps:to_list(At) ]), #{}),
+    Snaps = lists:reverse(slots(Store, P, <<"s">>)),
+    Kept = thin(Store, P, Snaps, #{ keep => 2, tiers => [[3600, 24], [86400, 7]],
+                                    now => Now, opts => #{ <<"store">> => [Store] } }),
+    ?assertEqual([10, 25, 30, 50, 60, 70], lists:sort(maps:keys(Kept))),
+    % No tiers: the newest two, and what cannot be dated.
+    ?assertEqual([25, 60, 70], lists:sort(maps:keys(thin(Store, P, Snaps,
+        #{ keep => 2, tiers => [], now => Now, opts => #{ <<"store">> => [Store] } })))).
+
+%% @doc A run deletes the snapshots the tiers no longer keep, also below the
+%% floor of its last finished walk (which it otherwise never lists), marker
+%% before state; the tiers must be well formed or nothing is deleted.
+thinned_below_swept_floor_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb, <<"ret-thinned">>),
+    ok = hb_store:start([Store], #{}, #{}),
+    P = new_pid(),
+    Head = age_layout(Store, P, lists:duplicate(6, 0)),
+    % As an earlier walk that finished at 40 left it: only snapshots below.
+    {ok, _} = elmdb:delete_batch(maps:get(<<"db">>, hb_store:find(Store)),
+        [ key(P, <<"d">>, S) || S <- lists:seq(1, 39), S rem 10 =/= 0 ]),
+    Opts = #{ <<"store">> => [Store], <<"store-retention-keep-seconds">> => 0,
+              <<"store-retention-checkpoint-tiers">> => [[3600, 24]] },
+    ?assertMatch(#{ status := invalid_checkpoint_tiers, deleted := 0 },
+        retain(Opts#{ <<"store-retention-checkpoint-tiers">> => [[0, 1]] })),
+    ?assertEqual(lists:seq(0, 50, 10), slots(Store, P, <<"s">>)),
+    % The walk stops at 40, yet the snapshots below it that one hourly
+    % bucket does not keep go: all made in the same instant, the oldest of
+    % them (0) stays, with the newest two.
+    #{ swept := Swept } = retain(Opts, #{ P => 40 }),
+    ?assertEqual([0, 40, 50], slots(Store, P, <<"s">>)),
+    ?assertEqual([0, 40, 50], slots(Store, P, <<"f">>)),
+    ?assertEqual(40, floor_of(Store, P, Head)),
+    ?assertMatch(#{ deleted := 0 }, retain(Opts, Swept)).
 
 %% @doc The newest `store-retention-checkpoints' checkpoints stay whatever
 %% their age: the floor is never above the `Keep'-th newest.
