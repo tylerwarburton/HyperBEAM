@@ -32,7 +32,13 @@ test_store(Mod, Tag) ->
             (hb_util:encode(crypto:strong_rand_bytes(6)))/binary
         >>,
     filelib:ensure_dir(binary_to_list(TestDir)),
-    #{ <<"store-module">> => Mod, <<"name">> => TestDir }.
+    Store = #{ <<"store-module">> => Mod, <<"name">> => TestDir },
+    % Hundreds of isolated test environments must fit in one VM's virtual
+    % address space; production's multi-terabyte default is not a test size.
+    case Mod of
+        hb_store_lmdb -> Store#{ <<"capacity">> => 1024 * 1024 * 1024 };
+        _ -> Store
+    end.
 
 %% @doc Return the URI of the committer of an Arweave wallet's key.
 committer(Wallet) ->
