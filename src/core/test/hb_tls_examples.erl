@@ -27,10 +27,13 @@ certificate_file() ->
     {ok, {_, GuardPort}} = inet:sockname(Guard),
     try
         URL = hb_http_server:start_node(Opts),
-        {ok, CSRReply} = hb_http:get(URL, <<
-            "/~tls@1.0/csr?domains%2Blist="
-            "%5C%22localhost%5C%22,%20%5C%22*.localhost%5C%22"
-        >>, #{}),
+        {ok, DirectCSR} = hb_ao:resolve(#{ <<"device">> => <<"tls@1.0">> },
+            #{<<"path">> => <<"csr">>,
+              <<"domains">> => [<<"localhost">>, <<"*.localhost">>]}, Opts),
+        verify_csr(hb_maps:get(<<"body">>, DirectCSR), Wallet),
+        {ok, CSRReply} = hb_http:get(URL,
+            #{<<"path">> => <<"/~tls@1.0/csr">>,
+              <<"domains">> => [<<"localhost">>, <<"*.localhost">>]}, #{}),
         PEM = hb_maps:get(<<"body">>, CSRReply),
         verify_csr(PEM, Wallet),
         ?assertMatch({error, #{ <<"status">> := 400 }},
@@ -120,7 +123,7 @@ verify_csr(PEM, #{ <<"type">> := Type, <<"owner">> := N }) ->
         publicExponent = E,
         modulus = binary:decode_unsigned(N)
     },
-    {ok, EncodedInfo} = 'PKCS-10':encode('CertificationRequestInfo', Info),
+    EncodedInfo = public_key:der_encode('CertificationRequestInfo', Info),
     ?assert(public_key:verify(EncodedInfo, sha256,
         CSR#'CertificationRequest'.signature, PublicKey)),
     SPKI = Info#'CertificationRequestInfo'.subjectPKInfo,

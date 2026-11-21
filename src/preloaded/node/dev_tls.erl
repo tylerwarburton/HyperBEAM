@@ -82,7 +82,11 @@ csr(_Base, Request, Opts) ->
             ])
         }}
     catch
-        _:_ -> {error, #{
+        Class:_Reason:Stack ->
+            ?event(warning, {tls_csr_failed, Class,
+                [{M, F, case A of N when is_integer(N) -> N; _ -> length(A) end}
+                    || {M, F, A, _} <- Stack]}),
+            {error, #{
             <<"status">> => 400,
             <<"body">> => <<"CSR requires domain names and an RSA node wallet.">>
         }}
