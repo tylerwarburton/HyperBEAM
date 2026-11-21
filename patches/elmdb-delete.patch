@@ -1,0 +1,237 @@
+diff -ruN a/native/elmdb_nif/src/lib.rs b/native/elmdb_nif/src/lib.rs
+--- a/native/elmdb_nif/src/lib.rs	2026-10-27 11:52:47.175977600 -0400
++++ b/native/elmdb_nif/src/lib.rs	2026-10-27 11:52:47.241436300 -0400
+@@ -177,10 +177,13 @@
+ 
+ type OverlayMap = SccHashMap<Vec<u8>, Vec<u8>, ahash::RandomState>;
+ type FlushSyncState = Arc<(Mutex<Option<Result<(), String>>>, Condvar)>;
++type DeleteSyncState = Arc<(Mutex<Option<Result<usize, String>>>, Condvar)>;
+ 
+ enum WorkerCommand {
+     Flush,
+     FlushSync(FlushSyncState),
++    /// Commit the overlay and delete the keys in the same write transaction.
++    Delete(Vec<Vec<u8>>, DeleteSyncState),
+     Shutdown,
+ }
+ 
+@@ -538,6 +541,79 @@
+     }
+ }
+ 
++/// Commit the overlay, then delete `keys`, in one write transaction. A put to
++/// one of the keys that returned before the delete was sent is committed and
++/// then deleted, never resurrected by a later flush. Absent keys are skipped.
++/// Any failure aborts the transaction (nothing is deleted) and puts the
++/// overlay back, as a failed flush does. Returns the number of keys deleted.
++fn do_flush_delete(db: &LmdbDatabase, keys: &[Vec<u8>]) -> Result<usize, String> {
++    let new_map = Arc::new(new_overlay_map());
++    let old_map = db.active.load_full();
++    db.draining.store(Arc::new(Some(old_map.clone())));
++    db.active.store(new_map);
++    let _ = db.op_count.swap(0, Ordering::AcqRel);
++
++    if let Err(e) = db.env.reopen_if_replaced() {
++        restore_failed_flush(db, old_map);
++        return Err(e);
++    }
++
++    let (live_env, live_db) = match db.fast_get_handles() {
++        Ok(handles) => handles,
++        Err(e) => {
++            restore_failed_flush(db, old_map);
++            return Err(e);
++        }
++    };
++
++    let mut txn = match live_env.begin_rw_txn() {
++        Ok(txn) => txn,
++        Err(_) => {
++            restore_failed_flush(db, old_map);
++            return Err("Failed to begin write transaction".to_string());
++        }
++    };
++
++    let mut write_err = None;
++    (*old_map).iter_sync(|k, v| {
++        if let Err(e) = txn.put(live_db, k, v, WriteFlags::empty()) {
++            write_err = Some(format!("Failed to put value: {:?}", e));
++            return false;
++        }
++        true
++    });
++    let mut deleted = 0usize;
++    if write_err.is_none() {
++        for key in keys {
++            match txn.del(live_db, key, None) {
++                Ok(()) => deleted += 1,
++                Err(lmdb::Error::NotFound) => {}
++                Err(e) => {
++                    write_err = Some(format!("Failed to delete key: {:?}", e));
++                    break;
++                }
++            }
++        }
++    }
++
++    if let Some(e) = write_err {
++        drop(txn);
++        restore_failed_flush(db, old_map);
++        return Err(e);
++    }
++
++    match txn.commit() {
++        Ok(()) => {
++            db.draining.store(Arc::new(None));
++            Ok(deleted)
++        }
++        Err(e) => {
++            restore_failed_flush(db, old_map);
++            Err(format!("Failed to commit delete transaction: {}", e))
++        }
++    }
++}
++
+ fn restore_failed_flush(db: &LmdbDatabase, failed_map: Arc<OverlayMap>) {
+     let current = db.active.load();
+     let mut count = 0usize;
+@@ -552,8 +628,14 @@
+ 
+ fn drain_remaining_sync_waiters(rx: &Receiver<WorkerCommand>, fatal_error: Option<String>) {
+     while let Ok(cmd) = rx.try_recv() {
++        let err_msg = fatal_error.clone().unwrap_or_else(|| "Worker shut down".to_string());
+         if let WorkerCommand::FlushSync(signal) = cmd {
+-            let err_msg = fatal_error.clone().unwrap_or_else(|| "Worker shut down".to_string());
++            let (lock, cvar) = &*signal;
++            if let Ok(mut guard) = lock.lock() {
++                *guard = Some(Err(err_msg));
++            }
++            cvar.notify_all();
++        } else if let WorkerCommand::Delete(_, signal) = cmd {
+             let (lock, cvar) = &*signal;
+             if let Ok(mut guard) = lock.lock() {
+                 *guard = Some(Err(err_msg));
+@@ -602,6 +684,28 @@
+                     break;
+                 }
+             }
++            Ok(WorkerCommand::Delete(keys, signal)) => {
++                db.flush_pending.store(false, Ordering::Release);
++                let result = do_flush_delete(&db, &keys);
++                let failed = result.as_ref().err().cloned();
++                if let Some(ref e) = failed {
++                    if let Ok(mut guard) = db.fatal_error.lock() {
++                        *guard = Some(e.clone());
++                    }
++                    db.has_fatal_error.store(true, Ordering::Release);
++                    exit_error = Some(e.clone());
++                }
++                {
++                    let (lock, cvar) = &*signal;
++                    if let Ok(mut guard) = lock.lock() {
++                        *guard = Some(result);
++                    }
++                    cvar.notify_all();
++                }
++                if failed.is_some() {
++                    break;
++                }
++            }
+             Ok(WorkerCommand::Shutdown) => {
+                 let result = do_flush(&db);
+                 if let Err(e) = result {
+@@ -647,6 +751,33 @@
+     result.take().unwrap()
+ }
+ 
++fn delete_sync(db_handle: &LmdbDatabase, keys: Vec<Vec<u8>>) -> Result<usize, String> {
++    let signal: DeleteSyncState = Arc::new((Mutex::new(None), Condvar::new()));
++    {
++        let tx = db_handle
++            .worker_tx
++            .lock()
++            .map_err(|_| "Failed to lock worker channel".to_string())?;
++        if let Some(ref sender) = *tx {
++            sender
++                .send(WorkerCommand::Delete(keys, signal.clone()))
++                .map_err(|_| "Worker thread is gone".to_string())?;
++        } else {
++            return Err("Worker thread is not running".to_string());
++        }
++    }
++    let (lock, cvar) = &*signal;
++    let mut result = lock
++        .lock()
++        .map_err(|_| "Failed to lock signal".to_string())?;
++    while result.is_none() {
++        result = cvar
++            .wait(result)
++            .map_err(|_| "Condvar wait failed".to_string())?;
++    }
++    result.take().unwrap()
++}
++
+ fn spawn_worker(resource: &ResourceArc<LmdbDatabase>) -> (Sender<WorkerCommand>, JoinHandle<()>) {
+     let (tx, rx) = mpsc::channel();
+     let worker_resource = resource.clone();
+@@ -1316,6 +1447,31 @@
+         Err(error_msg) => {
+             Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env))
+         }
++    }
++}
++
++/// Delete keys in one write transaction, after committing the overlay.
++/// Returns `{ok, Deleted}` with the number of keys that existed.
++#[rustler::nif(schedule = "DirtyIo")]
++fn delete_batch<'a>(
++    env: Env<'a>,
++    db_handle: ResourceArc<LmdbDatabase>,
++    keys: Vec<Binary>,
++) -> NifResult<Term<'a>> {
++    if let Err(error_msg) = db_handle.validate_database() {
++        return Ok((atoms::error(), atoms::database_error(), error_msg).encode(env));
++    }
++    if db_handle.has_fatal_error.load(Ordering::Relaxed) {
++        return Ok((atoms::error(), atoms::transaction_error(),
++                   "The database failed an earlier commit".to_string()).encode(env));
++    }
++    let key_vecs: Vec<Vec<u8>> = keys.iter().map(|k| k.as_slice().to_vec()).collect();
++    ensure_worker(&db_handle);
++    match delete_sync(&db_handle, key_vecs) {
++        Ok(n) => Ok((atoms::ok(), n).encode(env)),
++        Err(error_msg) => {
++            Ok((atoms::error(), atoms::transaction_error(), error_msg).encode(env))
++        }
+     }
+ }
+ 
+diff -ruN a/src/elmdb.erl b/src/elmdb.erl
+--- a/src/elmdb.erl	2026-10-27 11:52:47.177483300 -0400
++++ b/src/elmdb.erl	2026-10-27 11:52:47.241436300 -0400
+@@ -17,6 +17,9 @@
+ %% Key-value operations
+ -export([put/3, put_batch/2, get/2, flush/1]).
+ 
++%% Deletes
++-export([delete_batch/2]).
++
+ %% Diagnostics
+ -export([overlay_count/1]).
+ 
+@@ -334,6 +337,15 @@
+ flush(_DBInstance) ->
+     erlang:nif_error(nif_not_loaded).
+ 
++%% @doc Delete keys in one write transaction. The write worker first commits
++%% the overlay, so a put that returned before this call is committed and then
++%% deleted, not resurrected by a later flush. Absent keys are skipped.
++%% @returns `{ok, Deleted}' with the number of keys that existed.
++-spec delete_batch(DBInstance :: term(), Keys :: [binary()]) ->
++    {ok, non_neg_integer()} | {error, term(), term()}.
++delete_batch(_DBInstance, _Keys) ->
++    erlang:nif_error(nif_not_loaded).
++
+ %% @doc Return the number of entries in the write overlay (diagnostic)
+ -spec overlay_count(DBInstance :: term()) -> non_neg_integer().
+ overlay_count(_DBInstance) ->

@@ -48,9 +48,21 @@ read(BaseStoreOpts, #{ <<"read">> := Key }, NodeOpts) ->
                 {error, not_found} ->
                     ?event({gateway_read, {opts, StoreOpts}, {id, ID}, {subpath, Rest}}),
                     try hb_client_gateway:read(ID, GatewayReadOpts) of
-                        {error, _} ->
-                            ?event({read_not_found, {key, ID}}),
-                            {error, not_found};
+                        {error, Reason} ->
+                            Report =
+                                hb_opts:get(
+                                    <<"gateway-report-unavailable">>,
+                                    false,
+                                    NodeOpts
+                                ),
+                            case Report =/= true orelse is_miss(Reason) of
+                                true ->
+                                    ?event({read_not_found, {key, ID}}),
+                                    {error, not_found};
+                                false ->
+                                    ?event(gateway, {read_unavailable, {key, ID}}),
+                                    {error, gateway_unavailable}
+                            end;
                         {ok, Message} ->
                             ?event({read_found, {key, ID}}),
                             hb_store_remote_node:maybe_cache(StoreOpts, Message),
@@ -77,6 +89,18 @@ read(BaseStoreOpts, #{ <<"read">> := Key }, NodeOpts) ->
             ?event({ignoring_non_id, Key}),
             {error, not_found}
     end.
+
+%% @doc Whether a failed gateway read is a real miss: the gateway answered and
+%% had no such item, or there is no gateway to ask. A request that failed, timed
+%% out or got an error status is not a miss. Every failed read is
+%% `{error, not_found}', except that a caller that remembers misses (only
+%% `dev_push') sets `gateway-report-unavailable' on its read and then gets
+%% `{error, gateway_unavailable}' for one that is not a miss.
+is_miss(not_found) -> true;
+is_miss({no_viable_route, _, _}) -> true;
+is_miss({no_viable_responses, Responses = [_ | _]}) ->
+    lists:all(fun({ok, Res}) -> is_map(Res); (_) -> false end, Responses);
+is_miss(_) -> false.
 
 %% @doc Normalize the routes in the given `Opts`.
 opts(Opts) ->
@@ -448,6 +472,18 @@ external_http_access_test() ->
 %             ),
 %         ?assertMatch(#{ <<"assignments">> := _ }, X)
 %     end}.
+
+%% @doc A gateway that cannot be reached reads as not found, as before, for
+%% every caller but one that asks with `gateway-report-unavailable'.
+unreachable_gateway_reads_not_found_test() ->
+    Opts = #{ <<"store">> => [#{ <<"store-module">> => hb_store_gateway,
+        <<"node">> => <<"http://127.0.0.1:1">>, <<"node-type">> => <<"ao">> }] },
+    ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ?assertEqual({error, not_found}, hb_cache:read(ID, Opts)),
+    ?assertEqual(
+        {error, gateway_unavailable},
+        hb_cache:read(ID, Opts#{ <<"gateway-report-unavailable">> => true })
+    ).
 
 %% @doc Test to verify store opts is being set for Data-Protocol ao
 store_opts_test() ->
