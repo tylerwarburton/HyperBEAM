@@ -60,6 +60,7 @@
 -export([read_all_commitments/2]).
 -export([ensure_loaded/1, ensure_loaded/2, ensure_all_loaded/1, ensure_all_loaded/2]).
 -export([read/2, read_resolved/3, write/2, link/3, encode_value/1]).
+-export([packed_links/1]).
 -export([match/2, list/2, list_numbered/2]).
 -export([test_unsigned/1, test_signed/1]).
 -include("include/hb.hrl").
@@ -377,6 +378,12 @@ split_commitments(Msg, Opts) ->
 %% @doc Write a prepared message, with private keys from `RawMsg' for the hook.
 write_prepared(Msg, RawMsg, Opts) ->
     hb_message:paranoid_verify(cache_write, Msg, Opts),
+    case hb_opts:get(<<"cache-pack">>, false, Opts) =:= true andalso is_map(Msg) of
+        true -> write_packed(Msg, Opts);
+        false -> write_linked(Msg, RawMsg, Opts)
+    end.
+
+write_linked(Msg, RawMsg, Opts) ->
     % Conversion writes the children that it links only in `offload' mode.
     Linked =
         case hb_opts:get(<<"linkify-mode">>, offload, Opts) of
@@ -463,6 +470,85 @@ prepare_write(Values, Opts) when is_list(Values) ->
     [ prepare_write(Value, Opts) || Value <- Values ];
 prepare_write(Value, _Opts) -> Value.
 
+%%% Packed messages (`cache-pack').
+%%%
+%%% Written with `cache-pack' true, a message is ONE row at its unsigned ID,
+%%% its children inline: `hbpk1:', a header naming every other ID the row
+%%% answers for (the message's own other IDs, and each child message's IDs
+%%% with the key it is under), then the compressed term of the prepared
+%%% message, every commitment included. Each of those IDs is a row holding
+%%% `ao:<unsigned ID>', so a message and each of its children read by any of
+%%% their IDs, from the one row (`unpack/2'), and the header lets a reader
+%%% such as `hb_store_offsite_journal' find those rows without decoding.
+%%% The scheduler writes each assignment, with its message, this way:
+%%% exploded, they were ~140 rows and ~22 KB on disk for ~4 KB of signed
+%%% bytes. A path below a packed message is not readable on its own; read
+%%% the message.
+
+-define(PACKED, "hbpk1:").
+
+write_packed(Msg, Opts) ->
+    Store = hb_opts:get(store, no_viable_store, Opts),
+    IDOpts = Opts#{ <<"linkify-mode">> => discard },
+    Children =
+        [ {ID, Key}
+        || {Key, Child} <- maps:to_list(Msg),
+           is_map(Child), Key =/= <<"commitments">>, not hb_private:is_private(Key),
+           ID <- message_ids(Child, IDOpts) ],
+    % The IDs, and the `cache-write' hook, from the message's TABM, as for an
+    % exploded write; converted without writing its children.
+    TABM = hb_message:convert(Msg, tabm, <<"structured@1.0">>, IDOpts),
+    {ok, UncommittedID, Ops} =
+        write_message_ops(
+            TABM,
+            fun(ID) -> packed_ops(ID, Msg, Children, Store, Opts) end,
+            IDOpts
+        ),
+    run_write_ops(Store, Ops, Opts),
+    {ok, UncommittedID}.
+
+%% Every ID a message is read by: unsigned, signed and combined.
+message_ids(Msg, IDOpts) ->
+    Unsigned = hb_message:id(Msg, none, IDOpts),
+    {Signed, Others, All} = calculate_all_ids(Msg, Unsigned, IDOpts),
+    lists:usort([Unsigned, All | Signed ++ Others]).
+
+%% The message's row and its children's ID rows, unless the store already
+%% holds it exploded (a process definition is written that way, and is
+%% also the message of its slot 0), or a batch being written holds rows at
+%% or under it (a read of those raises in `hb_store_offsite_journal:hold/3').
+packed_ops(ID, Msg, Children, Store, Opts) ->
+    Held =
+        try hb_store:read(hb_store:scope(Store, local), ID, Opts)
+        catch error:{read_of_held_write, _} -> held
+        end,
+    case Held of
+        {composite, _} -> [];
+        held -> [];
+        _ ->
+            [{write, ID, pack(hb_private:reset(Msg), Children)} |
+                [ {write, CID, <<"ao:", ID/binary>>} || {CID, _} <- Children, CID =/= ID ]]
+    end.
+
+pack(Msg, Children) ->
+    Header = term_to_binary(maps:from_list(Children)),
+    <<?PACKED, (byte_size(Header)):32, Header/binary,
+      (zlib:compress(term_to_binary(Msg)))/binary>>.
+
+%% The message a packed row holds, or the child of it that `Target' names.
+unpack(<<?PACKED, HLen:32, Header:HLen/binary, Z/binary>>, Target) ->
+    Msg = binary_to_term(zlib:uncompress(Z), [safe]),
+    case maps:find(Target, binary_to_term(Header, [safe])) of
+        {ok, Key} -> maps:get(Key, Msg);
+        error -> Msg
+    end.
+
+%% @doc The IDs whose rows a packed row is read through (each holds
+%% `ao:<its unsigned ID>'), or `[]' for any other value.
+packed_links(<<?PACKED, HLen:32, Header:HLen/binary, _/binary>>) ->
+    maps:keys(binary_to_term(Header, [safe]));
+packed_links(_) -> [].
+
 do_write_message(Bin, Store, Opts) when is_binary(Bin) ->
     % Write the binary in the store at its calculated content-hash.
     % Return the path.
@@ -498,6 +584,12 @@ check_key_length(_Key) ->
     ok.
 
 write_message_ops(Msg, Opts) when is_map(Msg) ->
+    write_message_ops(
+        Msg,
+        fun(ID) -> key_ops(ID, maps:without([<<"priv">>], Msg), Opts) end,
+        Opts
+    ).
+write_message_ops(Msg, KeyOpsFun, Opts) when is_map(Msg) ->
     ?event_debug(debug_cache, {writing_message, Msg}),
     UncommittedID =
         hb_message:id(Msg, none, Opts#{ <<"linkify-mode">> => discard }),
@@ -511,7 +603,7 @@ write_message_ops(Msg, Opts) when is_map(Msg) ->
             {original, Msg}
         }
     ),
-    KeyOps = key_ops(UncommittedID, maps:without([<<"priv">>], Msg), Opts),
+    KeyOps = KeyOpsFun(UncommittedID),
     % Create an operation to write `ao:' and the unsigned ID at each of the
     % known alternative IDs for the message (signed IDs, and _other_ non-root
     % IDs). The combined 'all' ID of several signed commitments does not
@@ -645,6 +737,7 @@ is_immediate_value(Value) ->
 %% URI of the binary, escaped by `hb_escape:encode/1'. The gateway and remote
 %% node stores encode the binaries that they return in the same way.
 encode_value(Value = <<"ni:", _/binary>>) -> data_uri(Value);
+encode_value(Value = <<?PACKED, _/binary>>) -> data_uri(Value);
 encode_value(Value = <<"data:", _/binary>>) -> data_uri(Value);
 encode_value(Value) -> Value.
 
@@ -897,6 +990,8 @@ store_read(Target, Path, Store, Opts) ->
         {ok, _ReadTarget, ID, {ok, AOPath = <<"ao://", _/binary>>}}
                 when ?IS_ID(ID) ->
             read_commitments_path(AOPath, Opts);
+        {ok, ReadTarget, _ResolvedFullPath, {ok, Packed = <<?PACKED, _/binary>>}} ->
+            {ok, unpack(Packed, ReadTarget)};
         {ok, _ReadTarget, _ResolvedFullPath, {ok, Value}} ->
             {ok, decode_value(Value)};
         {ok, ReadTarget, ResolvedFullPath, {composite, Children}} ->
@@ -2013,6 +2108,34 @@ cache_suite_test_() ->
 
 %% @doc Test that message whose device is `#{}' cannot be written. If it were to
 %% be written, it would cause an infinite loop.
+%% @doc A packed assignment is one row with its message inline, plus a row
+%% per other ID: read by any ID of either, the message is the one signed,
+%% and verifies.
+packed_message_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb, <<"packed">>),
+    ok = hb_store:start(Store),
+    Opts = #{ <<"store">> => [Store], <<"priv-wallet">> => ar_wallet:new(),
+              <<"match-index">> => false },
+    Body = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"action">> => <<"Play">>,
+        <<"data">> => <<"hbpk1: a value that looks packed">> }, Opts, <<"ans104@1.0">>),
+    Assignment = hb_message:commit(#{ <<"type">> => <<"Assignment">>, <<"slot">> => 3,
+        <<"body">> => Body }, Opts#{ <<"cache-pack">> => true }, <<"ans104@1.0">>),
+    {ok, Unsigned} = write(Assignment, Opts#{ <<"cache-pack">> => true }),
+    #{ <<"db">> := DB } = hb_store:find(Store),
+    {ok, Rows} = elmdb:fold(DB, fun(K, V, A) -> [{K, V} | A] end, []),
+    [{Unsigned, Packed}] = [ R || R = {_, <<?PACKED, _/binary>>} <- Rows ],
+    % Only the row and its ID rows: nothing of either message exploded.
+    ?assertEqual([], [ K || {K, _} <- Rows, binary:match(K, <<"/">>) =/= nomatch ]),
+    ?assertEqual([], [ K || {K, V} <- Rows, K =/= Unsigned, V =/= <<"ao:", Unsigned/binary>> ]),
+    ?assert(lists:member(hb_message:id(Body, signed, Opts), packed_links(Packed))),
+    {ok, A} = read(hb_message:id(Assignment, signed, Opts), Opts),
+    ?assert(hb_message:verify(A, all, Opts)),
+    ?assertEqual(hb_message:id(Assignment, signed, Opts), hb_message:id(A, signed, Opts)),
+    {ok, B} = read(hb_message:id(Body, signed, Opts), Opts),
+    ?assert(hb_message:verify(B, all, Opts)),
+    ?assertEqual(<<"hbpk1: a value that looks packed">>, hb_maps:get(<<"data">>, B, Opts)),
+    ?assertEqual(hb_message:id(Body, signed, Opts), hb_message:id(B, signed, Opts)).
+
 test_device_map_cannot_be_written_test() ->
     try
         Opts = #{ <<"store">> => StoreOpts =

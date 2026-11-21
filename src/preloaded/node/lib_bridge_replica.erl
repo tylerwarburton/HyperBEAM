@@ -1071,7 +1071,8 @@ accept(Kept, Id, R = #{ pusd := Pusd, slot := Slot, chain := Chain, proc := Proc
     % Kept where the scheduler cache keeps a slot, so PUSD computes from it:
     % with what was verified, which no build changes.
     VOpts = ROpts#{ <<"store">> => [Verified] },
-    {ok, _} = hb_cache:write(Kept, VOpts),
+    % One row with its message, as the scheduler keeps it (`hb_cache').
+    {ok, _} = hb_cache:write(Kept, VOpts#{ <<"cache-pack">> => true }),
     Stored = hb_message:id(Kept, signed, VOpts),
     ok = hb_cache:link(Stored, slot_path(Pusd, Slot + 1, SchedulerDevice), VOpts),
     ok = hb_store:flush([Verified], VOpts),

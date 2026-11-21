@@ -25,6 +25,8 @@ opts(Opts) ->
 
 %% @doc Cache an assignment under the process whose schedule was requested.
 %% The assignment's own process field cannot select the cache namespace.
+%% The assignment and its message are written packed, one row each
+%% (`hb_cache', `cache-pack'), unless `scheduler-pack-messages' is false.
 write(ProcID, RawAssignment, RawOpts) ->
     Assignment = hb_cache:ensure_all_loaded(RawAssignment, RawOpts),
     Opts = opts(RawOpts),
@@ -37,7 +39,8 @@ write(ProcID, RawAssignment, RawOpts) ->
             {assignment, Assignment}
         }
     ),
-    case hb_cache:write(Assignment, Opts) of
+    Pack = hb_opts:get(<<"scheduler-pack-messages">>, true, Opts) =/= false,
+    case hb_cache:write(Assignment, Opts#{ <<"cache-pack">> => Pack }) of
         {ok, _UnsignedID} ->
             % Link the slot on the process to the signed message.
             ok = hb_cache:link(

@@ -810,7 +810,9 @@ commit_assignment(BaseAssignment, State) ->
     % store of its options. Give it the scheduler's store, where the
     % assignment and its body are written next anyway, so no copy of the
     % body lands in the node's store (the irreplaceable store, when one is
-    % set, is the scheduler's).
+    % set, is the scheduler's). Packed (`dev_scheduler_cache:write/3'), the
+    % body is written inside the assignment's own row: signing writes
+    % nothing then.
     RawOpts = maps:get(opts, State),
     Opts =
         RawOpts#{
@@ -819,7 +821,9 @@ commit_assignment(BaseAssignment, State) ->
                     scheduler_store,
                     hb_opts:get(store, no_viable_store, RawOpts),
                     RawOpts
-                )
+                ),
+            <<"cache-pack">> =>
+                hb_opts:get(<<"scheduler-pack-messages">>, true, RawOpts) =/= false
         },
     CommittmentSpec = maps:get(committment_spec, State),
     lists:foldr(
