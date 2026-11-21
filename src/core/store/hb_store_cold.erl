@@ -8,11 +8,14 @@
 %%%   slots/<pid>/<from>-<to>.hbc    every assignment and its message, as the
 %%%                                  rows the scheduler wrote (packed:
 %%%                                  `hb_cache'), a range per file
-%%%   checkpoints/<pid>/<slot>-<ms>.hbc
-%%%                                  every snapshot checkpoint, so an old
-%%%                                  read replays at most the slots between
-%%%                                  two snapshots; past `checkpoint-days'
-%%%                                  (30) only the oldest of each UTC day
+%%%   checkpoints/<pid>/<slot>-<ms>-<seq>.hbc
+%%%                                  every snapshot checkpoint (the `seq'th
+%%%                                  of the process), thinned with age but
+%%%                                  never to none: by default every one for
+%%%                                  30 days, 1 in 5 after, 1 in 25 after a
+%%%                                  year (`checkpoint-thinning'), so an old
+%%%                                  read replays at most 1, 5 or 25 snapshot
+%%%                                  intervals
 %%%   replica/<pusd>/<slot>.hbc      the newest snapshot of each bridge
 %%%                                  replica (`lib_bridge_replica'), two kept
 %%%
@@ -44,7 +47,9 @@
 %%%   peers               [#{ node, path, trusted }]: other nodes' folders,
 %%%                       read only
 %%%   keep-local-seconds  messages and assignments kept locally (604,800)
-%%%   checkpoint-days     every checkpoint kept on the share this long (30)
+%%%   checkpoint-thinning [[Days, N], ...]: past Days, keep the checkpoints
+%%%                       whose `seq' is a multiple of N, and in every age
+%%%                       band at least one ([[30, 5], [365, 25]])
 %%%   interval-ms         time between ticks (60,000)
 %%%   io-timeout-ms       one filesystem call, at most (10,000)
 %%%   range-slots         slots per file, at most (1,000)
@@ -79,7 +84,7 @@ config(Opts) ->
                          trusted => hb_util:atom(maps:get(<<"trusted">>, P, false)) =:= true }
                     || P <- peers(maps:get(<<"peers">>, C, [])) ],
                 keep_local_ms => Int(<<"keep-local-seconds">>, 604800) * 1000,
-                checkpoint_days_ms => Int(<<"checkpoint-days">>, 30) * ?DAY_MS,
+                thinning => thinning(maps:get(<<"checkpoint-thinning">>, C, [[30, 5], [365, 25]])),
                 interval => Int(<<"interval-ms">>, 60000),
                 io_timeout => Int(<<"io-timeout-ms">>, 10000),
                 range => max(1, Int(<<"range-slots">>, 1000)),
@@ -92,6 +97,17 @@ config(Opts) ->
             };
         _ -> undefined
     end.
+
+%% `[[Days, N], ...]' as `[{AgeMs, N}]', oldest band last. A malformed entry
+%% is dropped: the default is never fewer checkpoints than that.
+thinning(L) when is_list(L) ->
+    lists:sort(
+        [ {D * ?DAY_MS, N}
+        || E <- L, [D0, N0] <- [case E of [_, _] -> E; _ -> [x, x] end],
+           D <- [catch hb_util:int(D0)], N <- [catch hb_util:int(N0)],
+           is_integer(D), D >= 0, is_integer(N), N >= 1 ]);
+thinning(M) when is_map(M) -> thinning(hb_util:message_to_ordered_list(M));
+thinning(_) -> [].
 
 peers(L) when is_list(L) -> [ P || P <- L, is_map(P), is_map_key(<<"path">>, P) ];
 peers(M) when is_map(M) -> peers(hb_util:message_to_ordered_list(M));
@@ -545,34 +561,51 @@ ship_checkpoints(Cfg, Main, _Opts) ->
 ship_checkpoint(Cfg, Main, P, S) ->
     Rows = snapshot_rows(Main, P, S),
     Ms = case snap_ms(Main, P, S) of {ok, T} -> T; error -> erlang:system_time(millisecond) end,
+    Seq = read_int(Main, mark_key(<<"checkpoint-seq">>, P), -1) + 1,
     File = filename:join([maps:get(path, Cfg), "checkpoints", hb_util:list(P),
-        pad(S) ++ "-" ++ integer_to_list(Ms) ++ ".hbc"]),
+        pad(S) ++ "-" ++ integer_to_list(Ms) ++ "-" ++ integer_to_list(Seq) ++ ".hbc"]),
     Bytes = put_file(Cfg, File, #{ process => P, slot => S, rows => Rows }),
-    ok = hb_store:write([Main], #{ mark_key(<<"checkpoint">>, P) => integer_to_binary(S) }, #{}),
+    ok = hb_store:write([Main], #{ mark_key(<<"checkpoint">>, P) => integer_to_binary(S),
+                                  mark_key(<<"checkpoint-seq">>, P) => integer_to_binary(Seq) }, #{}),
     status_update(fun(St) -> St#{ shipped_bytes => maps:get(shipped_bytes, St, 0) + Bytes } end).
 
-%% On the share too, checkpoints older than `checkpoint-days' are thinned to
-%% the oldest of each UTC day, so the folder grows by one a day per process.
+%% On the share, checkpoints are thinned with age, never to none
+%% (`thin_plan/3').
 thin_checkpoints(Cfg, P) ->
     Dir = filename:join([maps:get(path, Cfg), "checkpoints", hb_util:list(P)]),
-    Old = erlang:system_time(millisecond) - maps:get(checkpoint_days_ms, Cfg),
-    Dated = [ {Ms, S, F} || F <- list_dir(Cfg, Dir), {S, Ms} <- [checkpoint_name(F)], Ms < Old ],
-    Keep = maps:values(lists:foldl(
-        fun({Ms, S, F}, M) ->
-            maps:update_with(Ms div ?DAY_MS, fun({S0, F0}) -> min({S0, F0}, {S, F}) end, {S, F}, M)
-        end, #{}, Dated)),
+    Files = [ {Seq, S, Ms, F} || F <- list_dir(Cfg, Dir), {S, Ms, Seq} <- [checkpoint_name(F)] ],
     [ io(Cfg, fun() -> file:delete(filename:join(Dir, F)) end)
-    || {_, S, F} <- Dated, not lists:member({S, F}, Keep) ],
+    || F <- thin_plan(Files, erlang:system_time(millisecond), maps:get(thinning, Cfg)) ],
     ok.
 
-%% A checkpoint file's slot and time: `<slot>-<ms>.hbc'.
+%% The checkpoint files to delete. Each is in the band of the oldest
+%% `{AgeMs, N}' it is at least `AgeMs' old for (none: younger than every
+%% band, kept). In a band a checkpoint stays when its `seq' is a multiple of
+%% `N'; and a band that would keep none keeps its newest, so no age is left
+%% without a checkpoint to replay from. The ratios divide one another (5,
+%% 25) in the default, so what a band keeps the next older keeps too.
+thin_plan(Files, Now, Bands) ->
+    Band =
+        fun(Ms) ->
+            case [ B || B = {Age, _} <- Bands, Now - Ms >= Age ] of
+                [] -> none;
+                In -> lists:last(In)
+            end
+        end,
+    Grouped = maps:groups_from_list(fun({_, _, Ms, _}) -> Band(Ms) end, Files),
+    lists:append(
+        [ case [ X || X = {Seq, _, _, _} <- Members, Seq rem N =:= 0 ] of
+              [] ->
+                  {_, _, _, Newest} = lists:max(Members),
+                  [ F || {_, _, _, F} <- Members, F =/= Newest ];
+              Kept -> [ F || X = {_, _, _, F} <- Members, not lists:member(X, Kept) ]
+          end
+        || {{_, N}, Members} <- maps:to_list(Grouped) ]).
+
+%% A checkpoint file's slot, time and sequence: `<slot>-<ms>-<seq>.hbc'.
 checkpoint_name(F) ->
-    case string:split(filename:rootname(F), "-") of
-        [S, Ms] ->
-            case {catch list_to_integer(S), catch list_to_integer(Ms)} of
-                {SI, MI} when is_integer(SI), is_integer(MI) -> {SI, MI};
-                _ -> error
-            end;
+    case [ catch list_to_integer(X) || X <- string:split(filename:rootname(F), "-", all) ] of
+        [S, Ms, Seq] when is_integer(S), is_integer(Ms), is_integer(Seq) -> {S, Ms, Seq};
         _ -> error
     end.
 
@@ -626,7 +659,7 @@ restore_checkpoint(P0, Target, Opts) ->
                         [ {S, filename:join([Dir, "checkpoints", hb_util:list(P), F])}
                         || Dir <- Dirs,
                            F <- list_dir(Cfg, filename:join([Dir, "checkpoints", hb_util:list(P)])),
-                           {S, _} <- [checkpoint_name(F)],
+                           {S, _, _} <- [checkpoint_name(F)],
                            S > Floor, S =< Target ])),
                 restore_first(Cfg, Main, Candidates)
             catch _:_ -> not_found
@@ -879,11 +912,12 @@ checkpoints_test_() ->
         {ok, _} = elmdb:delete_batch(DB, [ blob_key(Q, K, S) || K <- [<<"s">>, <<"f">>], S <- [10, 20, 30] ]),
         ?assertEqual({ok, 20}, restore_checkpoint(Q, 25, Opts)),
         ?assertEqual({ok, <<"state-20">>}, hb_store:read([Main], blob_key(Q, <<"f">>, 20), #{})),
-        % Older than `checkpoint-days', a day keeps only its oldest (10).
+        % Past one day, 1 in 2: of 10 (seq 0) and 20 (seq 1), 10 stays; 30
+        % is younger and stays.
         Cold0 = maps:get(<<"cold-tier">>, Opts),
-        ok = tick(Opts#{ <<"cold-tier">> => Cold0#{ <<"checkpoint-days">> => 1 } }),
+        ok = tick(Opts#{ <<"cold-tier">> => Cold0#{ <<"checkpoint-thinning">> => [[1, 2]] } }),
         ?assertEqual([10, 30], lists:sort([ S || F <- filelib:wildcard(Share ++ "/checkpoints/"
-            ++ binary_to_list(Q) ++ "/*.hbc"), {S, _} <- [checkpoint_name(filename:basename(F))] ])),
+            ++ binary_to_list(Q) ++ "/*.hbc"), {S, _, _} <- [checkpoint_name(filename:basename(F))] ])),
         % From a peer only when trusted.
         #{ opts := ROpts0 } = test_env("ckpt-reader"),
         Cold = maps:get(<<"cold-tier">>, ROpts0),
@@ -892,6 +926,42 @@ checkpoints_test_() ->
         ?assertEqual(not_found, restore_checkpoint(Q, 100, Peer(false))),
         ?assertEqual({ok, 30}, restore_checkpoint(Q, 100, Peer(true)))
     end}.
+
+%% @doc Thinning never leaves an age band without a checkpoint, keeps every
+%% `N'th in each band, and is stable: thinning what it kept deletes nothing.
+%% Two years of checkpoints at uneven intervals, and bands too sparse for
+%% their ratio.
+thinning_never_empties_a_band_test() ->
+    Day = ?DAY_MS, Now = 1000 * Day,
+    Bands = thinning([[30, 5], [365, 25]]),
+    Check =
+        fun(Files) ->
+            Doomed = thin_plan(Files, Now, Bands),
+            Kept = [ X || X = {_, _, _, F} <- Files, not lists:member(F, Doomed) ],
+            BandOf = fun(Ms) -> Age = Now - Ms,
+                         if Age >= 365 * Day -> old; Age >= 30 * Day -> mid; true -> new end end,
+            [ ?assert(lists:any(fun({_, _, Ms, _}) -> BandOf(Ms) =:= B end, Kept))
+            || B <- lists:usort([ BandOf(Ms) || {_, _, Ms, _} <- Files ]) ],
+            % Every checkpoint younger than 30 days stays.
+            ?assertEqual([ X || X = {_, _, Ms, _} <- Files, BandOf(Ms) =:= new ],
+                         [ X || X = {_, _, Ms, _} <- Kept, BandOf(Ms) =:= new ]),
+            % No gap of kept sequence numbers wider than the band's ratio,
+            % where the band had enough to keep.
+            [ ?assert(B - A =< case BandOf(MsB) of old -> 25; mid -> 5; new -> 1 end)
+            || {{A, _, MsA, _}, {B, _, MsB, _}} <- lists:zip(lists:droplast(lists:sort(Kept)), tl(lists:sort(Kept))),
+               BandOf(MsA) =:= BandOf(MsB) ],
+            ?assertEqual([], thin_plan(Kept, Now, Bands)),
+            Kept
+        end,
+    Name = fun(Seq, Ms) -> {Seq, Seq * 10, Ms, integer_to_list(Seq) ++ ".hbc"} end,
+    % Dense: one every 6 hours for two years.
+    Check([ Name(Seq, Now - (2920 - Seq) * Day div 4) || Seq <- lists:seq(0, 2920) ]),
+    % Sparse: 3 checkpoints over a year old (seqs 1-3, none a multiple of
+    % 25), 4 between 30 days and a year (none a multiple of 5), 2 recent.
+    Check([ Name(Seq, Ms) || {Seq, Ms} <- [{1, Now - 700 * Day}, {2, Now - 600 * Day},
+        {3, Now - 400 * Day}, {6, Now - 300 * Day}, {7, Now - 200 * Day}, {8, Now - 100 * Day},
+        {9, Now - 40 * Day}, {11, Now - 10 * Day}, {12, Now - Day}] ]),
+    ok.
 
 %% @doc A replica snapshot is shipped and seeds an empty computed store of
 %% the same build; one of another build is never used.

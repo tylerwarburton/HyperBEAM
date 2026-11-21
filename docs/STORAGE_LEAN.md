@@ -238,7 +238,7 @@ mounted at `/app/export`. The other nodes' folders are mounted read-only at
 | Head state, newest snapshots, rolling window | yes | no |
 | Packed messages and assignments | the newest `keep-local-seconds` (7 days) | `slots/<pid>/<from>-<to>.hbc`, every slot |
 | Offsite journal | until shipped | `irreplaceable/` |
-| Snapshot checkpoints | local tiers | `checkpoints/<pid>/<slot>-<ms>.hbc`: **every** snapshot for `checkpoint-days` (30), then the oldest per day |
+| Snapshot checkpoints | local tiers | `checkpoints/<pid>/<slot>-<ms>-<seq>.hbc`: **every** snapshot for 30 days, then 1 in 5, then 1 in 25 after a year; never none (`checkpoint-thinning`) |
 | Bridge replica snapshots | head and newest 2 | `replica/<lane>/`: the newest 2, so a new or wiped node starts from one instead of slot 0 |
 
 Each file starts with `HBC1` and the SHA-256 of the rest. It is written to
@@ -281,15 +281,15 @@ Each file starts with `HBC1` and the SHA-256 of the rest. It is written to
    |---|---:|
    | Packed slots (`slots/`), all nodes, ~4-6 KB per slot | ~5.5 |
    | Journal (`irreplaceable/`, gzipped) | ~4.0 |
-   | Every snapshot checkpoint, busy processes (game shard ~0.4, book ~0.2, token ~0.07 each) plus idle ones (at most 96 a day) | ~2-3, bounded: after 30 days thinned to 1 a day per process (~0.05 GB/day) |
+   | Every snapshot checkpoint, busy processes (game shard ~0.4, book ~0.2, token ~0.07 each) plus idle ones (at most 96 a day) | ~2-3 for 30 days (~75 GB held), then 1 in 5 (~0.5 GB/day kept), after a year 1 in 25 (~0.1 GB/day kept) |
    | Replica snapshots, newest 2 per lane | bounded, ~10 MB per node |
-   | **Total** | **~12 GB/day while checkpoints are inside their 30 days**, then **~9.5 GB/day** of permanent growth |
+   | **Total** | **~10 GB/day of permanent growth** (slots, journal, thinned checkpoints), plus ~75 GB held for the 30-day window |
 
    The journal and the `slots/` files hold the same messages twice. The
    journal exists for crash restore; the slot files for reads. Dropping the
    journal once a range's slot file is confirmed would save ~4 GB/day; that
-   is a decision for Tyler. At ~9.5 GB/day, 3 TB lasts about 10 months at
-   1,000 users; without the journal copy it lasts about 18 months.
+   was considered and declined: the journal stays. At ~10 GB/day, 3 TB
+   lasts about 9-10 months at 1,000 users.
 
 ### Configuration (`cold-tier`, per node in paralith-deploy1117 `infra/nodes/nodes.json`)
 
@@ -300,11 +300,11 @@ Each file starts with `HBC1` and the SHA-256 of the rest. It is written to
 | public | `/mnt/pxe-own` | none: it cannot read the others |
 
 Keys: `path`, `peers` (`[#{node, path, trusted}]`), `keep-local-seconds`
-(604,800), `checkpoint-days` (30), `interval-ms` (60,000), `io-timeout-ms`
+(604,800), `checkpoint-thinning` (`[[30, 5], [365, 25]]`), `interval-ms` (60,000), `io-timeout-ms`
 (10,000), `range-slots` (1,000), `arweave-gateway` (`https://arweave.net`,
 or `false`).
 
-### Tests (`hb_store_cold`, 7)
+### Tests (`hb_store_cold`, 8)
 
 - **Ship, prune, read back:** slots are shipped, deleted locally once
   confirmed and old, and read back. The newest 16 stay local.
@@ -316,7 +316,11 @@ or `false`).
 - **Peer reads:** a peer's slot is used only when the process's scheduler
   signed it; a forged one is refused.
 - **Checkpoints:** every one is shipped, restored nearest below the target,
-  taken from a peer only when trusted, and thinned after `checkpoint-days`.
+  taken from a peer only when trusted, and thinned by ratio with age.
+- **Never an empty age band:** two years of checkpoints, dense and too
+  sparse for the ratios. Every band keeps at least one, every checkpoint
+  under 30 days stays, no gap inside a band exceeds its ratio, and thinning
+  is stable.
 - **Replica snapshot:** shipped, then seeds an empty computed store of the
   same build; another build's is refused.
 - **Arweave fallback:** the slot is found in a stub gateway's archive window
@@ -370,23 +374,30 @@ Worst case, with **local tiers only** (no share):
 | 1 – 7 days | daily | 604,800 slots, **5.2 h** | 86,400 slots, **1.7 h** |
 | 7 days – 1 year | weekly | 4.2 M slots, **36 h** | 0.6 M slots, **12 h** |
 
-Worst case, with **every snapshot on the share** (`checkpoint-days` 30, now
-the default):
+Worst case with the share, which is the default. Every snapshot is shipped,
+then thinned by ratio and never to none (`checkpoint-thinning`
+`[[30, 5], [365, 25]]`). X is the snapshot gap, at most 1,000 slots, 60 s of
+compute, or 15 minutes:
 
-| Age | Game | Token |
-|---|---|---|
-| up to 30 days | ≤ 999 slots, **≤ 31 s** | ≤ 856 slots (60 s cap), **≤ 60 s** |
-| beyond 30 days (daily) | ≤ 1 day of slots, 5.2 h | ≤ 1.7 h |
+| Age of the slot | Checkpoints kept | Worst-case replay | Game (7 slots/s, 31 ms/slot) | Token (70 ms/slot) |
+|---|---|---|---|---|
+| < 1 day (delta) / < 1 h (full state) | the slot is stored | 0 | 0 | 0 |
+| up to 30 days | every one | X − 1 | ≤ 999 slots, **≤ 31 s** | ≤ 856 slots, **≤ 60 s** |
+| 30 days – 1 year | 1 in 5 | 5X − 1 | ≤ 4,999 slots, **≤ 2.6 min** | ≤ 4,284 slots, **≤ 5 min** |
+| over 1 year | 1 in 25 | 25X − 1 | ≤ 24,999 slots, **≤ 13 min** | ≤ 21,424 slots, **≤ 25 min** |
 
-So the time-based tiers alone are too sparse for a busy process: a day of
-game slots is hours of replay. This build does not make the local tiers
-denser, which would cost ~0.4 GB/day of local disk per busy process.
-Instead it ships **every** snapshot to the share. For 30 days the worst case
-is then Tyler's "X−1 slots since the last snapshot", where X is at most
-1,000 slots or 60 s of compute, so an old read takes at most about a minute.
-To keep that bound for older reads, raise `checkpoint-days`. Each extra day
-costs a busy process ~0.4 GB on the share, and the 1,000-slot snapshot
-interval already bounds the slot count.
+A band with fewer checkpoints than its ratio (an idle process) still keeps
+its newest. There the bound is the band's own gap, which for an idle
+process is few slots.
+
+So the time-based local tiers alone are too sparse for a busy process: a day
+of game slots is hours of replay. The share carries the density instead. Local
+disk keeps its tiers; the share keeps every snapshot for 30 days, then a
+fixed fraction. The worst case at **any** age is then a bounded multiple of
+one snapshot interval: Tyler's "X − 1 slots since the last snapshot" for a
+month, 5X then 25X after that. A tighter bound for old reads is a smaller
+ratio. Each step from 1 in 5 toward 1 in 1 costs a busy process up to
+~0.4 GB/day on the share.
 
 ## Configuration
 
