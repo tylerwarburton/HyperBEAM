@@ -1655,7 +1655,8 @@ journal_rows(Rows, S) ->
 
 %% @doc Every raw row reachable from `Path' in a store: the row itself or the
 %% rows below it, and, through each `ao:<ID>', `ao://with-commitments=' and
-%% `ni:' value, the rows they name.
+%% `ni:' value and each child a packed message names (`hb_cache'), the rows
+%% they name.
 closure(Store, Path) ->
     {Rows, _} = closure(Store, Path, {[], #{}}),
     lists:reverse(Rows).
@@ -1692,7 +1693,8 @@ follow(Store, <<"ao://with-commitments=", IDs/binary>>, Acc) ->
 follow(Store, <<"ao:", ID/binary>>, Acc) when ?IS_ID(ID) -> closure(Store, ID, Acc);
 follow(Store, Name = <<"ni:", _/binary>>, Acc) ->
     closure(Store, hb_escape:encode_path_component(Name), Acc);
-follow(_Store, _Value, Acc) -> Acc.
+follow(Store, Value, Acc) ->
+    lists:foldl(fun(ID, A) -> closure(Store, ID, A) end, Acc, hb_cache:packed_links(Value)).
 
 %%% The shipper.
 

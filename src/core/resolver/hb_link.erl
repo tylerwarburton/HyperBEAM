@@ -62,6 +62,9 @@ normalize_value(Key, V, Mode, Opts) when is_map(V) or is_list(V) ->
     % nested message.
     case Mode of
         discard -> do_nothing;
+        % Written packed (`hb_cache', `cache-pack'), the parent holds its
+        % children inline: nothing to write apart.
+        offload when map_get(<<"cache-pack">>, Opts) =:= true -> do_nothing;
         offload ->
             % Write the child to the store to ensure its
             % storage and availability. The child is written
