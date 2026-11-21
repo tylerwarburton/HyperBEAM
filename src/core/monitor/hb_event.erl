@@ -48,6 +48,13 @@ log(Topic, X, Mod, Func, undefined, Opts) -> log(Topic, X, Mod, Func, "", Opts);
 log(Topic, X, Mod, Func, Line, Opts) ->
     debug_print(Topic, X, Mod, Func, Line, Opts),
     try record(Topic, X, Mod, Func, Line, Opts) catch _:_ -> ok end,
+    % Warnings and errors are rows of the message trace too, joined to the
+    % process and slot they name (`hb_msg_trace:event/4').
+    case Topic of
+        warning -> hb_msg_trace:event(Topic, X, Mod, Line);
+        error -> hb_msg_trace:event(Topic, X, Mod, Line);
+        _ -> ok
+    end,
     % Return the logged value to the caller. This allows callers to insert 
     % `?event(...)' macros into the flow of other executions, without having to
     % break functional style.
@@ -164,12 +171,6 @@ print_logger_config() ->
 logger_handler_config(Domain, FilterId, FormatterConfig, HandlerConfig) ->
     #{
         level => all,
-        sync_mode_qlen => 200,
-        drop_mode_qlen => 200,
-        flush_qlen => 1000,
-        burst_limit_enable => true,
-        burst_limit_max_count => 500,
-        burst_limit_window_time => 1000,
         filter_default => stop,
         filters =>
             [
@@ -179,7 +180,25 @@ logger_handler_config(Domain, FilterId, FormatterConfig, HandlerConfig) ->
                 }
             ],
         formatter => {logger_formatter, FormatterConfig},
-        config => HandlerConfig
+        config => maps:merge(overload_config(), HandlerConfig)
+    }.
+
+%% @doc A log line never makes the work it describes wait. The handler drops
+%% events when it cannot keep up (`sync_mode_qlen' equal to `drop_mode_qlen'
+%% turns synchronous mode off) instead of making each caller wait for it.
+%% These are `logger_std_h' options, so they belong in the handler's `config':
+%% at the top level, where they used to be, OTP ignores them and its default
+%% applies -- every caller blocks once ten events are queued. Under load that
+%% was the process worker, waiting on the printer for each computed slot
+%% while the printer waited for CPU behind the requests.
+overload_config() ->
+    #{
+        sync_mode_qlen => 200,
+        drop_mode_qlen => 200,
+        flush_qlen => 1000,
+        burst_limit_enable => true,
+        burst_limit_max_count => 500,
+        burst_limit_window_time => 1000
     }.
 
 ensure_default_handler_filter(FilterId, Domain) ->

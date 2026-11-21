@@ -9,6 +9,7 @@
 ).
 -behaviour(prometheus_collector).
 -include("include/hb_http_client.hrl").
+-include_lib("eunit/include/eunit.hrl").
 %%====================================================================
 %% Collector API
 %%====================================================================
@@ -60,7 +61,77 @@ collect_mf(_Registry, Callback) ->
         )
     ),
 
+    Phases = hb_phase_timer:read(),
+    Callback(
+        prometheus_model_helpers:create_mf(
+            hb_phase_seconds_total,
+            "Wall time spent in each named phase of the message path "
+            "(hb_phase_timer; node option phase-timers).",
+            counter,
+            ?MODULE,
+            Phases
+        )
+    ),
+    Callback(
+        prometheus_model_helpers:create_mf(
+            hb_phase_count_total,
+            "Number of timed samples of each named phase (hb_phase_timer).",
+            counter,
+            ?MODULE,
+            Phases
+        )
+    ),
+    % The node's delivery backlog: sums and maxima over every process, never
+    % a series per process (`lib_process_delivery:metrics/0').
+    lists:foreach(
+        fun({Name, Help, Value}) -> Callback(create_gauge(Name, Help, Value)) end,
+        try
+            {ok, Gauges} =
+                hb_ao:raw(<<"process@1.0">>, #{}, #{ <<"path">> => <<"deliveries">> },
+                    #{ <<"process-delivery-metrics">> => true }),
+            Gauges
+        catch _:_ -> []
+        end
+    ),
+    ProcessPhases = hb_phase_timer:read_processes(),
+    Callback(
+        prometheus_model_helpers:create_mf(
+            hb_process_phase_seconds_total,
+            "hb_phase_seconds_total per process (phase-timers-processes "
+            "processes get a label; the rest share `other').",
+            counter,
+            ?MODULE,
+            ProcessPhases
+        )
+    ),
+    Callback(
+        prometheus_model_helpers:create_mf(
+            hb_process_phase_count_total,
+            "hb_phase_count_total per process.",
+            counter,
+            ?MODULE,
+            ProcessPhases
+        )
+    ),
+
     ok.
+collect_metrics(hb_phase_seconds_total, Phases) ->
+    prometheus_model_helpers:counter_metrics(
+        [ {[{phase, P}], T / 1_000_000} || {P, T, _N, _Mean} <- Phases ]
+    );
+collect_metrics(hb_phase_count_total, Phases) ->
+    prometheus_model_helpers:counter_metrics(
+        [ {[{phase, P}], N} || {P, _T, N, _Mean} <- Phases ]
+    );
+collect_metrics(hb_process_phase_seconds_total, Phases) ->
+    prometheus_model_helpers:counter_metrics(
+        [ {[{phase, P}, {process, Proc}], T / 1_000_000}
+        || {P, Proc, T, _N, _Mean} <- Phases ]
+    );
+collect_metrics(hb_process_phase_count_total, Phases) ->
+    prometheus_model_helpers:counter_metrics(
+        [ {[{phase, P}, {process, Proc}], N} || {P, Proc, _T, N, _Mean} <- Phases ]
+    );
 collect_metrics(system_load, SystemLoad) ->
     %% Return the gauge metric with no labels
     prometheus_model_helpers:gauge_metrics(
@@ -76,6 +147,8 @@ collect_metrics(hackney_pool_in_use, Value) ->
 collect_metrics(hackney_pool_free, Value) ->
     prometheus_model_helpers:gauge_metrics([{[], Value}]);
 collect_metrics(hackney_pool_queue, Value) ->
+    prometheus_model_helpers:gauge_metrics([{[], Value}]);
+collect_metrics(_Gauge, Value) when is_number(Value) ->
     prometheus_model_helpers:gauge_metrics([{[], Value}]).
 
 %%====================================================================
@@ -129,3 +202,24 @@ hackney_pool_stats() ->
 
 create_gauge(Name, Help, Data) ->
     prometheus_model_helpers:create_mf(Name, Help, gauge, ?MODULE, Data).
+%%====================================================================
+%% Tests
+%%====================================================================
+
+process_phases_render_with_process_label_test() ->
+    application:ensure_all_started(prometheus),
+    hb_phase_timer:reset(),
+    hb_phase_timer:record(slot_execution, <<"proc-a">>, 1_500_000),
+    Registry = hb_metrics_collector_test,
+    prometheus_registry:register_collector(Registry, ?MODULE),
+    try
+        Text = prometheus_text_format:format(Registry),
+        ?assertNotEqual(nomatch, binary:match(Text,
+            <<"hb_process_phase_seconds_total{phase=\"slot_execution\",process=\"proc-a\"} 1.5">>)),
+        ?assertNotEqual(nomatch, binary:match(Text,
+            <<"hb_process_phase_count_total{phase=\"slot_execution\",process=\"proc-a\"} 1">>)),
+        ?assertNotEqual(nomatch, binary:match(Text,
+            <<"hb_phase_seconds_total{phase=\"slot_execution\"} 1.5">>))
+    after
+        prometheus_registry:clear(Registry)
+    end.
