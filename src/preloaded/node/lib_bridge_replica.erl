@@ -61,6 +61,9 @@
 %% behind catches up over several calls, acting meanwhile on the verified
 %% state it has.
 -define(MAX_SLOTS, 5000).
+%% Assignments asked of a peer scheduler per request: a busy node builds a
+%% page of this size well inside the 300 s a request may wait.
+-define(PAGE_SLOTS, 500).
 %% Slots `view/3' verifies and computes between looks at its deadline.
 -define(SLICE_SLOTS, 25).
 %% The cursor's layout: 2 is the verified and computed stores apart.
@@ -533,7 +536,7 @@ forward(R) ->
 %% says why: null only when the replica is at the schedule's head.
 advance(R, 0) -> {R, 0};
 advance(R = #{ slot := Slot }, Left) ->
-    case fetch(R, Slot + 1, Left) of
+    case fetch(R, Slot + 1, min(Left, ?PAGE_SLOTS)) of
         {error, Why} -> {R#{ stopped := Why }, Left};
         {Head, []} when Slot >= Head -> {R#{ head := Head, stopped := null }, Left};
         {Head, []} ->
@@ -581,7 +584,6 @@ fetch(#{pusd := Pusd, scheduler_device := <<"arweave-scheduler@1.0">>, opts := O
 fetch(#{ pusd := Pusd, url := Url, http := Opts }, From, Max) ->
     Path = <<"/", Pusd/binary, "~process@1.0/schedule?from=", (integer_to_binary(From))/binary,
         "&to=", (integer_to_binary(From + Max - 1))/binary>>,
-    Unavailable = {error, <<"PUSD's schedule is unavailable">>},
     case catch hb_http:get(Url, Path, Opts#{ <<"http-client">> => httpc, <<"protocol">> => http2 }) of
         {ok, Res} ->
             GetOpts = Opts#{ <<"hashpath">> => ignore },
@@ -595,10 +597,25 @@ fetch(#{ pusd := Pusd, url := Url, http := Opts }, From, Max) ->
                     More = length(Served) >= Max orelse
                         hb_util:atom(hb_ao:get(<<"continues">>, Res, false, GetOpts)) =:= true,
                     {case More of true -> Last + 1; false -> Last end, [A || {_, A} <- Served]};
-                _ -> Unavailable
+                Other -> unavailable(Pusd, From, Max, {assignments, Other})
             end;
-        _ -> Unavailable
+        Other -> unavailable(Pusd, From, Max, Other)
     end.
+
+%% A page that could not be read: logged, and stopped with the reason, so a
+%% replica stuck behind a failing peer says what is failing.
+unavailable(Pusd, From, Max, Why) ->
+    Reason = fetch_reason(Why),
+    ?event(warning, {replica_fetch_failed, {pusd, Pusd}, {from, From}, {max, Max},
+        {reason, Reason}}),
+    {error, <<"PUSD's schedule is unavailable: ", Reason/binary>>}.
+
+fetch_reason({_, #{ <<"status">> := Status }}) when is_integer(Status) ->
+    <<"status ", (integer_to_binary(Status))/binary>>;
+fetch_reason({'EXIT', {Reason, _Stack}}) -> fetch_reason(Reason);
+fetch_reason(Other) ->
+    Bin = iolist_to_binary(io_lib:format("~0p", [Other])),
+    binary:part(Bin, 0, min(200, byte_size(Bin))).
 
 %% This node's materialized assignments `From'..`To', up to the first it does
 %% not hold.
@@ -928,6 +945,27 @@ empty_read_is_not_the_head_test() ->
         advance(R#{ pusd := hb_util:human_id(crypto:strong_rand_bytes(32)) }, 25)),
     ?assertMatch({error, _},
         fetch(R#{ http := #{ <<"arweave-scheduler-confirmation-depth">> => 1 } }, 1, 25)).
+
+%% A peer schedule is asked for in pages a busy node can build: a 5,000-slot
+%% page (~14 MB) took longer than the 300 s a request may wait, and every
+%% retry asked for the same page (CAPACITY_LOG_1118, breakpoint 19). A page
+%% that fails says why, instead of a bare "unavailable".
+replica_pages_are_bounded_and_say_why_test_() ->
+    {timeout, 60, fun() ->
+        {ok, URL, Mock} = hb_mock_server:start([{"/[...]", schedule, {504, <<"slow">>}}]),
+        Pusd = hb_util:human_id(crypto:strong_rand_bytes(32)),
+        R = #{ pusd => Pusd, url => URL, http => #{}, slot => 0, head => 0, stopped => null },
+        {R1, _} = advance(R, ?MAX_SLOTS),
+        [Req | _] = hb_mock_server:get_requests(Mock, schedule),
+        Query = maps:from_list(uri_string:dissect_query(maps:get(<<"qs">>, Req))),
+        Asked = binary_to_integer(maps:get(<<"to">>, Query))
+            - binary_to_integer(maps:get(<<"from">>, Query)) + 1,
+        ?assert(Asked =< 500),
+        Stopped = maps:get(stopped, R1),
+        ?assertNotEqual(<<"PUSD's schedule is unavailable">>, Stopped),
+        ?assertNotEqual(nomatch, binary:match(Stopped, <<"504">>)),
+        hb_mock_server:stop(Mock)
+    end}.
 
 %% A node's Arweave index (blocks to 18, PUSD materialized to `Head'), in a
 %% store of its own, and a replica reading it.
