@@ -67,7 +67,7 @@ read(Address, Opts) ->
 read(Address, Variant, Opts) ->
     % Search for the location of the scheduler in the scheduler-location cache.
     maybe
-        {ok, Cached} ?= dev_location_cache:read(Address, Opts),
+        {ok, Cached} ?= dev_location_cache:read(Address, Variant, Opts),
         true ?= Variant =:= undefined orelse
             Variant =:= hb_maps:get(<<"variant">>, Cached, <<"ao.N.1">>, Opts),
         {ok, Cached}
@@ -75,8 +75,10 @@ read(Address, Variant, Opts) ->
         _ ->
             case gateway_location(Address, Variant, Opts) of
                 {ok, Location} ->
-                    dev_location_cache:write(Location, Opts),
-                    {ok, Location};
+                    case dev_location_cache:write(Location, Opts) of
+                        ok -> {ok, Location};
+                        {error, _} = Error -> Error
+                    end;
                 _ ->
                     {error,
                         #{
@@ -95,19 +97,67 @@ read(Address, Variant, Opts) ->
 gateway_location(Address, Variant, Opts) ->
     maybe
         {ok, Location} ?= hb_client_gateway:location(Address, Variant, Opts),
-        Signers = hb_message:signers(Location, Opts),
-        true ?=
-            Signers =:= [hb_committer:uri(Address, Opts)]
-            orelse {error, <<"Address is not the sole signer of the record.">>},
-        {ok, Location}
+        {ok, Signed} ?= validate_gateway_location(Address, Location, Opts),
+        true ?= gateway_nonce_allowed(Address, Signed, Variant, Opts)
+            orelse {error, <<"Gateway location is older than the cached record.">>},
+        {ok, Signed}
     end.
+
+%% @doc Cache expiry must not erase the nonce floor. An equal nonce may refresh
+%% the same routing fields, including an equivalent record in another codec.
+gateway_nonce_allowed(Address, Signed, Opts) ->
+    gateway_nonce_allowed(Address, Signed, undefined, Opts).
+gateway_nonce_allowed(Address, Signed, Variant, Opts) ->
+    dev_location_cache:accepts(Address, Signed, Opts) andalso
+        case {Variant, dev_location_cache:read_any(Address, Opts)} of
+            {undefined, {ok, Previous}} ->
+                location_integer(hb_maps:get(<<"nonce">>, Signed, not_found, Opts)) >=
+                    location_integer(hb_maps:get(<<"nonce">>, Previous, not_found, Opts));
+            _ -> true
+        end.
+
+%% @doc A gateway is a source of signed records, not an authority for their
+%% contents. Require the requested owner's signature and committed routing
+%% fields before a record can become a local routing hint.
+validate_gateway_location(Address, Location, Opts) ->
+    try
+        {ok, Signed} = hb_message:with_only_committed(Location, Opts),
+        [Signer] = hb_message:signers(Signed, Opts),
+        Signer = hb_committer:uri(Address, Opts),
+        true = hb_message:verify(Signed, [Signer], Opts),
+        RawType = hb_maps:get(<<"type">>, Signed, not_found, Opts),
+        true = is_binary(RawType),
+        Type = hb_util:to_lower(RawType),
+        true = lists:member(Type, [<<"location">>, <<"scheduler-location">>]),
+        URL = hb_maps:get(<<"url">>, Signed, not_found, Opts),
+        true = is_binary(URL),
+        #{scheme := Scheme, host := Host} = Parsed = uri_string:parse(URL),
+        true = (Scheme =:= <<"https">> orelse Scheme =:= <<"http">>) andalso Host =/= <<>>,
+        false = maps:is_key(userinfo, Parsed) orelse maps:is_key(fragment, Parsed),
+        _ = location_integer(hb_maps:get(<<"nonce">>, Signed, not_found, Opts)),
+        _ = location_integer(hb_maps:get(<<"time-to-live">>, Signed, not_found, Opts)),
+        true = is_binary(hb_maps:get(<<"variant">>, Signed, <<"ao.N.1">>, Opts)),
+        {ok, Signed}
+    catch _:_ -> {error, <<"Invalid signed gateway location record.">>}
+    end.
+
+%% @doc Nonce and cache lifetime must be nonnegative integers, never floats.
+location_integer(Value) when is_integer(Value), Value >= 0 -> Value;
+location_integer(Value) when is_binary(Value) ->
+    Integer = binary_to_integer(Value),
+    true = Integer >= 0,
+    Integer.
 
 %% @doc Find the latest known nonce for an address by checking the local cache
 %% first and then the gateway.
 latest_known_nonce(Address, Opts) ->
-    case read(Address, Opts) of
+    case dev_location_cache:read_any(Address, Opts) of
         {ok, Location} -> hb_maps:get(<<"nonce">>, Location, -1, Opts);
-        _ -> -1
+        _ ->
+            case read(Address, Opts) of
+                {ok, Location} -> hb_maps:get(<<"nonce">>, Location, -1, Opts);
+                _ -> -1
+            end
     end.
 
 %% @doc Read the node's location record from the cache. If the `location_url'
@@ -356,8 +406,8 @@ write_foreign(Base, RawReq, Opts) ->
         LocationType = hb_ao:get(<<"type">>, MaybeLocation, not_found, Opts),
         NormalizedType =
             case LocationType of
-                not_found -> not_found;
-                _ -> hb_ao:normalize_key(LocationType)
+                Value when is_binary(Value) -> hb_util:to_lower(Value);
+                _ -> not_found
             end,
         true ?= hb_message:verify(MaybeLocation, all, Opts)
             orelse {error, <<"Invalid location record signature.">>},
@@ -439,7 +489,7 @@ write_foreign(Base, RawReq, Opts) ->
 
 %% @doc Check if a given nonce is the latest nonce for a given signer.
 latest_nonce(Signer, Nonce, Opts) ->
-    case dev_location_cache:read(Signer, Opts) of
+    case dev_location_cache:read_any(Signer, Opts) of
         {ok, Location} ->
             hb_util:int(hb_ao:get(<<"nonce">>, Location, -1, Opts)) < Nonce;
         _ ->
@@ -447,6 +497,68 @@ latest_nonce(Signer, Nonce, Opts) ->
     end.
 
 %%% Tests
+
+%% @doc Claimed ownership alone is not gateway evidence. Exercise actual
+%% signatures and coverage before accepting any routing fields.
+gateway_signature_boundary_test() ->
+    Opts = #{<<"store">> => [hb_test_utils:test_store()], <<"priv-wallet">> => ar_wallet:new()},
+    Address = hb_util:human_id(ar_wallet:to_address(maps:get(<<"priv-wallet">>, Opts))),
+    Fields = #{<<"type">> => <<"Scheduler-Location">>, <<"url">> => <<"https://node.example">>,
+        <<"nonce">> => 7, <<"time-to-live">> => 3600000},
+    Signed = hb_message:commit(Fields, Opts),
+    {ok, Check} = hb_message:with_only_committed(Signed, Opts),
+    ?assertEqual([hb_committer:uri(Address, Opts)], hb_message:signers(Check, Opts)),
+    ?assert(hb_message:verify(Check, all, Opts)),
+    ?assert(hb_message:verify(Check, hb_message:signers(Check, Opts), Opts)),
+    ?assertEqual(<<"scheduler-location">>, hb_util:to_lower(hb_maps:get(<<"type">>, Check, Opts))),
+    ?assertMatch(#{scheme := <<"https">>, host := <<"node.example">>},
+        uri_string:parse(hb_maps:get(<<"url">>, Check, Opts))),
+    ?assertEqual(7, location_integer(hb_maps:get(<<"nonce">>, Check, Opts))),
+    ?assertEqual(3600000, location_integer(hb_maps:get(<<"time-to-live">>, Check, Opts))),
+    ?assertMatch({ok, _}, validate_gateway_location(Address, Signed, Opts)),
+    ANS = hb_message:commit(Fields, Opts, <<"ans104@1.0">>),
+    RoundTrip = hb_message:convert(hb_message:convert(ANS, <<"ans104@1.0">>, Opts),
+        <<"structured@1.0">>, <<"ans104@1.0">>, Opts),
+    ?assertMatch({ok, _}, validate_gateway_location(Address, RoundTrip, Opts)),
+    ?assertMatch({error, _}, validate_gateway_location(Address,
+        Signed#{<<"url">> := <<"https://attacker.example">>}, Opts)),
+    Partial = hb_message:commit(#{<<"nonce">> => 7}, Opts),
+    ?assertMatch({error, _}, validate_gateway_location(Address, maps:merge(Fields, Partial), Opts)),
+    Stranger = hb_message:commit(Fields, Opts#{<<"priv-wallet">> => ar_wallet:new()}),
+    ?assertMatch({error, _}, validate_gateway_location(Address, Stranger, Opts)),
+    lists:foreach(fun(Change) ->
+        Bad = hb_message:commit(maps:merge(Fields, Change), Opts),
+        ?assertMatch({error, _}, validate_gateway_location(Address, Bad, Opts))
+    end, [#{<<"nonce">> => -1}, #{<<"time-to-live">> => 1.5},
+        #{<<"url">> => <<"file:///private">>},
+        #{<<"url">> => <<"https://user:password@node.example">>}]).
+
+%% @doc Expired routing hints cannot be replaced by replayed older nonces.
+expired_location_nonce_floor_test() ->
+    Opts = #{<<"store">> => [hb_test_utils:test_store()], <<"priv-wallet">> => ar_wallet:new()},
+    Address = hb_util:human_id(ar_wallet:to_address(maps:get(<<"priv-wallet">>, Opts))),
+    Fields = #{<<"type">> => <<"Scheduler-Location">>, <<"url">> => <<"https://old.example">>,
+        <<"nonce">> => 7, <<"time-to-live">> => 0},
+    Signed = hb_message:commit(Fields, Opts),
+    ok = dev_location_cache:write(Signed, Opts),
+    ?assertEqual({error, not_found}, dev_location_cache:read(Address, Opts)),
+    ?assertEqual(7, latest_known_nonce(Address, Opts)),
+    ?assertNot(latest_nonce(Address, 6, Opts)),
+    ?assertNot(latest_nonce(Address, 7, Opts)),
+    ?assert(latest_nonce(Address, 8, Opts)),
+    ?assert(gateway_nonce_allowed(Address, Signed, Opts)),
+    ?assertNot(gateway_nonce_allowed(Address, hb_message:commit(Fields#{<<"nonce">> := 6}, Opts), Opts)),
+    ?assertNot(gateway_nonce_allowed(Address, hb_message:commit(Fields#{<<"url">> := <<"https://other.example">>}, Opts), Opts)),
+    Device = #{<<"device">> => <<"location@1.0">>},
+    Send = fun(Record) -> hb_ao:resolve(Device,
+        Record#{<<"path">> => <<"known">>, <<"method">> => <<"POST">>}, Opts) end,
+    ?assertMatch({error, _}, Send(hb_message:commit(Fields#{<<"nonce">> := 6}, Opts))),
+    New = hb_message:commit(Fields#{<<"nonce">> := 8, <<"time-to-live">> := 600000,
+        <<"url">> := <<"https://new.example">>}, Opts),
+    ?assertMatch({ok, _}, Send(New)),
+    ?assertEqual(8, latest_known_nonce(Address, Opts)),
+    ?assertMatch({ok, _}, dev_location_cache:read(Address, Opts)),
+    ?assertNot(gateway_nonce_allowed(Address, Signed, Opts)).
 
 %% @doc One wallet can advertise locations for different scheduler protocols.
 %% Disabled: it reads the location records of a live address from the public
