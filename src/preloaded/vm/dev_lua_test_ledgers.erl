@@ -415,9 +415,11 @@ normalize_without_root(RootProc, Procs) ->
 
 %% @doc Create a node message for the test that avoids looking up unknown 
 %% recipients via remote stores. This improves test performance.
+%% A durable store: only a node with one delivers outboxes, and a transfer to
+%% a sub-ledger is an outbox entry (`lib_process_delivery').
 test_opts() ->
     hb:init(),
-    #{ <<"store">> => [hb_test_utils:test_store()]}.
+    #{ <<"store">> => [hb_test_utils:test_store(hb_store_lmdb)]}.
 
 %%% Test cases.
 
