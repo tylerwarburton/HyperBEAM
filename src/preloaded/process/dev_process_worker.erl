@@ -615,7 +615,10 @@ grouper_skips_when_slot_cached_test() ->
     Opts =
         #{
             <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
-            <<"priv-wallet">> => ar_wallet:new()
+            <<"priv-wallet">> => ar_wallet:new(),
+            % A missing lower slot is refused, not rebuilt
+            % (`dev_process:history/6'), so the refusal is what is seen.
+            <<"process-history-replay">> => false
         },
     M1 = hb_process_test_vectors:aos_process(Opts),
     POpts = Opts#{ <<"process-workers">> => true },
@@ -1167,7 +1170,9 @@ worker_never_rewinds_test_() ->
             worker_setup(#{
                 <<"process-state-blobs">> => true,
                 <<"process-delta-cache">> => true,
-                <<"process-hot-cache-slots">> => 0
+                <<"process-hot-cache-slots">> => 0,
+                % Not rebuilt for the request either (`dev_process:history/6').
+                <<"process-history-replay">> => false
             }),
         % The store loses every slot and the head, so the requests below miss
         % the cache, pass the head gate in `dev_process:compute/3', and reach

@@ -37,8 +37,16 @@ read(ProcID, SlotRef, RawOpts) ->
             end
     end.
 
-%% @doc Write a process computation result to the cache.
+%% @doc Write a process computation result to the cache. With
+%% `process-cache-write' false nothing is written: a slot rebuilt for one
+%% read (`dev_process:history/6') is never stored again.
 write(ProcID, Slot, Msg, RawOpts) ->
+    case hb_opts:get(<<"process-cache-write">>, true, RawOpts) of
+        false -> {ok, not_stored};
+        _ -> write_stored(ProcID, Slot, Msg, RawOpts)
+    end.
+
+write_stored(ProcID, Slot, Msg, RawOpts) ->
     Opts = lib_process:cache_opts(RawOpts),
     Public = hb_private:reset(Msg),
     % The outbox row first, in the same buffered batch as the state row and

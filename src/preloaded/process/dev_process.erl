@@ -277,12 +277,15 @@ compute(Base, Req, Opts) ->
 
 %% @doc Compute a slot that is not stored. A process's state only moves
 %% forward: a slot at or below the newest stored slot (the head) that is not
-%% stored -- retention deleted it -- is refused with a 410, never recomputed.
-%% A recompute replays the process from its nearest kept checkpoint, or from
-%% the start, in whoever asked, with no deadline and no way to cancel it: on
-%% prod (2026-11-05) ~30 detached pushes of the order-book vault, each ~85k
-%% slots behind its head, replayed it at once, the node fell from 27 to 9
-%% slots/s, every process's slot took 3-7x as long, and the vault fell further
+%% stored -- retention deleted it -- is never computed into the process's
+%% cache again. It is rebuilt for the one request by `history/5' (a replay
+%% from the nearest kept checkpoint below it that stores and delivers
+%% nothing), one such replay per node at a time; with
+%% `process-history-replay' false it is refused with a 410. An unbounded
+%% recompute in whoever asked is what this guards against: on prod
+%% (2026-11-05) ~30 detached pushes of the order-book vault, each ~85k slots
+%% behind its head, replayed it at once, the node fell from 27 to 9 slots/s,
+%% every process's slot took 3-7x as long, and the vault fell further
 %% behind. Every route to a slot's state ends here or in the worker's
 %% `compute_to_slot/5', which refuses the same slots. A slot's outbox
 %% outlives its state in its `o' row (`lib_process_cache:read_results/3'),
@@ -294,16 +297,84 @@ compute_uncached(ProcID, ProcBase, Req, Slot, Opts) ->
     case Slot >= 0 andalso
             lib_process_cache:latest_slot(ProcID, lib_process:scoped_opts(Opts)) of
         {ok, Head} when is_integer(Head), Slot =< Head ->
-            ?event(compute, {refused_pruned_slot, ProcID, Slot, Head}, Opts),
-            {error, pruned_slot_error(ProcID, Slot, Head)};
+            history(ProcID, ProcBase, Req, Slot, Head, Opts);
         _ when Slot >= 0 ->
             % The worker said the slot is behind its live state, so it was
             % stored; it is not now, so it is gone (`dev_process_worker').
             case hb_opts:get(<<"process-stored-only">>, false, Opts) of
-                true -> {error, pruned_slot_error(ProcID, Slot, Slot)};
+                true -> history(ProcID, ProcBase, Req, Slot, Slot, Opts);
                 false -> compute_ahead(ProcID, ProcBase, Req, Slot, Opts)
             end;
         _ -> compute_here(ProcID, ProcBase, Req, Slot, Opts)
+    end.
+
+%% @doc A slot at or below the head that is no longer stored, rebuilt for
+%% this request: restored from the newest kept snapshot at or below it (or
+%% initialized from the definition when none is), then every slot after
+%% that recomputed from the irreplaceable schedule, with nothing written to
+%% the process's cache, no snapshot taken, no worker involved and nothing
+%% delivered. Old reads get slower, never wrong: a slot's state is a
+%% function of the definition and the messages before it. One replay runs
+%% per node at a time; another is answered 503 `retry-after' until it ends.
+history(ProcID, ProcBase, Req, Slot, Head, Opts) ->
+    case hb_opts:get(<<"process-history-replay">>, true, Opts) of
+        false ->
+            ?event(compute, {refused_pruned_slot, ProcID, Slot, Head}, Opts),
+            {error, pruned_slot_error(ProcID, Slot, Head)};
+        _ ->
+            case history_lock() of
+                ok ->
+                    try history_replay(ProcID, ProcBase, Req, Slot, Opts)
+                    after hb_name:unregister({?MODULE, history_replay})
+                    end;
+                busy ->
+                    ?event(compute, {history_replay_busy, ProcID, Slot}, Opts),
+                    {error, #{ <<"status">> => 503, <<"retry-after">> => 5,
+                               <<"body">> => <<"Busy rebuilding another old slot. Retry.">> }}
+            end
+    end.
+
+%% The node's one history replay: taken if free, or if its holder is dead.
+history_lock() ->
+    Name = {?MODULE, history_replay},
+    case hb_name:register(Name) of
+        ok -> ok;
+        error ->
+            case hb_name:lookup(Name) of
+                undefined -> case hb_name:register(Name) of ok -> ok; error -> busy end;
+                _ -> busy
+            end
+    end.
+
+history_replay(ProcID, ProcBase, Req, Slot, Opts) ->
+    HOpts = (slot_opts(Opts))#{
+        <<"process-cache-write">> => false,
+        <<"process-delivery">> => false,
+        <<"process-workers">> => false,
+        <<"spawn-worker">> => false,
+        <<"process-worker-spawn">> => false,
+        <<"scheduler-lookahead">> => false,
+        <<"process-snapshot-target">> => false,
+        <<"process-snapshot-slots">> => false,
+        <<"process-snapshot-time">> => false,
+        <<"process-snapshot-replay-ms">> => false,
+        <<"process-replay-from-start">> => true
+    },
+    T0 = erlang:monotonic_time(millisecond),
+    Definition = hb_maps:get(<<"process">>, ProcBase, ProcBase, Opts),
+    case ensure_loaded(Definition, Req#{ <<"slot">> => Slot }, HOpts) of
+        {ok, Loaded} ->
+            From = lib_process:get_key(<<"at-slot">>, Loaded, HOpts),
+            Res = compute_to_slot(ProcID, Loaded, Req, Slot, HOpts),
+            ?event(compute,
+                {history_replayed, {proc_id, ProcID}, {slot, Slot}, {from, From},
+                 {ms, erlang:monotonic_time(millisecond) - T0}},
+                Opts),
+            case Res of
+                {ok, State} -> {ok, mark_cached_state(without_snapshot(State, Opts), Opts)};
+                Other -> Other
+            end;
+        Error -> Error
     end.
 
 %% A slot beyond the head is the worker's to compute, even when its request
@@ -1134,7 +1205,9 @@ ensure_loaded_state(Base, Req, Opts) ->
 %% them, so a lowest slot of 0 alone does not say nothing was pruned: the
 %% marker does (`lib_process_cache:pruned/2').
 restorable_from_start(ProcID, Opts) ->
-    case {lib_process_cache:pruned(ProcID, Opts), lib_process_cache:stored_floor(ProcID, Opts)} of
+    case hb_opts:get(<<"process-replay-from-start">>, false, Opts) == true orelse
+            {lib_process_cache:pruned(ProcID, Opts), lib_process_cache:stored_floor(ProcID, Opts)} of
+        true -> ok;
         {false, none} -> ok;
         {false, {ok, 0}} -> ok;
         {_, Lowest} ->
@@ -1575,36 +1648,41 @@ snapshot_markers_dated_by_assignment_test_() ->
 
 %% @doc Prod, 2026-11-05: detached pushes of the order-book vault asked for
 %% slots ~85k below its head after retention had deleted them, and each one
-%% replayed the vault from the start in the requester -- ~30 at once, for
-%% hours, with no way to cancel them. A slot at or below the head that is not
-%% stored is a 410: nothing is executed, nothing is written below the floor,
-%% and the process carries on forward.
-pruned_slot_is_410_not_replay_test_() ->
+%% replayed the vault from the start in the requester, into its cache -- ~30
+%% at once, for hours, with no way to cancel them. A slot at or below the
+%% head that is not stored is rebuilt for the request alone: replayed from
+%% the nearest kept snapshot below it, one replay at a time, with nothing
+%% written; the process carries on forward. With `process-history-replay'
+%% false it is a 410 and nothing is executed.
+pruned_slot_is_replayed_not_stored_test_() ->
     {timeout, 180, fun() ->
         {Process, ProcID, Head, Opts} = pruned_setup(31),
         Kept = stored_slots(ProcID, Opts),
-        % Every snapshot checkpoint (every fifth slot) is kept; the slots
-        % between them below the floor are not.
-        ?assert(lists:member(5, Kept)),
+        % The oldest snapshot of the hour (slot 0) and the newest two are
+        % kept; the snapshots between them and every other slot below the
+        % floor are not.
+        ?assert(lists:member(0, Kept)),
+        ?assertNot(lists:member(5, Kept)),
         Pruned = [ S || S <- lists:seq(0, Head), not lists:member(S, Kept) ],
         ?assert(lists:member(1, Pruned)),
         ?assertEqual({ok, Head}, lib_process_cache:latest_slot(ProcID, Opts)),
-        Before = slot_executions(),
-        lists:foreach(
-            fun(Slot) ->
-                ?assertMatch(
-                    {error, #{ <<"status">> := 410 }},
-                    hb_ao:resolve(
-                        Process,
-                        #{ <<"path">> => <<"compute">>, <<"slot">> => Slot },
-                        Opts
-                    )
-                )
+        Compute =
+            fun(Slot, O) ->
+                hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, O)
             end,
-            [1, 6, lists:last(Pruned)]
-        ),
-        ?assertEqual(Before, slot_executions()),
+        Old = [1, 6, lists:last(Pruned)],
+        Before0 = slot_executions(),
+        [ ?assertMatch({error, #{ <<"status">> := 410 }},
+              Compute(Slot, Opts#{ <<"process-history-replay">> => false }))
+        || Slot <- Old ],
+        ?assertEqual(Before0, slot_executions()),
+        [ ?assertEqual(integer_to_binary(Slot + 1),
+              hb_ao:get(<<"count">>, element(2, {ok, _} = Compute(Slot, Opts)), Opts))
+        || Slot <- Old ],
+        % Replayed from slot 0, the only snapshot below them.
+        ?assertEqual(1 + 6 + lists:last(Pruned), slot_executions() - Before0),
         ?assertEqual(Kept, stored_slots(ProcID, Opts)),
+        Before = slot_executions(),
         % A kept slot still reads back, and the next one computes forward.
         {ok, Floor} =
             hb_ao:resolve(
