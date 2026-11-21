@@ -40,8 +40,11 @@
 %%%
 %%% Two stores, kept beside a cursor (slot, chain, last assignment, build):
 %%% `<pusd>' holds what was verified (the process, its module, each accepted
-%%% assignment), which no build changes; `<pusd>.computed' holds every slot's
-%%% computed state, the work of the build that computed it. A cursor another
+%%% assignment), which no build changes; `<pusd>.computed' holds the newest
+%%% computed states, the work of the build that computed it: the head and
+%%% the newest snapshots, pruned every `?PRUNE_SLOTS' slots (`prune/1'),
+%%% since the attestor acts on the head alone and any other slot is
+%%% recomputed from what was verified. A cursor another
 %%% build wrote drops only the computed store, and the replica recomputes from
 %%% the assignments it keeps, a slice at a time, so a node upgrade that changes
 %%% a result is never hidden behind a result the old code cached, and never
@@ -50,7 +53,7 @@
 -module(lib_bridge_replica).
 -export([view/3]).
 %% For `dev_scheduler_follower', which follows any process this way.
--export([load/4, load/5, forward/1, slot_path/3]).
+-export([load/4, load/5, forward/1, slot_path/3, prune/1]).
 %% For `dev_bridge_attestor', which reads a ledger's spawn before it endorses
 %% that ledger's registration.
 -export([spawned/3, schedulers/2]).
@@ -68,6 +71,8 @@
 -define(SLICE_SLOTS, 25).
 %% The cursor's layout: 2 is the verified and computed stores apart.
 -define(LAYOUT, 2).
+%% Computed slots between prunes of the computed store.
+-define(PRUNE_SLOTS, 100).
 %% Confirmations below which this node's Arweave index is not believed.
 -define(MIN_DEPTH, 2).
 
@@ -127,11 +132,15 @@ slice(R, Slice) ->
     end.
 
 %% Compute `Slot' and record it, durably, as this build's.
-computed(R, Slot) ->
+computed(R = #{ computed := Before }, Slot) ->
     case compute(R, Slot) of
         {ok, _} ->
             R1 = R#{ computed := Slot },
             ok = write_cursor(R1),
+            case Slot div ?PRUNE_SLOTS > Before div ?PRUNE_SLOTS of
+                true -> prune(R1);
+                false -> ok
+            end,
             {more, R1};
         error -> {done, R#{ stopped := did_not_compute(Slot) }}
     end.
@@ -257,6 +266,26 @@ raw_item(_, _, _) -> false.
 
 %%% The replica -----------------------------------------------------------------
 
+%% @doc Delete from the computed store every state but the newest snapshots
+%% and the newest slots (`hb_store_retention', at keep-seconds 0 and no
+%% checkpoint tiers): what the attestor and a follower act on is the head,
+%% and a call resumes from the newest snapshot. Every 1 MB PUSD lane slot was
+%% kept forever before, ~95% of each attestor's store (audit 2026-11-21).
+%% Never fails the replica: a prune that fails is logged and tried again.
+prune(#{ opts := ROpts, pusd := Pusd }) ->
+    try hb_store_retention:retain(ROpts#{
+            <<"store-retention-keep-seconds">> => 0,
+            <<"store-retention-full-keep-seconds">> => 0,
+            <<"store-retention-policy">> => [],
+            <<"store-retention-checkpoint-tiers">> => [],
+            <<"store-retention-checkpoints">> => 2,
+            <<"store-retention-recent-slots">> => 2,
+            <<"store-retention-max-cpu-pct">> => 100 }) of
+        #{ status := ok } -> ok;
+        Other -> ?event(warning, {replica_prune_skipped, Pusd, Other}), ok
+    catch C:E -> ?event(warning, {replica_prune_failed, Pusd, {C, E}}), ok
+    end.
+
 load(Pusd, Url, NodeOpts, Dir) ->
     load(Pusd, Url, NodeOpts, Dir, drop).
 
@@ -359,6 +388,9 @@ execution_opts(NodeOpts, Verified, Computed) ->
         % node's to deliver, and the node's deliverer is never started or
         % notified from here (`lib_process_delivery').
         <<"process-delivery">> => false,
+        % Every state a row of its own namespace, the only rows `prune/1'
+        % may delete.
+        <<"process-state-blobs">> => true,
         % Result-affecting options, pinned to what our nodes run
         % (paralith-mono infra/nodes/node-config.v011.json).
         <<"lua-patch-invalid-patches">> => <<"drop">>,
@@ -907,6 +939,30 @@ replica_failure_is_scrubbed_test() ->
     hb_store:stop(Store),
     ?assertMatch(<<"malformed assignment: ", _/binary>>, Why),
     ?assertEqual(nomatch, binary:match(Why, <<"KEY">>)).
+
+%% The computed store keeps only what the replica acts on and resumes from:
+%% the newest two snapshots and the newest two states. Every other state goes,
+%% and nothing of the verified store is touched.
+prune_keeps_the_head_test() ->
+    Verified = hb_test_utils:test_store(hb_store_lmdb, <<"replica-prune">>),
+    Computed = hb_test_utils:test_store(hb_store_lmdb, <<"replica-prune.computed">>),
+    ok = hb_store:start([Verified, Computed]),
+    Pusd = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Key = fun(K, S) -> iolist_to_binary(io_lib:format("pstate/~s/~s/~12..0B", [Pusd, K, S])) end,
+    Rows = maps:from_list(
+        [ {Key(<<"f">>, S), <<"state">>} || S <- lists:seq(0, 120) ] ++
+        [ {Key(<<"s">>, S), term_to_binary({1, #{ <<"timestamp">> => erlang:system_time(millisecond) }})}
+        || S <- lists:seq(0, 120, 25) ]),
+    ok = hb_store:write([Computed], Rows, #{}),
+    ok = hb_store:write([Verified], #{ <<"assignment">> => <<"kept">> }, #{}),
+    ok = prune(#{ pusd => Pusd, opts => execution_opts(#{}, Verified, Computed) }),
+    Left = fun(K) ->
+        {ok, L} = hb_store:list([Computed], <<"pstate/", Pusd/binary, "/", K/binary>>, #{}),
+        lists:sort([ binary_to_integer(N) || N <- L ])
+    end,
+    ?assertEqual([75, 100], Left(<<"s">>)),
+    ?assertEqual([75, 100, 119, 120], Left(<<"f">>)),
+    ?assertEqual({ok, <<"kept">>}, hb_store:read([Verified], <<"assignment">>, #{})).
 
 %% The replica reads PUSD's schedule from this node's own Arweave index, the
 %% one its `~arweave-scheduler@1.0' materialized, and never from a gateway:
