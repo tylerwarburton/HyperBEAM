@@ -284,6 +284,10 @@ raw_default_message() ->
         <<"compute-mode">> => lazy,
         % Choice of remote nodes for tasks that are not local to hyperbeam.
         <<"gateway">> => ?DEFAULT_GATEWAY,
+        % Requests per second to a host, from the whole node (`hb_http_gate').
+        % arweave.net limits each address to about 1,000 requests a minute
+        % and counts refused requests too.
+        <<"http-gate-rates">> => #{ <<"arweave.net">> => 8 },
         <<"bundler-ans104">> => <<"https://up.arweave.net:443">>,
         % Location of the wallet keyfile on disk that this node will use.
         <<"priv-key-location">> => <<"hyperbeam-key.json">>,
