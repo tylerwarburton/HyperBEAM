@@ -254,7 +254,9 @@ has_outbox(_, _) -> false.
 %% never been stored is computed, and that compute groups: the process
 %% worker's grouper names it by process id, which is how it reaches the live
 %% worker. A slot at or below the head whose state retention deleted is
-%% refused by the compute with a 410; it is never replayed.
+%% refused by the compute with a 410; it is never replayed, not even for the
+%% one request (`process-history-replay' false): a push of it must deliver
+%% nothing again.
 slot_results(Process, ProcID, Slot, Opts) ->
     case lib_process_cache:read_results(ProcID, Slot, Opts) of
         {ok, Results} -> {ok, Results};
@@ -262,7 +264,8 @@ slot_results(Process, ProcID, Slot, Opts) ->
             hb_ao:resolve(
                 {as, <<"process@1.0">>, Process},
                 #{ <<"path">> => <<"compute/results">>, <<"slot">> => Slot },
-                (worker_spawn_opts(Opts))#{ <<"hashpath">> => ignore }
+                (worker_spawn_opts(Opts))#{ <<"hashpath">> => ignore,
+                                            <<"process-history-replay">> => false }
             )
     end.
 
@@ -1931,7 +1934,8 @@ chain_without_client_test_() ->
 
 %% @doc A sender with 16 slots computed (slot 2 sends to a local target), a VM
 %% snapshot every 5 slots and retention run: its floor is slot 10, so slot
-%% 2's state is gone (the snapshot checkpoints at 0 and 5 stay). Its outbox
+%% 2's state is gone (of the snapshots below the floor, slot 0's stays: the
+%% oldest of its hour, `hb_store_retention'). Its outbox
 %% was delivered by the node, unasked.
 late_push_setup() ->
     {Sender, SenderID, {Target, TargetID}, _, Opts} = delivery_setup(#{}),
@@ -1953,7 +1957,7 @@ late_push_setup() ->
     Rows = fun(Kind) -> rows(SenderID, Kind, Opts) end,
     ?assertNot(lists:member(2, Rows(<<"d">>) ++ Rows(<<"f">>))),
     ?assertNot(lists:member(4, Rows(<<"d">>) ++ Rows(<<"f">>))),
-    ?assert(lists:member(5, Rows(<<"f">>))),
+    ?assert(lists:member(0, Rows(<<"f">>))),
     % Delivered, and below the floor: its receipts went with its state.
     ?assertEqual([], Rows(<<"x">>)),
     {Sender, SenderID, Target, TargetID, Opts}.
