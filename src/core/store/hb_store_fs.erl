@@ -50,7 +50,10 @@ read(Opts, #{ <<"read">> := Key }, _NodeOpts) ->
     read_path(add_prefix(Opts, hb_path:to_binary(Key))).
 read_path(Path) ->
 	?event({read, Path}),
-	case file:read_file_info(Path) of
+	% `raw': read the inode here, not through the node's one `file_server'.
+	% Every cache miss below the LMDB store reaches this line, and the process
+	% worker waited on that shared server behind every request's miss.
+	case file:read_file_info(Path, [raw]) of
 		{ok, #file_info{type = regular}} ->
 			{ok, _} = file:read_file(Path);
         {ok, #file_info{type = directory}} ->
