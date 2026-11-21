@@ -94,6 +94,7 @@ view(Pusd, Url, Args = #{ opts := NodeOpts, dir := Dir }) ->
         maps:get(slice, Args, ?SLICE_SLOTS), maps:get(deadline, Args, infinity)),
     case R of
         #{ computed := -1 } -> {not_yet, maps:get(stopped, R)};
+        #{ computed := C, snapshot := Snap } when C < Snap -> {not_yet, catching_up(R)};
         #{ computed := Slot, opts := ROpts } ->
             Info = #{ slot => Slot, stopped => maps:get(stopped, R),
                 head => case maps:get(head, R) of undefined -> null; H -> H end },
@@ -131,7 +132,13 @@ slice(R, Slice) ->
         {R1, _} -> {done, R1}
     end.
 
-%% Compute `Slot' and record it, durably, as this build's.
+%% Compute `Slot' and record it, durably, as this build's. Below a snapshot
+%% restored from the cold tier nothing is computed: the slots are verified,
+%% and computing resumes from the snapshot.
+computed(R = #{ snapshot := Snap }, Slot) when Snap >= Slot ->
+    R1 = R#{ computed := Slot },
+    ok = write_cursor(R1),
+    {more, R1};
 computed(R = #{ computed := Before }, Slot) ->
     case compute(R, Slot) of
         {ok, _} ->
@@ -281,7 +288,11 @@ prune(#{ opts := ROpts, pusd := Pusd }) ->
             <<"store-retention-checkpoints">> => 2,
             <<"store-retention-recent-slots">> => 2,
             <<"store-retention-max-cpu-pct">> => 100 }) of
-        #{ status := ok } -> ok;
+        #{ status := ok } ->
+            % The newest snapshot to the cold tier, so a wiped or new node
+            % starts from it (`hb_store_cold'); off this call.
+            [Computed | _] = maps:get(<<"process-store">>, ROpts),
+            hb_store_cold:ship_replica(Pusd, Computed, ROpts);
         Other -> ?event(warning, {replica_prune_skipped, Pusd, Other}), ok
     catch C:E -> ?event(warning, {replica_prune_failed, Pusd, {C, E}}), ok
     end.
@@ -307,16 +318,30 @@ load(Pusd, Url, NodeOpts, Dir, OnOtherBuild) ->
     ok = filelib:ensure_dir(binary_to_list(<<Base/binary, ".computed/">>)),
     ComputedTo = same_build(Cursor, Build, Verified, Computed, OnOtherBuild),
     ok = hb_store:start([Verified, Computed]),
+    % Nothing computed here: start from this build's newest replica snapshot
+    % on the cold tier, if there is one (`hb_store_cold').
+    case ComputedTo =:= -1 andalso newest_snapshot(Computed, Pusd) =:= -1 of
+        true -> _ = hb_store_cold:restore_replica(Pusd, Computed, NodeOpts, -1);
+        false -> ok
+    end,
     ROpts = execution_opts(NodeOpts, Verified, Computed),
     R = #{ pusd => Pusd, url => Url, opts => ROpts, http => NodeOpts,
         verified => Verified, cursor => Cursor, build => Build,
         proc => undefined, schedulers => [], scheduler_device => <<"scheduler@1.0">>,
         slot => -1, chain => Pusd, last => none, computed => -1, head => undefined,
-        stopped => null },
+        stopped => null, snapshot => newest_snapshot(Computed, Pusd) },
     R1 = #{ slot := Slot } = resume(process(R)),
     R1#{ computed := min(Slot, ComputedTo) }.
 
 lmdb(Name) -> #{ <<"store-module">> => hb_store_lmdb, <<"name">> => Name }.
+
+%% The newest snapshot slot in a computed store, or -1.
+newest_snapshot(Computed, Pusd) ->
+    case hb_store:list([Computed], <<"pstate/", (hb_util:human_id(Pusd))/binary, "/s">>, #{}) of
+        {ok, Names} ->
+            lists:max([-1 | [ I || N <- Names, I <- [catch binary_to_integer(N)], is_integer(I) ]]);
+        _ -> -1
+    end.
 
 %% This node's build: its source commit and when it was built.
 build(Opts) ->

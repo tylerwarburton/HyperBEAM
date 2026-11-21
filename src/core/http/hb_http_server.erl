@@ -444,6 +444,7 @@ new_server(RawNodeMsg) ->
                         hb_store_irreplaceable:node_message(
                             hb_store:normalize_opts(NodeMsgAfterHook))),
                 _ = hb_store_retention:maybe_start(NodeMsgIrr),
+                _ = hb_store_cold:maybe_start(NodeMsgIrr),
                 _ = start_delivery_sweep(NodeMsgIrr),
                 _ = start_arweave_follow(NodeMsgIrr),
                 NodeMsgIrr;

@@ -154,7 +154,19 @@ read(ProcID, Slot, RawOpts) ->
             {store, Store}
         }
     ),
-    case hb_cache:read(P1, Opts) of
+    % A slot this node no longer holds is read from the cold tier: its own
+    % folder on the share, the other nodes' (verified), then Arweave
+    % (`hb_store_cold').
+    Found =
+        case hb_cache:read(P1, Opts) of
+            {error, not_found} ->
+                case hb_store_cold:read_assignment(ProcID, hb_util:int(Slot), Opts) of
+                    {ok, Cold} -> {ok, Cold};
+                    not_found -> {error, not_found}
+                end;
+            Local -> Local
+        end,
+    case Found of
         {ok, RawAssignment} ->
             % The scheduler relies on each assignment carrying its unsigned
             % commitment ID, which `hb_cache:read' does not add.
