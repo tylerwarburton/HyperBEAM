@@ -142,8 +142,16 @@ Eunit, in Docker (erlang 27):
   `dev_scheduler` (20), `dev_scheduler_uploader` (15, with
   `unfunded_backs_off_test`), `hb_cache` (61, with `packed_message_test`),
   `hb_link`, `hb_store_offsite_journal` (35, with
-  `large_blob_journaled_once_test`), `hb_store_lmdb` (5).
-- The rest of the sweep is listed in the report that goes with this branch.
+  `large_blob_journaled_once_test`), `hb_store_lmdb` (5),
+  `dev_scheduler_server` (24), `dev_scheduler_cache` (11),
+  `dev_scheduler_admission` (18), `hb_store_irreplaceable`, `dev_lua_patch`
+  (34), `hb_message`, `dev_push` (52).
+- `dev_push`: a push of a pruned slot never history-replays
+  (`process-history-replay` false in `slot_results/4`). A push must not
+  deliver an old outbox again; `late_push_is_410_test_` pins this.
+- `dev_bridge_attestor`: 57 of 58 pass. The failure,
+  `root_endorse_endpoint` (a mock gateway's second post answers 429), fails
+  the same way on `51dd818e1`, so it predates this branch.
 - Not run: paralith-mono's `backend/native/e2e.mjs`. It plays the deployed
   game graph (`live-process.txt`), which a local node does not have without
   a full local deploy of every contract. It is the one check of the real
@@ -259,17 +267,28 @@ keeps only hot data; cold data moves under `<cold>/<node-name>/`.
    | Replica snapshots, 4 lanes × 1 MB × hourly × 3 nodes | ~0.3 |
    | **Total** | **~4.4 GB/day, about 1.6 TB/year** |
 
-   A 1 TB share lasts about 7 months at this rate, and growth is linear in
-   users. The journal is append-only and never pruned, because it is the
+   The share is being enlarged to about 3 TB, which lasts about 1.9 years at
+   this rate. Growth is linear in users. The journal is append-only and never pruned, because it is the
    irreplaceable copy.
 
 ### Status
 
-- **Available now, with config only.** Point `irreplaceable-export.path` at
-  `<cold>/<node-name>/irreplaceable` on every node. The journal shipper
-  already never blocks, keeps segments local until shipped, and poisons only
-  itself on a failed sync. rng and public need the same `irreplaceable-export`
-  block as main.
+- **Available now, with config only.** Every node ships its journal to its
+  own folder, `hyperbeam/<node>/`. The shipper never blocks, keeps segments
+  local until they are shipped, and poisons only itself on a failed sync.
+  The folders are set per node in paralith-deploy1117
+  `infra/nodes/nodes.json`: `exportMount` is mounted at `/app/export`, with
+  `irreplaceable-export.path` `/app/export/irreplaceable`:
+
+  | Node | Share mounted at | `exportMount` (its own folder) |
+  |---|---|---|
+  | paralith | share root at `/mnt/pxe-backup` | `/mnt/pxe-backup/hyperbeam/paralith` |
+  | rng | `hyperbeam` at `/mnt/pxe-backup` | `/mnt/pxe-backup/rng` |
+  | public | only `hyperbeam/public` at `/mnt/pxe-own` | `/mnt/pxe-own` |
+
+  The next commits write their cold data under the same folder:
+  `irreplaceable/` (the journal), `checkpoints/<pid>/`, and `replica/<lane>/`.
+  Public cannot read the other folders, and is untrusted anyway.
 - **Next commits, in order:**
   1. `cold: prune local packed slots older than cold-after-seconds once their journal segment is in the manifest, and read them back from the share`.
   2. `cold: ship daily/weekly checkpoints and replica head snapshots; restore a replica from the newest one`.
