@@ -107,7 +107,7 @@ check(Signer, Stamps, Req, ProcID, Opts) ->
         not_found ->
             % A push is waiting for this slot: the follower polls fast until
             % it is indexed, and the deliverer is told when to ask again.
-            ensure(P, S, Opts) ! {wanted, hb_util:int(Slot)},
+            want(ensure(P, S, Opts), P, hb_util:int(Slot)),
             case retry_after(P, hb_util:int(Slot), Opts) of
                 undefined -> throw({refused, 503, <<"entry not verified yet">>});
                 Secs ->
@@ -143,6 +143,21 @@ check(Signer, Stamps, Req, ProcID, Opts) ->
 
 need(true, _) -> ok;
 need(_, Why) -> throw({refused, 403, Why}).
+
+%% Tell the follower a push waits for `Slot', once per higher slot: it keeps
+%% only the highest, and every refused retry of a push used to queue another
+%% message behind a pass that could run for minutes. The highest slot told is
+%% kept per follower, so a new follower for the process is told again.
+want(Follower, P, Slot) ->
+    ensure_progress_table(),
+    Key = {wanted, hb_util:human_id(P)},
+    case ets:lookup(?PROGRESS, Key) of
+        [{_, Follower, Told}] when Told >= Slot -> ok;
+        _ ->
+            ets:insert(?PROGRESS, {Key, Follower, Slot}),
+            Follower ! {wanted, Slot},
+            ok
+    end.
 
 %% The address a scheduler URI or address names; a name that is neither is
 %% refused, never a crash in the door.
@@ -1185,6 +1200,39 @@ retry_after_follows_progress_test() ->
     _ = progress(F#{ indexed := 100 }),
     {100, Slower} = progress_of(P),
     ?assert(Slower < Rate).
+
+%% A push refused for a slot not yet indexed tells the follower once per
+%% higher slot, not once per refusal: 800 refusals while the follower is busy
+%% in a pass left 800 `{wanted, Slot}' in its mailbox (CAPACITY_LOG_1118,
+%% breakpoint 15). A new follower for the process is told again.
+wanted_is_sent_once_per_higher_slot_test() ->
+    Store = hb_test_utils:test_store(),
+    ok = hb_store:start([Store]),
+    Opts = #{ <<"store">> => [Store] },
+    P = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    S = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Busy = fun() -> receive stop -> ok end end,
+    Follower = hb_name:singleton({?MODULE, P}, Busy),
+    Refuse = fun(Slot) ->
+        Stamps = #{ <<"admit-process">> => P, <<"admit-slot">> => Slot,
+            <<"admit-outbox-key">> => <<"1">>, <<"admit-entry">> => <<"e">> },
+        ?assertThrow({refused, 503, _}, check(S, Stamps, #{}, P, Opts))
+    end,
+    lists:foreach(fun(N) -> Refuse(5 + N rem 3) end, lists:seq(1, 800)),
+    {message_queue_len, Queued} = erlang:process_info(Follower, message_queue_len),
+    ?assert(Queued < 10),
+    {messages, Msgs} = erlang:process_info(Follower, messages),
+    ?assert(lists:member({wanted, 7}, Msgs)),
+    Refuse(9),
+    {messages, Msgs2} = erlang:process_info(Follower, messages),
+    ?assertEqual({wanted, 9}, lists:last(Msgs2)),
+    Follower ! stop,
+    hb_name:unregister({?MODULE, P}),
+    Next = hb_name:singleton({?MODULE, P}, Busy),
+    Refuse(9),
+    {messages, Fresh} = erlang:process_info(Next, messages),
+    ?assertEqual([{wanted, 9}], Fresh),
+    Next ! stop.
 
 %% Windows the index has passed are dropped.
 windows_pruned_test() ->
