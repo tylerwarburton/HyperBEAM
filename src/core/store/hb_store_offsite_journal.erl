@@ -111,6 +111,10 @@
 -define(MAX_BACKOFF_MS, 300000).
 -define(CALL_MS, 120000).
 -define(ASSIGNMENTS, <<"~scheduler@1.0/assignments">>).
+%% A content-addressed row at least this large is journaled once per run
+%% (`new_blobs/2'); at most this many are remembered.
+-define(BLOB_BYTES, 4096).
+-define(MAX_BLOBS, 10000).
 -define(MAGIC, <<"HBJ1">>).
 
 %% @doc A store message that wraps `Inner' with an offsite journal configured
@@ -474,6 +478,7 @@ writer_init(Store) ->
                         cut => undefined,
                         last_round => undefined,
                         appended => 0,
+                        journaled_blobs => #{},
                         reconciled => 0,
                         rebased => 0,
                         errors => 0,
@@ -738,11 +743,13 @@ append_and_write(_Groups, S = #{ poisoned := P }) when P =/= false ->
 append_and_write(Groups0, S = #{ store := Store }) ->
     Groups = dedupe(Groups0),
     Pairs = lists:append(Groups),
-    case append({w, Pairs}, S) of
+    {Journal, Blobs} = new_blobs(Pairs, maps:get(journaled_blobs, S, #{})),
+    case append({w, Journal}, S) of
         {ok, S1} ->
             Inner = inner(Store),
             Res = write_inner(maps:get(<<"store-module">>, Inner), Inner, Groups),
-            {Res, S1#{ pending => mark(Pairs, maps:get(pending, S1)),
+            {Res, S1#{ journaled_blobs => Blobs,
+                       pending => mark(Pairs, maps:get(pending, S1)),
                        unflushed => true,
                        appended => maps:get(appended, S1) + 1 }};
         {error, Reason, S1} ->
@@ -775,6 +782,30 @@ dedupe(Groups) ->
             Groups
         ),
     [ G || G <- Kept, G =/= [] ].
+
+%% The rows to journal, and the large content-addressed (`ni:') rows this
+%% run has journaled. Such a row journaled earlier in the run is not
+%% journaled again: its key names its value, and a confirmation covers
+%% every frame before it, so a restore that has this frame has that one. A
+%% process's module (up to ~680 KB) was journaled again with every message
+%% that carried it: 14.3 MB of a 16.6 MB journal minute (audit 2026-11-21).
+%% Small rows are cheaper to journal than to remember.
+new_blobs(Pairs, Blobs0) ->
+    {Rev, Blobs} =
+        lists:foldl(
+            fun({K = <<"ni:", _/binary>>, V}, {Acc, B}) when byte_size(V) >= ?BLOB_BYTES ->
+                    case is_map_key(K, B) of
+                        true -> {Acc, B};
+                        false -> {[{K, V} | Acc], blob_seen(K, B)}
+                    end;
+               (Pair, {Acc, B}) -> {[Pair | Acc], B}
+            end,
+            {[], Blobs0},
+            Pairs),
+    {lists:reverse(Rev), Blobs}.
+
+blob_seen(K, B) when map_size(B) >= ?MAX_BLOBS -> #{ K => true };
+blob_seen(K, B) -> B#{ K => true }.
 
 stored_content(Mod, Inner, Key = <<"ni:", _/binary>>) ->
     case Mod:read(Inner, #{ <<"read">> => Key, <<"exact">> => true }, #{}) of
@@ -2405,6 +2436,17 @@ gap_refused_test() ->
     ok = flush(Store, #{}, #{}),
     idle = ship_now(Store),
     ?assertMatch({error, {gaps, [{P, [1]}]}}, restore(Target, fresh_store(<<"oj-gap-r">>))).
+
+%% @doc A large content-addressed row is journaled the first time a run
+%% writes it, and not again; small ones and every other row always are.
+large_blob_journaled_once_test() ->
+    Big = binary:copy(<<"m">>, ?BLOB_BYTES),
+    Rows = [{<<"ni:///sha-256;big">>, Big}, {<<"ni:///sha-256;small">>, <<"s">>},
+            {<<"~scheduler@1.0/assignments/P/1">>, <<"ao:x">>}],
+    {First, Seen} = new_blobs(Rows, #{}),
+    ?assertEqual(Rows, First),
+    {Again, Seen} = new_blobs(Rows, Seen),
+    ?assertEqual(tl(Rows), Again).
 
 %% @doc The closure of a message stored with several commitments follows the
 %% `ao://with-commitments=' value to each commitment's ID.
