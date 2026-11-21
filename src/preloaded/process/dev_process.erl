@@ -311,43 +311,46 @@ compute_uncached(ProcID, ProcBase, Req, Slot, Opts) ->
         _ -> compute_here(ProcID, ProcBase, Req, Slot, Opts)
     end.
 
-%% @doc A slot at or below the head that is no longer stored, rebuilt for
-%% this request: restored from the newest kept snapshot at or below it (or
-%% initialized from the definition when none is), then every slot after
-%% that recomputed from the irreplaceable schedule, with nothing written to
-%% the process's cache, no snapshot taken, no worker involved and nothing
-%% delivered. Old reads get slower, never wrong: a slot's state is a
-%% function of the definition and the messages before it. One replay runs
-%% per node at a time; another is answered 503 `retry-after' until it ends.
+%% @doc A slot at or below the head that is no longer stored, rebuilt: from
+%% the newest snapshot at or below it (held here, or put back from the cold
+%% tier; or the definition when there is none), then every slot after that
+%% recomputed from the schedule, with nothing written to the process's
+%% cache, no snapshot taken, no worker involved and nothing delivered. Old
+%% reads get slower, never wrong: a slot's state is a function of the
+%% definition and the messages before it. The rebuild is a job off the
+%% request (`hb_history'): the request is answered 202 with its progress and
+%% ETA, repeats join it, and the rebuilt state is kept for later reads.
 history(ProcID, ProcBase, Req, Slot, Head, Opts) ->
     case hb_opts:get(<<"process-history-replay">>, true, Opts) of
         false ->
             ?event(compute, {refused_pruned_slot, ProcID, Slot, Head}, Opts),
             {error, pruned_slot_error(ProcID, Slot, Head)};
         _ ->
-            case history_lock() of
-                ok ->
-                    try history_replay(ProcID, ProcBase, Req, Slot, Opts)
-                    after hb_name:unregister({?MODULE, history_replay})
-                    end;
-                busy ->
+            Run = fun(Job) ->
+                history_replay(ProcID, ProcBase, Req, Slot, Opts#{ <<"history-job">> => Job })
+            end,
+            case hb_history:request(hb_util:human_id(ProcID), Slot, Run, Opts) of
+                {pending, Info} ->
+                    {error, #{ <<"status">> => 202,
+                               <<"retry-after">> => retry_after(Info),
+                               <<"body">> => rebuilding(ProcID, Slot, Info) }};
+                {busy, #{ running := N }} ->
                     ?event(compute, {history_replay_busy, ProcID, Slot}, Opts),
-                    {error, #{ <<"status">> => 503, <<"retry-after">> => 5,
-                               <<"body">> => <<"Busy rebuilding another old slot. Retry.">> }}
+                    {error, #{ <<"status">> => 503, <<"retry-after">> => 30,
+                               <<"body">> => <<"Busy rebuilding ", (integer_to_binary(N))/binary,
+                                               " other old slots. Retry.">> }};
+                Result -> Result
             end
     end.
 
-%% The node's one history replay: taken if free, or if its holder is dead.
-history_lock() ->
-    Name = {?MODULE, history_replay},
-    case hb_name:register(Name) of
-        ok -> ok;
-        error ->
-            case hb_name:lookup(Name) of
-                undefined -> case hb_name:register(Name) of ok -> ok; error -> busy end;
-                _ -> busy
-            end
-    end.
+retry_after(#{ eta_seconds := ETA }) when is_integer(ETA) -> max(1, min(60, ETA));
+retry_after(_) -> 5.
+
+rebuilding(ProcID, Slot, #{ done := Done, total := Total, eta_seconds := ETA }) ->
+    iolist_to_binary(io_lib:format(
+        "Rebuilding slot ~b of ~s by replay: ~b of ~p slots done, ETA ~s. Ask again.",
+        [Slot, hb_util:human_id(ProcID), Done, Total,
+         case ETA of unknown -> "unknown"; _ -> integer_to_list(ETA) ++ " s" end])).
 
 history_replay(ProcID, ProcBase, Req, Slot, Opts) ->
     HOpts = (slot_opts(Opts))#{
@@ -364,10 +367,14 @@ history_replay(ProcID, ProcBase, Req, Slot, Opts) ->
         <<"process-replay-from-start">> => true
     },
     T0 = erlang:monotonic_time(millisecond),
+    % A shipped checkpoint nearer the slot than any held here is put back
+    % first (`hb_store_cold'), so the replay is the shorter one.
+    _ = hb_store_cold:restore_checkpoint(ProcID, Slot, Opts),
     Definition = hb_maps:get(<<"process">>, ProcBase, ProcBase, Opts),
     case ensure_loaded(Definition, Req#{ <<"slot">> => Slot }, HOpts) of
         {ok, Loaded} ->
             From = lib_process:get_key(<<"at-slot">>, Loaded, HOpts),
+            hb_history:started(HOpts, From, Slot),
             Res = compute_to_slot(ProcID, Loaded, Req, Slot, HOpts),
             ?event(compute,
                 {history_replayed, {proc_id, ProcID}, {slot, Slot}, {from, From},
@@ -722,6 +729,14 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
                     {action, Action}
                 }
             ),
+            % A rebuild of old slots counts the slot, and keeps it if a
+            % request is waiting for it (`hb_history').
+            case maps:is_key(<<"history-job">>, Opts) of
+                true ->
+                    hb_history:note_slot(Opts, hb_util:human_id(ProcID), Slot,
+                        mark_cached_state(without_snapshot(ProcStateWithSnapshot, Opts), Opts));
+                false -> ok
+            end,
             % Notify waiters only after the slot is readable from the process
             % cache. Waiters may immediately re-enter via `/compute' or `/push',
             % and those paths treat the cache as the completion boundary.
@@ -1262,6 +1277,7 @@ restorable_from_start(ProcID, Opts) ->
 ensure_loaded_state_inner(Base, Req, Opts) ->
     % Get the nonce we are currently on and the inbound nonce.
     TargetSlot = hb_ao:get(<<"slot">>, Req, undefined, Opts),
+    ColdTried = is_map(Req) andalso maps:get(<<"cold-tried">>, Req, false) =:= true,
     ProcID = lib_process:process_id(Base, #{}, Opts),
     ?event({ensure_loaded, {base, Base}, {req, Req}}),
     % A state is live only while it is the state that the process device
@@ -1334,6 +1350,16 @@ ensure_loaded_state_inner(Base, Req, Opts) ->
                         }
                     ),
                     {ok, set_initialized(NormalizedWithoutSnapshot, Opts)};
+                {error, not_found} when not ColdTried ->
+                    % None held here: one shipped to the cold tier is put
+                    % back and loaded (`hb_store_cold'); else, as below.
+                    case hb_store_cold:restore_checkpoint(ProcID,
+                            case is_integer(TargetSlot) of true -> TargetSlot; false -> 1 bsl 60 end,
+                            Opts) of
+                        {ok, _} -> ensure_loaded_state_inner(Base, Req, Opts);
+                        not_found ->
+                            ensure_loaded_state_inner(Base, Req#{ <<"cold-tried">> => true }, Opts)
+                    end;
                 {error, not_found} ->
                     % If we do not have a checkpoint, initialize the
                     % process from scratch -- but only when nothing of it was
@@ -1699,17 +1725,32 @@ pruned_slot_is_replayed_not_stored_test_() ->
             fun(Slot, O) ->
                 hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, O)
             end,
-        Old = [1, 6, lists:last(Pruned)],
+        Last = lists:last(Pruned),
+        Old = [Last, 1, 6],
         Before0 = slot_executions(),
         [ ?assertMatch({error, #{ <<"status">> := 410 }},
               Compute(Slot, Opts#{ <<"process-history-replay">> => false }))
         || Slot <- Old ],
         ?assertEqual(Before0, slot_executions()),
-        [ ?assertEqual(integer_to_binary(Slot + 1),
-              hb_ao:get(<<"count">>, element(2, {ok, _} = Compute(Slot, Opts)), Opts))
+        % The first request starts a rebuild and is answered at once with
+        % 202; the others join it (slots it passes on the way).
+        [ ?assertMatch({error, #{ <<"status">> := 202 }}, Compute(Slot, Opts)) || Slot <- Old ],
+        Await =
+            fun Await(Slot, N) ->
+                case Compute(Slot, Opts) of
+                    {ok, State} -> State;
+                    {error, #{ <<"status">> := 202 }} when N > 0 ->
+                        timer:sleep(100), Await(Slot, N - 1)
+                end
+            end,
+        [ ?assertEqual(integer_to_binary(Slot + 1), hb_ao:get(<<"count">>, Await(Slot, 300), Opts))
         || Slot <- Old ],
-        % Replayed from slot 0, the only snapshot below them.
-        ?assertEqual(1 + 6 + lists:last(Pruned), slot_executions() - Before0),
+        % One replay, from slot 0 (the only snapshot below them) to the
+        % newest asked for: the others were kept on its way.
+        ?assertEqual(Last, slot_executions() - Before0),
+        % Asked again, it is instant: from the cache, nothing replayed.
+        ?assertMatch({ok, _}, Compute(1, Opts)),
+        ?assertEqual(Last, slot_executions() - Before0),
         ?assertEqual(Kept, stored_slots(ProcID, Opts)),
         Before = slot_executions(),
         % A kept slot still reads back, and the next one computes forward.
