@@ -188,3 +188,18 @@ verdict: the node hangs up the single request at 300 s before the suite
 ends, and the 51dd818e image does the same on this laptop, so it is the box,
 not the build. `e2e.mjs` and the load gate need a deployed game and were not
 run.
+
+### Breakpoint fixes (CAPACITY_LOG_1118), 2026-11-21
+
+Three commits on top, each with a test that failed on the code before it:
+
+| Commit | Breakpoint | Test | Before | After |
+|---|---|---|---|---|
+| follower: wanted slot once per higher slot | 15 | `wanted_is_sent_once_per_higher_slot_test` (800 refusals, mailbox < 10) | failed: queue not bounded | passes |
+| bridge replica: 500-slot pages, failures say why | 19 | `replica_pages_are_bounded_and_say_why_test_` (mock 504) | failed: `Asked =< 500` | passes |
+| push: follow only targets this node schedules | 20 | `downstream_skips_targets_scheduled_elsewhere_test_` | failed: foreign target followed | passes |
+
+Suites after (dev_scheduler_follower, lib_bridge_replica, dev_push,
+dev_scheduler_admission, lib_process_delivery, dev_bridge_attestor): 189/190,
+the one failure the known `root_endorse_endpoint`. Image `hbnode:rebase-edge`
+rebuilt at the tip: `run-smoke.sh` 18/18, `test:rune` 279/279.
