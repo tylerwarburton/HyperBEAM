@@ -168,15 +168,17 @@ read(Process, RawSlot, {MaxDepth, ResultDepth}, RawOpts) ->
         Error -> Error
     end.
 
-%% @doc Each receipt of a target this node holds, with the push of the slot
-%% its message was assigned there. That push waits on the target's worker and
-%% deliverer like this one; it never computes or delivers for them.
+%% @doc Each receipt of a target this node schedules, with the push of the
+%% slot its message was assigned there. That push waits on the target's worker
+%% and deliverer like this one; it never computes or delivers for them. A
+%% target scheduled elsewhere is not followed, even when it is cached here:
+%% following it computed another node's process here.
 downstream(Receipts, 0, _ResultDepth, _Opts) -> Receipts;
 downstream(Receipts, MaxDepth, ResultDepth, Opts) ->
     maps:map(
         fun(_Key, Receipt = #{ <<"target">> := Target, <<"slot">> := Slot })
                 when Slot =/= undefined ->
-            case hb_cache:read(Target, hb_store:scope(Opts, local)) of
+            case scheduled_here(Target, Opts) of
                 {ok, TargetProcess} ->
                     Next = {next_depth(MaxDepth), ResultDepth - 1},
                     case catch read(TargetProcess, Slot, Next, Opts) of
@@ -190,6 +192,17 @@ downstream(Receipts, MaxDepth, ResultDepth, Opts) ->
         end,
         Receipts
     ).
+
+%% The target's definition, when this node holds it and schedules it.
+scheduled_here(Target, Opts) ->
+    case hb_cache:read(Target, hb_store:scope(Opts, local)) of
+        {ok, Process} ->
+            case lib_process_delivery:is_scheduler(Process, Opts) of
+                true -> {ok, Process};
+                false -> elsewhere
+            end;
+        Other -> Other
+    end.
 
 %% @doc Why a slot with an outbox has no receipts here. Never a 200: a push
 %% answered without receipts would read as a slot that sent nothing.
@@ -2305,6 +2318,26 @@ push_follows_chain_test_() ->
         ?assertEqual(RID, hb_util:deep_get(<<"1/target">>, Shallow, Opts)),
         ?assertEqual(not_found,
             hb_ao:get(<<"resulted-in">>, hb_ao:get(<<"1">>, Shallow, Opts), not_found, Opts))
+    end}.
+
+%% A receipt is followed downstream only where this node schedules the
+%% target. A target merely cached here (another node's process) used to be
+%% computed here to `max-depth', until the 300 s timeout: 8,588 s of compute
+%% an hour on the paralith node for results nobody read (CAPACITY_LOG_1118,
+%% breakpoint 20).
+downstream_skips_targets_scheduled_elsewhere_test_() ->
+    {timeout, 60, fun() ->
+        Opts = delivery_opts(#{}),
+        Elsewhere = hb_util:human_id(ar_wallet:to_address(ar_wallet:new())),
+        Foreign = hb_message:commit(
+            #{ <<"device">> => <<"process@1.0">>, <<"type">> => <<"Process">>,
+               <<"scheduler">> => Elsewhere, <<"execution-device">> => <<"lua@5.3a">> },
+            #{ <<"priv-wallet">> => ar_wallet:new() }, <<"httpsig@1.0">>),
+        {ok, _} = hb_cache:write(Foreign, Opts),
+        FID = hb_message:id(Foreign, all, Opts),
+        Receipts = #{ <<"1">> => #{ <<"target">> => FID, <<"slot">> => 0 } },
+        Out = downstream(Receipts, 30, 1, Opts),
+        ?assertEqual(error, maps:find(<<"resulted-in">>, maps:get(<<"1">>, Out)))
     end}.
 
 %%% Round 3: one test per decision.

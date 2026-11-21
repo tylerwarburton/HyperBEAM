@@ -121,7 +121,7 @@
 -export([read_target/2, recently_missing/2, remember_missing/2]).
 -export([augment_message/3, apply_security/4, normalize_message/2, origin/3]).
 -export([remote_schedule_result/3, find_type/2, parse_redirect/2]).
--export([classify/3]).
+-export([classify/3, is_scheduler/2]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
