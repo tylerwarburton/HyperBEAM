@@ -18,6 +18,7 @@
 -export([get/3, resolve/3, set/3, event/3, id/3, signers/3]).
 -export([install/3, reinstall/3]).
 -include("include/hb.hrl").
+-include_lib("luerl/include/luerl.hrl").
 
 %%% The set of devices that must be included in the device sandbox for an
 %%% execution that is able to perform AO-Core resolutions. Without the following
@@ -32,37 +33,41 @@
     {signers, fun signers/3}
 ]).
 
-%% @doc Install the library into the given Lua environment.
+%% @doc Install the library into the given Lua environment. Every read and
+%% write here is raw: a module can set `__index' or `__newindex' on `_G' or on
+%% `ao', and a metamethod would run Lua with the host functions in hand.
 install(Base, State, Opts) ->
     % Initialize the AO-Core resolver.
     BaseAOTable =
-        case luerl:get_table_keys_dec([ao], State) of
-            {ok, nil, _} ->
+        case raw_ao(State) of
+            nil ->
                 ?event(no_ao_table),
                 #{};
-            {ok, ExistingTable, _} ->
+            Existing ->
                 % The table keeps its functions, which `dev_lua:decode/2' drops.
+                ExistingTable = luerl:decode(Existing, State),
                 ?event({existing_ao_table, ExistingTable}),
                 ExistingTable
         end,
     ?event({base_ao_table, BaseAOTable}),
-    {ok, State2} =
-        luerl:set_table_keys_dec(
-            [ao],
-            BaseAOTable,
-            State
-        ),
+    % A new table, so it carries no metatable that the module set.
+    {AOTable, State1} = luerl:encode(BaseAOTable, State),
+    State2 = luerl_heap:raw_set_table_key(State1#luerl.g, <<"ao">>, AOTable, State1),
     set_functions(Base, State2, Opts).
 
 %% @doc Set the library functions again in the `ao' table of a Lua state
 %% restored from a snapshot. The functions are closures of the module that
 %% installed them, which is not loaded when another build of this device wrote
-%% the snapshot. A state whose `ao' cannot be indexed has no library to set.
+%% the snapshot. A state whose `ao' is not a table has no library to set.
 reinstall(Base, State, Opts) ->
-    case luerl:get_table_keys_dec([ao, get], State) of
-        {ok, _, _} -> set_functions(Base, State, Opts);
-        {lua_error, _, _} -> {ok, State}
+    case raw_ao(State) of
+        #tref{} -> set_functions(Base, State, Opts);
+        _ -> {ok, State}
     end.
+
+%% @doc The global `ao', read without metamethods.
+raw_ao(State) ->
+    luerl_heap:raw_get_table_key(State#luerl.g, <<"ao">>, State).
 
 %% @doc Set the library functions in the `ao' table of the given Lua state.
 set_functions(Base, State, Opts) ->
@@ -95,10 +100,10 @@ set_functions(Base, State, Opts) ->
         ok,
         lists:foldl(
             fun({FuncName, Func}, StateIn) ->
-                {ok, StateOut} =
-                    luerl:set_table_keys_dec(
-                        [ao, FuncName],
+                {Encoded, StateEnc} =
+                    luerl:encode(
                         fun(RawArgs, ImportState) ->
+                          guarded(FuncName, ImportState, fun() ->
                             ?event(lua_import, {calling_import, {func, FuncName}}),
                             % Get the node message of the invocation from the
                             % private data of the Lua state.
@@ -137,15 +142,51 @@ set_functions(Base, State, Opts) ->
                                 ),
                             % Encode the response for return to Lua
                             return(Res, ResState, ImportOpts)
+                          end)
                         end,
                         StateIn
                     ),
-                StateOut
+                luerl_heap:raw_set_table_key(
+                    raw_ao(StateEnc),
+                    atom_to_binary(FuncName),
+                    Encoded,
+                    StateEnc
+                )
             end,
             State,
             ?LIBRARY_FUNCTIONS
         )
     }.
+
+%% @doc Run a library call. A Lua error passes through. Any other error is
+%% raised, failing the call, unless the device set `host-errors' to `lua' in
+%% the state's private data: then it is a Lua error with a fixed message, which
+%% the contract's `pcall' catches. The message never carries the reason, which
+%% can depend on the node. `lua-patch@1.0' asks for `lua' only outside a
+%% process slot, where nothing is kept: inside one, catching an error that
+%% another node does not have would let the two states differ.
+guarded(FuncName, State, Call) ->
+    try Call()
+    catch
+        error:{lua_error, _, _} = LuaError:Stack -> erlang:raise(error, LuaError, Stack);
+        Class:Reason:Stack ->
+            case host_errors(State) of
+                lua ->
+                    luerl_lib:lua_error(
+                        {error_call,
+                            [<<"ao.", (atom_to_binary(FuncName))/binary, " failed on this node">>]},
+                        State
+                    );
+                raise -> erlang:raise(Class, Reason, Stack)
+            end
+    end.
+
+host_errors(State) ->
+    try luerl:get_private(<<"host-errors">>, State) of
+        lua -> lua;
+        _ -> raise
+    catch error:{badkey, _} -> raise
+    end.
 
 %% @doc Helper function for returning a result from a Lua function.
 return(Result, ExecState, Opts) ->

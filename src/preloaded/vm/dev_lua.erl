@@ -278,21 +278,48 @@ initialize(Base, Modules, Opts) ->
     {ok, hb_private:set(Base, <<"state">>, State3, Opts)}.
 
 %% @doc Create a Lua state with no modules, in the node's minimum sandbox and
-%% the sandbox that `requires-determinism' asks for.
+%% the sandbox that `requires-determinism' asks for. A device built on this one
+%% adds its own mandatory entries through `lua-device-sandbox', on top of the
+%% node's minimum rather than in place of it. It may also give a
+%% `lua-device-preload' function of the state, which runs last, before any
+%% module code. Restore takes its allowed host functions from this state too,
+%% so a host function the hook replaces cannot come back from a snapshot.
 create_state(Base, Opts) ->
     DeterministicSpec =
         case hb_util:bool(hb_maps:get(<<"requires-determinism">>, Base, false, Opts)) of
             true -> ?DETERMINISTIC_SANDBOX;
             false -> []
         end,
-    case hb_opts:get(<<"lua-minimum-sandbox">>, ?DEFAULT_MIN_SANDBOX, Opts) of
-        false -> sandbox(luerl:init(), DeterministicSpec, Opts);
-        MinSpec ->
-            dev_lua_require:install(
-                sandbox(luerl:init(), MinSpec ++ DeterministicSpec, Opts),
-                Opts
-            )
+    DeviceSpec = hb_opts:get(<<"lua-device-sandbox">>, [], Opts),
+    State =
+        case {hb_opts:get(<<"lua-minimum-sandbox">>, ?DEFAULT_MIN_SANDBOX, Opts), DeviceSpec} of
+            {false, []} -> sandbox(luerl:init(), DeterministicSpec, Opts);
+            {MinSpec, _} ->
+                dev_lua_require:install(
+                    sandbox(
+                        luerl:init(),
+                        sandbox_list(MinSpec) ++ DeterministicSpec ++ DeviceSpec,
+                        Opts
+                    ),
+                    Opts
+                )
+        end,
+    % Luerl's own collector is quadratic in the number of live tables
+    % (`hb_luerl_gc'); Lua's `collectgarbage' uses the linear one.
+    {ok, Collecting} =
+        luerl:set_table_keys(
+            [<<"collectgarbage">>],
+            #erl_mfa{ m = hb_luerl_gc, f = collectgarbage, a = nil },
+            State
+        ),
+    case hb_opts:get(<<"lua-device-preload">>, undefined, Opts) of
+        Preload when is_function(Preload, 1) -> Preload(Collecting);
+        _ -> Collecting
     end.
+
+sandbox_list(false) -> [];
+sandbox_list(Map) when is_map(Map) -> maps:to_list(Map);
+sandbox_list(List) when is_list(List) -> List.
 
 %%% @doc Return a list of all functions in the Lua environment.
 -spec functions(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) ->
@@ -358,35 +385,42 @@ compute(Key, RawBase, RawReq, Opts) ->
     OldPriv = #{ <<"state">> := State } = hb_private:from_message(Base),
     % TODO: looks like the script is injected in multiple places, does the 
     % script need to be passed?
-    % Get the Lua function to call from the base message.
+    % Get the Lua function to call. Inside a process slot (`dev_process'
+    % marks the state privately) the request is a scheduled message: input
+    % to the contract, never the choice of entry point or its arguments.
+    ReqSources =
+        case is_map_key(<<"initialized">>, OldPriv) of
+            true -> fun(_Keys) -> [] end;
+            false -> fun(Keys) -> [{Req, K} || K <- Keys] end
+        end,
     Function =
         hb_ao:get_first(
-            [
-                {Req, <<"body/function">>},
-                {Req, <<"function">>},
-                {{as, <<"message@1.0">>, Base}, <<"function">>}
-            ],
+            ReqSources([<<"body/function">>, <<"function">>]) ++
+                [{{as, <<"message@1.0">>, Base}, <<"function">>}],
             Key,
             Opts#{ <<"hashpath">> => ignore }
         ),
     ?event(debug_lua, function_found),
     case luerl:get_table_keys_dec([Function], State) of
         {ok, nil, _} -> {error, not_found};
-        _ -> call_function(Function, Base, Req, OldPriv, State, Opts)
+        _ ->
+            call_function(
+                Function,
+                ReqSources([<<"parameters">>]),
+                Base, Req, OldPriv, State, Opts
+            )
     end.
 
 %% @doc Call a function of the Lua state with the parameters that the request
-%% or the base gives, or else with the base and the request.
-call_function(Function, Base, Req, OldPriv, State, Opts) ->
+%% (outside a slot) or the base gives, or else with the base and the request.
+call_function(Function, ReqParams, Base, Req, OldPriv, State, Opts) ->
     % The default arguments carry no private keys from the base or the request.
     % A message in the request's `body', as a process's assignment carries,
     % gives no arguments: they would replace the base, the process's state.
     Params =
         hb_ao:get_first(
-            [
-                {Req, <<"parameters">>},
-                {{as, <<"message@1.0">>, Base}, <<"parameters">>}
-            ],
+            ReqParams ++
+                [{{as, <<"message@1.0">>, Base}, <<"parameters">>}],
             [
                 hb_private:reset(Base),
                 hb_private:reset(Req),
@@ -436,7 +470,7 @@ process_response({ok, [Status, MsgResult], NewState}, Priv, Opts) ->
             % only when it collects garbage, so collect after each call.
             {hb_util:atom(Status), Msg#{
                 <<"priv">> => Priv#{
-                    <<"state">> => luerl:gc(NewState)
+                    <<"state">> => hb_luerl_gc:gc(NewState)
                 }
             }};
         NonMsgRes -> {hb_util:atom(Status), NonMsgRes}
@@ -544,7 +578,110 @@ decode_snapshot(Serialized, Base, Opts) ->
     % Collect the garbage of the new state first: sandboxing `package.searchers'
     % leaves the disk searchers in its table store.
     Allowed = sets:from_list(collect_mfas(luerl:gc(create_state(Base, Opts)))),
-    strip_host_functions(binary_to_term(Serialized, [safe]), Allowed).
+    strip_host_functions(safe_binary_to_term(Serialized), Allowed).
+
+%% @doc `binary_to_term(Bin, [safe])', except that an atom this node does not
+%% have becomes `?UNKNOWN_ATOM' instead of failing the whole decode.
+%%
+%% A snapshot names the modules of its host functions, and the build renames
+%% every preloaded device module after a hash of its code
+%% (`_hb_device_lua_5_3a_<hash>'). So a snapshot written by one build names
+%% modules the next build does not have, and `[safe]' refused it: after the
+%% 2026-10-27 rebuild of the test node every process on it failed its first
+%% compute with `badarg' in `binary_to_term/2'. The functions those atoms name
+%% are not in `Allowed', so `strip_host_functions/2' turns them into `nil',
+%% and restore installs the current build's again, which is what a snapshot
+%% from this build gets too. No atom is ever created.
+safe_binary_to_term(Bin) ->
+    try binary_to_term(Bin, [safe])
+    catch error:badarg ->
+        <<131, Term/binary>> = Bin,
+        binary_to_term(
+            iolist_to_binary([131, existing_atoms(Term)]),
+            [safe]
+        )
+    end.
+
+-define(UNKNOWN_ATOM, hb_snapshot_unknown_atom).
+
+%% Rewrite an external term format body (without the version byte), replacing
+%% each atom that does not exist with `?UNKNOWN_ATOM'.
+existing_atoms(<<80, _Size:32, Z/binary>>) ->
+    existing_atoms(zlib:uncompress(Z));
+existing_atoms(Bin) ->
+    {Out, <<>>} = etf(Bin),
+    Out.
+
+etf(<<Tag, Len:16, Name:Len/binary, R/binary>>) when Tag == 100; Tag == 118 ->
+    {atom_out(Name, Tag == 100), R};
+etf(<<Tag, Len, Name:Len/binary, R/binary>>) when Tag == 115; Tag == 119 ->
+    {atom_out(Name, Tag == 115), R};
+etf(<<97, V, R/binary>>) -> {[97, V], R};
+etf(<<98, V:4/binary, R/binary>>) -> {[98, V], R};
+etf(<<70, V:8/binary, R/binary>>) -> {[70, V], R};
+etf(<<99, V:31/binary, R/binary>>) -> {[99, V], R};
+etf(<<106, R/binary>>) -> {[106], R};
+etf(<<107, Len:16, S:Len/binary, R/binary>>) -> {[107, <<Len:16>>, S], R};
+etf(<<109, Len:32, D:Len/binary, R/binary>>) -> {[109, <<Len:32>>, D], R};
+etf(<<77, Len:32, Bits, D:Len/binary, R/binary>>) -> {[77, <<Len:32, Bits>>, D], R};
+etf(<<110, N, Sign, D:N/binary, R/binary>>) -> {[110, N, Sign, D], R};
+etf(<<111, N:32, Sign, D:N/binary, R/binary>>) -> {[111, <<N:32, Sign>>, D], R};
+etf(<<104, Arity, R/binary>>) -> etf_n(Arity, R, [104, Arity]);
+etf(<<105, Arity:32, R/binary>>) -> etf_n(Arity, R, [105, <<Arity:32>>]);
+etf(<<116, Arity:32, R/binary>>) -> etf_n(2 * Arity, R, [116, <<Arity:32>>]);
+etf(<<108, Len:32, R/binary>>) -> etf_n(Len + 1, R, [108, <<Len:32>>]);
+etf(<<88, R0/binary>>) ->
+    {Node, <<Rest:12/binary, R/binary>>} = etf(R0),
+    {[88, Node, Rest], R};
+etf(<<103, R0/binary>>) ->
+    {Node, <<Rest:9/binary, R/binary>>} = etf(R0),
+    {[103, Node, Rest], R};
+etf(<<89, R0/binary>>) ->
+    {Node, <<Rest:8/binary, R/binary>>} = etf(R0),
+    {[89, Node, Rest], R};
+etf(<<120, R0/binary>>) ->
+    {Node, <<Rest:12/binary, R/binary>>} = etf(R0),
+    {[120, Node, Rest], R};
+etf(<<102, R0/binary>>) ->
+    {Node, <<Rest:5/binary, R/binary>>} = etf(R0),
+    {[102, Node, Rest], R};
+etf(<<101, R0/binary>>) ->
+    {Node, <<Rest:5/binary, R/binary>>} = etf(R0),
+    {[101, Node, Rest], R};
+etf(<<90, Len:16, R0/binary>>) ->
+    IDs = 4 * Len,
+    {Node, <<Rest:(4 + IDs)/binary, R/binary>>} = etf(R0),
+    {[90, <<Len:16>>, Node, Rest], R};
+etf(<<114, Len:16, R0/binary>>) ->
+    IDs = 4 * Len,
+    {Node, <<Rest:(1 + IDs)/binary, R/binary>>} = etf(R0),
+    {[114, <<Len:16>>, Node, Rest], R};
+etf(<<113, R0/binary>>) ->
+    % Module, function, arity.
+    etf_n(3, R0, [113]);
+etf(<<112, _Size:32, Arity, Uniq:16/binary, Index:32, NumFree:32, R0/binary>>) ->
+    % Module, old index, old uniq, pid, then the free variables. The size
+    % covers the whole fun, so it is recomputed for the rewritten body.
+    {Body, R} = etf_n(4 + NumFree, R0, []),
+    Fun = iolist_to_binary([Arity, Uniq, <<Index:32, NumFree:32>>, Body]),
+    {[112, <<(byte_size(Fun) + 4):32>>, Fun], R}.
+
+etf_n(0, R, Acc) -> {Acc, R};
+etf_n(N, Bin, Acc) ->
+    {Out, R} = etf(Bin),
+    etf_n(N - 1, R, [Acc, Out]).
+
+atom_out(Name, Latin1) ->
+    Encoding = case Latin1 of true -> latin1; false -> utf8 end,
+    Atom =
+        try binary_to_existing_atom(Name, Encoding)
+        catch error:badarg -> ?UNKNOWN_ATOM
+        end,
+    UTF8 = atom_to_binary(Atom, utf8),
+    case byte_size(UTF8) of
+        Small when Small < 256 -> [119, Small, UTF8];
+        Large -> [118, <<Large:16>>, UTF8]
+    end.
 
 %% @doc Collect the Erlang functions in a term.
 collect_mfas(#erl_mfa{} = MFA) -> [MFA];
@@ -613,18 +750,20 @@ do_decode(EncMsg = [{_K, _V} | _], Opts) when is_list(EncMsg) ->
     do_decode(
         maps:map(
             fun(Key, V) -> decode_value(Key, do_decode(V, Opts)) end,
-            hb_ao:normalize_keys(
-                maps:from_list(
-                    [
-                        {K, V}
-                    ||
-                        {K, V} <- EncMsg,
-                        not is_list(K),
-                        not is_function(V),
-                        not is_tuple(V)
-                    ]
-                ),
-                Opts
+            one_spelling(
+                hb_ao:normalize_keys(
+                    maps:from_list(
+                        [
+                            {K, V}
+                        ||
+                            {K, V} <- EncMsg,
+                            not is_list(K),
+                            not is_function(V),
+                            not is_tuple(V)
+                        ]
+                    ),
+                    Opts
+                )
             )
         ),
         Opts
@@ -649,6 +788,26 @@ decode_value(<<"commitments">>, Commitments) when is_map(Commitments) ->
     map_committers(fun hb_committer:uri/1, Commitments);
 decode_value(_Key, Value) ->
     Value.
+
+%% @doc A message has one key per lowercase spelling: RC7 stores and looks
+%% a key up by its lowercase form. A state comes into Lua with its keys
+%% lowercased, so a contract that writes `balance-<Address>' again leaves
+%% the table holding both spellings, and the message held both values as a
+%% list (`[new, [old, ...]]', PUSD on prod e50c10a0d). The spelling that is
+%% not already lowercase is the one the contract wrote in this call: it wins.
+one_spelling(Map) ->
+    maps:fold(
+        fun(Key, _Value, Acc) when is_binary(Key) ->
+                Lower = hb_util:lowercase_key(Key),
+                case Lower =/= Key andalso is_map_key(Lower, Acc) of
+                    true -> maps:remove(Lower, Acc);
+                    false -> Acc
+                end;
+           (_Key, _Value, Acc) -> Acc
+        end,
+        Map,
+        Map
+    ).
 
 %% @doc Encode a HyperBEAM `structured@1.0' message into a Lua term. Arweave
 %% committers are given to Lua as their addresses, because Lua code compares
@@ -1288,6 +1447,50 @@ snapshot_excludes_node_wallet_test() ->
         hb_ao:resolve(Restored, <<"ao_resolve">>, Opts)
     ).
 
+%% @doc A snapshot written by another build restores. The build names every
+%% preloaded device module after a hash of its code, so a snapshot's host
+%% functions name modules this build does not have; `[safe]' decoding refused
+%% the whole snapshot, and every process on the test node failed its first
+%% compute after the 2026-10-27 rebuild. Here the module names are made
+%% unknown by changing one byte of each, keeping their length.
+snapshot_from_another_build_restores_test() ->
+    Opts = #{
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"store">> => [hb_test_utils:test_store()]
+    },
+    {ok, Script} = file:read_file("test/test.lua"),
+    {ok, ModuleID} =
+        hb_cache:write(
+            #{ <<"content-type">> => <<"application/lua">>, <<"body">> => Script },
+            Opts
+        ),
+    Node = hb_http_server:start_node(Opts),
+    {ok, Snapshot} =
+        hb_http:get(
+            Node,
+            <<
+                "/~lua@5.3a&module=", ModuleID/binary,
+                "/init/hello~lua@5.3a/snapshot~lua@5.3a/body"
+            >>,
+            #{}
+        ),
+    ?assertNotEqual([], binary:matches(Snapshot, <<"_hb_device_">>)),
+    Foreign = binary:replace(Snapshot, <<"_hb_device_">>, <<"_hb_dexice_">>, [global]),
+    ?assertError(badarg, binary_to_term(Foreign, [safe])),
+    {ok, Restored} =
+        hb_ao:resolve(
+            #{
+                <<"device">> => <<"lua@5.3a">>,
+                <<"snapshot">> => #{ <<"body">> => Foreign }
+            },
+            <<"normalize">>,
+            Opts
+        ),
+    ?assertEqual(
+        {ok, <<"Hello, AO world!">>},
+        hb_ao:resolve(Restored, <<"ao_resolve">>, Opts)
+    ).
+
 pure_lua_process_benchmark_test_() ->
     {timeout,
         30,
@@ -1362,7 +1565,10 @@ aos_authority_not_trusted_test() ->
                         <<"action">> => <<"Eval">>,
                         <<"from-process">> => <<"1234">>
                     },
-                    Opts
+                    % A stranger's: the node's own wallet is a policy signer,
+                    % and the door refuses its unreadable stamp (400) before
+                    % the process could (`dev_scheduler_admission').
+                    #{ <<"priv-wallet">> => ar_wallet:new() }
                 )
         },
         Opts
@@ -1371,6 +1577,62 @@ aos_authority_not_trusted_test() ->
     {ok, _} = hb_ao:resolve(Process, Message, Opts#{ <<"hashpath">> => ignore }),
     {ok, Results} = hb_ao:resolve(Process, <<"now/results/output/data">>, Opts),
     ?assertEqual(<<"Message is not trusted.">>, Results).
+
+%% @doc A scheduled message is input to the contract: it cannot choose which
+%% Lua global a slot runs, nor replace the arguments it runs with.
+scheduled_messages_cannot_select_lua_invocation_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Wallet = ar_wallet:new(),
+        Opts = #{<<"store">> => hb_test_utils:test_store(),
+            <<"priv-wallet">> => Wallet, <<"hashpath">> => ignore,
+            <<"scheduler-publish-remote">> => false,
+            <<"scheduling-mode">> => local_confirmation,
+            <<"spawn-worker">> => false, <<"process-workers">> => false},
+        Script = <<
+            "function compute(base, req)\n"
+            "  base.seen = req.body and req.body.action or 'spawn'\n"
+            "  return base\n"
+            "end\n"
+            "function bypass(base, req) base.seen = 'bypassed' return base end\n"
+        >>,
+        Process = hb_message:commit(
+            #{
+                <<"device">> => <<"process@1.0">>,
+                <<"type">> => <<"Process">>,
+                <<"scheduler-device">> => <<"scheduler@1.0">>,
+                <<"execution-device">> => <<"lua@5.3a">>,
+                <<"module">> => #{
+                    <<"content-type">> => <<"application/lua">>,
+                    <<"body">> => Script
+                },
+                <<"scheduler-location">> =>
+                    hb_util:human_id(ar_wallet:to_address(Wallet))
+            },
+            Opts
+        ),
+        ProcessID = hb_message:id(Process, all, Opts),
+        {ok, _} = hb_cache:write(Process, Opts),
+        {ok, _} = hb_ao:resolve(#{<<"device">> => <<"scheduler@1.0">>},
+            #{<<"path">> => <<"schedule">>, <<"method">> => <<"POST">>,
+                <<"body">> => Process}, Opts),
+        Sender = ar_wallet:new(),
+        Attack = fun(Fields, Slot) ->
+            Body = hb_message:commit(Fields#{<<"target">> => ProcessID,
+                <<"type">> => <<"Message">>,
+                <<"action">> => <<"expected">>}, #{<<"priv-wallet">> => Sender}),
+            {ok, _} = hb_cache:write(Body, Opts),
+            {ok, _} = hb_ao:resolve(Process,
+                #{<<"path">> => <<"schedule">>, <<"method">> => <<"POST">>,
+                    <<"body">> => Body}, Opts),
+            {ok, Result} = hb_ao:resolve(Process,
+                #{<<"path">> => <<"compute">>, <<"slot">> => Slot}, Opts),
+            ?assertEqual(<<"expected">>, hb_ao:get(<<"seen">>, Result, Opts))
+        end,
+        Attack(#{<<"function">> => <<"bypass">>}, 1),
+        Attack(#{<<"parameters">> => [#{<<"body">> =>
+            #{<<"action">> => <<"injected-context">>}}]}, 2)
+    end}.
 
 %% @doc Benchmark the performance of Lua executions.
 aos_process_benchmark_test_() ->
