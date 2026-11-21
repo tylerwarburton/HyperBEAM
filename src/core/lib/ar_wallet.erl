@@ -10,6 +10,7 @@
 -export([compress_ecdsa_pubkey/1]).
 -include("include/ar.hrl").
 -include_lib("public_key/include/public_key.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 %%% @doc Utilities for manipulating wallets.
 %%%
@@ -206,16 +207,27 @@ verify(Wallet, Data, Sig) ->
 
 verify(#{ <<"type">> := Type = ?RSA_SIGN_TYPE, <<"owner">> := Pub },
         Data, Sig, DigestType) ->
-    {rsa, PublicExpnt} = ar_tx:deserialize_sig_type(Type),
-    rsa_pss:verify(
-        Data,
-        DigestType,
-        Sig,
-        #'RSAPublicKey'{
-            publicExponent = PublicExpnt,
-            modulus = binary:decode_unsigned(Pub)
-        }
-    );
+    % One message is verified many times while a node handles it (codecs,
+    % cache writes, normalisation). A success is remembered under the hash of
+    % every input to the check, so a hit can only be the same check again.
+    Key = verified_key(Type, Pub, Data, Sig, DigestType),
+    case verified(Key) of
+        true -> true;
+        false ->
+            {rsa, PublicExpnt} = ar_tx:deserialize_sig_type(Type),
+            Res =
+                rsa_pss:verify(
+                    Data,
+                    DigestType,
+                    Sig,
+                    #'RSAPublicKey'{
+                        publicExponent = PublicExpnt,
+                        modulus = binary:decode_unsigned(Pub)
+                    }
+                ),
+            Res =:= true andalso remember_verified(Key),
+            Res
+    end;
 %% NOTE: We will not write pubkey for ECDSA signature. So don't use verify function 
 %% for ECDSA directly, use ecrecover pattern. This function will return always false 
 %% if called with no Pub.
@@ -540,3 +552,118 @@ odd_part(R, T) -> {R, T}.
 %% @doc Return the greatest common divisor of two integers.
 gcd(A, 0) -> A;
 gcd(A, B) -> gcd(B, A rem B).
+
+%%% Successful RSA verifications, node-wide and bounded.
+
+-define(VERIFIED_TABLE, ar_wallet_verified).
+-define(VERIFIED_MAX, 50000).
+
+%% @doc The cache key of a check: SHA-256 over every input to it, each one
+%% length-prefixed, so two different checks cannot share a key.
+verified_key(Type, Pub, Data, Sig, DigestType) ->
+    crypto:hash(
+        sha256,
+        [
+            [<<(byte_size(F)):64>>, F]
+        ||
+            F <- [term_to_binary({Type, DigestType}), Pub, Data, Sig]
+        ]
+    ).
+
+verified(Key) ->
+    try ets:member(?VERIFIED_TABLE, Key)
+    catch error:badarg -> false
+    end.
+
+%% @doc Remember a success. A full table is emptied, not evicted from: a
+%% forgotten entry costs one more RSA verification and nothing else.
+remember_verified(Key) ->
+    ensure_verified_table(),
+    try
+        case ets:info(?VERIFIED_TABLE, size) >= ?VERIFIED_MAX of
+            true -> ets:delete_all_objects(?VERIFIED_TABLE);
+            false -> ok
+        end,
+        ets:insert(?VERIFIED_TABLE, {Key})
+    catch error:badarg -> true
+    end.
+
+%% The table is owned by a process that never exits: a table dies with its
+%% owner, and the first verifier is usually a short-lived request.
+ensure_verified_table() ->
+    case ets:whereis(?VERIFIED_TABLE) of
+        undefined ->
+            Parent = self(),
+            Ref = make_ref(),
+            {Owner, Mon} =
+                spawn_monitor(
+                    fun() ->
+                        try ets:new(?VERIFIED_TABLE, [named_table, public, set,
+                                {read_concurrency, true},
+                                {write_concurrency, true}]) of
+                            _ ->
+                                Parent ! {Ref, created},
+                                receive after infinity -> ok end
+                        catch error:badarg -> Parent ! {Ref, exists}
+                        end
+                    end
+                ),
+            receive
+                {Ref, _} -> ok;
+                {'DOWN', Mon, process, Owner, _} -> ok
+            after 5000 -> ok
+            end,
+            erlang:demonitor(Mon, [flush]),
+            ok;
+        _ -> ok
+    end.
+
+%%% Tests
+
+%% @doc Count RSA verifications done while `Fun' runs: each is one public
+%% key operation, `rsa_pss:ep/2'.
+count_rsa_verifies(Fun) ->
+    erlang:trace_pattern({rsa_pss, ep, 2}, true, [local, call_count]),
+    erlang:trace(self(), true, [call]),
+    try
+        Res = Fun(),
+        {call_count, N} = erlang:trace_info({rsa_pss, ep, 2}, call_count),
+        {Res, N}
+    after
+        erlang:trace(self(), false, [call]),
+        erlang:trace_pattern({rsa_pss, ep, 2}, false, [local, call_count])
+    end.
+
+verify_once_test() ->
+    Wallet = new(),
+    Data = crypto:strong_rand_bytes(64),
+    Sig = sign(Wallet, Data),
+    {Results, N} =
+        count_rsa_verifies(
+            fun() -> [ verify(Wallet, Data, Sig) || _ <- lists:seq(1, 5) ] end
+        ),
+    ?assertEqual([true, true, true, true, true], Results),
+    ?assertEqual(1, N).
+
+verify_cache_never_crosses_inputs_test() ->
+    Wallet = new(),
+    Other = new(),
+    Data = crypto:strong_rand_bytes(64),
+    Sig = sign(Wallet, Data),
+    ?assert(verify(Wallet, Data, Sig)),
+    % Different bytes, a different key, a different digest or a different
+    % signature: none of them is answered by the success above, and a failure
+    % is never remembered, so checking them again costs the same again.
+    Checks =
+        fun() ->
+            [
+                verify(Wallet, <<Data/binary, 0>>, Sig),
+                verify(Other, Data, Sig),
+                verify(Wallet, Data, Sig, sha384),
+                verify(Wallet, Data, sign(Other, Data))
+            ]
+        end,
+    {First, N} = count_rsa_verifies(Checks),
+    ?assertEqual([false, false, false, false], First),
+    ?assertMatch({[false, false, false, false], N}, count_rsa_verifies(Checks)),
+    ?assert(N >= 3).
