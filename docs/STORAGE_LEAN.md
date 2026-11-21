@@ -23,7 +23,7 @@ The next deploy wipes every node, so none of this migrates old stores.
 |---|---|
 | `bench: storage_bench` | Bench: bytes per slot by row family, plus the `kill -9` crash test |
 | `retention: thin old snapshot checkpoints by age tiers` | Snapshots below the floor are thinned to hourly for a day, daily for a week, weekly for a year. Defaults: keep 1 day of slots, 1 hour for a full-state process |
-| `process: rebuild a pruned slot by replay instead of a 410` | An old slot is replayed for the one request, stores nothing, runs one at a time per node |
+| `process: rebuild a pruned slot by replay instead of a 410` | An old slot is rebuilt by replay and stored nothing; now an async job (below) |
 | `replica: keep only the head and newest snapshots` | Bridge replica `.computed` is pruned every 100 slots |
 | `follower: replicas on the store volume` | The follower's `admission-replica` moves beside the first LMDB store, and is pruned the same way |
 | `process: snapshot by replay time` | Snapshot once 60 s of compute has passed since the last one (`process-snapshot-replay-ms`) |
@@ -31,6 +31,10 @@ The next deploy wipes every node, so none of this migrates old stores.
 | `journal: journal a large content-addressed row once per run` | A module is no longer re-journaled with every message that carries it |
 | `uploader: spawns and modules, unfunded backoff, cost per day` | Spawn and module upload, 402 backoff, fingerprint latency, `status/0` with bytes and $ per day |
 | `lmdb: survive a full disk` | The elmdb writer survives ENOSPC and a full map; `health/0`, plus disk and map fill gauges |
+| `push: never rebuild a pruned slot for a push` | A push of a pruned slot stays a 410; an old outbox is never delivered twice |
+| `cold: hb_store_cold, the share as a cold tier` | Slots, checkpoints and replica snapshots shipped to the node's own folder. Old local slots are pruned once shipped. Reads fall back to the share, then verified peers, then verified Arweave |
+| `process: old-slot rebuilds as async jobs` | `hb_history`: 202 with ETA, coalesced, cached, bounded; replaces the one-at-a-time 503 |
+| `uploader: bytes and $ per process` | `status/0` also lists `processes` |
 
 Each commit is one topic and touches the files it names, so each can be
 cherry-picked onto `paralith/rebase-edge` on its own. The packed-row commit
@@ -219,83 +223,170 @@ of a guarantee we keep.
    cost per process of a few KB, up to about 0.7 MB for a module. The cost
    now shows in `dev_scheduler_uploader:status/0`.
 
-## Cold tier on the shared NFS (design; local hot tier landed)
+## Cold tier on the shared NFS (`hb_store_cold`)
 
-Every node mounts the same NFS share over WireGuard (paralith:
-`/mnt/pxe-backup`). It is a residential link and will go down. Local disk
-keeps only hot data; cold data moves under `<cold>/<node-name>/`.
+Every node mounts the shared NFS (about 3 TB) over WireGuard. It is a
+residential link and will go down. Local disk keeps only hot data. Each node
+writes cold data only to its own folder, `hyperbeam/<node>/`, which is
+mounted at `/app/export`. The other nodes' folders are mounted read-only at
+`/app/cold-peers/<node>`.
 
 ### What lands where
 
-| Data | Local (hot) | Share (cold) |
+| Data | Local (hot) | Share, own folder |
 |---|---|---|
-| Head state, newest 2 snapshots, rolling window | yes | no |
-| Packed messages and assignments | newest N days (`cold-after-seconds`, default 7 days) | all, as journal segments |
-| Offsite journal | until shipped and confirmed | all (already `irreplaceable-export.path`) |
-| Daily and weekly snapshot checkpoints | newest of each tier | all |
-| Replica snapshots | head only | the newest per lane, so a new or wiped node starts from it instead of slot 0 |
+| Head state, newest snapshots, rolling window | yes | no |
+| Packed messages and assignments | the newest `keep-local-seconds` (7 days) | `slots/<pid>/<from>-<to>.hbc`, every slot |
+| Offsite journal | until shipped | `irreplaceable/` |
+| Snapshot checkpoints | local tiers | `checkpoints/<pid>/<slot>-<ms>.hbc`: **every** snapshot for `checkpoint-days` (30), then the oldest per day |
+| Bridge replica snapshots | head and newest 2 | `replica/<lane>/`: the newest 2, so a new or wiped node starts from one instead of slot 0 |
+
+Each file starts with `HBC1` and the SHA-256 of the rest. It is written to
+`.tmp`, synced, renamed, and read back before its slots count as shipped.
 
 ### Rules, and how each is met
 
-1. **Never block on NFS.** Every write to the share is made by a shipper
-   process off the write path, as the offsite journal already does: copy to
-   `.tmp`, sync, rename, then append to `manifest.log` with CRC and a hash
-   chain. Data stays local until its copy is confirmed in the manifest. A
-   failed or hung share stops only the shipper. `status/1` and a
-   `hb_cold_lag_bytes` gauge report how far behind it is, and the node stays
-   healthy. Local pruning of cold-eligible data waits for the manifest, so a
-   share outage costs local disk, never data.
-2. **Each node writes only its own directory and may read the others'.**
-   Signed messages and assignments read from another node's directory are
-   verified before use: signatures, the scheduler's key, slot order and the
-   `base-hashpath` chain. That is the same check `lib_bridge_replica:step/2`
-   applies to a schedule it fetches. A checkpoint from another node is used
-   only if that node is named in `cold-trusted-nodes`. Public is never on
-   that list. Otherwise the checkpoint must match an attested state hash, or
-   it is recomputed.
-3. **Reads fall back: local, then cold, then Arweave.** A slot read
-   (`dev_scheduler_cache:read/3`) that misses locally reads the share's
-   segment index for that process and slot, then the uploader's Arweave
-   windows (the follower already reads these). A checkpoint read for replay
-   does the same.
+1. **Never block on NFS.** A server ships on a timer (`interval-ms`, 60 s).
+   Every filesystem call runs in a process of its own and is abandoned after
+   `io-timeout-ms` (10 s), so a hung mount costs a timeout, never a blocked
+   request. A failed tick marks the share unavailable: `status/0` reports
+   `available` false with `unavailable_since` and `last_error`, and the
+   `hb_cold_available` gauge drops to 0. Retries back off to 10 minutes.
+   Local slots are deleted only after their file is confirmed **and** they
+   are older than `keep-local-seconds`. An outage therefore costs local disk,
+   never data, and the shipper catches up from its markers when the share
+   returns (`hb_cold_lag_slots`). Checkpoints and replica snapshots are only
+   *added* locally from the share, never removed for it.
+2. **Each node writes only its own folder.** Anything read from a peer's
+   folder or from Arweave is verified before use. Every signature must
+   verify. It must name the process and slot asked for. One of the
+   process's schedulers (from the definition this node holds) must have
+   signed the assignment, and the message must verify too. A checkpoint or
+   replica snapshot is taken only from the node's own folder or a peer marked
+   `trusted`, and public is never trusted. A replica snapshot must also come
+   from the same build.
+3. **Reads fall back: local, then cold, then Arweave.**
+   `dev_scheduler_cache:read/3` tries this order:
+   - the local store;
+   - the node's own folder;
+   - the peers' folders;
+   - the process's archive windows on Arweave (`ao-schedule-archive`, format
+     2, full windows).
+
+   A replay with no local checkpoint below its target restores the nearest
+   shipped one first (`restore_checkpoint/3`).
 4. **Bytes per day to the share at 1,000 users:**
 
    | | GB/day |
    |---|---:|
-   | Journal (packed messages and assignments, gzipped), all nodes | ~4.0 (paralith ~2.2, rng ~1.6, public ~0.2) |
-   | Daily snapshot checkpoints, ~50 processes × ~1 MB | ~0.05 |
-   | Replica snapshots, 4 lanes × 1 MB × hourly × 3 nodes | ~0.3 |
-   | **Total** | **~4.4 GB/day, about 1.6 TB/year** |
+   | Packed slots (`slots/`), all nodes, ~4-6 KB per slot | ~5.5 |
+   | Journal (`irreplaceable/`, gzipped) | ~4.0 |
+   | Every snapshot checkpoint, busy processes (game shard ~0.4, book ~0.2, token ~0.07 each) plus idle ones (at most 96 a day) | ~2-3, bounded: after 30 days thinned to 1 a day per process (~0.05 GB/day) |
+   | Replica snapshots, newest 2 per lane | bounded, ~10 MB per node |
+   | **Total** | **~12 GB/day while checkpoints are inside their 30 days**, then **~9.5 GB/day** of permanent growth |
 
-   The share is being enlarged to about 3 TB, which lasts about 1.9 years at
-   this rate. Growth is linear in users. The journal is append-only and never pruned, because it is the
-   irreplaceable copy.
+   The journal and the `slots/` files hold the same messages twice. The
+   journal exists for crash restore; the slot files for reads. Dropping the
+   journal once a range's slot file is confirmed would save ~4 GB/day; that
+   is a decision for Tyler. At ~9.5 GB/day, 3 TB lasts about 10 months at
+   1,000 users; without the journal copy it lasts about 18 months.
 
-### Status
+### Configuration (`cold-tier`, per node in paralith-deploy1117 `infra/nodes/nodes.json`)
 
-- **Available now, with config only.** Every node ships its journal to its
-  own folder, `hyperbeam/<node>/`. The shipper never blocks, keeps segments
-  local until they are shipped, and poisons only itself on a failed sync.
-  The folders are set per node in paralith-deploy1117
-  `infra/nodes/nodes.json`: `exportMount` is mounted at `/app/export`, with
-  `irreplaceable-export.path` `/app/export/irreplaceable`:
+| Node | Own folder (`exportMount` → `/app/export`) | Peers (`coldPeersMount` → `/app/cold-peers`, read-only) |
+|---|---|---|
+| paralith | `/mnt/pxe-backup/hyperbeam/paralith` | `/mnt/pxe-backup/hyperbeam`: rng (trusted), public (untrusted) |
+| rng | `/mnt/pxe-backup/rng` | `/mnt/pxe-backup`: paralith (trusted), public (untrusted) |
+| public | `/mnt/pxe-own` | none: it cannot read the others |
 
-  | Node | Share mounted at | `exportMount` (its own folder) |
-  |---|---|---|
-  | paralith | share root at `/mnt/pxe-backup` | `/mnt/pxe-backup/hyperbeam/paralith` |
-  | rng | `hyperbeam` at `/mnt/pxe-backup` | `/mnt/pxe-backup/rng` |
-  | public | only `hyperbeam/public` at `/mnt/pxe-own` | `/mnt/pxe-own` |
+Keys: `path`, `peers` (`[#{node, path, trusted}]`), `keep-local-seconds`
+(604,800), `checkpoint-days` (30), `interval-ms` (60,000), `io-timeout-ms`
+(10,000), `range-slots` (1,000), `arweave-gateway` (`https://arweave.net`,
+or `false`).
 
-  The next commits write their cold data under the same folder:
-  `irreplaceable/` (the journal), `checkpoints/<pid>/`, and `replica/<lane>/`.
-  Public cannot read the other folders, and is untrusted anyway.
-- **Next commits, in order:**
-  1. `cold: prune local packed slots older than cold-after-seconds once their journal segment is in the manifest, and read them back from the share`.
-  2. `cold: ship daily/weekly checkpoints and replica head snapshots; restore a replica from the newest one`.
-  3. `cold: read other nodes' directories, verified (and trusted-node checkpoints only)`.
-  4. `cold: Arweave as the last fallback for a slot read`.
+### Tests (`hb_store_cold`, 7)
 
-  These were not started in this pass, which went to the hot path.
+- **Ship, prune, read back:** slots are shipped, deleted locally once
+  confirmed and old, and read back. The newest 16 stay local.
+- **Share goes away:** the folder becomes a file mid-run. The tick fails,
+  status says unavailable, every slot stays local, and reads miss without
+  failing. When the folder returns, the next tick ships the backlog, prunes
+  it, and reads return.
+- **Hung call:** a hung filesystem call costs its timeout.
+- **Peer reads:** a peer's slot is used only when the process's scheduler
+  signed it; a forged one is refused.
+- **Checkpoints:** every one is shipped, restored nearest below the target,
+  taken from a peer only when trusted, and thinned after `checkpoint-days`.
+- **Replica snapshot:** shipped, then seeds an empty computed store of the
+  same build; another build's is refused.
+- **Arweave fallback:** the slot is found in a stub gateway's archive window
+  and verified.
+
+## Old-slot reads: async rebuilds (`hb_history`)
+
+A read of a slot whose state was pruned never replays in the request:
+
+- **Asynchronous.** The request starts one rebuild job and is answered at
+  once with **202**, `retry-after`, and "Rebuilding slot S of P by replay: N
+  of M slots done, ETA X s". The job replays at low priority from the nearest
+  snapshot, using local first, then the share, with assignments read local,
+  then share, then Arweave.
+- **Coalesced.** A repeat request for the same slot, or for any slot the
+  running job of that process will pass, joins the job instead of starting
+  one. The job keeps those slots' states when it reaches them.
+- **Cached.** Rebuilt states stay in memory for `process-history-ttl-ms`
+  (30 min), at most `process-history-cache` (32) of them, so follow-up reads
+  are instant.
+- **Bounded.** At most `process-history-jobs` (2) run per node; past that a
+  request gets 503 with `retry-after: 30`.
+- **Observable.** `hb_history:status/0` lists jobs (done, total, slots/s,
+  ETA) and cached states. Gauges `hb_history_jobs` and `hb_history_cached`,
+  and the counter `hb_history_replayed_slots_total`, follow them.
+- **Pushes excluded.** A push never takes this path, so it never delivers an
+  old outbox again.
+
+Test (`dev_process`, `pruned_slot_is_replayed_not_stored_test_`):
+
+1. Slots 24, 1 and 6 are deleted.
+2. All three are answered 202.
+3. **One** job of exactly 24 slot executions serves all three.
+4. A repeat read is instant from the cache, with no execution.
+
+## Replay window: how far an old read replays
+
+An old read replays from the nearest snapshot at or below its slot.
+Snapshots are taken every `process-snapshot-slots` (1,000), every 15 minutes
+(`-time` 900), and after 60 s of compute (`-replay-ms`), whichever comes
+first. So the snapshot gap is at most `min(1000, 900 s × rate, 60 s ÷ cost)`
+slots. Measured replay cost: game 31 ms/slot, token 70 ms/slot (kill -9
+bench).
+
+Worst case, with **local tiers only** (no share):
+
+| Age of the slot | Nearest kept snapshot | Game at 7 slots/s | Token at 1 slot/s |
+|---|---|---|---|
+| < 1 day (delta) / < 1 h (full state) | the slot is stored | 0 | 0 |
+| 1 h – 1 day (full state) | hourly | (stored) | 3,600 slots, **4.2 min** |
+| 1 – 7 days | daily | 604,800 slots, **5.2 h** | 86,400 slots, **1.7 h** |
+| 7 days – 1 year | weekly | 4.2 M slots, **36 h** | 0.6 M slots, **12 h** |
+
+Worst case, with **every snapshot on the share** (`checkpoint-days` 30, now
+the default):
+
+| Age | Game | Token |
+|---|---|---|
+| up to 30 days | ≤ 999 slots, **≤ 31 s** | ≤ 856 slots (60 s cap), **≤ 60 s** |
+| beyond 30 days (daily) | ≤ 1 day of slots, 5.2 h | ≤ 1.7 h |
+
+So the time-based tiers alone are too sparse for a busy process: a day of
+game slots is hours of replay. This build does not make the local tiers
+denser, which would cost ~0.4 GB/day of local disk per busy process.
+Instead it ships **every** snapshot to the share. For 30 days the worst case
+is then Tyler's "X−1 slots since the last snapshot", where X is at most
+1,000 slots or 60 s of compute, so an old read takes at most about a minute.
+To keep that bound for older reads, raise `checkpoint-days`. Each extra day
+costs a busy process ~0.4 GB on the share, and the 1,000-slot snapshot
+interval already bounds the slot count.
 
 ## Configuration
 
@@ -304,7 +395,8 @@ keeps only hot data; cold data moves under `<cold>/<node-name>/`.
 | `store-retention-keep-seconds` | 86,400 (was 259,200) | Slots newer than this are kept whole |
 | `store-retention-full-keep-seconds` | min(keep-seconds, 3,600) | The same, for a full-state process |
 | `store-retention-checkpoint-tiers` | `[[3600,24],[86400,7],[604800,52]]` | Below the floor, keep the oldest snapshot of each of the newest N buckets. `[]` keeps only the newest |
-| `process-history-replay` | `true` | Rebuild a pruned slot by replay. `false` keeps the old 410 |
+| `process-history-replay` | `true` | Rebuild a pruned slot by replay (a job, `hb_history`). `false` keeps the old 410 |
+| `process-history-jobs` / `-ttl-ms` / `-cache` | 2 / 1,800,000 / 32 | Rebuild jobs per node; how long and how many rebuilt states stay cached |
 | `process-snapshot-replay-ms` | 60,000 | Snapshot after this much compute since the last snapshot. `false` turns it off |
 | `scheduler-pack-messages` | `true` | Write assignments and their messages packed |
 | `scheduler-upload-spawns` | `true` | Post each published process's spawn and module once |
