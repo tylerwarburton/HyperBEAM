@@ -1,0 +1,56 @@
+--- a/native/elmdb_nif/src/lib.rs
++++ b/native/elmdb_nif/src/lib.rs
+@@ -626,6 +626,17 @@
+     db.draining.store(Arc::new(None));
+ }
+ 
++/// A commit that failed because the disk or the LMDB map is full. The batch
++/// is back in the overlay (`restore_failed_flush`), so it is NOT fatal: the
++/// caller is answered with the error, the worker stays up, and the next flush
++/// retries it, so writes resume, without a restart, once space is freed.
++/// Before, the worker exited on it and the store refused every write until
++/// the node restarted (public node, 2026-11-21).
++fn out_of_space(e: &str) -> bool {
++    e.contains("No space left") || e.contains("os error 28")
++        || e.contains("MAP_FULL") || e.contains("MapFull")
++}
++
+ fn drain_remaining_sync_waiters(rx: &Receiver<WorkerCommand>, fatal_error: Option<String>) {
+     while let Ok(cmd) = rx.try_recv() {
+         let err_msg = fatal_error.clone().unwrap_or_else(|| "Worker shut down".to_string());
+@@ -652,6 +663,11 @@
+             Ok(WorkerCommand::Flush) => {
+                 db.flush_pending.store(false, Ordering::Release);
+                 let result = do_flush(&db);
++                if let Err(ref e) = result {
++                    if out_of_space(e) {
++                        continue;
++                    }
++                }
+                 if let Err(e) = result {
+                     if let Ok(mut guard) = db.fatal_error.lock() {
+                         *guard = Some(e.clone());
+@@ -664,9 +680,13 @@
+             Ok(WorkerCommand::FlushSync(signal)) => {
+                 db.flush_pending.store(false, Ordering::Release);
+                 let result = do_flush(&db);
+-                let is_err = result.is_err();
++                let is_err = match result {
++                    Err(ref e) => !out_of_space(e),
++                    Ok(()) => false,
++                };
+                 if is_err {
+                     let e = result.as_ref().unwrap_err().clone();
++                    // (Out of space is answered below and not fatal.)
+                     if let Ok(mut guard) = db.fatal_error.lock() {
+                         *guard = Some(e.clone());
+                     }
+@@ -687,7 +707,7 @@
+             Ok(WorkerCommand::Delete(keys, signal)) => {
+                 db.flush_pending.store(false, Ordering::Release);
+                 let result = do_flush_delete(&db, &keys);
+-                let failed = result.as_ref().err().cloned();
++                let failed = result.as_ref().err().cloned().filter(|e| !out_of_space(e));
+                 if let Some(ref e) = failed {
+                     if let Ok(mut guard) = db.fatal_error.lock() {
+                         *guard = Some(e.clone());

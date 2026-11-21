@@ -20,6 +20,7 @@
 %% Public API exports
 -export([start/3, stop/3, flush/3, scope/0, scope/1, reset/3]).
 -export([read/3, write/3, list/3, match/3]).
+-export([health/0, fill/1]).
 
 %% Test framework and project includes
 -include_lib("eunit/include/eunit.hrl").
@@ -31,7 +32,12 @@
                                                 % every 5,000 write operations.
 -define(DEFAULT_FLUSH_EVERY, 1_000).            % Commit buffered writes at
                                                 % least every second.
--define(MAX_KEY_SIZE, 511).                     % LMDB's key size limit, bytes.
+-define(MAX_KEY_SIZE, 511).
+%% How often a store's flusher measures its disk and map fill, and the disk
+%% fill (`store-disk-alarm-pct') at which it raises an alarm.
+-define(MONITOR_MS, 30000).
+-define(DISK_ALARM_PCT, 85).
+-define(HEALTH, {?MODULE, health}).                     % LMDB's key size limit, bytes.
 
 %% @doc Start the LMDB storage system for a given database configuration.
 %%
@@ -110,20 +116,95 @@ start_flusher(Opts = #{ <<"name">> := DataDir }, Instance) ->
         false ->
             hb_name:singleton(
                 {?MODULE, DataDir},
-                fun() -> flusher(Instance, FlushEvery) end
+                fun() -> flusher(Opts, Instance, FlushEvery, 0) end
             ),
             ok
     end.
 
 %% @doc Commit the store's buffered writes every `FlushEvery' milliseconds,
-%% until the store stops.
-flusher(Instance, FlushEvery) ->
+%% until the store stops, noting whether the store takes them (`health/0'),
+%% and measure the store's disk and map fill every `?MONITOR_MS'.
+flusher(Opts, Instance, FlushEvery, Ticks) ->
     receive
         stop -> ok
     after FlushEvery ->
-        commit(Instance),
-        flusher(Instance, FlushEvery)
+        note(Opts, commit(Instance)),
+        case Ticks rem max(1, ?MONITOR_MS div max(1, FlushEvery)) of
+            0 -> catch monitor(Opts);
+            _ -> ok
+        end,
+        flusher(Opts, Instance, FlushEvery, Ticks + 1)
     end.
+
+%% @doc The stores that cannot commit (a full disk or map: `elmdb' keeps
+%% their writes and takes them once there is room, without a restart), and
+%% the last disk and map fill of every store with a flusher:
+%% `#{ Name => #{ error, since, disk_used_pct, disk_free_bytes, file_bytes,
+%% map_used_pct } }'. A store with an `error' is unhealthy.
+health() -> persistent_term:get(?HEALTH, #{}).
+
+health_update(Name, Fun) ->
+    H = health(),
+    New = Fun(maps:get(Name, H, #{})),
+    case New =:= maps:get(Name, H, #{}) of
+        true -> ok;
+        false -> persistent_term:put(?HEALTH, H#{ Name => New })
+    end.
+
+%% A commit's result: unhealthy from the first failure (an error, once) to
+%% the next success.
+note(#{ <<"name">> := Name }, ok) ->
+    case maps:get(error, maps:get(Name, health(), #{}), none) of
+        none -> ok;
+        _ ->
+            ?event(warning, {lmdb_store_writable_again, {store, Name}}),
+            set_gauge(hb_store_unhealthy, Name, 0),
+            health_update(Name, fun(S) -> maps:without([error, since], S) end)
+    end;
+note(#{ <<"name">> := Name }, {error, Reason}) ->
+    case maps:is_key(error, maps:get(Name, health(), #{})) of
+        true -> ok;
+        false ->
+            ?event(error, {lmdb_store_unhealthy, {store, Name}, {reason, Reason}}),
+            set_gauge(hb_store_unhealthy, Name, 1),
+            health_update(Name, fun(S) ->
+                S#{ error => Reason, since => erlang:system_time(millisecond) } end)
+    end;
+note(_, _) -> ok.
+
+%% @doc A store's fill: of its filesystem (`df'), and of its LMDB map.
+fill(#{ <<"name">> := Name } = Opts) ->
+    Dir = hb_util:list(Name),
+    File = filelib:file_size(filename:join(Dir, "data.mdb")),
+    Map = hb_util:int(maps:get(<<"capacity">>, Opts, ?DEFAULT_SIZE)),
+    Disk =
+        case string:lexemes(os:cmd("df -Pk " ++ Dir ++ " 2>/dev/null | tail -1"), " \n") of
+            [_, Total, _Used, Avail, _Pct | _] ->
+                T = list_to_integer(Total), A = list_to_integer(Avail),
+                #{ disk_used_pct => round(100 * (T - A) / max(1, T)), disk_free_bytes => A * 1024 };
+            _ -> #{}
+        end,
+    Disk#{ file_bytes => File, map_used_pct => round(100 * File / max(1, Map)) }.
+
+monitor(Opts = #{ <<"name">> := Name }) ->
+    Fill = fill(Opts),
+    set_gauge(hb_store_map_used_percent, Name, maps:get(map_used_pct, Fill)),
+    Alarm = hb_util:int(maps:get(<<"disk-alarm-pct">>, Opts, ?DISK_ALARM_PCT)),
+    case maps:find(disk_used_pct, Fill) of
+        {ok, Pct} ->
+            set_gauge(hb_store_disk_used_percent, Name, Pct),
+            case Pct >= Alarm andalso not maps:get(disk_alarm, maps:get(Name, health(), #{}), false) of
+                true -> ?event(error, {lmdb_store_disk_alarm, {store, Name}, {fill, Fill}});
+                false -> ok
+            end;
+        error -> ok
+    end,
+    health_update(Name, fun(S) ->
+        maps:merge(S, Fill#{ disk_alarm => maps:get(disk_used_pct, Fill, 0) >= Alarm })
+    end).
+
+set_gauge(Metric, Name, Value) ->
+    try prometheus_gauge:set(Metric, [Name], Value) catch _:_ -> ok end.
 
 %% @doc Ensure that the database directory exists.
 ensure_dir(DataDirPath) ->
@@ -415,7 +496,9 @@ stop_flusher(DataDir) ->
 %% loses them. A store syncs every commit to disk unless `sync' is `false';
 %% such a store commits to the OS page cache only, so the flush syncs it, and
 %% a loss of power can lose (or corrupt) its commits since the last flush.
-flush(Opts, _Req, _NodeOpts) ->
+flush(Opts, Req, NodeOpts) -> flush_noted(Opts, Req, NodeOpts).
+
+flush_unnoted(Opts, _Req, _NodeOpts) ->
     case hb_util:atom(maps:get(<<"sync">>, Opts, true)) of
         false ->
             Instance = #{ <<"env">> := Env } = find_env(Opts),
@@ -428,6 +511,11 @@ flush(Opts, _Req, _NodeOpts) ->
             end;
         _ -> commit(find_env(Opts))
     end.
+
+flush_noted(Opts, Req, NodeOpts) ->
+    Result = flush_unnoted(Opts, Req, NodeOpts),
+    note(Opts, Result),
+    Result.
 
 %% @doc Commit the writes that `elmdb' holds in memory.
 %% Timed as `lmdb_commit': inside a slot against the slot (`hb_slot_log'),
@@ -505,6 +593,11 @@ init_prometheus() ->
         {labels, [name]},
         {help, "LMDB name requested"}
     ]),
+    [ hb_prometheus:declare(gauge, [{name, G}, {labels, [store_name]}, {help, H}])
+    || {G, H} <- [
+        {hb_store_disk_used_percent, "Fill of the filesystem an LMDB store is on"},
+        {hb_store_map_used_percent, "Fill of an LMDB store's map (file size / capacity)"},
+        {hb_store_unhealthy, "1 while an LMDB store cannot commit its writes"}] ],
     ok.
 
 %% @doc Test suite demonstrating basic store operations.
