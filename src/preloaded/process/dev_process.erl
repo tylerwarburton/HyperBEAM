@@ -59,6 +59,9 @@
 -define(DEFAULT_SNAPSHOT_SLOTS, undefined).
 -define(DEFAULT_SNAPSHOT_TIME, 60).
 -endif.
+%% Compute time since the last snapshot after which the next slot snapshots
+%% (`process-snapshot-replay-ms'): what a restart replays at most.
+-define(DEFAULT_SNAPSHOT_REPLAY_MS, 60000).
 
 %% @doc Return the options of the device: the `worker', `grouper' and `await'
 %% functions of its executions, and the keys that it exports.
@@ -676,9 +679,14 @@ compute_slot(ProcID, State, RawInputMsg, InitReq, TargetSlot, Opts) ->
         {ok, NewProcStateMsg} when is_map(NewProcStateMsg) ->
             % We have now transformed slot n -> n + 1. Increment the current slot.
             NewProcStateMsgWithSlot =
-                lib_process:normalize_changed(
-                    NewProcStateMsg,
-                    #{ <<"device">> => <<"process@1.0">>, <<"at-slot">> => Slot },
+                with_replay_time(
+                    lib_process:normalize_changed(
+                        NewProcStateMsg,
+                        #{ <<"device">> => <<"process@1.0">>, <<"at-slot">> => Slot },
+                        Opts
+                    ),
+                    State,
+                    PrepTimeMicroSecs + RuntimeMicroSecs,
                     Opts
                 ),
             % Force a snapshot of the target slot so the terminal state is
@@ -924,8 +932,8 @@ store_result(ForceSnapshot, ProcID, Slot, Res, Req, RawOpts) ->
 				WithLastSnapshot =
                     hb_private:set(
                         WithSnapshot,
-                        <<"last-snapshot">>,
-                        os:system_time(second),
+                        #{ <<"last-snapshot">> => os:system_time(second),
+                           <<"replay-us">> => 0 },
                         Opts
                     ),
                 ?event(debug_interval,
@@ -948,7 +956,28 @@ store_result(ForceSnapshot, ProcID, Slot, Res, Req, RawOpts) ->
 %% `process_snapshot_slots' option. If it is set, we check if the slot is
 %% a multiple of the interval. If either are true, we must snapshot.
 should_snapshot(Slot, Res, Opts) ->
-    should_snapshot_slots(Slot, Opts) orelse should_snapshot_time(Res, Opts).
+    should_snapshot_slots(Slot, Opts) orelse should_snapshot_time(Res, Opts)
+        orelse should_snapshot_replay(Res, Opts).
+
+%% @doc Snapshot once the slots since the last snapshot took
+%% `process-snapshot-replay-ms' (default 60,000) to compute: a restart then
+%% replays at most that long, however slow the process's slots are. A slot
+%% count alone left a full-state token at ~2 s a slot ~30 minutes of replay
+%% behind its newest snapshot (1,000 slots), and a 15 s/slot one hours.
+%% `false' turns it off.
+should_snapshot_replay(Res, Opts) ->
+    case hb_util:safe_int(
+            hb_opts:get(<<"process-snapshot-replay-ms">>, ?DEFAULT_SNAPSHOT_REPLAY_MS, Opts)) of
+        {ok, Ms} when Ms > 0 ->
+            hb_private:get(<<"replay-us">>, Res, 0, Opts) >= Ms * 1000;
+        _ -> false
+    end.
+
+%% The compute time since the last snapshot, carried in the state's private
+%% keys from slot to slot (never stored).
+with_replay_time(Res, Prev, Micros, Opts) ->
+    hb_private:set(Res, <<"replay-us">>,
+        hb_private:get(<<"replay-us">>, Prev, 0, Opts) + Micros, Opts).
 
 %% @doc Calculate if we should snapshot based on the number of slots. A value
 %% that is not a positive integer, such as `false' or `0', turns it off.
