@@ -20,10 +20,32 @@
 %% 1. The `Opts' map (letting the node operator have the final say).
 %% 2. The `Res' results message (granted by Base's device).
 %% 3. The `OriginalReq' message (the user's request).
-%% Base is not used, such that it can specify cache control information about 
+%% Base is not used, such that it can specify cache control information about
 %% itself, without affecting its outputs. Cache identity uses the varied inputs.
+%% Under `request-cache-store => false' (every HTTP request, and every
+%% resolution nested in one) the request can turn storing off but never on:
+%% a client's `store' or `always' would otherwise write results that nothing
+%% ever deletes.
 maybe_store(Base, Req, Res, OriginalReq, Opts) ->
-    case derive_cache_settings([Res, OriginalReq], Opts) of
+    case is_process_cached_state(Base) orelse is_process_cached_state(Res) of
+        true ->
+            % A process state read back from the process cache is already
+            % durable there. Writing it again re-serializes and re-hashes the
+            % whole state on every `now' read, and on every key read from it,
+            % for no new data.
+            ?event(caching, {skip_store, process_cached_state}),
+            not_caching;
+        false ->
+            maybe_store_by_settings(Base, Req, Res, OriginalReq, Opts)
+    end.
+
+maybe_store_by_settings(Base, Req, Res, OriginalReq, Opts) ->
+    Request =
+        case hb_opts:get(<<"request-cache-store">>, true, Opts) of
+            false -> {request, OriginalReq};
+            _ -> OriginalReq
+        end,
+    case derive_cache_settings([Res, Request], Opts) of
         #{ <<"store">> := true } ->
             ?event(caching, {caching_result, {base, Base}, {req, Req}, {res, Res}}),
             dispatch_cache_write(Base, Req, Res, Opts);
@@ -74,6 +96,14 @@ maybe_lookup(Base, Req, _OriginalBase, OriginalReq, Opts) ->
     end.
 
 %%% Internal functions
+
+%% @doc Is this a process state served from the process cache? The process
+%% device marks such states privately with `process-cached-state'.
+is_process_cached_state(Msg) when is_map(Msg) ->
+    maps:get(<<"process-cached-state">>, hb_private:from_message(Msg), false)
+        =:= true;
+is_process_cached_state(_) ->
+    false.
 
 %% @doc Dispatch the cache write to a worker process if requested.
 %% Invoke the appropriate cache write function based on the type of the message.
@@ -178,8 +208,11 @@ derive_cache_settings(SourceList, Opts) ->
             maybe_set(Acc, cache_source_to_cache_settings(Source, Opts), Opts)
         end,
         #{ <<"store">> => ?DEFAULT_STORE_OPT, <<"lookup">> => ?DEFAULT_LOOKUP_OPT },
-        [{opts, Opts}|lists:filter(fun erlang:is_map/1, SourceList)]
+        [{opts, Opts}|lists:filter(fun is_source/1, SourceList)]
     ).
+
+is_source({request, Msg}) -> is_map(Msg);
+is_source(Msg) -> is_map(Msg).
 
 %% @doc Takes a key and two maps, returning the first map with the key set to
 %% the value of the second map _if_ the value is not undefined.
@@ -202,10 +235,26 @@ maybe_set(Map1, Map2, Opts) ->
 %% which leads to the result not being cached (as it may be stored with an 
 %% incorrect hashpath).
 cache_source_to_cache_settings({opts, Opts}, _) ->
-    CCMap = specifiers_to_cache_settings(hb_opts:get(cache_control, [], Opts)),
+    CCMap0 = specifiers_to_cache_settings(hb_opts:get(cache_control, [], Opts)),
+    % `cache-control' is a temporary option: every nested resolution drops it.
+    % `result-cache-lookup => false' survives nesting, so a caller that knows
+    % no result of its whole subtree is ever in the result cache (a process
+    % worker computing slots) can stop every nested resolution from hashing
+    % its base to look one up.
+    CCMap =
+        case hb_opts:get(<<"result-cache-lookup">>, true, Opts) of
+            false -> CCMap0#{ <<"lookup">> => false };
+            _ -> CCMap0
+        end,
     case hb_opts:get(hashpath, update, Opts) of
         ignore -> CCMap#{ <<"store">> => false };
         _ -> CCMap
+    end;
+cache_source_to_cache_settings({request, Msg}, Opts) ->
+    % A request that may not turn storing on keeps only its `no-store'.
+    case cache_source_to_cache_settings(Msg, Opts) of
+        Settings = #{ <<"store">> := true } -> Settings#{ <<"store">> => undefined };
+        Settings -> Settings
     end;
 cache_source_to_cache_settings(Msg, Opts) ->
     case hb_maps:find(<<"cache-control">>, Msg, Opts) of
@@ -278,6 +327,30 @@ directives(RawCCList) ->
 msg_with_cc(CC) -> #{ <<"cache-control">> => CC }.
 opts_with_cc(CC) -> #{ <<"cache-control">> => CC }.
 
+%% Under `request-cache-store => false' a request's `always' or `store' writes
+%% nothing, and the node's own `always' still stores.
+request_cannot_force_store_test() ->
+    Edge = #{ <<"request-cache-store">> => false },
+    Req = fun(CC) -> {request, msg_with_cc(CC)} end,
+    Store = fun(Sources, Opts) -> maps:get(<<"store">>, derive_cache_settings(Sources, Opts)) end,
+    ?assertEqual(false, Store([Req([<<"always">>])], Edge)),
+    ?assertEqual(false, Store([Req([<<"store">>])], Edge)),
+    ?assertEqual(true, Store([msg_with_cc([<<"always">>])], #{})),
+    ?assertEqual(true, Store([Req([<<"always">>])], opts_with_cc([<<"always">>]))),
+    ?assertEqual(true, maps:get(<<"lookup">>, derive_cache_settings([Req([<<"always">>])], Edge))),
+    % End to end: the resolved result is not in the cache afterwards.
+    Opts = Edge#{
+        <<"store">> => hb_test_utils:test_store(),
+        <<"attested-store">> => hb_test_utils:test_store()
+    },
+    Base = #{ <<"device">> => <<"test-device@1.0">> },
+    Path = #{ <<"path">> => <<"vary-unspecified">>, <<"cache-control">> => [<<"always">>] },
+    Cached = Opts#{ <<"cache-control">> => [<<"only-if-cached">>] },
+    {ok, _} = hb_ao:resolve(Base, Path, Opts),
+    ?assertMatch({error, #{ <<"status">> := 504 }}, hb_ao:resolve(Base, Path, Cached)),
+    {ok, _} = hb_ao:resolve(Base, Path, maps:remove(<<"request-cache-store">>, Opts)),
+    ?assertMatch({ok, _}, hb_ao:resolve(Base, Path, Cached)).
+
 %% Test precedence order (Opts > Res > Req)
 opts_override_message_settings_test() ->
     Req = msg_with_cc([<<"no-store">>]),
@@ -323,6 +396,18 @@ hashpath_ignore_prevents_storage_test() ->
     Opts = (opts_with_cc([]))#{<<"hashpath">> => ignore},
     Result = derive_cache_settings([], Opts),
     ?assertEqual(#{<<"store">> => ?DEFAULT_STORE_OPT, <<"lookup">> => ?DEFAULT_LOOKUP_OPT}, Result).
+
+%% `result-cache-lookup => false' turns lookups off from the options, and
+%% unlike `cache-control' it survives into nested resolutions.
+result_cache_lookup_off_test() ->
+    Opts = (opts_with_cc([]))#{ <<"result-cache-lookup">> => false },
+    ?assertEqual(
+        #{ <<"store">> => ?DEFAULT_STORE_OPT, <<"lookup">> => false },
+        derive_cache_settings([], Opts)
+    ),
+    % A nested resolution drops `cache-control' (hb_ao's TEMP_OPTS).
+    Nested = maps:remove(<<"cache-control">>, Opts),
+    ?assertEqual(false, maps:get(<<"lookup">>, derive_cache_settings([], Nested))).
 
 %% Test multiple directives
 multiple_directives_test() ->
@@ -777,3 +862,25 @@ async_computation_writes_test() ->
             end
         end, 2000))
     end, [<<"first">>, <<"second">>]).
+
+%% A process state served from the process cache is never written back, even
+%% when the node asks for every result to be stored.
+process_cached_state_not_stored_test() ->
+    Cached =
+        #{
+            <<"count">> => <<"1">>,
+            <<"priv">> => #{ <<"process-cached-state">> => true }
+        },
+    Always = #{ <<"cache-control">> => [<<"always">>] },
+    Now = #{ <<"path">> => <<"now">> },
+    ?assertEqual(not_caching, maybe_store(#{}, Now, Cached, Now, Always)),
+    ?assertEqual(
+        not_caching,
+        maybe_store(
+            Cached,
+            #{ <<"path">> => <<"count">> },
+            <<"1">>,
+            #{ <<"path">> => <<"count">> },
+            Always
+        )
+    ).

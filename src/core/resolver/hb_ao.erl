@@ -102,6 +102,12 @@
 %%% `hashpath':         Whether to add the `Req' to `HashPath' for the `Res'.
 %%% `resolve-mode':     Set to `raw' to apply device functions directly,
 %%% 					skipping the resolver's management stages.
+%%% `normalized-base':  A base message that the caller asserts is already in
+%%%                     the form the resolver gives a device: decoded by
+%%%                     `structured@1.0' and stripped of unsigned commitments.
+%%%                     A resolution on exactly this term, with no hashpath
+%%%                     to keep, does not normalise it again (`normalized/2').
+%%%                     Nested resolutions do not inherit it.
 %%% </pre>
 -module(hb_ao).
 %%% Main AO-Core API:
@@ -125,7 +131,8 @@
         <<"spawn-worker">>,
         <<"return-context">>,
         <<"only">>,
-        <<"prefer">>
+        <<"prefer">>,
+        <<"normalized-base">>
     ]
 ).
 
@@ -447,8 +454,13 @@ resolve_stage(2, Base, Req, Opts = #{ <<"resolve-mode">> := raw }) ->
 resolve_stage(2, RawBase, RawReq, Opts) ->
     ?event_debug(debug_ao_core, {stage, 2, vary_inputs}, Opts),
     % Devices receive their inputs in `structured@1.0' form: `to' decodes the
-    % base and the request here.
-    {ok, Base} = raw(<<"structured@1.0">>, <<"to">>, RawBase, #{}, Opts),
+    % base and the request here, unless the base is already decoded
+    % (`normalized/2').
+    {ok, Base} =
+        case normalized(RawBase, Opts) of
+            true -> {ok, RawBase};
+            false -> raw(<<"structured@1.0">>, <<"to">>, RawBase, #{}, Opts)
+        end,
     {ok, Req} = raw(<<"structured@1.0">>, <<"to">>, RawReq, #{}, Opts),
     % Vary the inputs by the schema of the function that will execute them
     % before the cache lookup, such that every execution the schema deems
@@ -474,6 +486,10 @@ resolve_stage(3, Func, Base, Req, Original, Opts) ->
     ),
     resolve_stage(4, Func, Base, Req, Original, Opts);
 resolve_stage(4, Func, Base, Req, Original, Opts) ->
+    persistent_lookup(Func, Base, Req, Original, Opts, 0).
+
+%% @doc Stage 4, carrying how many times a leader we waited on has died.
+persistent_lookup(Func, Base, Req, Original, Opts, LeaderDeaths) ->
     ?event_debug(debug_ao_core, {stage, 4, persistent_resolver_lookup}, Opts),
     % Persistent-resolver lookup: Search for local (or Distributed
     % Erlang cluster) processes that are already performing the execution.
@@ -501,24 +517,38 @@ resolve_stage(4, Func, Base, Req, Original, Opts) ->
                 {continue, NewBase, NewReq} ->
                     resolve_stage(5, Func, NewBase, NewReq, Original, ExecName, Opts)
             end;
-        {wait, Leader} ->
+        {wait, Leader, GroupName} ->
             % There is another executor of this resolution in-flight.
             % Bail execution, register to receive the response, then
-            % wait.
-            case hb_persistent:await(Leader, Base, Req, maps:without(?TEMP_OPTS, Opts)) of
+            % wait, under the name the leader is registered as.
+            case
+                hb_persistent:await(
+                    Leader, GroupName, Base, Req, maps:without(?TEMP_OPTS, Opts)
+                )
+            of
                 {error, leader_died} ->
                     ?event(
                         ao_core,
                         {leader_died_during_wait,
                             {leader, Leader},
+                            {deaths, LeaderDeaths + 1},
                             {base, Base},
                             {req, Req},
                             {opts, Opts}
                         },
                         Opts
                     ),
-                    % Re-try again if the group leader has died.
-                    resolve_stage(4, Func, Base, Req, Original, Opts);
+                    % Re-elect, a bounded number of times. A request that
+                    % crashes its leader every time would otherwise spawn,
+                    % crash and re-send forever while its caller waited.
+                    case LeaderDeaths < hb_opts:get(leader_died_retries, 2, Opts) of
+                        true ->
+                            persistent_lookup(
+                                Func, Base, Req, Original, Opts, LeaderDeaths + 1
+                            );
+                        false ->
+                            error_leader_died(GroupName, LeaderDeaths + 1, Opts)
+                    end;
                 Res ->
                     % Apply this caller's overlay and generate its hashpath.
                     resolve_stage(10, Base, Req, Res, Original, undefined, Opts)
@@ -552,7 +582,11 @@ resolve_stage(5, Resolver, Base, Req, Original, ExecName, Opts) ->
     ?event_debug(debug_ao_core, {stage, 5, ExecName, execution}, Opts),
 	% Execution.
     ExecOpts = execution_opts(Opts),
-    ExecBase = execution_input(Base, Opts),
+    ExecBase =
+        case normalized(Base, Opts) of
+            true -> Base;
+            false -> execution_input(Base, Opts)
+        end,
     ExecReq = execution_input(Req, Opts),
     {Func, Args} =
         case Resolver of
@@ -758,23 +792,47 @@ resolve_stage(10, Base, Req, Res, Original, ExecName, Opts) ->
 resolve_stage(11, _Base, _Req, Res, _Original, undefined, _Opts) ->
     % Cached and awaited results do not start a worker.
     Res;
-resolve_stage(11, _Base, _Req, {ok, Res} = Res, _Original, ExecName, Opts) ->
+resolve_stage(11, _Base, _Req, {ok, Res} = FullRes, _Original, ExecName, Opts) ->
     ?event_debug(debug_ao_core, {stage, 11, ExecName, maybe_spawn_worker}, Opts),
-    % Check if we should fork out a new worker process for the current execution
+    % Check if we should fork out a new worker process for the current execution.
+    % The head used to be `{ok, Res} = Res', which no term matches, so no
+    % worker was ever spawned. `ungrouped_exec' is the sentinel for a
+    % resolution that was never registered under a name: there is nothing for
+    % a worker to be found under, and spawning one would leak a process per
+    % request, all under that one name.
     case
-        {is_map(Res), hb_opts:get(spawn_worker, false, Opts#{ <<"prefer">> => local })}
+        {
+            is_map(Res),
+            ExecName =/= ungrouped_exec,
+            hb_opts:get(spawn_worker, false, Opts#{ <<"prefer">> => local })
+        }
     of
-        {A, B} when (A == false) or (B == false) ->
-            Res;
-        {_, _} ->
-            % Spawn a worker for the current execution
+        {true, true, SpawnWorker} when SpawnWorker =/= false ->
             WorkerPID = hb_persistent:start_worker(ExecName, Res, Opts),
-            hb_persistent:forward_work(WorkerPID, Opts),
-            Res
+            hb_persistent:forward_work(WorkerPID, ExecName, Opts),
+            FullRes;
+        _ ->
+            FullRes
     end;
 resolve_stage(11, _Base, _Req, OtherRes, _Original, _ExecName, _Opts) ->
     ?event_debug(debug_ao_core, {stage, 11, _ExecName, abnormal_status_skip_spawning}, _Opts),
     OtherRes.
+
+%% @doc The executor of a request kept dying: answer with an error rather than
+%% re-electing again.
+error_leader_died(GroupName, Deaths, Opts) ->
+    ?event(
+        ao_core,
+        {error, {type, leader_died}, {group, GroupName}, {deaths, Deaths}},
+        Opts
+    ),
+    {
+        error,
+        #{
+            <<"status">> => 500,
+            <<"body">> => <<"The executor for this request died repeatedly.">>
+        }
+    }.
 
 %% @doc Execute a sub-resolution.
 subresolve(RawBase, DevID, ReqPath, Opts) when is_binary(ReqPath) ->
@@ -1010,11 +1068,33 @@ vary_loaded(Base, Req, Opts) ->
                 end;
             _ -> root
         end,
+    NormalizedBase =
+        case Mode == strip andalso normalized(VariedBase, Opts) of
+            true -> VariedBase;
+            false -> normalize_input(VariedBase, Mode, Opts)
+        end,
     {Resolver,
-        normalize_input(VariedBase, Mode, Opts),
+        NormalizedBase,
         normalize_input(VariedReq, Mode, Opts),
         Overlay
     }.
+
+%% @doc Whether `Base' is the base the caller gave as `normalized-base': a
+%% message already decoded and stripped of unsigned commitments, which the
+%% resolution's normalisations would return unchanged. Each of them rebuilds
+%% every key of the base, so on a process state with one published key per
+%% player every resolution cost O(published keys). Only a resolution that
+%% keeps no hashpath takes it: with a hashpath the base also gains its
+%% unsigned commitments. The test is term equality, which is immediate for the
+%% same term and fails fast for another.
+normalized(Base, Opts) ->
+    case maps:get(<<"normalized-base">>, Opts, undefined) of
+        undefined -> false;
+        Normalized ->
+            Normalized =:= Base andalso
+                hb_opts:get(hashpath, update, Opts) == ignore andalso
+                hb_opts:get(return_context, false, Opts) == false
+    end.
 
 %% @doc Remove unsigned commitments from loaded invocation inputs recursively.
 %% Lazy children carry the same rule into loading. Signed subtrees are unchanged.
