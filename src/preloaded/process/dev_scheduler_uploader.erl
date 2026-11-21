@@ -26,6 +26,23 @@
 %%% (`dev_scheduler_follower') verify the process; only the first lets anyone
 %%% rebuild it from Arweave alone. Off both lists nothing is uploaded.
 %%%
+%%% A fingerprint window waits `scheduler-fingerprint-latency-ms' (default an
+%%% hour) instead of `latency-ms': it pays the item fee for 32 bytes.
+%%%
+%%% Every process this node schedules and publishes for also has its spawn,
+%%% and the module it names by ID, posted once as the signed items they
+%%% are (`scheduler-upload-spawns', default true): an explorer such as Lunar
+%%% opens a process by its ID on Arweave, whatever its schedule's mode. A
+%%% spawn that is not an ANS-104 item cannot keep its ID there and is not
+%%% posted. `uploaded-spawn/<id>' records each that was taken.
+%%%
+%%% A bundler that answers 402 (or `x-free-tier-exhausted') is unfunded: that
+%%% is logged once as an error, `status/0' says so, and the uploader waits
+%%% `scheduler-upload-unfunded-backoff-ms' (default 15 minutes) between tries
+%%% instead of a minute; a `retry-after' is honoured. `status/0' also counts
+%%% the bytes taken, per mode, and their cost a day at
+%%% `scheduler-upload-usd-per-gib' (default 47.29: Turbo by card, 2026-11-21).
+%%%
 %%% Format 2 (`Archive-Format: 2'), the only one written: tags `Process',
 %%% `From-Slot', `To-Slot', `Last-Assignment' (the signed ID of slot
 %%% `To-Slot''s assignment) and `Archive-Data'. `full': the data is the window's
@@ -36,7 +53,7 @@
 %%% uncompressed archive item; windows persisted in it still post and confirm.
 -module(dev_scheduler_uploader).
 -export([start/2, cursor/2, posted/2, allowed/2, mode/2, list_option/2]).
--export([archive_bundle/2, prepare_window/6]).
+-export([archive_bundle/2, prepare_window/6, status/0]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -48,10 +65,15 @@
 -define(DEFAULT_LATENCY_MS, 60000).
 -define(MIN_BACKOFF, 1000).
 -define(MAX_BACKOFF, 60000).
+-define(DEFAULT_FINGERPRINT_LATENCY_MS, 3600000).
+-define(DEFAULT_UNFUNDED_BACKOFF_MS, 900000).
+-define(DEFAULT_USD_PER_GIB, 47.29).
+-define(STATUS, {?MODULE, status}).
 
 %% @doc Start the uploader of `ProcID', linked to the caller, or `undefined'
 %% for a process on neither upload list.
 start(ProcID, Opts) ->
+    ok = upload_spawn(ProcID, Opts),
     case mode(ProcID, Opts) of
         none ->
             ?event(warning, {schedule_upload_skipped, {proc_id, ProcID},
@@ -108,7 +130,13 @@ start_uploader(ProcID, Mode, Opts) ->
                 window_slots =>
                     max(1, Int(scheduler_upload_window_slots, ?DEFAULT_WINDOW_SLOTS)),
                 window_bytes => Int(scheduler_upload_window_bytes, ?DEFAULT_WINDOW_BYTES),
-                latency => Int(scheduler_upload_latency_ms, ?DEFAULT_LATENCY_MS)
+                latency =>
+                    case Mode of
+                        fingerprint ->
+                            Int(scheduler_fingerprint_latency_ms,
+                                ?DEFAULT_FINGERPRINT_LATENCY_MS);
+                        full -> Int(scheduler_upload_latency_ms, ?DEFAULT_LATENCY_MS)
+                    end
             })
         end
     ).
@@ -199,18 +227,157 @@ upload_window(State = #{ id := ProcID, opts := Opts, cursor := Cursor,
                 Opts
             ),
             ok = hb_store:flush(store(Opts), Opts),
+            funded(true),
             State#{ cursor => PostedLast, backoff => ?MIN_BACKOFF };
         Error ->
+            Wait = refused_wait(ProcID, Error, Backoff, Opts),
             ?event(warning,
                 {schedule_upload_retrying,
                     {proc_id, ProcID},
                     {slot, Cursor + 1},
                     {reason, Error},
-                    {backoff_ms, Backoff}
+                    {backoff_ms, Wait}
                 }
             ),
-            timer:sleep(Backoff),
+            timer:sleep(Wait),
             State#{ backoff => min(?MAX_BACKOFF, Backoff * 2) }
+    end.
+
+%% How long to wait after a refused post: the unfunded backoff when it was
+%% for want of payment, else the backoff or the bundler's `retry-after'.
+refused_wait(ID, Error, Backoff, Opts) ->
+    case unfunded(Error) of
+        true ->
+            funded(false, ID, Error),
+            hb_util:int(hb_opts:get(scheduler_upload_unfunded_backoff_ms,
+                ?DEFAULT_UNFUNDED_BACKOFF_MS, Opts));
+        false -> max(Backoff, retry_after_ms(Error))
+    end.
+
+%% @doc The uploads of this node: whether its bundler is funded (and since
+%% when not), and per mode the bytes and posts it took since the node
+%% started, with their rate and cost a day.
+status() ->
+    S = persistent_term:get(?STATUS, #{}),
+    Days = max(1 / 24, (now_ms() - maps:get(started_ms, S, now_ms())) / 86400000),
+    Price = maps:get(usd_per_gib, S, ?DEFAULT_USD_PER_GIB),
+    Modes =
+        maps:map(
+            fun(_, #{ bytes := B, posts := N }) ->
+                PerDay = B / Days,
+                #{ bytes => B, posts => N, bytes_per_day => round(PerDay),
+                   usd_per_day => PerDay / (1 bsl 30) * Price }
+            end,
+            maps:get(posted, S, #{})),
+    maps:merge(maps:with([unfunded_since, last_refusal], S),
+        #{ funded => not maps:get(unfunded, S, false), posted => Modes }).
+
+status_update(Fun) ->
+    S = persistent_term:get(?STATUS, #{ started_ms => now_ms() }),
+    persistent_term:put(?STATUS, Fun(S)).
+
+%% A post taken: its bytes, under its mode (`full', `fingerprint', `spawn').
+count_posted(Mode, Bytes, Opts) ->
+    status_update(fun(S) ->
+        Posted = maps:get(posted, S, #{}),
+        #{ bytes := B, posts := N } = maps:get(Mode, Posted, #{ bytes => 0, posts => 0 }),
+        S#{ usd_per_gib =>
+                hb_opts:get(scheduler_upload_usd_per_gib, ?DEFAULT_USD_PER_GIB, Opts),
+            posted => Posted#{ Mode => #{ bytes => B + Bytes, posts => N + 1 } } }
+    end).
+
+%% The bundler took a post: funded again, if it was not.
+funded(true) ->
+    case maps:get(unfunded, persistent_term:get(?STATUS, #{}), false) of
+        true ->
+            ?event(warning, {schedule_upload_funded_again}),
+            status_update(fun(S) -> maps:without([unfunded_since], S#{ unfunded => false }) end);
+        false -> ok
+    end.
+
+%% A refusal for want of payment: an error the first time, then quiet.
+funded(false, ID, Error) ->
+    case maps:get(unfunded, persistent_term:get(?STATUS, #{}), false) of
+        true -> ok;
+        false ->
+            ?event(error, {schedule_upload_unfunded, {id, ID}, {refusal, Error}}),
+            status_update(fun(S) ->
+                S#{ unfunded => true, unfunded_since => now_ms(), last_refusal => Error }
+            end)
+    end.
+
+%% @doc Whether a bundler refused for want of payment: 402, or Turbo's
+%% `x-free-tier-exhausted' header.
+unfunded({error, {402, _, _, _, _}}) -> true;
+unfunded({error, {_Status, _URL, _Bytes, {headers, Headers}, _Body}}) ->
+    lists:member({<<"x-free-tier-exhausted">>, <<"true">>},
+        [ {string:lowercase(K), string:lowercase(V)} || {K, V} <- Headers ]);
+unfunded(_) -> false.
+
+%% A refusal's `retry-after' in milliseconds, or 0.
+retry_after_ms({error, {_Status, _URL, _Bytes, {headers, Headers}, _Body}}) ->
+    case [ V || {K, V} <- Headers, string:lowercase(K) =:= <<"retry-after">> ] of
+        [V | _] -> try binary_to_integer(V) * 1000 catch _:_ -> 0 end;
+        [] -> 0
+    end;
+retry_after_ms(_) -> 0.
+
+%%% Spawns.
+
+%% @doc Post `ProcID''s spawn, and the module it names by ID, as the signed
+%% ANS-104 items they are, once, off the caller: a node that publishes
+%% uploads them for every process it schedules.
+upload_spawn(ProcID, Opts) ->
+    case hb_opts:get(scheduler_upload_spawns, true, Opts) of
+        false -> ok;
+        _ ->
+            _ = spawn(fun() ->
+                case upload_item(ProcID, Opts) of
+                    {ok, Msg} ->
+                        case hb_maps:get(<<"module">>, Msg, undefined, Opts) of
+                            Module when ?IS_ID(Module) -> upload_item(Module, Opts);
+                            _ -> ok
+                        end;
+                    _ -> ok
+                end
+            end),
+            ok
+    end.
+
+%% Post one stored message under its own ID, unless it was posted before:
+%% `{ok, Msg}' when the message is stored here.
+upload_item(ID0, Opts) ->
+    ID = hb_util:human_id(ID0),
+    Marker = hb_path:to_binary([<<"~scheduler@1.0">>, <<"uploaded-spawn">>, ID]),
+    case hb_cache:read(ID, Opts) of
+        {ok, Raw} ->
+            Msg = hb_cache:ensure_all_loaded(Raw, Opts),
+            Done = hb_store:read(store(Opts), #{ <<"read">> => Marker, <<"exact">> => true }, Opts),
+            Signed = lists:member(<<"ans104@1.0">>, hb_message:commitment_devices(Msg, Opts)),
+            case {Done, Signed} of
+                {{ok, _}, _} -> ok;
+                {_, false} -> ?event(warning, {spawn_not_uploaded, {id, ID}, {reason, not_ans104}});
+                {_, true} ->
+                    post_item(ID, ar_bundles:serialize(item(Msg, Opts)), Marker, ?MIN_BACKOFF, Opts)
+            end,
+            {ok, Msg};
+        _ ->
+            ?event(warning, {spawn_not_uploaded, {id, ID}, {reason, not_stored}}),
+            not_found
+    end.
+
+post_item(ID, Serialized, Marker, Backoff, Opts) ->
+    case post(Serialized, Opts) of
+        ok ->
+            count_posted(spawn, byte_size(Serialized), Opts),
+            funded(true),
+            ok = hb_store:write(store(Opts), #{ Marker => <<"posted">> }, Opts),
+            ok = hb_store:flush(store(Opts), Opts);
+        Error ->
+            Wait = refused_wait(ID, Error, Backoff, Opts),
+            ?event(warning, {spawn_upload_retrying, {id, ID}, {reason, Error}, {backoff_ms, Wait}}),
+            timer:sleep(Wait),
+            post_item(ID, Serialized, Marker, min(?MAX_BACKOFF, Backoff * 2), Opts)
     end.
 
 %% @doc Release clients only through the confirmed contiguous prefix.
@@ -246,6 +413,7 @@ post_window(ProcID, First, Max, #{ mode := Mode, window_bytes := Bytes, opts := 
         case post(Serialized, Opts) of
             ok ->
                 ok = mark_posted(ProcID, First, Opts),
+                count_posted(Mode, byte_size(Serialized), Opts),
                 {ok, Last};
             Error -> Error
         end
@@ -778,6 +946,28 @@ stub_serve(Socket, Statuses, Test, Length) ->
         {ok, _} -> stub_serve(Socket, Statuses, Test, Length);
         {error, _} -> Statuses
     end.
+
+%% @doc A 402, or Turbo's free-tier header on any status, is a bundler that
+%% wants paying: the uploader waits the unfunded backoff and says so in
+%% `status/0' until a post is taken. A `retry-after' is honoured otherwise.
+unfunded_backs_off_test() ->
+    Refusal = fun(Status, Headers) ->
+        {error, {Status, {url, <<"u">>}, {bytes, 1}, {headers, Headers}, {body, <<>>}}}
+    end,
+    ?assert(unfunded(Refusal(402, []))),
+    ?assert(unfunded(Refusal(403, [{<<"X-Free-Tier-Exhausted">>, <<"true">>}]))),
+    ?assertNot(unfunded(Refusal(503, [{<<"retry-after">>, <<"7">>}]))),
+    Opts = #{ <<"scheduler-upload-unfunded-backoff-ms">> => 900000 },
+    persistent_term:erase(?STATUS),
+    ?assertEqual(900000, refused_wait(<<"p">>, Refusal(402, []), 1000, Opts)),
+    ?assertMatch(#{ funded := false }, status()),
+    ?assertEqual(7000, refused_wait(<<"p">>, Refusal(503, [{<<"Retry-After">>, <<"7">>}]), 1000, Opts)),
+    count_posted(full, 1 bsl 30, Opts),
+    funded(true),
+    #{ funded := true, posted := #{ full := #{ bytes := B, usd_per_day := Usd } } } = status(),
+    ?assertEqual(1 bsl 30, B),
+    % A GiB taken within the first hour counts as a day's worth 24 times.
+    ?assert(Usd > 47.29 * 23).
 
 %% @doc What the uploader reads back is the message that was signed: the same
 %% ID, so the item on Arweave is the one the client sent.
