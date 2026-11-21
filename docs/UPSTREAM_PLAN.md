@@ -203,3 +203,47 @@ Suites after (dev_scheduler_follower, lib_bridge_replica, dev_push,
 dev_scheduler_admission, lib_process_delivery, dev_bridge_attestor): 189/190,
 the one failure the known `root_endorse_endpoint`. Image `hbnode:rebase-edge`
 rebuilt at the tip: `run-smoke.sh` 18/18, `test:rune` 279/279.
+
+## Node scheduling policy (`scheduler-policy`)
+
+Which processes a node schedules, as one node option
+(`dev_scheduler_policy`). Without it a node schedules everything, as before.
+
+```json
+"scheduler-policy": {
+  "mode": "owners",
+  "owners": ["<address>", "..."],
+  "refusal-message": "This node only schedules its operator's processes. ...",
+  "deny": { "<process id>": "<message>" }
+}
+```
+
+```json
+"scheduler-policy": {
+  "mode": "open",
+  "deny": { "<process id>": "<message>" }
+}
+```
+
+- `deny` (both modes): a spawn of, or a message to, a listed process is
+  refused with **402** and its message, before anything else. Keys are
+  compared lowercased, because loading a JSON config lowercases map keys; a
+  deny list can only refuse, so that costs nothing.
+- `owners` mode: a spawn is admitted when an owner signed it, or when the
+  scheduler's door admitted its `from-process` (`admit-process`) and that
+  parent is admitted, so processes spawned by admitted processes (hunt
+  workers, DAOs spawned through Yap) keep working and a stranger cannot claim
+  an admitted parent. A message is admitted when its process is. Anything else
+  gets **403** with `refusal-message`.
+- Whether an existing process is admitted is read back from its slot-0
+  assignment (the spawn's signers and the door's `admit-process`), so it
+  survives restarts and covers processes spawned before the policy was set.
+- Reads are never refused.
+- Order in `dev_scheduler:post_local_schedule/4`: deny, then the door
+  (`dev_scheduler_admission:admit/3`), then the policy. The child rule needs
+  the door's verified origin, so the policy decision comes after the door;
+  the door does real work only for a message a trusted or verified scheduler
+  signed, so a stranger's spawn costs no more than before.
+
+Upstream fit: a small, self-contained module and two calls in
+`post_local_schedule/4`; proposable on its own after PR 7.

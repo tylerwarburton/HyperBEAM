@@ -500,9 +500,11 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
             false -> true
         end,
     ?event({verified, Verified}),
-    % Handle scheduling of the message if the message is valid. A message
-    % that claims a process origin (`from-process') is admitted or refused
-    % here, never assigned bare (`dev_scheduler_admission').
+    % Handle scheduling of the message if the message is valid. A denied
+    % process is refused before anything else; a message that claims a
+    % process origin (`from-process') is admitted or refused here, never
+    % assigned bare (`dev_scheduler_admission'); then the node's policy says
+    % whether it schedules the process at all (`dev_scheduler_policy').
     case {Verified, hb_ao:get(<<"type">>, Req, Opts)} of
         {false, _} ->
             {error,
@@ -513,9 +515,11 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
                 }
             };
         {true, Type} ->
-            case dev_scheduler_admission:admit(ProcID, Req, Opts) of
-                {ok, Admitted} -> schedule_valid(ProcID, PID, Type, Admitted, Opts);
-                {error, Refusal} -> {error, Refusal}
+            maybe
+                ok ?= dev_scheduler_policy:deny(ProcID, Opts),
+                {ok, Admitted} ?= dev_scheduler_admission:admit(ProcID, Req, Opts),
+                ok ?= dev_scheduler_policy:admit(ProcID, Type, Admitted, Opts),
+                schedule_valid(ProcID, PID, Type, Admitted, Opts)
             end
     end.
 
