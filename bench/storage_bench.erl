@@ -70,7 +70,12 @@ opts(Dir) ->
         <<"store-retention">> => false,
         <<"match-index">> => false,
         <<"store-all-signed">> => false,
-        <<"lua-patch-invalid-patches">> => <<"drop">>
+        <<"lua-patch-invalid-patches">> => <<"drop">>,
+        % The cold tier, shipping every 5 s and keeping 30 s locally, so a
+        % run ships, prunes and reads back (`hb_store_cold').
+        <<"cold-tier">> => #{ <<"path">> => list_to_binary(Dir ++ "/share"),
+                              <<"keep-local-seconds">> => 30, <<"interval-ms">> => 5000,
+                              <<"arweave-gateway">> => false }
     }).
 
 %% The node's key, kept beside its stores so a restarted node is the same
@@ -428,13 +433,12 @@ crash_verify_one(Name, P, Ack, Opts, Dir) ->
     Pid = pid(P, Opts),
     % The scheduler's head (this also loads its device's modules).
     {ok, Current} = hb_ao:resolve(P, #{ <<"path">> => <<"slot/current">> }, Opts),
-    % Every slot the scheduler holds, in order, each naming its slot.
-    Slots = (sched_cache()):list(Pid, Opts),
-    true = hb_util:int(Current) =:= lists:max([ hb_util:int(S) || S <- Slots ]),
-    Sorted = lists:sort([ hb_util:int(S) || S <- Slots ]),
-    Top = lists:last(Sorted),
-    InOrder = Sorted =:= lists:seq(0, Top)
-        andalso lists:all(
+    % Every slot up to the head reads back, in order, each naming its slot:
+    % held here, or (shipped and pruned) read back from the cold tier.
+    Top = hb_util:int(Current),
+    Local = length((sched_cache()):list(Pid, Opts)),
+    Sorted = lists:seq(0, Top),
+    InOrder = lists:all(
             fun(S) ->
                 {ok, A} = (sched_cache()):read(Pid, S, Opts),
                 hb_util:int(hb_ao:get(<<"slot">>, A, Opts)) =:= S
@@ -451,14 +455,21 @@ crash_verify_one(Name, P, Ack, Opts, Dir) ->
     _ = hb_store_retention:retain(Opts#{ <<"store-retention-keep-seconds">> => 0 }),
     Old = max(1, Top div 2),
     forget(P, Opts),
-    {TOld, OldRes} = timer:tc(fun() -> catch published(compute(P, Old, Opts), Opts) end),
+    {TOld, OldRes} = timer:tc(fun() -> catch published(await(P, Old, Opts), Opts) end),
     forget(P, Opts),
-    {_, OldFresh} = timer:tc(fun() -> catch published(compute(P, Old, Fresh), Fresh) end),
-    #{ name => Name, top => Top, acked_present => Top >= Ack, in_order => InOrder,
+    {_, OldFresh} = timer:tc(fun() -> catch published(await(P, Old, Fresh), Fresh) end),
+    #{ name => Name, top => Top, held_locally => Local, acked_present => Top >= Ack, in_order => InOrder,
        head_equal => Head =:= FromIrr, head_ms => THead div 1000,
        head_from_irreplaceable_ms => TFresh div 1000,
        old_slot => Old, old_slot_equal => OldRes =:= OldFresh, old_slot_replay_ms => TOld div 1000,
        ok => Top >= Ack andalso InOrder andalso Head =:= FromIrr andalso OldRes =:= OldFresh }.
+
+%% A slot's state, waiting out a rebuild of an old slot (202, `hb_history').
+await(P, N, Opts) ->
+    case hb_ao:resolve(P, #{ <<"path">> => <<"compute">>, <<"slot">> => N }, Opts) of
+        {ok, State} -> State;
+        {error, #{ <<"status">> := 202 }} -> timer:sleep(200), await(P, N, Opts)
+    end.
 
 %% Drop the process's worker and the in-memory hot cache, so the next
 %% compute starts from what the stores hold.
