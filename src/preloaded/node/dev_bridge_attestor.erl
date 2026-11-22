@@ -427,7 +427,7 @@ root_certificate_approval(Message, View, St = #{cfg := Cfg, opts := Opts, me := 
             member -> not maps:is_key(<<"root-sequence">>, Payload);
             _ ->
                 Sequence = root_positive_integer(maps:get(<<"root-sequence">>, Payload)),
-                Previous = maps:get(Account, key(<<"rootintents">>, View), #{}),
+                Previous = maps:get(Account, root_intents(View), #{}),
                 Sequence =:= hb_util:int(maps:get(<<"sequence">>, Previous, 0)) + 1
         end,
         % A holder spends what it holds; a lane release is escrow the root
@@ -451,9 +451,24 @@ root_certificate_approval(Message, View, St = #{cfg := Cfg, opts := Opts, me := 
 %% touched account's scalar is the current value, including an explicit zero.
 root_balance(Account, View = {State, ROpts}) ->
     case hb_ao:get(<<"balance-", Account/binary>>, State, not_found, ROpts) of
-        not_found -> hb_util:int(maps:get(Account, key(<<"balances">>, View), 0));
+        not_found ->
+            % pusd.lua folds balances into `balances-<n>' (BALANCE_BUCKETS);
+            % `balances' is only its checkpoint and reads empty.
+            Bucket = key(<<"balances-", (integer_to_binary(fold_bucket(Account, 256)))/binary>>, View),
+            hb_util:int(maps:get(Account, Bucket, maps:get(Account, key(<<"balances">>, View), 0)));
         Current -> hb_util:int(Current)
     end.
+
+%% pusd.lua's fold rule: the sum of the address's first four bytes mod `N'.
+fold_bucket(<<A, B, C, D, _/binary>>, N) -> (A + B + C + D) rem N;
+fold_bucket(Address, N) -> lists:sum(binary_to_list(Address)) rem N.
+
+%% Every account's root-intent row: pusd.lua publishes them folded into
+%% `rootintents-<n>' (32 buckets); an older root published one `rootintents'.
+root_intents(View) ->
+    lists:foldl(fun(N, Acc) ->
+            maps:merge(Acc, key(<<"rootintents-", (integer_to_binary(N))/binary>>, View))
+        end, key(<<"rootintents">>, View), lists:seq(0, 31)).
 
 %% @doc This member's endorsement: its BLS signature over the root domain,
 %% under the committee's own tag (dev_bridge_root). The current set must
@@ -700,6 +715,15 @@ root_certificate_approval_test() ->
         {State#{BalanceKey => <<"0">>}, Opts}, St)),
     FreshCredit = State#{<<"balances">> => <<"{}">>, BalanceKey => <<"100">>},
     ?assertMatch({ok, _}, root_certificate_approval(Signed, {FreshCredit, Opts}, St)),
+    % pusd.lua folds balances into `balances-<n>' and leaves `balances' empty:
+    % the holder's bucket is what the endorsement must read (2026-11-22, the
+    % fresh root refused every Ledger-Enter reading 0 from `balances').
+    BucketKey = <<"balances-", (integer_to_binary(fold_bucket(Author, 256)))/binary>>,
+    Folded = maps:remove(BalanceKey, State#{<<"balances">> => <<"{}">>,
+        BucketKey => hb_json:encode(#{Author => <<"100">>})}),
+    ?assertMatch({ok, _}, root_certificate_approval(Signed, {Folded, Opts}, St)),
+    ?assertMatch({error, _}, root_certificate_approval(Signed,
+        {Folded#{BucketKey => <<"{}">>}, Opts}, St)),
     ?assertMatch({error, _}, root_certificate_approval(
         Signed#{<<"quantity">> => <<"90">>}, View, St)),
     ?assertMatch({error, _}, root_certificate_approval(
@@ -1276,7 +1300,7 @@ attest(Info, View, St = #{ cfg := Cfg, me := Me }) ->
             St3 = apply_proposals(Info, St2),
             St4 = acknowledge(Withdrawals, chain_signatures(Info, Withdrawals, Epoch, St3)),
             St5 = relay_fast_ledgers(Info, LedgerDeposits, LedgerReceipts,
-                MoveReceipts, Epoch, St4#{root_intents => key(<<"rootintents">>, View),
+                MoveReceipts, Epoch, St4#{root_intents => root_intents(View),
                     root_certificate_info => Info}),
             St6 = committee_certificate(Epoch, St5),
             save_state(Cfg, St6),
