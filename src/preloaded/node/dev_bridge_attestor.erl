@@ -454,8 +454,12 @@ root_balance(Account, View = {State, ROpts}) ->
         not_found ->
             % pusd.lua folds balances into `balances-<n>' (BALANCE_BUCKETS);
             % `balances' is only its checkpoint and reads empty.
-            Bucket = key(<<"balances-", (integer_to_binary(fold_bucket(Account, 256)))/binary>>, View),
-            hb_util:int(maps:get(Account, Bucket, maps:get(Account, key(<<"balances">>, View), 0)));
+            % An empty Lua table publishes as `[]', so either may be a list.
+            Bucket = as_map(key(<<"balances-", (integer_to_binary(fold_bucket(Account, 256)))/binary>>, View)),
+            case maps:find(Account, Bucket) of
+                {ok, Atoms} -> hb_util:int(Atoms);
+                error -> hb_util:int(maps:get(Account, as_map(key(<<"balances">>, View)), 0))
+            end;
         Current -> hb_util:int(Current)
     end.
 
@@ -467,8 +471,11 @@ fold_bucket(Address, N) -> lists:sum(binary_to_list(Address)) rem N.
 %% `rootintents-<n>' (32 buckets); an older root published one `rootintents'.
 root_intents(View) ->
     lists:foldl(fun(N, Acc) ->
-            maps:merge(Acc, key(<<"rootintents-", (integer_to_binary(N))/binary>>, View))
-        end, key(<<"rootintents">>, View), lists:seq(0, 31)).
+            maps:merge(Acc, as_map(key(<<"rootintents-", (integer_to_binary(N))/binary>>, View)))
+        end, as_map(key(<<"rootintents">>, View)), lists:seq(0, 31)).
+
+as_map(M) when is_map(M) -> M;
+as_map(_) -> #{}.
 
 %% @doc This member's endorsement: its BLS signature over the root domain,
 %% under the committee's own tag (dev_bridge_root). The current set must
@@ -719,7 +726,7 @@ root_certificate_approval_test() ->
     % the holder's bucket is what the endorsement must read (2026-11-22, the
     % fresh root refused every Ledger-Enter reading 0 from `balances').
     BucketKey = <<"balances-", (integer_to_binary(fold_bucket(Author, 256)))/binary>>,
-    Folded = maps:remove(BalanceKey, State#{<<"balances">> => <<"{}">>,
+    Folded = maps:remove(BalanceKey, State#{<<"balances">> => <<"[]">>,
         BucketKey => hb_json:encode(#{Author => <<"100">>})}),
     ?assertMatch({ok, _}, root_certificate_approval(Signed, {Folded, Opts}, St)),
     ?assertMatch({error, _}, root_certificate_approval(Signed,
