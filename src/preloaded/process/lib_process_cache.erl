@@ -851,8 +851,18 @@ blob_slots(ProcID, Kind, Store) ->
         _ -> []
     end.
 
-blob_encode(Term) -> term_to_binary({?BLOB_VSN, Term}, [{compressed, 1}]).
-blob_decode(Bin) -> {?BLOB_VSN, Term} = binary_to_term(Bin), Term.
+blob_encode(Term) ->
+    T0 = erlang:monotonic_time(microsecond),
+    Bin = term_to_binary({?BLOB_VSN, Term}, [{compressed, 1}]),
+    % A slot's store time, split: encoding a row (`store_encode'), and a
+    % whole checkpoint row (`store_checkpoint', `full_blob/5').
+    hb_slot_log:note(store_encode, erlang:monotonic_time(microsecond) - T0),
+    Bin.
+blob_decode(Bin) ->
+    T0 = erlang:monotonic_time(microsecond),
+    {?BLOB_VSN, Term} = binary_to_term(Bin),
+    hb_slot_log:note(store_decode, erlang:monotonic_time(microsecond) - T0),
+    Term.
 
 %% @doc Write a delta process's slot as one row. A checkpoint is the whole
 %% public state; one carrying a VM snapshot also gets its `s' marker, written
@@ -886,6 +896,12 @@ write_full_blob(ProcID, Slot, Msg, Store, Opts) ->
     {ok, Key}.
 
 full_blob(ProcID, Slot, Msg, Store, Opts) ->
+    T0 = erlang:monotonic_time(microsecond),
+    K = full_blob_row(ProcID, Slot, Msg, Store, Opts),
+    hb_slot_log:note(store_checkpoint, erlang:monotonic_time(microsecond) - T0),
+    K.
+
+full_blob_row(ProcID, Slot, Msg, Store, Opts) ->
     Loaded = hb_cache:ensure_all_loaded(hb_private:reset(Msg), Opts),
     K = blob_key(ProcID, <<"f">>, Slot),
     Encoded = blob_encode(Loaded),

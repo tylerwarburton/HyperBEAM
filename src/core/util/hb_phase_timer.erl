@@ -28,6 +28,7 @@
 -export([configure/1, enabled/0, record/2, record/3, time/2, time/3]).
 -export([set_process/1, read/0, read_processes/0, reset/0]).
 -export([label/1, record_node/2, record_label/3]).
+-export([read_hist/0, percentiles/2, bucket/1]).
 -include_lib("eunit/include/eunit.hrl").
 
 -define(TABLE, hb_phase_timer).
@@ -37,6 +38,10 @@
 -define(DEFAULT_MAX, 128).
 -define(LABEL_KEY, {?MODULE, process}).
 -define(OTHER, <<"other">>).
+%% Node-wide rows also carry a log2 histogram of their samples: bucket `B'
+%% counts samples of `2^B' to `2^(B+1)-1' microseconds (bucket 0 also holds
+%% 0), the last one everything from `2^(?BUCKETS-1)' up (~33 s).
+-define(BUCKETS, 26).
 
 %% @doc Set recording on or off from the node option `phase-timers', and the
 %% number of processes that get their own label from `phase-timers-processes'.
@@ -138,11 +143,28 @@ time(Phase, Process, Fun) ->
         false -> Fun()
     end.
 
-add(Key, Micros) ->
+%% A node-wide row is `{Key, Total, Count, Bucket0, ...}', updated by one
+%% `ets:update_counter' (its histogram bucket is a third increment); a
+%% process's row `{{Phase, Label}, Total, Count}' has no histogram.
+add(Key = {_, _}, Micros) ->
     ensure_table(),
     try ets:update_counter(?TABLE, Key, [{2, Micros}, {3, 1}], {Key, 0, 0})
     catch error:badarg -> ok
+    end;
+add(Key, Micros) ->
+    ensure_table(),
+    try
+        ets:update_counter(?TABLE, Key,
+            [{2, Micros}, {3, 1}, {4 + bucket(Micros), 1}],
+            setelement(1, erlang:make_tuple(3 + ?BUCKETS, 0), Key))
+    catch error:badarg -> ok
     end.
+
+%% @doc The histogram bucket of a sample: the log2 of its microseconds, at
+%% most `?BUCKETS - 1'.
+bucket(Micros) -> bucket(Micros bsr 1, 0).
+bucket(M, B) when M =< 0; B >= ?BUCKETS - 1 -> B;
+bucket(M, B) -> bucket(M bsr 1, B + 1).
 
 %% A process keeps the label it was given; a new one gets its own while fewer
 %% than the cap have one, `other' after. A racing admission can overshoot the
@@ -169,15 +191,40 @@ label(Process) ->
     catch error:badarg -> ?OTHER
     end.
 
-%% @doc Every phase as `{Phase, TotalMicros, Count, MeanMicros}'.
+%% @doc Every phase as `{Phase, TotalMicros, Count, MeanMicros}'. A phase of
+%% an HTTP request (`{http, Class, Phase}') is named `<<"http_Class_Phase">>'.
 read() ->
+    [ {P, T, N, T div max(N, 1)} || {P, T, N, _} <- read_hist() ].
+
+%% @doc Every node-wide phase as `{Phase, TotalMicros, Count, Buckets}', with
+%% `Buckets' the histogram's counts, lowest first (`bucket/1').
+read_hist() ->
     try
         lists:sort(
-            [ {P, T, N, T div max(N, 1)}
-            || {P, T, N} <- ets:tab2list(?TABLE), is_atom(P) ]
+            [ {name(element(1, Row)), element(2, Row), element(3, Row),
+                    lists:nthtail(3, tuple_to_list(Row))}
+            || Row <- ets:tab2list(?TABLE), tuple_size(Row) =:= 3 + ?BUCKETS ]
         )
     catch error:badarg -> []
     end.
+
+name({http, Class, Phase}) ->
+    <<"http_", (atom_to_binary(Class))/binary, "_", (atom_to_binary(Phase))/binary>>;
+name(P) -> P.
+
+%% @doc The upper bound in microseconds of the bucket holding each quantile
+%% in `Qs' (0-1) of a histogram: exact to a factor of two.
+percentiles(Buckets, Qs) ->
+    N = lists:sum(Buckets),
+    [ case N of
+          0 -> 0;
+          _ -> upper(Buckets, max(1, ceil(Q * N)), 0, 0)
+      end
+    || Q <- Qs ].
+
+upper([C | Rest], Rank, B, Seen) when Seen + C < Rank ->
+    upper(Rest, Rank, B + 1, Seen + C);
+upper(_, _, B, _) -> 1 bsl (B + 1).
 
 %% @doc Every phase of every named process as
 %% `{Phase, Process, TotalMicros, Count, MeanMicros}'.
@@ -256,6 +303,18 @@ record_and_read_test() ->
     record(test_phase, 30),
     ?assertMatch([{test_phase, 40, 2, 20} | _],
         [ R || R = {test_phase, _, _, _} <- read() ]).
+
+histogram_test() ->
+    reset(),
+    [ record(hist_phase, U) || U <- [0, 1, 3, 3, 100, 1000] ],
+    [{hist_phase, 1107, 6, Buckets}] = [ R || R = {hist_phase, _, _, _} <- read_hist() ],
+    ?assertEqual(?BUCKETS, length(Buckets)),
+    ?assertEqual([2, 2, 0, 0, 0, 0, 1, 0, 0, 1], lists:sublist(Buckets, 10)),
+    ?assertEqual([4, 128, 1024], percentiles(Buckets, [0.5, 0.8, 1.0])),
+    ?assertEqual(?BUCKETS - 1, bucket(1 bsl 40)),
+    record_node({http, now, resolve}, 10),
+    ?assertMatch([{<<"http_now_resolve">>, 10, 1, 10}],
+        [ R || R = {<<"http_now_resolve">>, _, _, _} <- read() ]).
 
 time_returns_result_and_counts_test() ->
     reset(),
