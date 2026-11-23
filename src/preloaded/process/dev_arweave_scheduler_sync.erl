@@ -549,35 +549,39 @@ write_process_assignments(
 %% somebody asks, and nothing then computed them, so `/now' stayed at the old
 %% slot. The PUSD bridge waited on exactly that: every attestor had signed a
 %% deposit, PUSD held the three messages at slots 17-19, and the credit never
-%% appeared until a compute was forced by hand (2026-11-04). One compute to
-%% the newest slot, through the process's worker; it discards the state, so
-%% it neither names nor stores it. `process-compute-on-schedule' false turns
-%% it off, as for `scheduler@1.0'.
+%% appeared until a compute was forced by hand (2026-11-04).
+%%
+%% It is the node's compute, under the same rule as `scheduler@1.0''s: the
+%% new head goes to the process's one follower (`follower/2'), which computes
+%% through the process's worker, one compute in flight, heads that arrive
+%% meanwhile collapsing into the newest -- and only from options that compute
+%% with workers. Options without them (a bridge replica, a follower's
+%% isolated copy: `lib_bridge_replica:execution_opts/3') compute what their
+%% caller asks and nothing else. This used to spawn a compute per
+%% materialization, under whatever options the materializing call carried:
+%% a replica catching up materialized, so each new block started another
+%% replay of PUSD in the replica's stores, without a worker and storing
+%% nothing, which itself materialized and started more. On the Paralith node
+%% 10-14 of them ran at once, 3,140 computes of 594 slots in 427 s, ~9.5 of
+%% 13.75 busy cores (2026-11-23). `process-compute-on-schedule' false turns
+%% it off.
 compute_on_schedule(_ProcessID, From, To, _Opts) when To =< From -> ok;
 compute_on_schedule(ProcessID, _From, To, Opts) ->
-    case hb_util:atom(hb_opts:get(<<"process-compute-on-schedule">>, true, Opts)) of
+    Enabled =
+        hb_util:atom(hb_opts:get(<<"process-compute-on-schedule">>, true, Opts))
+            =/= false,
+    case Enabled andalso workers(Opts) of
         false -> ok;
-        _ ->
-            spawn(fun() ->
-                try
-                    {ok, Process} = hb_cache:read(ProcessID, Opts),
-                    hb_ao:resolve(
-                        Process,
-                        #{ <<"path">> => <<"compute">>, <<"slot">> => To - 1 },
-                        Opts#{
-                            <<"spawn-worker">> => true,
-                            <<"hashpath">> => ignore,
-                            <<"cache-control">> => [<<"no-store">>]
-                        }
-                    )
-                catch Class:Reason ->
-                    ?event(warning, {arweave_compute_on_schedule_failed,
-                        {process, ProcessID}, {slot, To - 1},
-                        {class, Class}, {reason, Reason}})
-                end
-            end),
+        true ->
+            follower(ProcessID, Opts) ! {head, To - 1},
             ok
     end.
+
+%% The test `dev_scheduler_server' makes: whether these options compute
+%% through a process worker.
+workers(Opts) ->
+    hb_opts:get(<<"process-workers">>, false, Opts) == true orelse
+        hb_opts:get(<<"process-worker-spawn">>, false, Opts) == true.
 
 %% @doc One pass of the node's background follow (`hb_http_server'): bring
 %% the global index to the confirmed tip, then materialize each process named
@@ -613,11 +617,12 @@ followed(Opts) ->
         _ -> []
     end.
 
-%% Materializing the new slots computes them (`compute_on_schedule/4'). The
-%% head goes to the process's follower as well, which computes it when it is
-%% past the last head it computed: so a compute that failed, or a node that
-%% restarted between materializing and computing, is caught up by the next
-%% pass instead of waiting for the next slot.
+%% Materializing the new slots hands their head to the process's follower
+%% (`compute_on_schedule/4'), and each pass sends the head again: the
+%% follower computes it when it is past the last head it computed, so a
+%% compute that failed, or a node that restarted between materializing and
+%% computing, is caught up by the next pass instead of waiting for the next
+%% slot.
 follow_process(ProcessID, Opts) ->
     try process(ProcessID, Opts) of
         {ok, #{ <<"next-slot">> := NextSlot }} when NextSlot > 0 ->
@@ -1882,6 +1887,54 @@ target_listing_failure_does_not_advance_test() ->
 
 %% @doc Materialization filters at the exact spawn ordinate, sorts numeric
 %% positions, writes dense slots, and is deterministic when replayed.
+%% A materialization hands its new head to the process's one follower, from
+%% options that compute with workers, and starts nothing from options that do
+%% not (a bridge replica's). It used to spawn a compute for every call, under
+%% the caller's options: twenty calls here were twenty computes.
+compute_on_schedule_is_the_followers_test() ->
+    ProcessID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Name = {?MODULE, follower, ProcessID},
+    ok = hb_name:register(Name, self()),
+    Me = self(),
+    Tracer = spawn(fun() -> trace_collector([], Me) end),
+    erlang:trace(self(), true, [procs, {tracer, Tracer}]),
+    try
+        Replica =
+            #{
+                <<"process-workers">> => false,
+                <<"spawn-worker">> => false,
+                <<"process-worker-spawn">> => false
+            },
+        Off = #{ <<"process-compute-on-schedule">> => false },
+        Node = #{},
+        Slots = lists:seq(1, 10),
+        [ ok = compute_on_schedule(ProcessID, S, S + 3, Replica) || S <- Slots ],
+        ok = compute_on_schedule(ProcessID, 1, 9, Off),
+        [ ok = compute_on_schedule(ProcessID, S, S + 3, Node) || S <- Slots ],
+        ok = compute_on_schedule(ProcessID, 5, 5, Node),
+        erlang:trace(self(), false, [procs]),
+        ?assertEqual([ S + 2 || S <- Slots ], heads()),
+        Tracer ! stop,
+        Spawned =
+            receive {Tracer, Events} -> [ E || E = {trace, _, spawn, _, _} <- Events ]
+            after 5000 -> timeout
+            end,
+        ?assertEqual([], Spawned)
+    after
+        hb_name:unregister(Name)
+    end.
+
+heads() ->
+    receive {head, Head} -> [Head | heads()]
+    after 0 -> []
+    end.
+
+trace_collector(Events, Parent) ->
+    receive
+        stop -> Parent ! {self(), lists:reverse(Events)};
+        Event -> trace_collector([Event | Events], Parent)
+    end.
+
 sparse_materialization_test() ->
     Store = hb_test_utils:test_store(hb_store_volatile, <<"ar-sched-sync">>),
     ok = hb_store:start(Store),

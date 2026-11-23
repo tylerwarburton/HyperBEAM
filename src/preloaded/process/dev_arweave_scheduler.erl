@@ -47,10 +47,27 @@ next(Base, Req, Opts) ->
             )
         ),
     maybe
-        {ok, _} ?= dev_arweave_scheduler_sync:process(ProcessID, Opts),
-        {ok, Assignment} ?=
-            find_assignment(ProcessID, LastProcessed + 1, Opts),
+        {ok, Assignment} ?= assignment(ProcessID, LastProcessed + 1, Opts),
         {ok, #{ <<"body">> => Assignment, <<"state">> => Base }}
+    end.
+
+%% @doc The assignment at `Slot', synchronizing only when it is not yet
+%% materialized. A materialized slot is final -- it was ordered from
+%% confirmed blocks, and materializing again writes the same assignment
+%% (`dev_arweave_scheduler_sync' `sparse_materialization_test') -- so a
+%% compute replaying slots this node already holds reads them from the cache
+%% and never queues behind the node-wide sync and the process's materializer.
+%% Every slot used to ask both: replaying PUSD's history cost ~720 ms a slot
+%% in that queue (p99 10 s) on the Paralith node, 2026-11-23, for slots it
+%% had held for hours.
+assignment(ProcessID, Slot, Opts) ->
+    case dev_arweave_scheduler_cache:read_assignment(ProcessID, Slot, Opts) of
+        {ok, Assignment} -> {ok, Assignment};
+        not_found ->
+            maybe
+                {ok, _} ?= dev_arweave_scheduler_sync:process(ProcessID, Opts),
+                find_assignment(ProcessID, Slot, Opts)
+            end
     end.
 
 find_assignment(ProcessID, Slot, Opts) ->
@@ -319,6 +336,38 @@ invalid_transaction() ->
     }.
 
 %%% Tests
+
+%% A slot already materialized is read from the cache: neither the node-wide
+%% sync nor the process's materializer is asked (there is no global record
+%% and no gateway here, so asking either could not return this slot).
+materialized_slot_skips_the_sync_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"ar-sched-next">>),
+    ok = hb_store:start(Store),
+    Opts = #{ <<"store">> => [Store], <<"priv-wallet">> => ar_wallet:new() },
+    ProcessID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ok =
+        dev_arweave_scheduler_cache:write_assignment(
+            #{
+                <<"path">> => <<"compute">>,
+                <<"process">> => ProcessID,
+                <<"slot">> => 1,
+                <<"block-height">> => 100,
+                <<"block-index">> => 0,
+                <<"body">> => <<"message">>,
+                <<"type">> => <<"Assignment">>
+            },
+            Opts
+        ),
+    {ok, Assignment} = assignment(ProcessID, 1, Opts),
+    ?assertEqual(1, hb_util:int(hb_maps:get(<<"slot">>, Assignment, 0, Opts))),
+    SchedulerStore =
+        hb_opts:get(store, no_viable_store, dev_arweave_scheduler_cache:opts(Opts)),
+    ?assertEqual(undefined,
+        hb_name:lookup({dev_arweave_scheduler_sync, sync, SchedulerStore})),
+    ?assertEqual(undefined,
+        hb_name:lookup(
+            {dev_arweave_scheduler_sync, process, SchedulerStore, ProcessID})),
+    ok = hb_store:stop(Store).
 
 slot_range_test() ->
     ?assertEqual({0, undefined}, slot_range(#{}, #{})),
