@@ -191,20 +191,16 @@ set_gauge(Name, Value) ->
 
 %%% Filesystem calls, bounded
 
-%% Run `Fun' in a process of its own: its result, or `{cold_io, timeout}' is
-%% thrown after `io-timeout-ms'. A call on a hung mount is left behind.
+%% Run `Fun' in a process of its own (`hb_file:bounded/2'): its result, or
+%% `{cold_io, timeout}' is thrown after `io-timeout-ms'. A call on a hung
+%% mount is left behind. Every call in `Fun' is an `hb_file' one, made in that
+%% process: through the node's one `file_server_2', a hung mount held every
+%% file call of the node, and every compute that read `hb_store_fs' waited.
 io(Cfg, Fun) ->
-    Parent = self(),
-    Ref = make_ref(),
-    {Pid, Mon} = spawn_monitor(fun() -> Parent ! {Ref, catch Fun()} end),
-    receive
-        {Ref, {'EXIT', Why}} -> erlang:demonitor(Mon, [flush]), throw({cold_io, Why});
-        {Ref, Res} -> erlang:demonitor(Mon, [flush]), Res;
-        {'DOWN', Mon, process, Pid, Why} -> throw({cold_io, Why})
-    after maps:get(io_timeout, Cfg) ->
-        erlang:demonitor(Mon, [flush]),
-        exit(Pid, kill),
-        throw({cold_io, timeout})
+    case hb_file:bounded(Fun, maps:get(io_timeout, Cfg)) of
+        {ok, Res} -> Res;
+        {error, timeout} -> throw({cold_io, timeout});
+        {error, {'EXIT', Why}} -> throw({cold_io, Why})
     end.
 
 %% Write a term as a cold file, durably, and read it back.
@@ -213,17 +209,17 @@ put_file(Cfg, Path, Term) ->
     Bin = <<"HBC1", (crypto:hash(sha256, Body))/binary, Body/binary>>,
     io(Cfg, fun() ->
         Tmp = Path ++ ".tmp",
-        ok = filelib:ensure_dir(Path),
-        ok = file:write_file(Tmp, Bin, [raw, binary, sync]),
-        ok = file:rename(Tmp, Path),
-        {ok, Bin} = file:read_file(Path),
+        ok = hb_file:ensure_dir(Path),
+        ok = hb_file:write_file(Tmp, Bin, [binary, sync]),
+        ok = hb_file:rename(Tmp, Path),
+        {ok, Bin} = hb_file:read_file(Path),
         ok
     end),
     byte_size(Bin).
 
 %% A cold file's term, or `error' if it is absent or damaged.
 get_file(Cfg, Path) ->
-    case io(Cfg, fun() -> file:read_file(Path) end) of
+    case io(Cfg, fun() -> hb_file:read_file(Path) end) of
         {ok, <<"HBC1", Hash:32/binary, Body/binary>>} ->
             case crypto:hash(sha256, Body) of
                 Hash -> {ok, binary_to_term(Body, [safe])};
@@ -233,7 +229,7 @@ get_file(Cfg, Path) ->
     end.
 
 list_dir(Cfg, Dir) ->
-    case io(Cfg, fun() -> file:list_dir(Dir) end) of
+    case io(Cfg, fun() -> hb_file:list_dir(Dir) end) of
         {ok, Names} -> [ N || N <- Names, lists:suffix(".hbc", N) ];
         _ -> []
     end.
@@ -574,7 +570,7 @@ ship_checkpoint(Cfg, Main, P, S) ->
 thin_checkpoints(Cfg, P) ->
     Dir = filename:join([maps:get(path, Cfg), "checkpoints", hb_util:list(P)]),
     Files = [ {Seq, S, Ms, F} || F <- list_dir(Cfg, Dir), {S, Ms, Seq} <- [checkpoint_name(F)] ],
-    [ io(Cfg, fun() -> file:delete(filename:join(Dir, F)) end)
+    [ io(Cfg, fun() -> hb_file:delete(filename:join(Dir, F)) end)
     || F <- thin_plan(Files, erlang:system_time(millisecond), maps:get(thinning, Cfg)) ],
     ok.
 
@@ -691,14 +687,14 @@ ship_replica(Pusd, Computed, Opts) ->
                         [S | _] ->
                             Dir = filename:join([maps:get(path, Cfg), "replica", hb_util:list(Pusd)]),
                             File = filename:join(Dir, pad(S) ++ ".hbc"),
-                            case io(Cfg, fun() -> filelib:is_file(File) end) of
+                            case io(Cfg, fun() -> hb_file:is_file(File) end) of
                                 true -> ok;
                                 false ->
                                     _ = put_file(Cfg, File, #{ process => Pusd, slot => S,
                                         build => build(), rows => snapshot_rows(Computed, Pusd, S) }),
                                     Old = lists:nthtail(min(2, length(list_dir(Cfg, Dir))),
                                         lists:reverse(lists:sort(list_dir(Cfg, Dir)))),
-                                    [ io(Cfg, fun() -> file:delete(filename:join(Dir, F)) end) || F <- Old ]
+                                    [ io(Cfg, fun() -> hb_file:delete(filename:join(Dir, F)) end) || F <- Old ]
                             end;
                         [] -> ok
                     end
@@ -855,6 +851,21 @@ hung_call_times_out_test() ->
     T0 = erlang:monotonic_time(millisecond),
     ?assertThrow({cold_io, timeout}, io(Cfg, fun() -> timer:sleep(5000) end)),
     ?assert(erlang:monotonic_time(millisecond) - T0 < 1000).
+
+%% @doc Shipping to the share and reading back from it never use the node's
+%% one `file_server_2': a hung share held it, and with it every file call of
+%% the node (2026-11-23). With the server suspended, a tick and a read work.
+does_not_use_the_file_server_test_() ->
+    {timeout, 120, fun() ->
+        Env = #{ opts := Opts, p := P } = test_env("no-fs"),
+        assign(Env, lists:seq(0, 39), 3600000),
+        {ok, {Tick, Read}} = hb_file:without_file_server(
+            fun() -> {tick(Opts), read_assignment(P, 5, Opts)} end, 60000),
+        ?assertEqual(ok, Tick),
+        ?assertNot(local(Env, 5)),
+        {ok, A} = Read,
+        ?assertEqual(5, hb_util:int(hb_ao:get(<<"slot">>, A, Opts)))
+    end}.
 
 %% @doc A slot read from another node's folder is used only if it verifies
 %% and the process's scheduler signed it.

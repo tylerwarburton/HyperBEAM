@@ -26,7 +26,7 @@
 
 %% @doc Initialize the file system store with the given data directory.
 start(#{ <<"name">> := DataDir }, _Req, _Opts) ->
-    ok = filelib:ensure_dir(DataDir).
+    ok = hb_file:ensure_dir(DataDir).
 
 %% @doc Stop the file system store. Currently a no-op.
 stop(#{ <<"name">> := _DataDir }, _Req, _Opts) ->
@@ -50,14 +50,15 @@ read(Opts, #{ <<"read">> := Key }, _NodeOpts) ->
     read_path(add_prefix(Opts, hb_path:to_binary(Key))).
 read_path(Path) ->
 	?event({read, Path}),
-	% `raw': read the inode here, not through the node's one `file_server'.
-	% Every cache miss below the LMDB store reaches this line, and the process
-	% worker waited on that shared server behind every request's miss.
-	case file:read_file_info(Path, [raw]) of
+	% Every call here is made in the caller (`hb_file'), never through the
+	% node's one `file_server_2': every cache miss below the LMDB store
+	% reaches this line, and the process worker waited on that shared server
+	% behind every request's miss, and behind every call on the NFS share.
+	case hb_file:read_file_info(Path) of
 		{ok, #file_info{type = regular}} ->
-			{ok, _} = file:read_file(Path);
+			{ok, _} = hb_file:read_file(Path);
         {ok, #file_info{type = directory}} ->
-            case file:list_dir_all(Path) of
+            case hb_file:list_dir_all(Path) of
                 {ok, Files} ->
                     {composite, [ child(Path, File) || File <- Files ]};
                 {error, _} ->
@@ -82,7 +83,7 @@ write_path(Opts, PathComponents, Value) ->
     Path = add_prefix(Opts, hb_path:to_binary(PathComponents)),
     ?event({writing, Path, byte_size(Value)}),
     % Keep a file that contains the value; replace any other entry.
-    Make = fun(Temp) -> file:write_file(Temp, Value) end,
+    Make = fun(Temp) -> hb_file:write_file(Temp, Value) end,
     case holds_value(Path, Value) of
         true -> ok;
         false -> replace(Opts, Path, Make)
@@ -90,17 +91,17 @@ write_path(Opts, PathComponents, Value) ->
 
 %% @doc Whether `Path' is a file, not a link, that holds `Value'.
 holds_value(Path, Value) ->
-    case file:read_link_info(Path) of
+    case hb_file:read_link_info(Path) of
         {ok, #file_info{ type = regular, size = Size }} ->
             Size == byte_size(Value) andalso
-                file:read_file(Path) == {ok, Value};
+                hb_file:read_file(Path) == {ok, Value};
         _ ->
             false
     end.
 
 %% @doc List contents of a directory in the store.
 list(Opts, Req = #{ <<"list">> := Path }, _NodeOpts) ->
-    case file:list_dir_all(add_prefix(Opts, hb_path:to_binary(Path))) of
+    case hb_file:list_dir_all(add_prefix(Opts, hb_path:to_binary(Path))) of
         {ok, Files} ->
             Children = lists:map(fun name/1, Files),
             {ok, hb_store_utils:apply_list_bounds(Children, Req, Opts)};
@@ -109,7 +110,7 @@ list(Opts, Req = #{ <<"list">> := Path }, _NodeOpts) ->
 
 %% @doc Return a listed file with its value, or a listed directory by its name.
 child(Dir, File) ->
-    case file:read_file(filename:join(Dir, File)) of
+    case hb_file:read_file(filename:join(Dir, File)) of
         {ok, Value} -> {name(File), Value};
         {error, _} -> name(File)
     end.
@@ -132,12 +133,12 @@ replace(#{ <<"name">> := DataDir }, Path, Make) ->
     R =
         maybe
             ok ?= in_dir(Temp, Make),
-            in_dir(Path, fun(P) -> file:rename(Temp, P) end)
+            in_dir(Path, fun(P) -> hb_file:rename(Temp, P) end)
         end,
     % Remove the temporary entry if the rename did not move it.
     case R of
         ok -> ok;
-        _ -> file:delete(Temp)
+        _ -> hb_file:delete(Temp)
     end,
     R.
 
@@ -146,7 +147,7 @@ replace(#{ <<"name">> := DataDir }, Path, Make) ->
 in_dir(Path, Fun) ->
     case Fun(Path) of
         {error, enoent} ->
-            filelib:ensure_dir(Path),
+            hb_file:ensure_dir(Path),
             Fun(Path);
         Res -> Res
     end.
@@ -213,4 +214,28 @@ key_cannot_escape_the_store_test() ->
     ?assertEqual(
         {error, not_found},
         read(Store, #{ <<"read">> => <<"ordinary">> }, #{})
+    ).
+
+%% @doc A read, a list and a write never wait for the node's one
+%% `file_server_2'. A call on the NFS share held it for up to a minute, and
+%% every compute that read this store (`hb_cache:read_all_commitments/2')
+%% waited behind it (2026-11-23).
+does_not_wait_for_the_file_server_test() ->
+    Store = hb_test_utils:test_store(?MODULE, <<"no-file-server">>),
+    ok = start(Store, #{}, #{}),
+    ok = write(Store, #{ <<"msg/commitments/c1">> => <<"one">> }, #{}),
+    ?assertEqual(
+        {ok, {{ok, [<<"c1">>]}, {ok, <<"one">>}, {error, not_found}, ok, {ok, <<"two">>}}},
+        hb_file:without_file_server(
+            fun() ->
+                {
+                    list(Store, #{ <<"list">> => <<"msg/commitments">> }, #{}),
+                    read(Store, #{ <<"read">> => <<"msg/commitments/c1">> }, #{}),
+                    list(Store, #{ <<"list">> => <<"none/commitments">> }, #{}),
+                    write(Store, #{ <<"new/dir/key">> => <<"two">> }, #{}),
+                    read(Store, #{ <<"read">> => <<"new/dir/key">> }, #{})
+                }
+            end,
+            5000
+        )
     ).

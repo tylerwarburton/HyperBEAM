@@ -55,10 +55,18 @@ burst(Process, Last, Opts) ->
                 hb_json:encode(hb_msg_trace:report(0, 5000)))
     end.
 
+%% `GAME_BENCH_FS=true' puts an `hb_store_fs' store under the LMDB one, as
+%% every node runs (`/app/cache-mainnet'): a miss in LMDB (a message's
+%% commitments, every compute) is then a read or a list of the filesystem.
 opts(Dir) ->
+    FS = case os:getenv("GAME_BENCH_FS") of
+             "true" -> [#{ <<"store-module">> => hb_store_fs,
+                           <<"name">> => list_to_binary(Dir ++ "/fs") }];
+             _ -> []
+         end,
     #{
         <<"store">> => [#{ <<"store-module">> => hb_store_lmdb,
-                           <<"name">> => list_to_binary(Dir ++ "/main") }],
+                           <<"name">> => list_to_binary(Dir ++ "/main") } | FS],
         <<"priv-wallet">> => ar_wallet:new(),
         <<"spawn-worker">> => true,
         <<"process-worker-spawn">> => true,
@@ -146,6 +154,26 @@ compute(Process, Slot, Opts) ->
     {ok, _} = hb_ao:resolve(Process,
         #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, Opts).
 
+%% `GAME_BENCH_FS_STALL=<hold-ms>:<every-ms>' holds the node's one
+%% `file_server_2' for `hold-ms' of every `every-ms' while the slots run, as
+%% a call on a slow or hung NFS share holds it (prod, 2026-11-23: >= 110 ms a
+%% call, up to ~60 s hung). Every non-`raw' `file' call waits behind it.
+stall_file_server() ->
+    case os:getenv("GAME_BENCH_FS_STALL") of
+        false -> spawn(fun() -> receive stop -> ok end end);
+        Spec ->
+            [Hold, Every] = [ list_to_integer(X) || X <- string:split(Spec, ":") ],
+            FS = whereis(file_server_2),
+            Loop =
+                fun L() ->
+                    true = erlang:suspend_process(FS),
+                    timer:sleep(Hold),
+                    true = erlang:resume_process(FS),
+                    receive stop -> ok after max(0, Every - Hold) -> L() end
+                end,
+            spawn_link(Loop)
+    end.
+
 run(Players, N, Dir0, MaxWorkerMs) ->
     hb:init(),
     % `GAME_BENCH_TRACE=false' measures the same build with the message
@@ -164,6 +192,7 @@ run(Players, N, Dir0, MaxWorkerMs) ->
         fun(I) -> schedule(Process, <<"Play">>, I, Opts), compute(Process, I, Opts) end,
         lists:seq(1, 10)),
     hb_phase_timer:reset(),
+    Stall = stall_file_server(),
     % Schedule and compute are timed apart: the compute is the one process
     % worker every message to the process queues behind, so it sets the
     % process's ceiling (1000 / compute ms messages a second). The schedule
@@ -176,6 +205,7 @@ run(Players, N, Dir0, MaxWorkerMs) ->
                   {TS, TC}
               end
             || I <- lists:seq(11, 10 + N) ]),
+    Stall ! stop,
     Med = fun(L) -> lists:nth(length(L) div 2 + 1, lists:sort(L)) / 1000 end,
     P95 = fun(L) -> lists:nth(max(1, trunc(length(L) * 0.95)), lists:sort(L)) / 1000 end,
     Phases = [ {P, round(Mean / 100) / 10} || {P, _T, _C, Mean} <- hb_phase_timer:read() ],

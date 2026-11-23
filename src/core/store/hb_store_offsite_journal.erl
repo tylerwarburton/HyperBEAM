@@ -421,14 +421,14 @@ compress(Store) -> hb_util:atom(cfg(<<"compress">>, true, Store)) =/= false.
 writer_init(Store) ->
     process_flag(trap_exit, true),
     Dir = journal_dir(Store),
-    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    ok = hb_file:ensure_dir(filename:join(Dir, "x")),
     case read_poison(Dir) of
         {poisoned, Reason} ->
             ?event(error, {offsite_journal_refusing, {poisoned, Reason}}),
             writer_refusing(Store, {journal_poisoned, Reason});
         none ->
-            Clean = filelib:is_regular(filename:join(Dir, "clean")),
-            _ = file:delete(filename:join(Dir, "clean")),
+            Clean = hb_file:is_regular(filename:join(Dir, "clean")),
+            _ = hb_file:delete(filename:join(Dir, "clean")),
             {Sealed, Marks0, Token} = read_marks(Dir),
             % Every local file newer than the last seal (or not sealed at
             % all) may hold assignments the marks do not: read them, cut
@@ -514,7 +514,7 @@ ensure_started(S = #{ clean_start := Clean, dir := Dir }) ->
                  true -> S1;
                  false -> reconcile(S1)
              end,
-        S3 = case filelib:is_regular(filename:join(Dir, "rebase")) of
+        S3 = case hb_file:is_regular(filename:join(Dir, "rebase")) of
                  true -> rebase(S2);
                  false -> S2
              end,
@@ -649,7 +649,7 @@ write_poison(Dir, Reason) ->
 read_poison(Dir) -> read_poison(Dir, "poisoned").
 
 read_poison(Dir, Name) ->
-    case file:read_file(filename:join(Dir, Name)) of
+    case hb_file:read_file(filename:join(Dir, Name)) of
         {ok, Bin} ->
             case catch binary_to_term(Bin) of
                 {poisoned, Reason} -> {poisoned, Reason};
@@ -667,7 +667,7 @@ clear_poison(Store) ->
     stop_writer_process(Store),
     ok = write_synced(filename:join(Dir, "rebase"), <<>>),
     ok = sync_dir(Dir),
-    ok = case file:delete(filename:join(Dir, "poisoned")) of
+    ok = case hb_file:delete(filename:join(Dir, "poisoned")) of
              ok -> ok;
              {error, enoent} -> ok;
              E -> E
@@ -711,7 +711,7 @@ rebase(S = #{ store := Store, dir := Dir }) ->
         false -> ok;
         Why -> throw({not_started, {rebase_failed, Why}, S3})
     end,
-    ok = file:delete(filename:join(Dir, "rebase")),
+    ok = hb_file:delete(filename:join(Dir, "rebase")),
     sync_dir(Dir),
     ?event(warning, {offsite_journal_rebased, {rows, N}}),
     S3#{ rebased => N,
@@ -1063,7 +1063,7 @@ sync_segs(Dir, [N | Segs], St) ->
     end.
 
 seal_rename(Dir, N) ->
-    case file:rename(open_name(Dir, N), seg_name(Dir, N)) of
+    case hb_file:rename(open_name(Dir, N), seg_name(Dir, N)) of
         ok -> ok;
         {error, enoent} -> ok;
         {error, Reason} -> ?event(error, {offsite_journal_seal_failed, {seg, N}, Reason})
@@ -1079,7 +1079,7 @@ sealed(Store, ok, Seal) ->
             File = filename:join(journal_dir(Store), "marks"),
             Tmp = File ++ ".syncer.tmp",
             case write_synced(Tmp, term_to_binary(Marks)) of
-                ok -> _ = file:rename(Tmp, File), ok;
+                ok -> _ = hb_file:rename(Tmp, File), ok;
                 {error, Reason} -> ?event(error, {offsite_journal_marks_failed, Reason})
             end;
         _ -> ok
@@ -1300,7 +1300,7 @@ seal_synced(S, Fd, Dir, N, Store) ->
     Open = open_name(Dir, N),
     case maps:get(off, S) of
         0 ->
-            case file:delete(Open) of
+            case hb_file:delete(Open) of
                 ok -> S#{ fd => undefined };
                 {error, enoent} -> S#{ fd => undefined };
                 {error, DelReason} ->
@@ -1310,7 +1310,7 @@ seal_synced(S, Fd, Dir, N, Store) ->
             % The marks only shorten the next start's scan, so a full disk
             % that refuses them does not stop the seal.
             S1 = write_marks(S#{ sealed => N }),
-            S2 = case file:rename(Open, seg_name(Dir, N)) of
+            S2 = case hb_file:rename(Open, seg_name(Dir, N)) of
                      ok ->
                          case sync_dir(Dir) of
                              ok -> S1;
@@ -1346,13 +1346,26 @@ open_segment(S = #{ dir := Dir, seg := N }) ->
 %% with no shell between (any path goes as one argument), and its exit
 %% status is the answer.
 sync_dir(Dir) ->
-    case os:find_executable("sync") of
+    case sync_executable() of
         false -> {error, {sync_dir, hb_util:bin(Dir), no_sync_executable}};
         Exe ->
             Port = open_port({spawn_executable, Exe},
                              [{args, [hb_util:list(Dir)]}, exit_status,
                               stderr_to_stdout, binary]),
             sync_dir_wait(Port, Dir, <<>>)
+    end.
+
+%% `os:find_executable/1' asks the node's one `file_server_2', which a call on
+%% the NFS share can hold for a minute; the writer seals and syncs through
+%% here. Found once, then remembered.
+sync_executable() ->
+    case persistent_term:get({?MODULE, sync_executable}, undefined) of
+        undefined ->
+            case os:find_executable("sync") of
+                false -> false;
+                Exe -> persistent_term:put({?MODULE, sync_executable}, Exe), Exe
+            end;
+        Exe -> Exe
     end.
 
 sync_dir_wait(Port, Dir, Out) ->
@@ -1413,7 +1426,7 @@ assignment_key(<<"~scheduler@1.0/assignments/", Rest/binary>>) ->
 assignment_key(_) -> false.
 
 read_marks(Dir) ->
-    case file:read_file(filename:join(Dir, "marks")) of
+    case hb_file:read_file(filename:join(Dir, "marks")) of
         {ok, Bin} ->
             case catch binary_to_term(Bin) of
                 {marks, Sealed, Marks, Token} -> {Sealed, Marks, Token};
@@ -1428,7 +1441,7 @@ write_marks(S = #{ dir := Dir, sealed := Sealed, marks := Marks, token := Token 
     Written =
         maybe
             ok ?= write_synced(Tmp, term_to_binary({marks, Sealed, Marks, Token})),
-            ok = file:rename(Tmp, File),
+            ok = hb_file:rename(Tmp, File),
             sync_dir(Dir)
         end,
     case Written of
@@ -1459,7 +1472,7 @@ recover_local(Dir, Sealed, Marks) ->
                ({_N, seg, File}, {_, _, _, _, End}) when End =/= false ->
                     corrupt(File, {after_end_of_log, End});
                ({N, Kind, File}, {Max, R, Seals, Drop, false}) ->
-                    {ok, Bin} = file:read_file(File),
+                    {ok, Bin} = hb_file:read_file(File),
                     Valid = valid_prefix(Bin, 0),
                     Whole = Valid == byte_size(Bin),
                     case {Kind, Whole} of
@@ -1489,7 +1502,7 @@ recover_local(Dir, Sealed, Marks) ->
         [] -> ok;
         _ ->
             ?event(warning, {offsite_journal_dropped_after_end, {files, Drop}}),
-            lists:foreach(fun(F) -> ok = file:delete(F) end, Drop),
+            lists:foreach(fun(F) -> ok = hb_file:delete(F) end, Drop),
             recovery_sync(Dir, sync_dir(Dir))
     end,
     lists:foreach(fun(Seal) -> recover_seal(Dir, Seal) end, lists:reverse(Seals)),
@@ -1512,7 +1525,7 @@ corrupt(File, Off) ->
 %% run's tail may be in the page cache only: a segment is renamed sealed
 %% only once synced), rename it. One with nothing whole in it is deleted.
 recover_seal(_Dir, {_N, File, 0, _Size}) ->
-    ok = file:delete(File);
+    ok = hb_file:delete(File);
 recover_seal(Dir, {N, File, Valid, Size}) ->
     case Valid < Size of
         true ->
@@ -1527,7 +1540,7 @@ recover_seal(Dir, {N, File, Valid, Size}) ->
         false ->
             recovery_sync(File, sync_file(File))
     end,
-    ok = file:rename(File, seg_name(Dir, N)).
+    ok = hb_file:rename(File, seg_name(Dir, N)).
 
 recovery_sync(_What, ok) -> ok;
 recovery_sync(What, {error, Reason}) ->
@@ -1562,7 +1575,7 @@ replay_finish(R) -> maps:get(acc, drop_pending(apply_held(R))).
 
 %% @doc The journal files in a directory, oldest first.
 local_files(Dir) ->
-    {ok, Names} = file:list_dir(Dir),
+    {ok, Names} = hb_file:list_dir(Dir),
     lists:sort(
         lists:filtermap(
             fun(Name) ->
@@ -1760,7 +1773,7 @@ backlog(Store) ->
     Files = try local_files(journal_dir(Store)) catch _:_ -> [] end,
     Segs = [ F || {_, seg, F} <- Files ],
     #{ segments => length(Segs),
-       bytes => lists:sum([ filelib:file_size(F) || F <- Segs ]) }.
+       bytes => lists:sum([ hb_file:file_size(F) || F <- Segs ]) }.
 
 %% @doc Ship the sealed segments, oldest first, stopping at the first that
 %% cannot go. A poisoned journal ships nothing until `clear_poison/1', and a
@@ -1843,7 +1856,7 @@ clear_ship_poison(Store) ->
     Dir = journal_dir(Store),
     stop_shipper(Store),
     hb_name:unregister({?MODULE, shipper, maps:get(<<"name">>, Store)}),
-    ok = case file:delete(filename:join(Dir, "ship-poisoned")) of
+    ok = case hb_file:delete(filename:join(Dir, "ship-poisoned")) of
              ok -> ok;
              {error, enoent} -> ok;
              E -> E
@@ -1861,7 +1874,7 @@ failed(St, Reason) ->
 %% so the next line starts on a line of its own.
 manifest_tip(Target) ->
     File = filename:join(Target, "manifest.log"),
-    case file:read_file(File) of
+    case hb_file:read_file(File) of
         {ok, <<>>} -> <<>>;
         {ok, Bin} ->
             {Lines, Torn} = manifest_lines(Bin),
@@ -1903,7 +1916,7 @@ chain(Prev, Body) ->
 
 ship_one(N, File, Store, Prev) ->
     Target = target_dir(Store),
-    {ok, Raw} = file:read_file(File),
+    {ok, Raw} = hb_file:read_file(File),
     % Never ship a damaged segment: the offsite copy would carry the damage
     % under a matching CRC.
     case whole(Raw) of
@@ -1916,19 +1929,19 @@ ship_one(N, File, Store, Prev) ->
         case compress(Store) of true -> ".gz"; false -> "" end,
     Chain = chain(Prev, Body),
     maybe
-        ok ?= filelib:ensure_dir(filename:join(Target, "x")),
+        ok ?= hb_file:ensure_dir(filename:join(Target, "x")),
         ok ?= space_ok(Target, byte_size(Body),
                        cfg(<<"max-fill-pct">>, ?MAX_FILL_PCT, Store)),
         Final = filename:join(Target, Name),
         Tmp = Final ++ ".tmp",
         ok ?= write_synced(Tmp, Body),
-        ok ?= file:rename(Tmp, Final),
+        ok ?= hb_file:rename(Tmp, Final),
         ok ?= synced(sync_dir(Target)),
         Line = io_lib:format("~s ~B ~B ~s~n",
                              [Name, byte_size(Body), erlang:crc32(Body), Chain]),
         ok ?= append_synced(filename:join(Target, "manifest.log"), Line),
         ok ?= synced(sync_dir(Target)),
-        ok ?= file:delete(File),
+        ok ?= hb_file:delete(File),
         % Or a host crash brings it back, to be shipped again.
         ok ?= case sync_dir(journal_dir(Store)) of
                   ok -> ok;
@@ -1974,7 +1987,7 @@ write_synced(File, Data) ->
         _ = file:close(F),
         case R of
             ok -> ok;
-            Err -> _ = file:delete(File), Err
+            Err -> _ = hb_file:delete(File), Err
         end
     end.
 
@@ -2089,7 +2102,7 @@ gaps(Store, Procs) ->
 
 %% A source is an export directory (it has a manifest) or a local journal.
 source_files(Dir) ->
-    case file:read_file(filename:join(Dir, "manifest.log")) of
+    case hb_file:read_file(filename:join(Dir, "manifest.log")) of
         {ok, Manifest} ->
             {Lines, _Torn} = manifest_lines(Manifest),
             {Files, _} =
@@ -2117,7 +2130,7 @@ shipped_key(Name) ->
 
 restore_file(N, File, Check, R, C) ->
     Body =
-        case file:read_file(File) of
+        case hb_file:read_file(File) of
             {ok, B} -> B;
             Error -> throw({restore_error, {File, Error}})
         end,
@@ -2243,7 +2256,7 @@ recovered_open_segment_synced_before_sealed_test() ->
     {Sealed, Marks, _} = read_marks(Dir),
     Self = self(),
     Worker = spawn(fun() -> receive go -> Self ! {recovered, recover_local(Dir, Sealed, Marks)} end end),
-    Patterns = [{?MODULE, datasync, 1}, {file, rename, 2}],
+    Patterns = [{?MODULE, datasync, 1}, {hb_file, rename, 2}],
     [ erlang:trace_pattern(P, true, [local]) || P <- Patterns ],
     erlang:trace(Worker, true, [call]),
     Worker ! go,
@@ -2258,7 +2271,7 @@ recovered_open_segment_synced_before_sealed_test() ->
 collect_calls(Open) ->
     receive
         {trace, _, call, {?MODULE, datasync, _}} -> [synced | collect_calls(Open)];
-        {trace, _, call, {file, rename, [From, _]}} ->
+        {trace, _, call, {hb_file, rename, [From, _]}} ->
             case filename:absname(From) == filename:absname(Open) of
                 true -> [{renamed, Open} | collect_calls(Open)];
                 false -> collect_calls(Open)
@@ -2848,6 +2861,27 @@ roll_does_not_hold_up_appends_test() ->
     Fresh = fresh_store(<<"oj-roll-r">>),
     {ok, _} = restore(Target, Fresh),
     assert_rows(Fresh, Rows#{ <<"r/0">> => <<"0">> }).
+
+%% @doc Writes, flushes (with every segment sealed: renamed, marks
+%% rewritten, directory synced) and shipping never wait for the node's one
+%% `file_server_2'. A call on the NFS share held it for up to a minute, and
+%% the writer's renames queued behind it: every scheduler flush stalled
+%% (2026-11-23, 10-14 s, HTTP 500 `scheduler_timeout').
+does_not_wait_for_the_file_server_test() ->
+    {Store, _Inner, Target} = test_setup(<<"oj-no-fs">>, #{ <<"segment-bytes">> => 1 }),
+    ok = write(Store, #{ <<"f/0">> => <<"0">> }, #{}),
+    ok = flush(Store, #{}, #{}),
+    Rows = rows(<<"f/">>, 1, 20),
+    ?assertEqual({ok, idle}, hb_file:without_file_server(
+        fun() ->
+            write_rows(Store, Rows),
+            ok = flush(Store, #{}, #{}),
+            ship_now(Store)
+        end,
+        20000)),
+    Fresh = fresh_store(<<"oj-no-fs-r">>),
+    {ok, _} = restore(Target, Fresh),
+    assert_rows(Fresh, Rows#{ <<"f/0">> => <<"0">> }).
 
 test_dir(Tag) ->
     Dir = hb_util:list(maps:get(<<"name">>, hb_test_utils:test_store(hb_store_fs, Tag))),
