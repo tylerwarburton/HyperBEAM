@@ -163,6 +163,8 @@
 
 -define(DEFAULT_RESCAN_MS, 30000).
 -define(DEFAULT_HELPER_TIMEOUT_MS, 300000).
+%% How long a push waits for its slot's delivery before answering `pending'.
+-define(DEFAULT_DELIVERY_WAIT_MS, 10000).
 
 %%% Public API.
 
@@ -264,10 +266,16 @@ ensure(ProcID, Opts) ->
 %% @doc Wait until slot `Slot' of `ProcID' is delivered and return its
 %% receipts, or `{error, not_delivering}' when this node does not deliver the
 %% process, or `{error, no_delivery_record}' when it holds neither the slot's
-%% outbox nor its receipts. There is no deadline: the wait is the caller's,
-%% and a caller that goes away (an HTTP client that disconnects) leaves at
-%% most one registry row, deleted when the slot is delivered. Delivery itself
-%% never depends on anybody waiting.
+%% outbox nor its receipts.
+%%
+%% The wait is bounded: a slot not delivered within `push-delivery-wait-ms'
+%% (default 10 s) answers `pending' -- its status as it stands -- and the
+%% caller may ask again. Delivery never depends on anybody waiting, so the
+%% bound changes no outcome, only how long an HTTP request is held: unbounded,
+%% every push of a slot whose target was slow held a connection until the
+%% client or the proxy gave up (2026-11-23: ~1,250 pushes of the PUSD fast
+%% ledgers open at once on prod, each cut at 300 s, while their deliverers
+%% waited on gateway lookups of wallet targets).
 await_delivered(ProcID, Slot, Opts) ->
     case delivers(ProcID, Opts) of
         false -> {error, not_delivering};
@@ -275,12 +283,20 @@ await_delivered(ProcID, Slot, Opts) ->
             ensure_table(?WAITERS, ordered_set),
             Ref = make_ref(),
             ets:insert(?WAITERS, {{ProcID, Slot, Ref}, self()}),
-            try await_delivered(ProcID, Slot, Ref, store(Opts), Opts)
-            after ets:delete(?WAITERS, {ProcID, Slot, Ref})
+            Deadline = now_ms() + delivery_wait_ms(Opts),
+            try await_delivered(ProcID, Slot, Ref, Deadline, store(Opts), Opts)
+            after
+                ets:delete(?WAITERS, {ProcID, Slot, Ref}),
+                % A wake that raced the deadline leaves nothing behind.
+                receive {delivered, Ref, _} -> ok after 0 -> ok end
             end
     end.
 
-await_delivered(ProcID, Slot, Ref, Store, Opts) ->
+delivery_wait_ms(Opts) ->
+    max(0, hb_util:int(hb_opts:get(<<"push-delivery-wait-ms">>,
+        ?DEFAULT_DELIVERY_WAIT_MS, Opts))).
+
+await_delivered(ProcID, Slot, Ref, Deadline, Store, Opts) ->
     case receipts(ProcID, Slot, Store, Opts) of
         {ok, Receipts} -> {ok, Receipts};
         not_found ->
@@ -301,13 +317,21 @@ await_delivered(ProcID, Slot, Ref, Store, Opts) ->
                                     erlang:demonitor(Mon, [flush]),
                                     {ok, Receipts};
                                 {'DOWN', Mon, process, Pid, _} ->
-                                    await_delivered(ProcID, Slot, Ref, Store, Opts)
+                                    await_delivered(ProcID, Slot, Ref, Deadline, Store, Opts)
+                            after max(0, Deadline - now_ms()) ->
+                                erlang:demonitor(Mon, [flush]),
+                                pending
                             end;
                         {error, {deliverer_failed, _}} ->
                             % A start that died (or was replaced): the slot
                             % is still owed, so wait for the next one.
-                            receive after min(?FIRST_BACKOFF_MS, rescan_ms(Opts)) -> ok end,
-                            await_delivered(ProcID, Slot, Ref, Store, Opts);
+                            Left = Deadline - now_ms(),
+                            case Left > 0 of
+                                false -> pending;
+                                true ->
+                                    receive after min(Left, min(?FIRST_BACKOFF_MS, rescan_ms(Opts))) -> ok end,
+                                    await_delivered(ProcID, Slot, Ref, Deadline, Store, Opts)
+                            end;
                         {error, Reason} -> {error, Reason}
                     end
             end

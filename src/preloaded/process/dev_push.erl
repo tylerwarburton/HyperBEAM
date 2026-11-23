@@ -15,6 +15,10 @@
 %%% this node holds, the same way. It never signs or schedules an outbox entry
 %%% and never detaches: it dies with its HTTP client, and delivery goes on
 %%% without it. `async' and `push' are accepted and ignored.
+%%%
+%%% The wait for a delivery is bounded by `push-delivery-wait-ms' (10 s): a
+%%% slot still being delivered then answers 202 with its results and
+%%% `delivery: pending', and no receipts. Asking again is free.
 -module(dev_push).
 -specification("../../../specs/push@1.0.md").
 -device_libraries([lib_process, lib_process_cache, lib_process_delivery]).
@@ -162,6 +166,7 @@ read(Process, RawSlot, {MaxDepth, ResultDepth}, RawOpts) ->
                                     Response,
                                     downstream(Receipts, MaxDepth, ResultDepth, RawOpts)
                                 )};
+                        pending -> {ok, pending(Response)};
                         {error, Reason} -> {error, delivery_error(ID, Slot, Reason)}
                     end
             end;
@@ -203,6 +208,15 @@ scheduled_here(Target, Opts) ->
             end;
         Other -> Other
     end.
+
+%% @doc A slot whose outbox is still being delivered: a 202 with its results
+%% and no receipts, never a 200. Its deliverer keeps going; asking again reads
+%% the receipts once they are written.
+pending(Response) ->
+    Response#{
+        <<"status">> => 202,
+        <<"delivery">> => <<"pending">>
+    }.
 
 %% @doc Why a slot with an outbox has no receipts here. Never a 200: a push
 %% answered without receipts would read as a slot that sent nothing.
@@ -294,6 +308,7 @@ schedule(Base, Req, Opts) ->
     case lib_process_delivery:await_delivered(ProcessID, Slot, Opts) of
         {ok, Receipts} when is_map(Receipts), is_map_key(Key, Receipts) ->
             {ok, maps:get(Key, Receipts)};
+        pending -> {ok, pending(#{ <<"slot">> => Slot, <<"process">> => ProcessID })};
         {error, Reason} -> {error, delivery_error(ProcessID, Slot, Reason)};
         _ ->
             {error,
@@ -1604,6 +1619,52 @@ slow_downstream_does_not_block_test_() ->
         Helper ! release,
         ?assert(wait_until(fun() -> delivered(SID, [0], Opts) end, 15000)),
         ?assertEqual(BeforeA + 1, receiver_slot(A, Opts))
+    end}.
+
+%% @doc A push of a slot whose target does not answer answers within
+%% `push-delivery-wait-ms' with a 202 and no receipts, and leaves no waiter
+%% row behind; once the target answers, the same push is a 200 with them.
+%% (2026-11-23: unbounded, prod held ~1,250 such pushes open, each cut by the
+%% proxy at 300 s.)
+push_of_undelivered_slot_is_bounded_test_() ->
+    {timeout, 90, fun() ->
+        Self = self(),
+        Gate = fun(AID) ->
+            fun(TP, T, L, S, O, Real) ->
+                case T of
+                    AID ->
+                        Self ! {blocked, self()},
+                        receive release -> Real(TP, T, L, S, O) end;
+                    _ -> Real(TP, T, L, S, O)
+                end
+            end
+        end,
+        Opts0 = delivery_opts(#{}),
+        {_A, AID} = spawn_process(<<"function compute() end">>, Opts0),
+        Opts = Opts0#{ <<"delivery-test-post">> => Gate(AID),
+                       <<"push-delivery-wait-ms">> => 500 },
+        Sender = hb_process_test_vectors:lua_patch_process(sender_script(), Opts),
+        {ok, _} = hb_cache:write(Sender, Opts),
+        SID = hb_message:id(Sender, all, Opts),
+        send(Sender, 1, #{ <<"sendto">> => AID }, Opts),
+        {ok, _} = compute(Sender, 0, Opts),
+        Helper = receive {blocked, H} -> H after 15000 -> erlang:error(never_posted) end,
+        Push = fun() ->
+            hb_ao:resolve(Sender, #{ <<"path">> => <<"push">>, <<"slot">> => 0,
+                <<"max-depth">> => 0 }, Opts)
+        end,
+        {Micros, {ok, Pending}} = timer:tc(Push),
+        ?assert(Micros < 5000000),
+        ?assertEqual(202, hb_maps:get(<<"status">>, Pending, undefined, Opts)),
+        ?assertEqual(<<"pending">>, hb_maps:get(<<"delivery">>, Pending, undefined, Opts)),
+        ?assertEqual(0, ets:select_count(lib_process_delivery_waiters,
+            [{{{SID, '_', '_'}, '_'}, [], [true]}])),
+        ?assertEqual([], rows(SID, <<"x">>, Opts)),
+        Helper ! release,
+        ?assert(wait_until(fun() -> delivered(SID, [0], Opts) end, 15000)),
+        {ok, Done} = Push(),
+        ?assertNotEqual(202, hb_maps:get(<<"status">>, Done, 200, Opts)),
+        ?assertEqual(undefined, hb_maps:get(<<"delivery">>, Done, undefined, Opts))
     end}.
 
 %% @doc A crash after a target assigned an entry but before the slot's `x':
