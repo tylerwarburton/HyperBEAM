@@ -482,7 +482,37 @@ latest(ProcID, RawRequiredPath, Limit, RawOpts) ->
                 true -> {ok, HotSlot, HotMsg};
                 false -> latest_stored(ProcID, RequiredPath, Limit, Opts)
             end;
+        not_found when RequiredPath == [], Limit == undefined ->
+            latest_filled(ProcID, Opts);
         not_found -> latest_stored(ProcID, RequiredPath, Limit, Opts)
+    end.
+
+%% @doc The newest stored state, kept hot once read. Reading it materializes
+%% the slot -- a delta slot replays every slot back to its checkpoint -- and
+%% nothing but a computed slot used to fill the hot cache, so a process that
+%% was not computing since a restart paid that whole replay on every `/now'
+%% read. One reader per process materializes it; the others, queued behind
+%% it, find it hot. A state with a limit or a required path is not the newest
+%% one, so it is never put in the hot cache, whose newest slot is the head.
+latest_filled(ProcID, Opts) ->
+    case hot_slots(Opts) of
+        0 -> latest_stored(ProcID, [], undefined, Opts);
+        _ ->
+            hb_name:atomic(
+                {?MODULE, latest, ProcID},
+                fun() ->
+                    case hot_latest(ProcID, undefined) of
+                        {ok, _, _} = Hot -> Hot;
+                        not_found ->
+                            case latest_stored(ProcID, [], undefined, Opts) of
+                                {ok, Slot, Msg} = Found ->
+                                    hot_put(ProcID, Slot, Msg, Opts),
+                                    Found;
+                                Other -> Other
+                            end
+                    end
+                end
+            )
     end.
 
 %% @doc The latest stored slot at or below `Limit' that has the path. Only a
@@ -1163,6 +1193,48 @@ delta_slots_read_back_test() ->
     ?assert(lists:all(Same, lists:seq(0, 4))),
     {ok, 4, Latest} = latest(ProcID, Opts),
     ?assertEqual(<<"4">>, hb_maps:get(<<"count">>, hb_cache:ensure_all_loaded(Latest, Opts), Opts)).
+
+%% @doc With the hot cache empty (a restart, then no slot computed), the newest
+%% stored state is materialized once and kept hot: the next `latest' -- every
+%% `/now' read served from the cache -- does not replay the delta chain again.
+%% Concurrent cold readers all get the head. A read below the head (a limit)
+%% never puts its older state in the hot cache.
+latest_fills_hot_cache_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+        <<"process-delta-cache">> => true,
+        <<"process-delta-checkpoint-slots">> => 100
+    },
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    State0 = #{ <<"count">> => <<"0">>, <<"at-slot">> => 0 },
+    {ok, _} = write(ProcID, 0, State0, Opts),
+    lists:foldl(
+        fun(N, Prev) ->
+            Patches = [#{ <<"path">> => <<"/count">>, <<"value">> => integer_to_binary(N) }],
+            Results = #{ <<"output">> => #{ <<"data">> => integer_to_binary(N) } },
+            {ok, Next} = hb_state_patch:apply(Prev, Patches, Results, N, Opts),
+            {ok, _} = write(ProcID, N, Next#{ <<"priv">> => #{ <<"process-cache-delta">> =>
+                #{ <<"patches">> => Patches, <<"results">> => Results } } }, Opts),
+            Next
+        end,
+        State0,
+        lists:seq(1, 4)
+    ),
+    Count = fun(Msg) ->
+        hb_maps:get(<<"count">>, hb_cache:ensure_all_loaded(Msg, Opts), Opts)
+    end,
+    ets:delete_all_objects(?HOT),
+    ?assertMatch({ok, 2, _}, latest(ProcID, [], 2, Opts)),
+    ?assertEqual(not_found, hot_latest(ProcID, undefined)),
+    {ok, 4, Latest} = latest(ProcID, Opts),
+    ?assertEqual(<<"4">>, Count(Latest)),
+    {ok, 4, Hot} = hot_latest(ProcID, undefined),
+    ?assertEqual(<<"4">>, Count(Hot)),
+    ets:delete_all_objects(?HOT),
+    Concurrent =
+        hb_pmap:parallel_map(lists:seq(1, 20), fun(_) -> latest(ProcID, Opts) end, 20),
+    ?assert(lists:all(fun({ok, 4, M}) -> Count(M) =:= <<"4">>; (_) -> false end, Concurrent)),
+    ?assertMatch({ok, 4, _}, hot_latest(ProcID, undefined)).
 
 
 process_cache_suite_test_() ->
