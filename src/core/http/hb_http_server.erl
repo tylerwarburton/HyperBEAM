@@ -119,6 +119,8 @@
 -include("include/hb.hrl").
 
 -define(DEFAULT_FILTER_KEYS, [<<"content-length">>]).
+%% A request's phase-timer class, start and last mark (`http_phase/1').
+-define(HTTP_PHASE, {?MODULE, http_phase}).
 %% The HTTP methods that keep their own Prometheus label value.
 -define(METRIC_METHODS, [
     <<"GET">>, <<"HEAD">>, <<"POST">>, <<"PUT">>,
@@ -783,6 +785,7 @@ start_http2(ServerID, ProtoOpts, NodeMsg, TLSOpts) ->
 init(Req, {ServerID, MaxBody}) ->
     % When the request arrived, for the message trace (`hb_msg_trace').
     hb_msg_trace:arrived(),
+    http_phase_start(Req),
     case {cowboy_req:method(Req), ServerID} of
         {<<"OPTIONS">>, {tls_http_01, _}} ->
             request_body(Req, ServerID, MaxBody);
@@ -794,11 +797,60 @@ init(Req, {ServerID, MaxBody}) ->
             end
     end.
 
+%%% Per-request phase timers (`hb_phase_timer'): each request's time from
+%%% arrival to its body read (`body'), parsed and verified (`parse'), resolved
+%%% (`resolve') and its reply encoded and sent (`reply'), and the whole
+%%% (`total'), by the class of its path. A request that fails records only
+%%% the phases it finished. Recorded as `{http, Class, Phase}', read as
+%%% `http_<class>_<phase>'. A request is its own Erlang process, so its
+%%% start and last mark live in the process dictionary (`?HTTP_PHASE').
+
+http_phase_start(Req) ->
+    case hb_phase_timer:enabled() of
+        true ->
+            Now = erlang:monotonic_time(microsecond),
+            put(?HTTP_PHASE, {http_class(cowboy_req:path(Req)), Now, Now});
+        false -> ok
+    end.
+
+http_phase(Phase) ->
+    case get(?HTTP_PHASE) of
+        {Class, Start, Last} ->
+            Now = erlang:monotonic_time(microsecond),
+            hb_phase_timer:record_node({http, Class, Phase}, Now - Last),
+            put(?HTTP_PHASE, {Class, Start, Now});
+        _ -> ok
+    end.
+
+http_phase_end() ->
+    case erase(?HTTP_PHASE) of
+        {Class, Start, Last} ->
+            hb_phase_timer:record_node({http, Class, total}, Last - Start);
+        _ -> ok
+    end.
+
+%% The class of a request path: what the swarm and the clients mostly send.
+http_class(Path) when is_binary(Path) ->
+    case binary:match(Path, [<<"/schedule">>, <<"/compute">>, <<"/now">>,
+            <<"/push">>, <<"/slot">>]) of
+        {Pos, Len} ->
+            case binary:part(Path, Pos, Len) of
+                <<"/schedule">> -> schedule;
+                <<"/compute">> -> compute;
+                <<"/now">> -> now;
+                <<"/push">> -> push;
+                <<"/slot">> -> slot
+            end;
+        nomatch -> other
+    end;
+http_class(_) -> other.
+
 %% @doc Read and handle a request body within the node's limits.
 request_body(Req, ServerID, MaxBody) ->
     case read_body(Req, MaxBody) of
         {ok, Body} ->
             hb_msg_trace:body_read(),
+            http_phase(body),
             handle_request(Req, Body, ServerID);
         {too_large, Req2} ->
             {ok, cowboy_req:reply(
@@ -943,6 +995,7 @@ handle_request(RawReq, Body, ServerID) ->
     % Parse the HTTP request into HyerBEAM's message format.
     try req_to_tabm_singleton(Req, Body, NodeMsg) of
         ReqSingleton ->
+            http_phase(parse),
             try
                 ?event(http,
                     {parsed_singleton,
@@ -955,7 +1008,10 @@ handle_request(RawReq, Body, ServerID) ->
                         ReqSingleton,
                         NodeMsg
                     ),
+                http_phase(resolve),
                 Replied = reply(Req, Request, Res, NodeMsg),
+                http_phase(reply),
+                http_phase_end(),
                 % A signed request is a row of the message trace: arrival,
                 % body read, reply sent (`hb_msg_trace:replied/1').
                 hb_msg_trace:replied(ReqSingleton),
