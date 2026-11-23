@@ -1171,3 +1171,50 @@ last answer and matches it by exact term equality. Another 8% was printing
 debug lines: `hb-node.sh` (paralith-mono) sets
 `HB_PRINT=error,http_error,cron_error,hook_error,warning`, dropping the
 per-request and per-slot lines (3.7 MB of log a minute).
+
+## No file call on a hot or NFS path goes through `file_server_2` (2026-11-23)
+
+Every `file:`/`filelib:` call without `raw` is a `gen_server:call` to the
+node's one `file_server_2`, which makes them one at a time. Prod, read-only
+profile: 56-76% of worker time on the vault, pairs and game was spent waiting
+on it, 23 of 23 stuck computes in `dev_lua_patch` prep ->
+`hb_cache:read_all_commitments` -> `hb_store_fs:list` (`file:list_dir_all`),
+0.8-1.9 s each, up to 24 released at once. It was held by NFS calls (the cold
+tier, the offsite journal shipper; NFSv4 soft over WireGuard, >= 110 ms a
+call, up to ~60 s hung), and the journal writer's seal and marks renames
+queued behind them: scheduler flushes stalled 10-14 s (HTTP 500
+`scheduler_timeout`).
+
+`hb_file` makes the same calls through `prim_file`, in the caller.
+`hb_store_fs`, the cold tier and the offsite journal (writer, syncer,
+shipper, restore) use it, and the journal finds `sync` once instead of per
+directory sync (`os:find_executable/1` asks `file_server_2`). Same system
+calls in the same order, so durability (fsync before rename, directory
+syncs) is unchanged. `read_all_commitments` still lists `hb_store_fs` after
+an LMDB miss; that is now a local `ENOENT` in the caller.
+
+Trade-off: a call on a hung mount now holds a dirty IO thread (10 by
+default, shared with local files and LMDB) until the kernel gives up, where
+before it held `file_server_2`. Cold-tier calls run through
+`hb_file:bounded/2`: a process of their own, abandoned after
+`io-timeout-ms` as before, at most 4 in flight node-wide; a fifth waits for a
+place within the same timeout. The shipper is one process, so at most one
+more.
+
+Bench (`bench/game_slot_bench.erl`, local Docker, 4 CPUs, 300 players, 200
+slots; `GAME_BENCH_FS=true` adds an `hb_store_fs` store under LMDB as every
+node runs, `GAME_BENCH_FS_STALL=500:1000` holds `file_server_2` half the
+time as a slow share does):
+
+| Build | Stores | Worker ms/slot | Compute p50 / p95 | `lua_patch_prep` |
+|---|---|---:|---:|---:|
+| f9404f1a9 | LMDB | 2.5 | 8.0 / 11.8 ms | |
+| f9404f1a9 | LMDB + fs | 3.1 | 8.6 / 14.1 ms | |
+| f9404f1a9 | LMDB + fs, stalled | 44.0 | 10.0 / 489 ms | 41.0 ms |
+| this | LMDB | 2.5 | 8.5 / 12.1 ms | |
+| this | LMDB + fs | 3.3 | 9.5 / 15.7 ms | |
+| this | LMDB + fs, stalled | 3.1 | 9.4 / 16.2 ms | 0.2 ms |
+
+Tests that run with `file_server_2` suspended and fail on f9404f1a9:
+`hb_store_fs`, `hb_store_cold` (tick + read), `hb_store_offsite_journal`
+(write, flush, seal every segment, ship); `hb_file` 3.
