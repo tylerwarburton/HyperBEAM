@@ -1191,6 +1191,330 @@ process_test_() ->
         ?assertEqual(<<"11">>, hb_ao:get(<<"count">>, Old, Opts))
     end}.
 
+%% `bridge-root@1.0' through `ao.resolve': the Lua runtime's own
+%% bridge_root.lua, over this NIF's verification natives (`wp_bls_fav',
+%% `wp_rsa_pss_sha256'), against the Erlang device under `lua-patch@1.0'.
+%% Every path PUSD uses (`possession', `verify'), valid and refused, gives
+%% the same status and the same value as Lua sees it, under the interpreter
+%% and AOT, instrumented. Runs when `HB_WASM_LUA' names the runtime's
+%% `.wasm'; `HB_BRIDGE_ROOT_VECTORS' also writes the vectors and lua-patch's
+%% answers as JSON, for the runtime's own host test (runtime.test.mjs).
+bridge_root_matches_lua_patch_test_() ->
+    {timeout, 900, fun() ->
+        case os:getenv("HB_WASM_LUA") of
+            false -> ok;
+            Path ->
+                hb:init(),
+                {ok, Runtime} = file:read_file(Path),
+                Vectors = br_vectors(),
+                Module = #{ <<"content-type">> => <<"application/lua">>,
+                    <<"body">> => br_script() },
+                Interp = test_opts(#{ <<"wasm-patch-allow-uninstrumented">> => false }),
+                Aot = Interp#{ <<"wasm-patch-aot">> => true,
+                    <<"wasm-patch-aot-dir">> => "_build/test-wasm-aot-bridge-root" },
+                Run =
+                    fun(Base, Opts) ->
+                        {ok, S0} = hb_ao:resolve(Base, <<"init">>, Opts),
+                        lists:map(
+                            fun({Name, _Expect, Call}) ->
+                                {ok, S} = hb_ao:resolve(S0,
+                                    #{ <<"path">> => <<"compute">>,
+                                        <<"body">> => #{ <<"call">> => Call } }, Opts),
+                                {Name, hb_ao:get(<<"r">>, S, Opts)}
+                            end,
+                            Vectors
+                        )
+                    end,
+                Lua = Run(#{ <<"device">> => <<"lua-patch@1.0">>, <<"module">> => Module }, Interp),
+                % Each vector says what the Erlang device answers, so a vector
+                % that stopped testing what it names fails here.
+                lists:foreach(
+                    fun({{Name, Expect, _}, {Name, Out}}) ->
+                        ?assertEqual({Name, Expect},
+                            {Name, binary_to_atom(hd(binary:split(Out, <<"|">>)))})
+                    end,
+                    lists:zip(Vectors, Lua)
+                ),
+                case os:getenv("HB_BRIDGE_ROOT_VECTORS") of
+                    false -> ok;
+                    Out ->
+                        ok = file:write_file(Out, hb_json:encode(#{
+                            <<"script">> => br_script(),
+                            <<"vectors">> => [
+                                #{ <<"name">> => Name, <<"call">> => br_json(Call),
+                                    <<"expect">> => Result }
+                            || {{Name, _, Call}, {Name, Result}} <- lists:zip(Vectors, Lua)]
+                        }))
+                end,
+                WasmBase = #{ <<"device">> => ?DEVICE, <<"image">> => Runtime, <<"module">> => Module },
+                lists:foreach(
+                    fun(Opts) ->
+                        lists:foreach(
+                            fun({Expected, Got}) -> ?assertEqual(Expected, Got) end,
+                            lists:zip(Lua, Run(WasmBase, Opts))
+                        )
+                    end,
+                    [Interp, Aot]
+                ),
+                % A native charges its fixed fuel (FUEL_BLS, 1e9) before it
+                % runs: a slot that cannot pay traps as out of fuel, the same
+                % under both.
+                {_, _, PopValid} = hd(Vectors),
+                lists:foreach(
+                    fun(Opts) ->
+                        {ok, Low} = hb_ao:resolve(WasmBase#{ <<"fuel-per-slot">> => 500000000 },
+                            <<"init">>, Opts),
+                        ?assertMatch(
+                            {error, #{ <<"body">> := <<"wasm-patch@1.0 trap: out of fuel">> }},
+                            hb_ao:resolve(Low, #{ <<"path">> => <<"compute">>,
+                                <<"body">> => #{ <<"call">> => PopValid } }, Opts))
+                    end,
+                    [Interp, Aot]
+                )
+        end
+    end}.
+
+%% A value for the JSON fixture: every binary as base64, so any bytes survive.
+br_json(Bin) when is_binary(Bin) -> #{ <<"b">> => base64:encode(Bin) };
+br_json(Int) when is_integer(Int) -> #{ <<"i">> => Int };
+br_json(List) when is_list(List) -> [br_json(V) || V <- List];
+br_json(Map) when is_map(Map) -> #{ <<"m">> => maps:map(fun(_, V) -> br_json(V) end, Map) }.
+
+%% Calls `ao.resolve' with the request in the slot's body and publishes the
+%% answer serialised canonically: sorted keys, every string as hex.
+br_script() ->
+    <<
+        "local HEX = '0123456789abcdef'\n"
+        "local function hex(s)\n"
+        "  local t = {}\n"
+        "  for i = 1, #s do\n"
+        "    local b = string.byte(s, i)\n"
+        "    local hi, lo = b // 16 + 1, b % 16 + 1\n"
+        "    t[i] = string.sub(HEX, hi, hi) .. string.sub(HEX, lo, lo)\n"
+        "  end\n"
+        "  return table.concat(t)\n"
+        "end\n"
+        "local function ser(v)\n"
+        "  local t = type(v)\n"
+        "  if t == 'string' then return 's' .. hex(v) end\n"
+        "  if t ~= 'table' then return t .. ':' .. tostring(v) end\n"
+        "  local keys = {}\n"
+        "  for k in pairs(v) do keys[#keys + 1] = { ser(k), k } end\n"
+        "  table.sort(keys, function(a, b) return a[1] < b[1] end)\n"
+        "  local out = {}\n"
+        "  for i, p in ipairs(keys) do out[i] = p[1] .. '=' .. ser(v[p[2]]) end\n"
+        "  return '{' .. table.concat(out, ',') .. '}'\n"
+        "end\n"
+        "function compute(req)\n"
+        "  local body = req.body or req\n"
+        "  local status, value = ao.resolve({ device = 'bridge-root@1.0' }, body.call)\n"
+        "  local out = tostring(status) .. '|' .. ser(value)\n"
+        "  return { patches = { { path = '/r', value = out } },\n"
+        "    results = { output = { data = out } } }\n"
+        "end\n"
+    >>.
+
+-define(BR_DST, <<"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_PUSD_ROOT_">>).
+-define(BR_POP_DST, <<"BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_PUSD_ROOT_">>).
+-define(BR_P, 16#1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab).
+
+br_member(I) ->
+    {Secret, Key} = blst_nif:keygen(<<I:256>>),
+    AO = hb_util:human_id(crypto:hash(sha256, <<"member", I:32>>)),
+    {Secret, Key, AO}.
+
+br_hex(Key) -> <<"0x", (binary:encode_hex(Key, lowercase))/binary>>.
+
+br_pop(Secret, AO, Key, Dst) ->
+    blst_nif:sign(Secret, <<"PUSD_BLS_POSSESSION_V1", (hb_util:decode(AO))/binary, Key/binary>>, Dst).
+
+%% Points on the curves outside the prime-order subgroups (as in
+%% dev_bridge_root's tests).
+br_fp(X) -> ((X rem ?BR_P) + ?BR_P) rem ?BR_P.
+br_fp_pow(B, E) -> binary:decode_unsigned(crypto:mod_pow(br_fp(B), E, ?BR_P)).
+br_fp_square(A) -> br_fp_pow(A, (?BR_P - 1) div 2) =:= 1.
+br_g1_off(X) ->
+    case br_fp_square(X * X * X + 4) of
+        true ->
+            Y = br_fp_pow(X * X * X + 4, (?BR_P + 1) div 4),
+            <<1:1, 0:1, (case Y > (?BR_P - 1) div 2 of true -> 1; false -> 0 end):1, X:381>>;
+        false -> br_g1_off(X + 1)
+    end.
+br_g2_off(C1) ->
+    {S0, S1} = {br_fp(1 - C1 * C1), br_fp(2 * C1)},
+    {A0, A1} = {br_fp(S0 - S1 * C1 + 4), br_fp(S0 * C1 + S1 + 4)},
+    case br_fp_square(A0 * A0 + A1 * A1) of
+        true -> <<1:1, 0:1, 0:1, C1:381, 1:384>>;
+        false -> br_g2_off(C1 + 1)
+    end.
+
+%% The author's signed item for an operation, as the device rebuilds it.
+br_item(Wallet, Root, Operation) ->
+    Author = hb_util:human_id(crypto:hash(sha256, ar_wallet:to_pubkey(Wallet))),
+    Payload = Operation#{ <<"target">> => Root, <<"author">> => Author,
+        <<"certificate-version">> => <<"pusd-root/v1">> },
+    Anchor = case maps:get(<<"anchor">>, Payload, not_found) of
+        not_found -> <<>>;
+        A -> hb_util:decode(A)
+    end,
+    ar_bundles:sign_item(#tx{ format = ans104, target = hb_util:decode(Root), anchor = Anchor,
+        tags = lists:sort(maps:to_list(maps:without([<<"target">>, <<"anchor">>], Payload))) },
+        Wallet).
+
+br_bitmap(N, Indices) ->
+    Bytes = (N + 7) div 8,
+    <<(lists:foldl(fun(I, Acc) -> Acc bor (1 bsl I) end, 0, Indices)):(Bytes * 8)/little>>.
+
+br_signing_bytes(Root, Epoch, IntentID) ->
+    <<"PUSD_ROOT_CERTIFICATE_V2", (hb_util:decode(Root))/binary, Epoch:64/big,
+        (hb_util:decode(IntentID))/binary>>.
+
+br_endorse(Members, Indices, Bytes) ->
+    <<(br_bitmap(length(Members), Indices))/binary,
+        (blst_nif:aggregate([blst_nif:sign(element(1, lists:nth(I + 1, Members)), Bytes, ?BR_DST)
+            || I <- Indices]))/binary>>.
+
+%% {Name, what the Erlang device answers, the request}.
+br_vectors() ->
+    Members = [br_member(I) || I <- lists:seq(1, 17)],
+    [{S1, K1, AO1}, {_S2, K2, AO2} | _] = Members,
+    Pop1 = br_pop(S1, AO1, K1, ?BR_POP_DST),
+    Pop1Text = hb_util:encode(Pop1),
+    Poss = fun(Fields) -> maps:merge(#{ <<"path">> => <<"possession">>, <<"ao">> => AO1,
+        <<"bls">> => br_hex(K1), <<"pop">> => Pop1Text }, Fields) end,
+    OffG1 = br_g1_off(1),
+    Aliased = << <<(case C of $- -> $+; $_ -> $/; _ -> C end)>> || <<C>> <= Pop1Text >>,
+    <<AOHead:42/binary, AOLast>> = AO1,
+    Possession = [
+        {<<"pop-valid">>, ok, Poss(#{})},
+        {<<"pop-key-upper-hex">>, ok, Poss(#{ <<"bls">> => <<"0x", (binary:encode_hex(K1))/binary>> })},
+        {<<"pop-key-raw">>, ok, Poss(#{ <<"bls">> => K1 })},
+        {<<"pop-hex">>, ok, Poss(#{ <<"pop">> => br_hex(Pop1) })},
+        {<<"pop-raw">>, ok, Poss(#{ <<"pop">> => Pop1 })},
+        {<<"pop-aliased">>, ok, Poss(#{ <<"pop">> => Aliased })},
+        {<<"pop-padded">>, ok, Poss(#{ <<"pop">> => <<Pop1Text/binary, "==">> })},
+        {<<"pop-missing">>, error, maps:remove(<<"pop">>, Poss(#{}))},
+        {<<"pop-empty">>, error, Poss(#{ <<"pop">> => <<>> })},
+        {<<"pop-long">>, error, Poss(#{ <<"pop">> => <<Pop1Text/binary, "AA">> })},
+        {<<"pop-bad-char">>, error, Poss(#{ <<"pop">> => <<(binary:part(Pop1Text, 0, 127))/binary, "!">> })},
+        {<<"pop-other-key">>, error, Poss(#{ <<"bls">> => br_hex(K2) })},
+        {<<"pop-other-ao">>, error, Poss(#{ <<"ao">> => AO2 })},
+        {<<"pop-wrong-tag">>, error, Poss(#{ <<"pop">> => hb_util:encode(br_pop(S1, AO1, K1, ?BR_DST)) })},
+        {<<"pop-garbage">>, error, Poss(#{ <<"pop">> => binary:copy(<<7>>, 96) })},
+        {<<"pop-infinity">>, error, Poss(#{ <<"bls">> => br_hex(<<16#c0, 0:376>>),
+            <<"pop">> => br_hex(<<16#c0, 0:760>>) })},
+        {<<"pop-off-subgroup-key">>, error, Poss(#{ <<"bls">> => br_hex(OffG1) })},
+        {<<"pop-off-subgroup-sig">>, error, Poss(#{ <<"pop">> => br_hex(br_g2_off(1)) })},
+        {<<"pop-key-bad-hex">>, error, Poss(#{ <<"bls">> => <<"0x", (binary:part(br_hex(K1), 2, 95))/binary, "g">> })},
+        {<<"pop-key-short">>, error, Poss(#{ <<"bls">> => binary:part(br_hex(K1), 0, 96) })},
+        {<<"pop-ao-noncanonical">>, error, Poss(#{ <<"ao">> => <<AOHead/binary,
+            (case AOLast of $A -> $B; _ -> $A end)>> })},
+        {<<"pop-ao-short">>, error, Poss(#{ <<"ao">> => AOHead })}
+    ],
+    Wallet = ar_wallet:new(),
+    Root = hb_util:human_id(crypto:hash(sha256, <<"root">>)),
+    Committee = fun(N) -> [#{ <<"ao">> => AO, <<"bls">> => br_hex(K) } || {_, K, AO} <- lists:sublist(Members, N)] end,
+    Base = #{ <<"action">> => <<"Transfer">>, <<"quantity">> => <<"50">>,
+        <<"recipient">> => AO2, <<"attestor-epoch">> => <<"7">>, <<"root-sequence">> => <<"1">> },
+    %% A certificate: the operation the author signs, the JSON the request
+    %% carries (default: its encoding), the committee size and signers.
+    Cert =
+        fun(Opts) ->
+            Op = maps:get(op, Opts, Base),
+            Epoch = maps:get(epoch, Opts, 7),
+            N = maps:get(n, Opts, 3),
+            Item = br_item(Wallet, Root, Op),
+            IntentID = hb_util:human_id(Item#tx.id),
+            Bytes = br_signing_bytes(Root, Epoch, IntentID),
+            #{ <<"path">> => <<"verify">>, <<"root">> => Root,
+                <<"epoch">> => maps:get(epoch_value, Opts, Epoch),
+                <<"intent-id">> => IntentID, <<"committee">> => Committee(N),
+                <<"operation">> => maps:get(json, Opts, hb_json:encode(Op)),
+                <<"authorization">> => <<(Item#tx.owner)/binary, (Item#tx.signature)/binary>>,
+                <<"endorsements">> => br_endorse(lists:sublist(Members, N),
+                    maps:get(signers, Opts, lists:seq(0, N div 2)), Bytes) }
+        end,
+    Valid = Cert(#{}),
+    WithOp = fun(Extra) -> Cert(#{ op => maps:merge(Base, Extra) }) end,
+    %% JSON the device reads as Base: the encoding with text spliced in after
+    %% the opening brace.
+    Spliced = fun(Prefix) ->
+        <<"{", Rest/binary>> = hb_json:encode(Base),
+        Cert(#{ json => <<"{", Prefix/binary, Rest/binary>> })
+    end,
+    BigEpoch = 18446744073709551615,
+    Verify = [
+        {<<"cert-valid">>, ok, Valid},
+        {<<"cert-one-member">>, ok, Cert(#{ n => 1 })},
+        {<<"cert-sixteen">>, ok, Cert(#{ n => 16 })},
+        {<<"cert-other-majority">>, ok, Cert(#{ n => 5, signers => [1, 3, 4] })},
+        {<<"cert-anchor">>, ok, WithOp(#{ <<"anchor">> => hb_util:human_id(crypto:hash(sha256, <<"a">>)) })},
+        {<<"cert-epoch-text">>, ok, Cert(#{ epoch_value => <<"7">> })},
+        {<<"cert-epoch-plus">>, ok, Cert(#{ epoch_value => <<"+07">> })},
+        {<<"cert-epoch-max">>, ok, Cert(#{ epoch => BigEpoch, epoch_value => integer_to_binary(BigEpoch),
+            op => Base#{ <<"attestor-epoch">> => integer_to_binary(BigEpoch) } })},
+        {<<"cert-epoch-negative">>, error, Cert(#{ epoch_value => -7 })},
+        {<<"cert-epoch-other">>, error, Cert(#{ epoch_value => 8 })},
+        {<<"cert-minority">>, error, Cert(#{ signers => [0] })},
+        {<<"cert-bit-past-committee">>, error, (fun() ->
+            #{ <<"endorsements">> := <<Map, Agg/binary>> } = Valid,
+            Valid#{ <<"endorsements">> => <<(Map bor 8), Agg/binary>> } end)()},
+        {<<"cert-long-bitmap">>, error, (fun() ->
+            #{ <<"endorsements">> := <<Map, Agg/binary>> } = Valid,
+            Valid#{ <<"endorsements">> => <<Map, 0, Agg/binary>> } end)()},
+        {<<"cert-identity">>, error, Valid#{ <<"endorsements">> => <<3, 16#c0, 0:760>> }},
+        {<<"cert-off-subgroup">>, error, Valid#{ <<"endorsements">> => <<3, (br_g2_off(1))/binary>> }},
+        {<<"cert-tampered">>, error, Valid#{ <<"operation">> =>
+            hb_json:encode(Base#{ <<"quantity">> => <<"5000">> }) }},
+        {<<"cert-authorization-zero">>, error, Valid#{ <<"authorization">> => <<0:8192>> }},
+        {<<"cert-intent-other">>, error, Valid#{ <<"intent-id">> => Root }},
+        {<<"cert-root-other">>, error, Valid#{ <<"root">> => AO1 }},
+        {<<"cert-committee-17">>, error, Valid#{ <<"committee">> => Committee(17) }},
+        {<<"cert-committee-empty">>, error, Valid#{ <<"committee">> => [] }},
+        {<<"cert-committee-repeat-key">>, error, Valid#{ <<"committee">> =>
+            (fun([M0, M1, M2]) -> [M0, M1#{ <<"bls">> => string:uppercase(maps:get(<<"bls">>, M0)) }, M2] end)(Committee(3)) }},
+        {<<"cert-committee-raw-key">>, ok, Valid#{ <<"committee">> =>
+            [M#{ <<"bls">> => K } || {M, {_, K, _}} <- lists:zip(Committee(3), lists:sublist(Members, 3))] }},
+        {<<"cert-committee-loose-ao">>, ok, Valid#{ <<"committee">> =>
+            [M#{ <<"ao">> => <<"member-", (integer_to_binary(I))/binary>> } || {I, M} <- lists:enumerate(Committee(3))] }},
+        {<<"cert-json-first-wins">>, ok, Spliced(<<"\"quantity\":\"50\",\"quantity\":\"5000\",">>)},
+        {<<"cert-json-later-number">>, ok, Spliced(<<"\"quantity\":\"50\",\"quantity\":-1.5e+3,">>)},
+        {<<"cert-json-later-nested">>, ok, Spliced(<<"\"quantity\":\"50\",\"quantity\":{\"a\":[1,true,null,\"x\",{}]},">>)},
+        {<<"cert-json-overflow">>, error, Spliced(<<"\"quantity\":\"50\",\"quantity\":1e400,">>)},
+        {<<"cert-json-bad-utf8">>, error, Spliced(<<"\"quantity\":\"50\",\"quantity\":\"", 16#c0, 16#af, "\",">>)},
+        {<<"cert-json-lone-surrogate">>, error, Spliced(<<"\"quantity\":\"50\",\"quantity\":\"\\ud800\",">>)},
+        {<<"cert-json-number-value">>, error, Spliced(<<"\"zz\":1,">>)},
+        {<<"cert-json-escaped-key">>, ok, (fun() ->
+            <<"{", Rest/binary>> = hb_json:encode(maps:remove(<<"action">>, Base)),
+            Valid#{ <<"operation">> => <<"{\"\\u0061ction\":\"Tr\\u0061nsfer\",", Rest/binary>> } end)()},
+        {<<"cert-json-trailing">>, error, Valid#{ <<"operation">> =>
+            <<(maps:get(<<"operation">>, Valid))/binary, "x">> }},
+        {<<"cert-key-newline">>, ok, WithOp(#{ <<"note\n">> => <<"x">> })},
+        {<<"cert-key-upper">>, error, WithOp(#{ <<"Note">> => <<"x">> })},
+        {<<"cert-key-private">>, error, WithOp(#{ <<"private">> => <<"x">> })},
+        {<<"cert-key-reserved">>, error, WithOp(#{ <<"body">> => <<"x">> })},
+        {<<"cert-too-long">>, error, WithOp(#{ <<"pad">> => binary:copy(<<"x">>, 2048) })},
+        {<<"cert-from-stamp">>, ok, WithOp(#{ <<"from-process">> => AO1 })},
+        {<<"cert-data-key">>, ok, WithOp(#{ <<"ao-data-key">> => <<"x">> })},
+        {<<"cert-data-key-existing">>, ok, WithOp(#{ <<"ao-data-key">> => <<"author">> })},
+        {<<"cert-data-key-own">>, ok, WithOp(#{ <<"ao-data-key">> => <<"action">> })},
+        {<<"cert-data-key-refused">>, error, WithOp(#{ <<"ao-data-key">> => <<"owner">> })},
+        {<<"cert-data-key-private">>, error, WithOp(#{ <<"ao-data-key">> => <<"PRIVx">> })},
+        {<<"cert-bundle-format">>, ok, WithOp(#{ <<"bundle-format">> => <<"binary">> })},
+        {<<"cert-bundle-binary">>, ok, WithOp(#{ <<"bundle-format">> => <<"binary">>,
+            <<"bundle-version">> => <<"2.0.0">> })},
+        {<<"cert-bundle-map">>, ok, WithOp(#{ <<"bundle-format">> => <<"binary">>,
+            <<"bundle-version">> => <<"2.0.0">>, <<"bundle-map">> => <<"x">> })},
+        {<<"cert-bundle-version">>, ok, WithOp(#{ <<"bundle-version">> => <<"2.0.0">> })},
+        {<<"cert-bundle-upper">>, ok, WithOp(#{ <<"bundle-format">> => <<"BINARY">>,
+            <<"bundle-version">> => <<"2.0.0">> })},
+        {<<"cert-bundle-map-empty">>, ok, WithOp(#{ <<"bundle-format">> => <<"binary">>,
+            <<"bundle-version">> => <<"2.0.0">>, <<"bundle-map">> => <<>> })},
+        {<<"cert-ao-type-binary">>, ok, WithOp(#{ <<"ao-type">> => <<"binary">> })},
+        {<<"cert-ao-type-other">>, ok, WithOp(#{ <<"ao-type">> => <<"list">> })}
+    ],
+    Possession ++ Verify.
+
 %% @doc Per-slot phase means, run only when asked:
 %% `HB_WASM_PATCH_BENCH=2000 rebar3 device test -d dev_wasm_patch'
 %% (with `HB_WAMRC' set for the AOT rows). A trivial direct call, and a

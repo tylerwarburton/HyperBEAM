@@ -15,6 +15,10 @@
  *   env.throw_longjmp       raise the sentinel.
  *   env.setThrew            emscripten: set exported __THREW__/__threwValue.
  *   env.getTempRet0 / env.setTempRet0
+ *   env.wp_bls_fav          BLS12-381 fast aggregate verify (blst).
+ *   env.wp_rsa_pss_sha256   RSA-PSS-SHA256 verify, as `rsa_pss:verify/4'.
+ * The last two serve `bridge-root@1.0''s checks to the Lua runtime: pure,
+ * fixed fuel per call (see "verification natives").
  *
  * An instance lives in a resource with its own mutex. `gen' is the number of
  * successful calls applied to its memory; a call names the gen it expects and
@@ -24,6 +28,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <openssl/bn.h>
+#include <openssl/evp.h>
+#include "blst.h"
 #include "wasm_export.h"
 
 #define SENTINEL "wasm-patch-longjmp"
@@ -161,11 +168,146 @@ static void n_invoke(wasm_exec_env_t e, uint64_t *args) {
     else if (sig[0] == 'j' || sig[0] == 'd') memcpy(&args[0], argv, 8);
 }
 
+/* ---------- verification natives ----------
+ *
+ * Pure functions of their byte inputs: no node state, no clock, no
+ * randomness. Each charges a fixed fuel cost before it runs, written to the
+ * module's own `wp_fuel' global, so a call costs the same under the
+ * interpreter and AOT; below zero it traps as out of fuel (`trap/2' reads
+ * the global). Arguments are wasm32 pointers and lengths, checked against
+ * linear memory: a bad pointer is a trap, malformed bytes are an answer of
+ * 0. A module without `wp_fuel' (uninstrumented tests) runs them uncharged. */
+
+/* A slot of the pair stream is ~1e8 fuel for ~1 ms; a 64-key verify is a
+ * few ms, a 4096-bit RSA verify well under one. */
+#define FUEL_BLS 1000000000LL
+#define FUEL_RSA 100000000LL
+#define BLS_PK 48
+#define BLS_SIG 96
+#define BLS_MAX_KEYS 64
+#define BLS_MAX_MSG 4096
+#define RSA_MAX_BYTES 512
+
+static int charge(wasm_exec_env_t e, int64_t cost) {
+    wp_inst *w = self_of(e);
+    if (w && w->has_fuel) {
+        int64_t left = global_signed(&w->fuel) - cost;
+        global_set(&w->fuel, (uint64_t)left);
+        if (left < 0) {
+            wasm_runtime_set_exception(wasm_runtime_get_module_inst(e), "out of fuel");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* [ptr, ptr + len) in linear memory, or NULL with a trap set. */
+static const uint8_t *app_bytes(wasm_exec_env_t e, uint32_t ptr, uint32_t len) {
+    wasm_module_inst_t mi = wasm_runtime_get_module_inst(e);
+    if (!wasm_runtime_validate_app_addr(mi, ptr, len ? len : 1)) {
+        wasm_runtime_set_exception(mi, "out of bounds memory access");
+        return NULL;
+    }
+    return wasm_runtime_addr_app_to_native(mi, ptr);
+}
+
+/* env.wp_bls_fav(keys, nkeys, msg, msg_len, sig, dst, dst_len) -> 1 | 0
+ * BLS12-381 fast aggregate verify: 1 exactly when
+ * `blst_nif:fast_aggregate_verify/4' answers `true'. 1 to 64 keys of 48
+ * compressed bytes each (valid, in G1, none the identity, their sum not the
+ * identity), one 96-byte signature in G2, the message (at most 4 KiB) hashed
+ * to G2 under `dst' (1 to 255 bytes). */
+static int32_t n_bls_fav(wasm_exec_env_t e, uint32_t keys, uint32_t nkeys,
+        uint32_t msg, uint32_t msg_len, uint32_t sig, uint32_t dst, uint32_t dst_len) {
+    if (!charge(e, FUEL_BLS)) return 0;
+    if (nkeys < 1 || nkeys > BLS_MAX_KEYS || msg_len > BLS_MAX_MSG
+            || dst_len < 1 || dst_len > 255)
+        return 0;
+    const uint8_t *k, *m, *s, *d;
+    if (!(k = app_bytes(e, keys, nkeys * BLS_PK)) || !(m = app_bytes(e, msg, msg_len))
+            || !(s = app_bytes(e, sig, BLS_SIG)) || !(d = app_bytes(e, dst, dst_len)))
+        return 0;
+    blst_p1_affine one, agg_pk;
+    blst_p1 sum;
+    blst_p2_affine sg;
+    for (uint32_t i = 0; i < nkeys; i++) {
+        if (blst_p1_uncompress(&one, k + i * BLS_PK) != BLST_SUCCESS) return 0;
+        if (blst_p1_affine_is_inf(&one) || !blst_p1_affine_in_g1(&one)) return 0;
+        if (i == 0) blst_p1_from_affine(&sum, &one);
+        else blst_p1_add_or_double_affine(&sum, &sum, &one);
+    }
+    if (blst_p1_is_inf(&sum)) return 0;
+    blst_p1_to_affine(&agg_pk, &sum);
+    if (blst_p2_uncompress(&sg, s) != BLST_SUCCESS || !blst_p2_affine_in_g2(&sg)) return 0;
+    return blst_core_verify_pk_in_g1(&agg_pk, &sg, true, m, msg_len, d, dst_len, NULL, 0)
+        == BLST_SUCCESS;
+}
+
+static void sha256_of(const uint8_t *in, size_t n, uint8_t out[32]) {
+    unsigned int len = 32;
+    EVP_Digest(in, n, out, &len, EVP_sha256(), NULL);
+}
+
+/* env.wp_rsa_pss_sha256(n, n_len, digest, sig, sig_len) -> 1 | 0
+ * RSA-PSS with exponent 65537, MGF1-SHA-256 and any salt length over a
+ * 32-byte SHA-256 digest: step for step `rsa_pss:verify/4' (what
+ * `ar_wallet:verify' runs for an ANS-104 item), so any modulus -- an author
+ * chooses its own -- gives the same answer. At most 4096 bits. */
+static int32_t n_rsa_pss_sha256(wasm_exec_env_t e, uint32_t n_ptr, uint32_t n_len,
+        uint32_t digest_ptr, uint32_t sig_ptr, uint32_t sig_len) {
+    if (!charge(e, FUEL_RSA)) return 0;
+    if (n_len > RSA_MAX_BYTES || sig_len > RSA_MAX_BYTES) return 0;
+    const uint8_t *nb, *digest, *sb;
+    if (!(nb = app_bytes(e, n_ptr, n_len)) || !(digest = app_bytes(e, digest_ptr, 32))
+            || !(sb = app_bytes(e, sig_ptr, sig_len)))
+        return 0;
+    int ok = 0;
+    BN_CTX *ctx = BN_CTX_new();
+    BIGNUM *n = BN_bin2bn(nb, (int)n_len, NULL), *s = BN_bin2bn(sb, (int)sig_len, NULL);
+    BIGNUM *ex = BN_new(), *m = BN_new();
+    uint8_t em[RSA_MAX_BYTES], db[RSA_MAX_BYTES], buf[8 + 32 + RSA_MAX_BYTES], h2[32];
+    if (!ctx || !n || !s || !ex || !m || !BN_set_word(ex, 65537)) goto done;
+    int bits = BN_num_bits(n), k = (bits + 7) / 8;
+    /* The signature is exactly as long as the modulus and below it. */
+    if (bits == 0 || k != (int)sig_len || BN_cmp(s, n) >= 0) goto done;
+    /* Room for the digest and the trailer (the Erlang check crashes below). */
+    if (k < 32 + 2) goto done;
+    if (!BN_mod_exp(m, s, ex, n, ctx) || BN_bn2binpad(m, em, k) != k) goto done;
+    if (em[k - 1] != 0xBC) goto done;
+    int db_len = k - 32 - 1;
+    const uint8_t *h = em + db_len;
+    for (uint32_t counter = 0, at = 0; at < (uint32_t)db_len; counter++) {
+        uint8_t seed[36], mask[32];
+        memcpy(seed, h, 32);
+        seed[32] = counter >> 24; seed[33] = counter >> 16; seed[34] = counter >> 8; seed[35] = counter;
+        sha256_of(seed, 36, mask);
+        for (int i = 0; i < 32 && at < (uint32_t)db_len; i++, at++) db[at] = em[at] ^ mask[i];
+    }
+    int sh = (bits - 1) & 7;
+    if (sh > 0) db[0] &= 0xFF >> (8 - sh);
+    /* Zeros, then 0x01, then the salt. */
+    int p = 0;
+    while (p < db_len && db[p] == 0) p++;
+    if (p == db_len || db[p] != 1) goto done;
+    int salt = db_len - p - 1;
+    memset(buf, 0, 8);
+    memcpy(buf + 8, digest, 32);
+    memcpy(buf + 40, db + p + 1, salt);
+    sha256_of(buf, 40 + salt, h2);
+    ok = memcmp(h2, h, 32) == 0;
+done:
+    BN_free(n); BN_free(s); BN_free(ex); BN_free(m);
+    BN_CTX_free(ctx);
+    return ok;
+}
+
 static NativeSymbol FIXED_NATIVES[] = {
     { "throw_longjmp", (void *)n_throw_longjmp, "()", NULL },
     { "setThrew", (void *)n_set_threw, "(ii)", NULL },
     { "getTempRet0", (void *)n_get_temp_ret0, "()i", NULL },
     { "setTempRet0", (void *)n_set_temp_ret0, "(i)", NULL },
+    { "wp_bls_fav", (void *)n_bls_fav, "(iiiiiii)i", NULL },
+    { "wp_rsa_pss_sha256", (void *)n_rsa_pss_sha256, "(iiiii)i", NULL },
 };
 
 static int allowed_import(const char *module, const char *name) {
