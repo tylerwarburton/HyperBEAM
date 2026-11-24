@@ -27,6 +27,9 @@
 %%% both runtimes' results into the same terms.
 -module(hb_wasm_patch_codec).
 -export([encode/1, decode_result/1, decode_init/1, decode_value/1, decode_terms/1]).
+%% Pieces of `encode/1', for an encoder that writes a request in one walk
+%% (`lib_patch_exec:encode/3', `wire').
+-export([enc/1, key/1]).
 -include_lib("eunit/include/eunit.hrl").
 
 -define(BIN, 1).

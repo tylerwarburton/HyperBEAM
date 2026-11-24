@@ -140,11 +140,18 @@ literal_links(Value, _Opts) -> Value.
 
 %% @doc Encode AO-Core maps for a runtime without eagerly loading whole
 %% trees. `luerl' gives the `{Key, Value}' lists Luerl encodes; `term' gives
-%% plain maps and lists (`hb_wasm_patch_codec').
+%% plain maps and lists; `wire' gives the `wasm-patch@1.0' request bytes
+%% (iodata) in the same walk, exactly `hb_wasm_patch_codec:encode/1' of the
+%% `term' shape.
 encode(Map, Shape, Opts) when is_map(Map) ->
     Normalized = assign_to_target(Map),
-    case hb_util:is_ordered_list(Normalized, Opts) of
+    case maybe_ordered(Normalized, Opts) of
         true -> encode(hb_util:message_to_ordered_list(Normalized), Shape, Opts);
+        false when Shape == wire ->
+            Pairs = lists:sort(maps:to_list(Normalized)),
+            [6, <<(length(Pairs)):32/little>>,
+                [ [hb_wasm_patch_codec:key(Key), encode_value(Key, Value, wire, Opts)]
+                || {Key, Value} <- Pairs ]];
         false ->
             Encoded =
                 maps:map(
@@ -156,13 +163,38 @@ encode(Map, Shape, Opts) when is_map(Map) ->
                 term -> Encoded
             end
     end;
+encode(List, wire, Opts) when is_list(List) ->
+    [7, <<(length(List)):32/little>>, [ encode(Value, wire, Opts) || Value <- List ]];
 encode(List, Shape, Opts) when is_list(List) ->
     lists:map(fun(Value) -> encode(Value, Shape, Opts) end, List);
 encode(Link, Shape, Opts) when ?IS_LINK(Link) ->
     encode(hb_cache:ensure_all_loaded(Link, Opts), Shape, Opts);
-encode(Atom, _Shape, _Opts) when is_atom(Atom) andalso Atom =/= false andalso Atom =/= true ->
-    hb_util:bin(Atom);
+encode(Atom, Shape, _Opts) when is_atom(Atom) andalso Atom =/= false andalso Atom =/= true ->
+    case Shape of
+        wire -> hb_wasm_patch_codec:enc(hb_util:bin(Atom));
+        _ -> hb_util:bin(Atom)
+    end;
+encode(Value, wire, _Opts) -> hb_wasm_patch_codec:enc(Value);
 encode(Value, _Shape, _Opts) -> Value.
+
+%% @doc `hb_util:is_ordered_list/2', answered at once for the usual message: a
+%% map is a list only if every key it counts is a positive integer, so one
+%% binary key starting with anything but a digit (and not one the check skips)
+%% settles it without normalising every key.
+maybe_ordered(Map, Opts) ->
+    case has_word_key(maps:next(maps:iterator(Map))) of
+        true -> false;
+        false -> hb_util:is_ordered_list(Map, Opts)
+    end.
+
+has_word_key(none) -> false;
+has_word_key({<<C, _/binary>> = Key, _, Next}) when C < $0; C > $9 ->
+    case Key =:= <<"commitments">> orelse Key =:= <<"ao-types">>
+            orelse hb_private:is_private(Key) of
+        true -> has_word_key(maps:next(Next));
+        false -> true
+    end;
+has_word_key({_, _, Next}) -> has_word_key(maps:next(Next)).
 
 %% @doc A contract sees only the signed commitments of a message, each with
 %% its committer as an address, as `lua@5.3a' gives them. v0.11 holds a

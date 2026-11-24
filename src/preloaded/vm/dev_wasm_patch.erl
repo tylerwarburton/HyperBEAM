@@ -271,10 +271,25 @@ module_by_id(Def, _Opts) -> Def.
 %% result handling. A failed slot puts the instance back first.
 compute(Key, RawBase, RawReq, Opts) ->
     T0 = erlang:monotonic_time(microsecond),
-    Req = hb_cache:read_all_commitments(RawReq, Opts),
+    Req = request_commitments(RawBase, RawReq, Opts),
     case init(RawBase, Req, Opts) of
         {ok, Base} -> compute(Key, Base, Req, T0, Opts);
         Error -> Error
+    end.
+
+%% The request with every commitment the store holds for it, as
+%% `lua-patch@1.0' reads it -- except in a process slot. There the request is
+%% the assignment the scheduler just read from the store, with its path set to
+%% `compute' (`dev_process:prepare_next_slot/4'), so it already carries every
+%% stored commitment of that assignment; and the lookup is by the uncommitted
+%% ID of the whole request, computed on every slot (0.5 ms of a 0.9 ms prep on
+%% a signed message). Over both devices' suites (5,448 requests) it never
+%% added one. The message's own commitments, the ones `signer()' reads, are
+%% the body's and are not touched by it.
+request_commitments(Base, Req, Opts) ->
+    case lib_patch_exec:in_slot(hb_private:from_message(Base)) of
+        true -> Req;
+        false -> hb_cache:read_all_commitments(Req, Opts)
     end.
 
 compute(_Key, Base, Req, T0, Opts) ->
@@ -285,11 +300,15 @@ compute(_Key, Base, Req, T0, Opts) ->
     {Literal, St0} = literal_links(InSlot, maps:get(<<"state">>, Priv), Base, Opts),
     Params = lib_patch_exec:params(Req, InSlot, Literal, Opts),
     ReqBin =
-        hb_wasm_patch_codec:encode(
-            case lib_patch_exec:encode(Params, term, Opts) of
-                [One] -> One;
-                Many -> Many
-            end
+        iolist_to_binary(
+            lib_patch_exec:encode(
+                case Params of
+                    [One] -> One;
+                    Many -> Many
+                end,
+                wire,
+                Opts
+            )
         ),
     T1 = erlang:monotonic_time(microsecond),
     hb_slot_log:note(wasm_patch_prep, T1 - T0),
@@ -780,6 +799,26 @@ types_script() ->
         "  }\n"
         "end\n"
     >>.
+
+%% The request written in one walk is the term encoding's bytes exactly.
+wire_encoding_matches_term_encoding_test() ->
+    hb:init(),
+    Opts = test_opts(),
+    rand:seed(exsss, {5, 6, 7}),
+    Signed = hb_message:commit(#{ <<"action">> => <<"Order.Place">>, <<"price">> => 12,
+        <<"assign-to">> => binary:copy(<<"T">>, 43), <<"tags">> => [<<"a">>, <<"b">>] },
+        #{ <<"priv-wallet">> => ar_wallet:new() }),
+    Samples = [#{ <<"slot">> => 3, <<"body">> => Signed, <<"path">> => <<"compute">> }, #{}, []]
+        ++ [ gen_value(4) || _ <- lists:seq(1, 300) ],
+    lists:foreach(
+        fun(Value) ->
+            ?assertEqual(
+                hb_wasm_patch_codec:encode(lib_patch_exec:encode(Value, term, Opts)),
+                iolist_to_binary(lib_patch_exec:encode(Value, wire, Opts))
+            )
+        end,
+        Samples
+    ).
 
 %% A module importing anything outside the allow-list never starts.
 refuses_imports_test() ->
