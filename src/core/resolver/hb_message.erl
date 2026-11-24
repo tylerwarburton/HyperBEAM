@@ -304,7 +304,13 @@ normalize_message(Msg, Opts, Settings = #{ <<"verify">> := fast }) ->
     hb_private:set(Normalized, <<"verified-commitments">>,
         normalization_fast_hash(Normalized), Opts);
 normalize_message(Msg, Opts, Settings) ->
-    Mode = hb_maps:get(<<"verify">>, Settings, passive, Opts),
+    % A message the caller holds as verified -- this exact term, in the
+    % settings' `verified' list -- keeps its commitments unchecked.
+    Mode =
+        case lists:member(Msg, hb_maps:get(<<"verified">>, Settings, [], Opts)) of
+            true -> passive;
+            false -> hb_maps:get(<<"verify">>, Settings, passive, Opts)
+        end,
     Commitments = hb_maps:get(<<"commitments">>, Msg, #{}, Opts),
     Kept = hb_maps:filter(
         fun(ID, Commitment) ->

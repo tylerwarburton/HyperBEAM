@@ -48,7 +48,7 @@ write(ProcID, Slot, Msg, RawOpts) ->
 
 write_stored(ProcID, Slot, Msg, RawOpts) ->
     Opts = lib_process:cache_opts(RawOpts),
-    Public = hb_private:reset(Msg),
+    Public = public_state(ProcID, Slot, Msg, Opts),
     % The outbox row first, in the same buffered batch as the state row and
     % before it: a stored slot never exists without its outbox row, so a
     % slot the process worker will not compute again still has what it owes
@@ -70,7 +70,62 @@ write_stored(ProcID, Slot, Msg, RawOpts) ->
             {not_found, _} -> write_full(ProcID, Slot, Msg, Opts)
         end,
     hot_put(ProcID, Slot, Public, Opts),
+    % The published-key view `now' reads are answered from.
+    hb_process_view:update(ProcID, Slot, Public,
+        case delta(Msg, Opts) of
+            {ok, SlotPatches, _} -> SlotPatches;
+            _ -> full
+        end,
+        Opts),
     Result.
+
+%% @doc The public state of a slot (`hb_private:reset/1' of it), built from
+%% the slot before's when the slot is a delta of it: that one with the keys
+%% the slot's patches name, `results' and `at-slot', which every slot sets
+%% (`hb_state_patch:apply/5'), and `snapshot', which a snapshot slot carries
+%% (`dev_process:store_result/6'), reset again. Resetting the whole state
+%% was a deep walk of every published key every slot: at 10,000 keys ~10,000
+%% `reset' calls a slot and most of the store step. The slot before's public
+%% state is the calling process's own (the process worker computes in
+%% order); any other slot -- the first, a gap, a full state, a patch list
+%% that does not parse -- is reset whole. `process-cache-public-check' (tests)
+%% resets every slot whole as well and refuses a difference.
+public_state(ProcID, Slot, Msg, Opts) ->
+    Key = {?MODULE, public, ProcID},
+    Public =
+        case {is_integer(Slot) andalso get(Key), delta(Msg, Opts)} of
+            {{Prev, PrevPublic}, {ok, Patches, _}} when Prev == Slot - 1 ->
+                case hb_state_patch:roots(Patches, Opts) of
+                    {ok, Roots} ->
+                        lists:foldl(
+                            fun(K, Acc) ->
+                                case not hb_private:is_private(K) andalso maps:find(K, Msg) of
+                                    {ok, V} -> Acc#{ K => hb_private:reset(V) };
+                                    _ -> maps:remove(K, Acc)
+                                end
+                            end,
+                            PrevPublic,
+                            Roots ++ [<<"results">>, <<"at-slot">>, <<"snapshot">>]
+                        );
+                    error -> hb_private:reset(Msg)
+                end;
+            _ -> hb_private:reset(Msg)
+        end,
+    case hb_opts:get(<<"process-cache-public-check">>, false, Opts) of
+        true ->
+            case hb_private:reset(Msg) of
+                Public -> ok;
+                Full -> erlang:error({public_state_diverged, ProcID, Slot,
+                    [ K || K <- lists:usort(maps:keys(Full) ++ maps:keys(Public)),
+                           maps:get(K, Full, absent) =/= maps:get(K, Public, absent) ]})
+            end;
+        _ -> ok
+    end,
+    case is_integer(Slot) of
+        true -> put(Key, {Slot, Public});
+        false -> ok
+    end,
+    Public.
 
 %% @doc Write the whole public state of a slot, as RC7 does for every slot.
 write_full(ProcID, Slot, Msg, Opts) ->
@@ -269,15 +324,16 @@ checkpoint_slots(Opts) ->
     end.
 
 base_exists(ProcID, Slot, Opts) ->
-    case hot_get(ProcID, Slot, Opts) of
-        {ok, _} -> true;
-        not_found when Slot >= 0 ->
+    % Whether the hot cache holds it, without copying the state out.
+    case hot_member(ProcID, Slot, Opts) of
+        true -> true;
+        false when Slot >= 0 ->
             blob_exists(ProcID, Slot, Opts) orelse
                 case hb_cache:read(path(ProcID, Slot, Opts), Opts) of
                     {ok, _} -> true;
                     _ -> false
                 end;
-        not_found ->
+        false ->
             case hb_cache:read(path(ProcID, Slot, Opts), Opts) of
                 {ok, _} -> true;
                 _ -> false
@@ -344,7 +400,7 @@ hot_put(ProcID, Slot, Msg, Opts) when is_integer(Slot) ->
             ensure_hot_table(),
             try
                 ets:insert(?HOT, {{ProcID, Slot}, Msg}),
-                hot_trim(ProcID, Keep)
+                hot_trim(ProcID, Slot, Keep)
             catch error:badarg -> ok
             end,
             ok
@@ -352,18 +408,19 @@ hot_put(ProcID, Slot, Msg, Opts) when is_integer(Slot) ->
 hot_put(_ProcID, _Slot, _Msg, _Opts) ->
     ok.
 
-hot_trim(ProcID, Keep) ->
-    Held = ets:select_count(?HOT, [{{{ProcID, '_'}, '_'}, [], [true]}]),
-    case Held > Keep of
-        true ->
-            case ets:next(?HOT, {ProcID, -2}) of
-                {ProcID, Oldest} ->
-                    ets:delete(?HOT, {ProcID, Oldest}),
-                    hot_trim(ProcID, Keep);
-                _ -> ok
-            end;
-        false -> ok
+%% Drop the slots of a process at or below `Slot - Keep', walking back from
+%% there: what each insert pushed out, not a count of every slot held.
+hot_trim(ProcID, Slot, Keep) ->
+    case ets:prev(?HOT, {ProcID, Slot - Keep + 1}) of
+        {ProcID, Old} = Key when Old =< Slot - Keep ->
+            ets:delete(?HOT, Key),
+            hot_trim(ProcID, Slot, Keep);
+        _ -> ok
     end.
+
+hot_member(ProcID, Slot, Opts) ->
+    hot_slots(Opts) > 0 andalso
+        (try ets:member(?HOT, {ProcID, Slot}) catch error:badarg -> false end).
 
 %% The hot cache is node-wide and keyed by process ID alone, so only a
 %% computation that writes it (`process-delta-cache') reads it: one with its
@@ -386,8 +443,10 @@ hot_get(ProcID, Slot) ->
 %% stored slot goes through it (`refresh/3'), so while it holds any slot of
 %% a process it holds the newest one stored since the node started.
 hot_head(ProcID, RawOpts) ->
-    case hot_latest(ProcID, undefined, lib_process:cache_opts(RawOpts)) of
-        {ok, Slot, _} -> {ok, Slot};
+    % The key alone: the state is not copied out.
+    case hot_slots(lib_process:cache_opts(RawOpts)) > 0 andalso
+            (try ets:prev(?HOT, {ProcID, infinity}) catch error:badarg -> none end) of
+        {ProcID, Slot} -> {ok, Slot};
         _ -> not_found
     end.
 

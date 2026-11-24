@@ -458,7 +458,10 @@ prepare_write(Msg, Opts) when is_map(Msg) ->
         Msg
     ),
     Settings = #{ <<"verify">> => all, <<"add-unsigned">> => false,
-        <<"depth">> => shallow },
+        <<"depth">> => shallow,
+        % Messages the writer already holds as verified (exact terms,
+        % `cache-verified'): their commitments are kept, not checked again.
+        <<"verified">> => hb_opts:get(<<"cache-verified">>, [], Opts) },
     Verified = hb_message:normalize_commitments(Deep, Opts, Settings),
     {ok, Committed} = hb_message:with_only_committed(Verified, any, Opts),
     case lists:all(fun hb_private:is_private/1,
