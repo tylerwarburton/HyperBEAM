@@ -282,8 +282,16 @@ can_sign(_Spec, ?RSA_SIGN_TYPE) -> true;
 can_sign(_Spec, _Type) -> false.
 
 %% @doc Options that sign as the process's scheduler: its first commitment
-%% key, the one its assignments carry.
-signer_opts([Wallet | _], Opts) -> Opts#{ <<"priv-wallet">> => Wallet };
+%% key, the one its assignments carry. The uploads it signs are paid for by
+%% `scheduler-upload-paid-by', the node's own key by default
+%% (`dev_scheduler_uploader:paid_by/1'): a scheduling key of its own
+%% (`scheduler-key-type') holds no upload credit.
+signer_opts([Wallet | _], Opts) ->
+    Opts#{
+        <<"priv-wallet">> => Wallet,
+        <<"scheduler-upload-paid-by">> =>
+            hb_opts:get(scheduler_upload_paid_by, hb_opts:address(Opts), Opts)
+    };
 signer_opts([], Opts) -> Opts.
 
 %% @doc Call the appropriate scheduling server to assign a message.
@@ -2095,3 +2103,17 @@ wal_crash_during_checkpoint_test_() ->
         ok = file:write_file(filename:join(wal_journal(Torn), "durable"), <<131, 104, 3, 0, 0>>),
         wal_check(Torn, Opts, ProcID, Proc, First, Confirmed)
     end}.
+
+%% @doc A scheduling key of its own signs a process's uploads, and the node's
+%% own key pays for them unless `scheduler-upload-paid-by' names a payer.
+upload_paid_by_node_key_test() ->
+    Node = ar_wallet:new(),
+    Sched = ar_wallet:new(?EDDSA_KEY_TYPE),
+    Opts = #{ <<"priv-wallet">> => Node },
+    Signing = signer_opts([Sched], Opts),
+    ?assertEqual(Sched, maps:get(<<"priv-wallet">>, Signing)),
+    ?assertEqual(hb_util:human_id(ar_wallet:to_address(Node)),
+        maps:get(<<"scheduler-upload-paid-by">>, Signing)),
+    Funded = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ?assertEqual(Funded, maps:get(<<"scheduler-upload-paid-by">>,
+        signer_opts([Sched], Opts#{ <<"scheduler-upload-paid-by">> => Funded }))).

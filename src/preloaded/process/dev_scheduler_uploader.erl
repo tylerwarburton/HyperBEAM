@@ -53,7 +53,7 @@
 %%% uncompressed archive item; windows persisted in it still post and confirm.
 -module(dev_scheduler_uploader).
 -export([start/2, cursor/2, posted/2, allowed/2, mode/2, list_option/2]).
--export([archive_bundle/2, prepare_window/6, status/0]).
+-export([archive_bundle/2, prepare_window/6, status/0, paid_by/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -598,9 +598,10 @@ item(Msg, Opts) ->
 
 post(Serialized, Opts) ->
     URL = upload_url(Opts),
+    PaidBy = [ {"x-paid-by", hb_util:list(Payer)} || Payer <- paid_by(Opts) ],
     case hb_http_gate:httpc_request(
             post,
-            {URL, [], "application/octet-stream", Serialized},
+            {URL, PaidBy, "application/octet-stream", Serialized},
             [{timeout, 60000}],
             [{body_format, binary}],
             Opts) of
@@ -618,6 +619,23 @@ post(Serialized, Opts) ->
             };
         Error -> Error
     end.
+
+%% @doc The addresses whose Turbo credit pays for an item this uploader signs
+%% (`scheduler-upload-paid-by': one address, a list, or comma-separated; the
+%% scheduling server sets the node's own key's address by default), sent as
+%% one `x-paid-by' header each. Turbo spends the credit those payers shared
+%% with the signer (a credit-share approval the payer signs first, Turbo's
+%% `x-approve-payment'), then the signer's own. The signer itself is left
+%% out: it pays as it always did.
+paid_by(Opts) ->
+    Signer =
+        case hb_opts:get(priv_wallet, undefined, Opts) of
+            undefined -> undefined;
+            Wallet -> hb_util:human_id(ar_wallet:to_address(Wallet))
+        end,
+    [ Payer
+    || Payer <- list_option(hb_opts:get(scheduler_upload_paid_by, [], Opts), Opts),
+        ?IS_ID(Payer), Payer =/= Signer ].
 
 %% @doc Where a window is posted: `scheduler-upload-url' whole, or the
 %% `bundler-ans104' node's `/tx'. A Turbo-style bundler takes items at
@@ -938,6 +956,9 @@ stub_serve(Socket, Statuses, Test, Length) ->
     case gen_tcp:recv(Socket, 0, 5000) of
         {ok, {http_header, _, 'Content-Length', _, Value}} ->
             stub_serve(Socket, Statuses, Test, binary_to_integer(Value));
+        {ok, {http_header, _, Name, _, Value}} when is_binary(Name) ->
+            Test ! {header, string:lowercase(Name), Value},
+            stub_serve(Socket, Statuses, Test, Length);
         {ok, http_eoh} ->
             ok = inet:setopts(Socket, [{packet, raw}]),
             {ok, Body} = gen_tcp:recv(Socket, Length, 5000),
@@ -1236,3 +1257,40 @@ mode_test() ->
     ?assertEqual(fingerprint, mode(B, Opts)),
     ?assertNot(allowed(B, Opts)),
     ?assertEqual(none, mode(hb_util:human_id(crypto:strong_rand_bytes(32)), Opts)).
+
+%% @doc An item signed by a scheduling key of its own (`scheduler-key-type')
+%% is paid for by the addresses `scheduler-upload-paid-by' names, one
+%% `x-paid-by' header each; the signer itself is never named, and with no
+%% payer set no header goes (the signer pays, as before).
+paid_by_header_test_() ->
+    {timeout, 30, fun paid_by_header/0}.
+paid_by_header() ->
+    {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(Listen),
+    ok = gen_tcp:close(Listen),
+    Base = <<"http://localhost:", (integer_to_binary(Port))/binary>>,
+    Stub = stub_bundler(Port, [200, 200], self()),
+    Sched = ar_wallet:new(?EDDSA_KEY_TYPE),
+    SchedAddr = hb_util:human_id(ar_wallet:to_address(Sched)),
+    Payer = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Opts = #{ <<"scheduler-upload-url">> => <<Base/binary, "/v1/tx">>,
+        <<"priv-wallet">> => Sched,
+        <<"scheduler-upload-paid-by">> => <<Payer/binary, ",", SchedAddr/binary>> },
+    ?assertEqual([Payer], paid_by(Opts)),
+    ok = post(<<"abc">>, Opts),
+    receive {posted, 200, <<"abc">>} -> ok after 5000 -> error(no_post) end,
+    ?assertEqual([Payer], paid_by_headers()),
+    Unpaid = maps:remove(<<"scheduler-upload-paid-by">>, Opts),
+    ?assertEqual([], paid_by(Unpaid)),
+    ok = post(<<"def">>, Unpaid),
+    receive {posted, 200, <<"def">>} -> ok after 5000 -> error(no_post) end,
+    ?assertEqual([], paid_by_headers()),
+    unlink(Stub),
+    exit(Stub, kill).
+
+paid_by_headers() ->
+    receive {header, <<"x-paid-by">>, V} -> [V | paid_by_headers()]
+    after 0 -> flush_headers(), []
+    end.
+flush_headers() ->
+    receive {header, _, _} -> flush_headers() after 0 -> ok end.
