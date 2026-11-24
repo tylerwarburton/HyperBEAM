@@ -1106,11 +1106,16 @@ resolve_request(Path, Singleton, NodeMsg) ->
                     NodeMsg
                 )
             ))#{ <<"request-cache-store">> => false },
+        ResolveOpts = (read_opts(Request, HTTPOpts))#{ <<"force-message">> => true },
+        % A `now' read of a published key is answered from the process's
+        % published-key view when it can be (`hb_process_view'): the same
+        % result, without resolving the process. Only for an unsigned reply.
         {ErlStatus, Res} =
-            hb_ao:resolve_many(
-                PreProcessedMsgs,
-                (read_opts(Request, HTTPOpts))#{ <<"force-message">> => true }
-            ),
+            case hb_opts:get(hashpath, update, ResolveOpts) == ignore andalso
+                    hb_process_view:read(RequestPath, Request, ResolveOpts) of
+                {ok, _} = Viewed -> Viewed;
+                _ -> hb_ao:resolve_many(PreProcessedMsgs, ResolveOpts)
+            end,
         % The result keeps its Erlang status unless the `response' hook returns
         % an error.
         {_, {ok, #{ <<"body">> := Body }}} ?=

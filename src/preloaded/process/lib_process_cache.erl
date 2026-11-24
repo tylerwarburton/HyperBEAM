@@ -70,6 +70,13 @@ write_stored(ProcID, Slot, Msg, RawOpts) ->
             {not_found, _} -> write_full(ProcID, Slot, Msg, Opts)
         end,
     hot_put(ProcID, Slot, Public, Opts),
+    % The published-key view `now' reads are answered from.
+    hb_process_view:update(ProcID, Slot, Public,
+        case delta(Msg, Opts) of
+            {ok, SlotPatches, _} -> SlotPatches;
+            _ -> full
+        end,
+        Opts),
     Result.
 
 %% @doc Write the whole public state of a slot, as RC7 does for every slot.
