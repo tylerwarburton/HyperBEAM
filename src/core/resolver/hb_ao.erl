@@ -434,7 +434,13 @@ resolve_stage(1, Base, _Req, _Opts) when not is_map(Base) ->
 resolve_stage(1, RawBase, RawReq, Opts) ->
     % Parse the path into a list of requests.
     ?event_debug(debug_ao_core, {stage, 1, normalize}, Opts),
-    Base = normalize_keys(RawBase, Opts),
+    % A base the caller asserts is normalised (`normalized/2') has binary keys
+    % only: walking all of them again was O(published keys) every stage.
+    Base =
+        case normalized(RawBase, Opts) of
+            true -> RawBase;
+            false -> normalize_keys(RawBase, Opts)
+        end,
     Req = normalize_keys(RawReq, Opts),
     case hb_maps:get(<<"path">>, Req, undefined, Opts) of
         Empty when Empty == undefined; Empty == <<>>; Empty == [] ->
