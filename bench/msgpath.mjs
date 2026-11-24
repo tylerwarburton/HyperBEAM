@@ -189,6 +189,7 @@ async function main() {
     const p1 = await phases(); const u1 = cpuUs();
     report.idle = { n, rtt_p50_ms: pct(ms, 0.5), rtt_p95_ms: pct(ms, 0.95), sched_p50_ms: pct(sc, 0.5),
       cpu_ms_per_msg: u0 === null ? null : +((u1 - u0) / 1000 / n).toFixed(2),
+      kreds_per_msg: p1.reductions == null ? null : Math.round((p1.reductions - p0.reductions) / 1000 / n),
       phases: phaseDelta(p0, p1, n) };
     console.error('idle', JSON.stringify({ n, rtt_p50_ms: report.idle.rtt_p50_ms, rtt_p95_ms: report.idle.rtt_p95_ms }));
   }
@@ -222,6 +223,7 @@ async function main() {
       proc_msg_s_min: +Math.min(...per).toFixed(1),
       rtt_p50_ms: pct(rtts, 0.5), rtt_p95_ms: pct(rtts, 0.95), sched_p50_ms: pct(scs, 0.5), sched_p95_ms: pct(scs, 0.95),
       cpu_ms_per_msg: u0 === null ? null : +((u1 - u0) / 1000 / confirmed).toFixed(2),
+      kreds_per_msg: p1.reductions == null ? null : Math.round((p1.reductions - p0.reductions) / 1000 / confirmed),
       cpu_cores: u0 === null ? null : +((u1 - u0) / 1000 / (t1 - t0)).toFixed(2),
       errors, first_error: firstErr, run_queue: p1.run_queue,
       phases: phaseDelta(p0, p1, confirmed),

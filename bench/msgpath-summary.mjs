@@ -3,7 +3,7 @@
 // (top 25); with two files, the second's delta against the first.
 import fs from 'node:fs';
 const [a, b] = process.argv.slice(2).map((f) => JSON.parse(fs.readFileSync(f, 'utf8')));
-const line = (r) => `${r.msg} procs=${r.procs} clients=${r.clients}  sat: node ${r.sat.node_msg_s} msg/s, per-proc ${r.sat.proc_msg_s} (min ${r.sat.proc_msg_s_min}), rtt p50/p95 ${r.sat.rtt_p50_ms}/${r.sat.rtt_p95_ms} ms, sched p50 ${r.sat.sched_p50_ms}` + (r.sat.cpu_ms_per_msg != null ? `, cpu ${r.sat.cpu_ms_per_msg} ms/msg (${r.sat.cpu_cores} cores)` : '') +
+const line = (r) => `${r.msg} procs=${r.procs} clients=${r.clients}  sat: node ${r.sat.node_msg_s} msg/s, per-proc ${r.sat.proc_msg_s} (min ${r.sat.proc_msg_s_min}), rtt p50/p95 ${r.sat.rtt_p50_ms}/${r.sat.rtt_p95_ms} ms, sched p50 ${r.sat.sched_p50_ms}` + (r.sat.cpu_ms_per_msg != null ? `, cpu ${r.sat.cpu_ms_per_msg} ms/msg (${r.sat.cpu_cores} cores), ${r.sat.kreds_per_msg} kred/msg` : '') +
   (r.idle ? `  |  idle rtt p50/p95 ${r.idle.rtt_p50_ms}/${r.idle.rtt_p95_ms} ms (sched ${r.idle.sched_p50_ms})` + (r.idle.cpu_ms_per_msg != null ? ` cpu ${r.idle.cpu_ms_per_msg} ms/msg` : '') : '') + `  errors ${r.sat.errors}`;
 console.log(line(a)); if (b) console.log(line(b));
 for (const w of ['idle', 'sat']) {

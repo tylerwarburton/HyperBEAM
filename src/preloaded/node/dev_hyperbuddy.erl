@@ -123,6 +123,10 @@ phases_body() ->
         <<"v">> => 1,
         <<"at">> => erlang:system_time(millisecond),
         <<"uptime_s">> => element(1, erlang:statistics(wall_clock)) div 1000,
+        % Work done by every process since the node started: per message, a
+        % measure of the Erlang-side cost that other load on the host does
+        % not inflate, as CPU time does. NIF time (RSA, LMDB) is not in it.
+        <<"reductions">> => element(1, erlang:statistics(exact_reductions)),
         <<"run_queue">> => #{
             <<"schedulers">> => lists:sum(Sched),
             <<"dirty_cpu">> => lists:nth(1, Dirty ++ [0]),
