@@ -747,3 +747,20 @@ buildinfo_test() ->
         {ok, maps:get(<<"build-time">>, BuildInfo)},
         hb_http:get(Node, <<"/~meta@1.0/build/build-time">>, #{})
     ).
+
+%% @doc `scheduler-key-type' makes the node's scheduling key at
+%% `scheduler-key-location' on first start, of that type, and reads the same
+%% key after; a key file of another type, or an unknown type, stops the node.
+%% Unset, the node has no scheduling key of its own.
+scheduler_key_type_test() ->
+    Dir = <<"cache-TEST/scheduler-key-", (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary>>,
+    Ed = <<Dir/binary, "/ed25519.json">>,
+    Opts = #{ <<"scheduler-key-type">> => <<"ed25519">>, <<"scheduler-key-location">> => Ed },
+    Wallet = hb:scheduler_wallet(Opts),
+    ?assertEqual(?EDDSA_SIGN_TYPE, maps:get(<<"type">>, Wallet)),
+    ?assertEqual(Wallet, ar_wallet:load_keyfile(Ed)),
+    ?assertEqual(undefined, hb:scheduler_wallet(#{})),
+    ?assertThrow({scheduler_key_type_mismatch, _, _, _},
+        hb:scheduler_wallet(Opts#{ <<"scheduler-key-type">> => <<"rsa4096">> })),
+    ?assertThrow({unsupported_scheduler_key_type, <<"secp256k1">>},
+        hb:scheduler_wallet(Opts#{ <<"scheduler-key-type">> => <<"secp256k1">> })).

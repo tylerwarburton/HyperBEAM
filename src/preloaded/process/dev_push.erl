@@ -488,6 +488,7 @@ core_push_test_cases() ->
         {timeout, 60, fun() -> test_push_stamps_provenance(<<"ans104@1.0">>) end},
         fun test_redirect_resign_keeps_stamps/0,
         {timeout, 90, fun test_push_as_identity/0},
+        fun test_push_signs_as_ed25519_identity/0,
         {timeout, 60, fun test_multi_process_push/0},
         {timeout, 90, fun test_remote_routed_push/0},
         {timeout, 60, fun test_oracle_push/0},
@@ -777,6 +778,30 @@ test_push_as_identity() ->
             Opts
         )
     ).
+
+%% @doc A delivery signs with the target's authority whatever its key type,
+%% when the codec carries it: an Ed25519 identity (the `scheduler' identity
+%% of `scheduler-key-type') signs an ANS-104 item, which verifies as its own.
+test_push_signs_as_ed25519_identity() ->
+    Wallet = ar_wallet:new(?EDDSA_KEY_TYPE),
+    ID = hb:address(Wallet),
+    Opts = #{
+        <<"priv-wallet">> => hb:wallet(),
+        <<"store">> => [hb_test_utils:test_store()],
+        <<"identities">> => #{ ID => #{ <<"priv-wallet">> => Wallet } }
+    },
+    Signed =
+        apply_security(
+            #{ <<"body">> => <<"pushed">>, <<"target">> => ID },
+            #{ <<"authority">> => [ID] },
+            <<"ans104@1.0">>,
+            Opts
+        ),
+    ?assertEqual([hb_test_utils:committer(Wallet)], hb_message:signers(Signed, Opts)),
+    ?assert(hb_message:verify(Signed, all, Opts)),
+    ?assertEqual([?EDDSA_SIGN_TYPE],
+        [ T || #{ <<"type">> := T } <- maps:values(maps:get(<<"commitments">>, Signed)),
+            T =/= <<"unsigned-sha256">>, T =/= <<"hmac-sha256">> ]).
 
 test_multi_process_push() ->
     {Sender, Receiver, MsgSlot, Opts} = setup_two_process_message(),

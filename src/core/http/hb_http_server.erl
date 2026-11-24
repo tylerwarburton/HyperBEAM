@@ -186,14 +186,29 @@ start_application() ->
         ),
     maybe_greeter(Loaded, PrivWallet),
     {ok, Listener} = start(
-        Loaded#{
-            <<"priv-wallet">> => PrivWallet,
-            <<"store">> => UpdatedStoreOpts,
-            <<"port">> => hb_opts:get(port, 8734, Loaded)
-        }
+        with_scheduler_identity(
+            Loaded#{
+                <<"priv-wallet">> => PrivWallet,
+                <<"store">> => UpdatedStoreOpts,
+                <<"port">> => hb_opts:get(port, 8734, Loaded)
+            },
+            hb:scheduler_wallet(Loaded)
+        )
     ),
     ServerID = hb_util:human_id(ar_wallet:to_address(PrivWallet)),
     {ok, Listener, ServerID}.
+
+%% @doc Add the node's own scheduling key, if it has one, as its `scheduler'
+%% identity: `hb_opts:as/2' finds it by that name or by its address, so a
+%% process that names the address is scheduled, and its assignments and
+%% pushes signed, with that key.
+with_scheduler_identity(Opts, undefined) -> Opts;
+with_scheduler_identity(Opts, Wallet) ->
+    Identities = hb_opts:get(identities, #{}, Opts),
+    Opts#{
+        <<"identities">> =>
+            Identities#{ <<"scheduler">> => #{ <<"priv-wallet">> => Wallet } }
+    }.
 start(Opts) ->
     application:ensure_all_started([
         kernel,
@@ -1334,6 +1349,14 @@ set_default_opts(Opts) ->
         <<"priv-wallet">> => Wallet,
         <<"address">> => hb_util:human_id(ar_wallet:to_address(Wallet)),
         <<"committer">> => hb_opts:committer(#{ <<"priv-wallet">> => Wallet }),
+        % The address a process names to be scheduled here: the node's own
+        % scheduling key (`scheduler-key-type'), else the node's key.
+        <<"scheduler-address">> =>
+            case hb_opts:get(identities, #{}, TempOpts) of
+                #{ <<"scheduler">> := #{ <<"priv-wallet">> := SchedulerWallet } } ->
+                    hb_util:human_id(ar_wallet:to_address(SchedulerWallet));
+                _ -> hb_util:human_id(ar_wallet:to_address(Wallet))
+            end,
         % Sign the hashpath of every reply unless the node is configured not
         % to: each one is an RSA signature.
         <<"force-signed">> => hb_opts:get(force_signed, true, TempOpts)

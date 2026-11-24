@@ -132,6 +132,8 @@
 -define(ENV_KEYS,
     #{
         <<"priv-key-location">> => {"HB_KEY", "hyperbeam-key.json"},
+        <<"scheduler-key-location">> =>
+            {"HB_SCHEDULER_KEY", "hyperbeam-scheduler-key.json"},
         <<"hb-config-location">> => {"HB_CONFIG", "config.flat"},
         <<"preloaded-store">> =>
             {"HB_PRELOADED_STORE", fun preloaded_store_from_env/1},
@@ -291,6 +293,11 @@ raw_default_message() ->
         <<"bundler-ans104">> => <<"https://up.arweave.net:443">>,
         % Location of the wallet keyfile on disk that this node will use.
         <<"priv-key-location">> => <<"hyperbeam-key.json">>,
+        % With `scheduler-key-type' set (`rsa4096' or `ed25519'), the node
+        % schedules under a key of its own, kept at this location (created on
+        % first start): the `scheduler' identity, whose address the node
+        % publishes as `scheduler-address'. Unset, the node's key schedules.
+        <<"scheduler-key-location">> => <<"hyperbeam-scheduler-key.json">>,
         % Generated LMDB store of preloaded device artifacts.
         <<"preloaded-store">> =>
             #{
