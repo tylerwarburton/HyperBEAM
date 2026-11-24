@@ -508,7 +508,10 @@ follow(Proc, Opts) ->
 %% for a hashpath nobody reads, about once a second for every busy process
 %% (`worker_slot_does_not_hash_state_test_').
 follower_opts(Opts) ->
-    Opts#{ <<"spawn-worker">> => true, <<"hashpath">> => ignore }.
+    Opts#{ <<"spawn-worker">> => true, <<"hashpath">> => ignore,
+        % It discards the state: the worker answers it with the slot alone
+        % (`dev_process_worker:answer/3').
+        <<"process-compute-wants">> => <<"slot">> }.
 
 workers(Opts) ->
     hb_opts:get(<<"process-workers">>, false, Opts) == true orelse
