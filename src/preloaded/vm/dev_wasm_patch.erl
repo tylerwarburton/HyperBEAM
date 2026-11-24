@@ -1018,7 +1018,7 @@ bench(process, N, Opts0) ->
             {ok, _} = hb_ao:resolve(Process,
                 #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, Opts)
           end))
-        || Slot <- lists:seq(2, N) ],
+        || Slot <- lists:seq(2, N - 1) ],
     bench_summary(Times).
 
 %% The test module, or the Lua runtime running `lua_equivalent_script/0'.
