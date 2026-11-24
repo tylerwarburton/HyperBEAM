@@ -518,3 +518,61 @@ admission_id_is_the_entry_not_the_signature_test() ->
     ?assertEqual(ids(A, Opts), ids(A#{ <<"admit-slot">> => <<"25">> }, Opts)),
     ?assertNotEqual(ids(A, Opts), ids(A#{ <<"admit-outbox-key">> => <<"2">> }, Opts)),
     ?assertEqual([], ids(#{}, Opts)).
+
+%% A push from a process that node A schedules under its Ed25519 scheduling
+%% key (`scheduler-key-type': its `scheduler' identity, beside the node's own
+%% RSA key), to a target on another node whose authority A holds no key of:
+%% the deliverer's signing path, `lib_process_delivery:sign_opts/2' and
+%% `apply_security/4', as A runs it. Returns the sender's definition, its ID,
+%% the target, and the signed push.
+ed25519_cross_node_push() ->
+    Sched = ar_wallet:new(?EDDSA_KEY_TYPE),
+    OptsA = (test_opts())#{
+        <<"identities">> => #{ <<"scheduler">> => #{ <<"priv-wallet">> => Sched } },
+        <<"scheduler-default-commitment-spec">> => <<"ans104@1.0">>
+    },
+    Sender = hb_message:commit(
+        #{ <<"type">> => <<"Process">>, <<"device">> => <<"process@1.0">>,
+           <<"scheduler">> => addr(Sched), <<"authority">> => addr(Sched),
+           <<"test-random-seed">> => rand:uniform(1 bsl 40) },
+        #{ <<"priv-wallet">> => ar_wallet:new() }, <<"httpsig@1.0">>),
+    SenderID = hb_util:human_id(hb_message:id(Sender, all, OptsA)),
+    Target = target(),
+    TargetProcess = #{ <<"authority">> => [addr(ar_wallet:new())] },
+    Origin = (lib_process_delivery:origin(SenderID, Sender, OptsA))#{
+        <<"from-slot">> => 7, <<"from-outbox-key">> => <<"1">>,
+        <<"from-entry">> => hb_util:human_id(crypto:strong_rand_bytes(32)) },
+    Msg = lib_process_delivery:augment_message(Origin,
+        #{ <<"target">> => Target, <<"action">> => <<"Credit-Notice">> }, OptsA),
+    Signed = lib_process_delivery:apply_security(Msg, TargetProcess, <<"ans104@1.0">>,
+        lib_process_delivery:sign_opts(Sender, OptsA)),
+    {Sched, Sender, SenderID, Target, Signed}.
+
+%% @doc Node B, which trusts the Ed25519 scheduling key, admits the push as the
+%% sending process: it is signed by that key, an ANS-104 Ed25519 item. Signed
+%% with node A's own key instead, as the deliverer used to sign whenever the
+%% target named no key A holds, it named no process at all.
+ed25519_scheduler_push_admitted_test() ->
+    {Sched, Sender, SenderID, Target, Signed} = ed25519_cross_node_push(),
+    OptsB = with_peer(test_opts(), Sched, <<"trusted">>),
+    {ok, _} = hb_cache:write(Sender, OptsB),
+    ?assertEqual([hb_committer:uri(addr(Sched))], signers(Signed, OptsB)),
+    {ok, Admitted} = admit(Target, Signed, OptsB),
+    ?assertMatch(#{ <<"admit-policy">> := <<"trusted">>, <<"admit-process">> := SenderID },
+        keys(Admitted, OptsB)),
+    ?assertEqual(hb_committer:uri(addr(Sched)),
+        hb_committer:uri(maps:get(<<"admit-scheduler">>, keys(Admitted, OptsB)))),
+    NodeKeySigned = hb_message:commit(hb_message:uncommitted(Signed),
+        #{ <<"priv-wallet">> => ar_wallet:new() }, <<"ans104@1.0">>),
+    ?assert(unadmitted(NodeKeySigned, admit(Target, NodeKeySigned, OptsB), OptsB)).
+
+%% @doc Fail closed: a node with no admission for the Ed25519 key, or one that
+%% trusts some other key, schedules the same push as sent, naming no process.
+ed25519_scheduler_not_in_admission_unadmitted_test() ->
+    {_Sched, Sender, _SenderID, Target, Signed} = ed25519_cross_node_push(),
+    Bare = test_opts(),
+    {ok, _} = hb_cache:write(Sender, Bare),
+    ?assert(unadmitted(Signed, admit(Target, Signed, Bare), Bare)),
+    Other = with_peer(test_opts(), ar_wallet:new(?EDDSA_KEY_TYPE), <<"trusted">>),
+    {ok, _} = hb_cache:write(Sender, Other),
+    ?assert(unadmitted(Signed, admit(Target, Signed, Other), Other)).

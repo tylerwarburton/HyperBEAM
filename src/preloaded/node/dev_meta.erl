@@ -755,7 +755,8 @@ buildinfo_test() ->
 scheduler_key_type_test() ->
     Dir = <<"cache-TEST/scheduler-key-", (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary>>,
     Ed = <<Dir/binary, "/ed25519.json">>,
-    Opts = #{ <<"scheduler-key-type">> => <<"ed25519">>, <<"scheduler-key-location">> => Ed },
+    Opts = #{ <<"scheduler-key-type">> => <<"ed25519">>, <<"scheduler-key-location">> => Ed,
+        <<"scheduler-default-commitment-spec">> => <<"ans104@1.0">> },
     Wallet = hb:scheduler_wallet(Opts),
     ?assertEqual(?EDDSA_SIGN_TYPE, maps:get(<<"type">>, Wallet)),
     ?assertEqual(Wallet, ar_wallet:load_keyfile(Ed)),
@@ -764,3 +765,21 @@ scheduler_key_type_test() ->
         hb:scheduler_wallet(Opts#{ <<"scheduler-key-type">> => <<"rsa4096">> })),
     ?assertThrow({unsupported_scheduler_key_type, <<"secp256k1">>},
         hb:scheduler_wallet(Opts#{ <<"scheduler-key-type">> => <<"secp256k1">> })).
+
+%% @doc An Ed25519 scheduling key under a default commitment spec that cannot
+%% sign with it (HTTP message signatures, given or by default) stops the node
+%% at start, before any key file is made; an RSA one runs under either.
+scheduler_key_type_needs_its_codec_test() ->
+    Dir = <<"cache-TEST/scheduler-key-", (hb_util:human_id(crypto:strong_rand_bytes(32)))/binary>>,
+    Ed = <<Dir/binary, "/ed25519.json">>,
+    Opts = #{ <<"scheduler-key-type">> => <<"ed25519">>, <<"scheduler-key-location">> => Ed },
+    ?assertThrow({scheduler_key_cannot_sign, {scheduler_key_type, <<"ed25519">>},
+            {scheduler_default_commitment_spec, <<"httpsig@1.0">>}, _},
+        hb:scheduler_wallet(Opts#{ <<"scheduler-default-commitment-spec">> => <<"httpsig@1.0">> })),
+    ?assertThrow({scheduler_key_cannot_sign, _, _, _}, hb:scheduler_wallet(Opts)),
+    ?assertNot(filelib:is_file(Ed)),
+    Rsa = <<Dir/binary, "/rsa.json">>,
+    ?assertMatch(#{ <<"type">> := ?RSA_SIGN_TYPE },
+        hb:scheduler_wallet(#{ <<"scheduler-key-type">> => <<"rsa4096">>,
+            <<"scheduler-key-location">> => Rsa,
+            <<"scheduler-default-commitment-spec">> => <<"httpsig@1.0">> })).
