@@ -327,13 +327,13 @@ base_exists(ProcID, Slot, Opts) ->
     % Whether the hot cache holds it, without copying the state out.
     case hot_member(ProcID, Slot, Opts) of
         true -> true;
-        not_found when Slot >= 0 ->
+        false when Slot >= 0 ->
             blob_exists(ProcID, Slot, Opts) orelse
                 case hb_cache:read(path(ProcID, Slot, Opts), Opts) of
                     {ok, _} -> true;
                     _ -> false
                 end;
-        not_found ->
+        false ->
             case hb_cache:read(path(ProcID, Slot, Opts), Opts) of
                 {ok, _} -> true;
                 _ -> false
