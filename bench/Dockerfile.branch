@@ -20,6 +20,9 @@ RUN rebar3 get-deps && patch -p1 --forward --batch -d _build/default/lib/elmdb <
     && patch -p1 --forward --batch -d _build/default/lib/elmdb < patches/elmdb-out-of-space.patch \
     && patch -p1 --forward --batch -d _build/default/lib/luerl < patches/luerl-nested-call-roots.patch
 RUN rebar3 release 2>&1 | tail -40; test -x /app/_build/default/rel/hb/bin/hb
+# Compile the approved wasm-patch@1.0 modules (config/wasm-patch-prewarm.json) into
+# the release's AOT cache, so a node never compiles one at a process's first init.
+RUN make wasm-patch-prewarm
 VOLUME /data
 WORKDIR /data
 EXPOSE 8734
