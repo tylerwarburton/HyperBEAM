@@ -1,3 +1,8 @@
 {
-  "modules": []
+  "modules": [
+    {
+      "sha256": "1becb5030e76a33dc3d76fe1c6979125f9a4b9935f7d2a581bf626157f555bad",
+      "source": "config/wasm-patch-runtimes/wasm-lua-1becb5030e76.wasm"
+    }
+  ]
 }
