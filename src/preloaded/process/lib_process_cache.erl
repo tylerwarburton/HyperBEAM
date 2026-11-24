@@ -70,10 +70,9 @@ write_stored(ProcID, Slot, Msg, RawOpts) ->
                 write_full_blob(ProcID, Slot, Msg, Store, Opts);
             {not_found, _} -> write_full(ProcID, Slot, Msg, Opts)
         end,
-    % A VM snapshot is only ever restored from its stored row: the hot cache
-    % does not keep one (left uncompressed for a checkpoint written off the
-    % slot, it is the whole instance's memory).
-    hot_put(ProcID, Slot, maps:remove(<<"snapshot">>, Public), Opts),
+    % The hot cache names the slot and the process holding its state, not a
+    % copy of it (`hot_hold/3').
+    hb_phase_timer:time(slot_hot_put, fun() -> hot_hold(ProcID, Slot, Opts) end),
     % The published-key view `now' reads are answered from.
     hb_process_view:update(ProcID, Slot, Public,
         case delta(Msg, Opts) of
@@ -397,6 +396,44 @@ patch_list(Patches, Opts) when is_map(Patches) ->
         false -> []
     end.
 
+%%% A stored slot's hot entry is `{?HELD, Pid}': the slot's public state is
+%%% the one `public_state/4' keeps in the writing process's dictionary (the
+%%% process worker's, as it computes in order), read from there by any other
+%%% process (`erlang:process_info/2', `{dictionary, Key}') while it is still
+%%% that slot. Copying the state into the table on every slot was the one
+%%% step of a slot that grew with the size of the state: 116 us a slot at
+%%% 1,000 published keys of 500 bytes, 17.4 ms at 100,000 (lab node, a
+%%% `lua-patch@1.0' process), so a large-state process paid for its whole
+%%% state on every message. A slot the holder has moved past is read from
+%%% the store (`read/3', its delta chain back to a checkpoint), on demand.
+%%% A state filled in by a read (`latest/4') is still kept whole: it was
+%%% materialised for the read anyway.
+-define(HELD, '$held').
+
+hot_hold(ProcID, Slot, Opts) when is_integer(Slot) ->
+    hot_put(ProcID, Slot, {?HELD, self()}, Opts);
+hot_hold(_ProcID, _Slot, _Opts) ->
+    ok.
+
+%% The state a hot entry stands for, or `not_found'.
+hot_value(ProcID, Slot, {?HELD, Pid}) ->
+    Key = {?MODULE, public, ProcID},
+    Held =
+        case Pid == self() of
+            true -> get(Key);
+            false ->
+                case catch erlang:process_info(Pid, {dictionary, Key}) of
+                    {{dictionary, Key}, Value} -> Value;
+                    _ -> undefined
+                end
+        end,
+    case Held of
+        {Slot, Public} -> {ok, maps:remove(<<"snapshot">>, Public)};
+        _ -> not_found
+    end;
+hot_value(_ProcID, _Slot, Msg) ->
+    {ok, Msg}.
+
 hot_put(ProcID, Slot, Msg, Opts) when is_integer(Slot) ->
     case hot_slots(Opts) of
         0 -> ok;
@@ -437,7 +474,7 @@ hot_get(ProcID, Slot, Opts) ->
 
 hot_get(ProcID, Slot) ->
     try ets:lookup(?HOT, {ProcID, Slot}) of
-        [{_, Msg}] -> {ok, Msg};
+        [{_, Msg}] -> hot_value(ProcID, Slot, Msg);
         [] -> not_found
     catch error:badarg -> not_found
     end.
@@ -466,7 +503,11 @@ hot_latest(ProcID, Limit) ->
     try ets:prev(?HOT, {ProcID, Upper}) of
         {ProcID, Slot} = Key ->
             case ets:lookup(?HOT, Key) of
-                [{_, Msg}] -> {ok, Slot, Msg};
+                [{_, Msg}] ->
+                    case hot_value(ProcID, Slot, Msg) of
+                        {ok, State} -> {ok, Slot, State};
+                        not_found -> not_found
+                    end;
                 [] -> not_found
             end;
         _ -> not_found
@@ -1371,6 +1412,60 @@ delta_slots_read_back_test() ->
     ?assert(lists:all(Same, lists:seq(0, 4))),
     {ok, 4, Latest} = latest(ProcID, Opts),
     ?assertEqual(<<"4">>, hb_maps:get(<<"count">>, hb_cache:ensure_all_loaded(Latest, Opts), Opts)).
+
+%% @doc A stored slot's hot entry names the process that wrote it, not a
+%% copy of its state: another process reads the state from the writer while
+%% it holds that slot; a slot the writer has moved past, or one whose writer
+%% is gone, is read from the store, the same.
+held_state_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+        <<"process-delta-cache">> => true,
+        <<"process-state-blobs">> => true,
+        <<"process-delta-checkpoint-slots">> => 100
+    },
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Self = self(),
+    Writer = spawn(fun() ->
+        State0 = #{ <<"count">> => <<"0">>, <<"at-slot">> => 0 },
+        {ok, _} = write(ProcID, 0, State0, Opts),
+        Loop = fun Loop(N, Prev) ->
+            receive
+                {step, From} ->
+                    Patches = [#{ <<"path">> => <<"/count">>, <<"value">> => integer_to_binary(N) }],
+                    Results = #{ <<"output">> => #{ <<"data">> => integer_to_binary(N) } },
+                    {ok, Next} = hb_state_patch:apply(Prev, Patches, Results, N, Opts),
+                    {ok, _} = write(ProcID, N,
+                        Next#{ <<"priv">> => #{ <<"process-cache-delta">> =>
+                            #{ <<"patches">> => Patches, <<"results">> => Results } } }, Opts),
+                    From ! {stepped, N},
+                    Loop(N + 1, Next);
+                stop -> ok
+            end
+        end,
+        Self ! ready,
+        Loop(1, State0)
+    end),
+    receive ready -> ok end,
+    Step = fun() -> Writer ! {step, Self}, receive {stepped, N} -> N end end,
+    Count = fun(N) -> {ok, M} = read(ProcID, N, Opts), hb_maps:get(<<"count">>, M, Opts) end,
+    1 = Step(),
+    ?assertMatch([{_, {?HELD, Writer}}], ets:lookup(?HOT, {ProcID, 1})),
+    ?assertEqual(<<"1">>, Count(1)),
+    2 = Step(),
+    % Slot 1 is no longer held: read from the store; slot 2 from the writer.
+    ?assertEqual(not_found, hot_get(ProcID, 1)),
+    ?assertEqual(<<"1">>, Count(1)),
+    ?assertMatch({ok, _}, hot_get(ProcID, 2)),
+    ?assertEqual(<<"2">>, Count(2)),
+    ?assertMatch({ok, 2, _}, latest(ProcID, Opts)),
+    Writer ! stop,
+    timer:sleep(50),
+    % Its writer gone, the head is read from the store.
+    ?assertEqual(not_found, hot_get(ProcID, 2)),
+    ?assertEqual(<<"2">>, Count(2)),
+    {ok, 2, Latest} = latest(ProcID, Opts),
+    ?assertEqual(<<"2">>, hb_maps:get(<<"count">>, Latest, Opts)).
 
 %% @doc With the hot cache empty (a restart, then no slot computed), the newest
 %% stored state is materialized once and kept hot: the next `latest' -- every
