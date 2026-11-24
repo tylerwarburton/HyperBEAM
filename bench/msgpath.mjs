@@ -1,6 +1,6 @@
 // node bench/msgpath.mjs <node-url> [--procs 1] [--clients 32] [--seconds 30]
 //                         [--idle 30] [--msg trivial|pair] [--out file.json]
-//                         [--container name]
+//                         [--container name] [--poll-ms 0]
 //
 // The per-message path of one process (or --procs N at once), on a local node.
 // Each process is lua-patch@1.0 doing a trivial mutation (a counter); with
@@ -79,6 +79,9 @@ async function main() {
   const KIND = opt('msg', 'trivial');
   const OUT = opt('out', null);
   const CONTAINER = opt('container', null);
+  // A pause between a watcher's polls of now/count: 0 polls back to back
+  // (the round-trip measurement); larger values show what the reads cost.
+  const POLL_MS = Number(opt('poll-ms', 0));
   const cpuUs = () => {
     if (!CONTAINER) return null;
     // cgroup v2 (cpu.stat, microseconds) or v1 (cpuacct.usage, nanoseconds).
@@ -138,6 +141,7 @@ async function main() {
         let r;
         try { r = await getText(`/${pid}~process@1.0/now/count`); } catch { continue; }
         w.polls++;
+        if (POLL_MS > 0) await new Promise((r) => setTimeout(r, POLL_MS));
         const c = Number(r.text);
         if (r.status !== 200 || !Number.isFinite(c)) continue;
         if (c > w.count) {
@@ -225,6 +229,7 @@ async function main() {
       cpu_ms_per_msg: u0 === null ? null : +((u1 - u0) / 1000 / confirmed).toFixed(2),
       kreds_per_msg: p1.reductions == null ? null : Math.round((p1.reductions - p0.reductions) / 1000 / confirmed),
       cpu_cores: u0 === null ? null : +((u1 - u0) / 1000 / (t1 - t0)).toFixed(2),
+      polls_per_msg: +(ws.reduce((a, w) => a + w.polls, 0) / Math.max(1, ws.reduce((a, w) => a + w.count, 0))).toFixed(2),
       errors, first_error: firstErr, run_queue: p1.run_queue,
       phases: phaseDelta(p0, p1, confirmed),
     };
