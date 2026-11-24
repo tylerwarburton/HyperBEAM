@@ -116,6 +116,14 @@ note(Phase, Micros) ->
 %% @doc A slot's VM phases from its notes, the same five columns for either
 %% runtime: `prep', `run' (Lua, or the WebAssembly call), `decode', `apply'
 %% and `gc' (Luerl's collection, or a WebAssembly instance restore).
+vm_phases(Notes) when not is_map_key(wasm_patch_call, Notes) ->
+    #{
+        prep => maps:get(lua_patch_prep, Notes, 0),
+        run => maps:get(lua_patch_lua, Notes, 0),
+        decode => maps:get(lua_patch_decode, Notes, 0),
+        apply => maps:get(lua_patch_apply, Notes, 0),
+        gc => maps:get(lua_patch_gc, Notes, 0)
+    };
 vm_phases(Notes) ->
     #{
         prep => vm(lua_patch_prep, wasm_patch_prep, Notes),
@@ -166,11 +174,8 @@ log(ProcID, _Slot, _Action, failure, _PrepUs, _ExecUs, _StoreUs, _Notes, _Size, 
                 {?LAST_MS, erlang:system_time(millisecond)})
     end;
 log(ProcID, Slot, Action, Status, PrepUs, ExecUs, StoreUs, Notes, Size, Cap) ->
-    LuaPrep = vm(lua_patch_prep, wasm_patch_prep, Notes),
-    Lua = vm(lua_patch_lua, wasm_patch_call, Notes),
-    Decode = vm(lua_patch_decode, wasm_patch_decode, Notes),
-    Apply = vm(lua_patch_apply, wasm_patch_apply, Notes),
-    Gc = vm(lua_patch_gc, wasm_patch_restore, Notes),
+    #{ prep := LuaPrep, run := Lua, decode := Decode, apply := Apply, gc := Gc } =
+        vm_phases(Notes),
     Err = case Status of ok -> 0; _ -> 1 end,
     Incr =
         [{2, 1}, {3, Err}, {4, PrepUs}, {5, ExecUs}, {6, StoreUs}, {7, LuaPrep},
