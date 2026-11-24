@@ -1,0 +1,27 @@
+[package]
+name = "wasm-patch-instrument"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.100"
+publish = false
+description = "Validation and deterministic fuel/depth instrumentation for wasm-patch@1.0 modules"
+
+[lib]
+name = "wasm_patch_instrument"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wasm-patch-instrument"
+path = "src/main.rs"
+
+[dependencies]
+wasmparser = { version = "=0.263.0", default-features = false, features = ["std", "validate", "features"] }
+wasm-encoder = { version = "=0.263.0", default-features = false, features = ["std", "wasmparser"] }
+
+[dev-dependencies]
+wat = "=1.263.0"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true

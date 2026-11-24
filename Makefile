@@ -1,10 +1,19 @@
-.PHONY: compile buildinfo clean-generated preloaded-store
+.PHONY: compile buildinfo clean-generated preloaded-store wamrc wasm-patch-instrument wasm-patch-instrument-test
 
 compile:
 	rebar3 compile
 
 WAMR_VERSION = 2.2.0
 WAMR_DIR = _build/wamr
+# wasm-patch@1.0 compiles AOT on the node with wamrc from the SAME WAMR release
+# as the runtime. The release binary is built on Ubuntu 22.04 (glibc 2.35) and
+# runs on the node image (Debian bookworm, glibc 2.36); it needs libz, libzstd
+# and libstdc++ at run time. x86_64 Linux only, like the nodes.
+WAMRC_URL = https://github.com/bytecodealliance/wasm-micro-runtime/releases/download/WAMR-$(WAMR_VERSION)/wamrc-$(WAMR_VERSION)-x86_64-ubuntu-22.04.tar.gz
+WAMRC_SHA256 = b6207bd4c98835cfdaaa92ead83de7eeff5b58c07d4ee209ec900dce502246d1
+WAMRC_BIN = priv/wamrc
+WPI_DIR = native/wasm_patch_instrument
+WPI_BIN = priv/wasm-patch-instrument
 BUILD_SOURCE = $(shell git rev-parse HEAD)
 BUILD_SOURCE_SHORT = $(shell git rev-parse --short HEAD)
 
@@ -29,6 +38,7 @@ PRELOADED_INPUTS = \
 CLEAN_GENERATED = \
 	priv \
 	$(WAMR_DIR) \
+	_build/wamrc \
 	_build/genesis_wasm \
 	_build/preloaded-store \
 	_build/device-test-store \
@@ -108,6 +118,10 @@ $(WAMR_DIR)/lib/libvmlib.a: $(WAMR_DIR)
 			./_build/wamr/core/iwasm/aot/aot_runtime.c > ./_build/wamr/core/iwasm/aot/aot_runtime.c.tmp && \
 		mv ./_build/wamr/core/iwasm/aot/aot_runtime.c.tmp ./_build/wamr/core/iwasm/aot/aot_runtime.c; \
 	fi; \
+	sed -i '/wasm_interp_call_func_native(module, exec_env, cur_func,/,/wasm_copy_exception(module, NULL)/ s/linear_mem_size = get_linear_mem_size();/linear_mem_size = GET_LINEAR_MEMORY_SIZE(memory);/' \
+		./_build/wamr/core/iwasm/interpreter/wasm_interp_classic.c && \
+	! sed -n '/wasm_interp_call_func_native(module, exec_env, cur_func,/,/wasm_copy_exception(module, NULL)/p' \
+		./_build/wamr/core/iwasm/interpreter/wasm_interp_classic.c | grep -q 'get_linear_mem_size()' && \
 	cmake \
 		$(WAMR_FLAGS) \
 		-S $(WAMR_DIR) \
@@ -131,6 +145,38 @@ $(WAMR_DIR)/lib/libvmlib.a: $(WAMR_DIR)
         -DWAMR_BUILD_MEMORY_PROFILING=1 \
         -DWAMR_BUILD_DUMP_CALL_STACK=1
 	make -C $(WAMR_DIR)/lib -j8
+
+# The second patch above is a WAMR 2.2.0 classic-interpreter fix: after a
+# native call returns, the caller frame refreshed its cached linear memory size
+# from get_linear_mem_size(), which without THREAD_MGR is that same cached
+# value. Memory grown inside the native's nested call (wasm-patch's invoke_*
+# natives re-enter wasm through call_indirect) then read as out of bounds in
+# the caller. AOT is unaffected. Runtime flags are unchanged.
+
+wamrc: $(WAMRC_BIN)
+
+$(WAMRC_BIN):
+	@if [ "$(UNAME_S)/$(UNAME_M)" != "Linux/x86_64" ]; then \
+		echo "wamrc: no pinned release for $(UNAME_S)/$(UNAME_M)"; exit 1; fi
+	@mkdir -p _build/wamrc priv
+	curl -fsSL -o _build/wamrc/wamrc.tar.gz $(WAMRC_URL)
+	echo "$(WAMRC_SHA256)  _build/wamrc/wamrc.tar.gz" | sha256sum -c -
+	tar xzf _build/wamrc/wamrc.tar.gz -C _build/wamrc wamrc
+	test "$$(_build/wamrc/wamrc --version)" = "wamrc $(WAMR_VERSION)"
+	install -m 0755 _build/wamrc/wamrc $@
+
+# The wasm-patch@1.0 validation and fuel/depth pass, built with the toolchain
+# pinned in $(WPI_DIR)/rust-toolchain.toml (rustup reads it from the cwd).
+wasm-patch-instrument:
+	cd $(WPI_DIR) && cargo build --release --locked
+	@mkdir -p priv
+	install -m 0755 $(WPI_DIR)/target/release/wasm-patch-instrument $(WPI_BIN)
+	$(WPI_BIN) --version
+
+# Unit tests, then interpreter-vs-AOT equivalence on the node's own runtime build.
+wasm-patch-instrument-test: wamr wamrc wasm-patch-instrument
+	cd $(WPI_DIR) && cargo test --release --locked
+	$(WPI_DIR)/tests/wamr/run.sh $(CURDIR)/$(WAMR_DIR) $(CURDIR)/$(WAMRC_BIN) $(CURDIR)/$(WPI_BIN)
 
 clean:
 	rebar3 clean
