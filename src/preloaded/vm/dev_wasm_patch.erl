@@ -1,0 +1,882 @@
+%%% @doc Request-in, patch-list-out execution of a WebAssembly module: the
+%%% `lua-patch@1.0' protocol with the VM swapped for WAMR, AOT-compiled by the
+%%% node (`hb_wasm_aot') or interpreted, called once per slot through a
+%%% dirty-CPU NIF (`hb_wasm_nif'). The ABI is docs/WASM_PATCH_ABI.md in
+%%% paralith-mono: `wp_alloc', `wp_init(definition)', `wp_handle(request)',
+%%% binary request and result (`hb_wasm_patch_codec'). The request build and
+%%% the result handling are `lua-patch@1.0''s own (`lib_patch_exec'), so a
+%%% contract publishes the same terms on either device.
+%%%
+%%% Process fields: `image' (the `.wasm', an ID or a message with it as its
+%%% body), `wasm-patch-abi' (1), optional `fuel-per-slot', and whatever the
+%%% module reads from its definition (the Lua runtime: `module').
+%%%
+%%% A process never halts. A slot that fails -- an error the module returns,
+%%% a trap, out of fuel, a result that does not decode or apply -- leaves the
+%%% state as it was before the slot: its patches are discarded, the slot's
+%%% results are the error (as `lua-patch@1.0' gives them), and the instance is
+%%% put back by restoring the last checkpoint and replaying the requests
+%%% applied since. The same restore serves a state that is not the
+%%% instance's newest (a stale base): the instance counts the calls applied
+%%% to it (`gen'), and the NIF refuses a call naming another gen.
+%%%
+%%% Private state (`priv/state'):
+%%% ```
+%%% inst      the instance (NIF resource), shared by every state of one lineage
+%%% gen       calls applied, counting `wp_init'
+%%% ckpt      {Gen, Memory, Globals}: an in-memory checkpoint
+%%% log       requests applied since the checkpoint, newest first
+%%% '''
+-module(dev_wasm_patch).
+-implements(<<"wasm-patch@1.0">>).
+-device_libraries([lib_patch_exec]).
+-export([device_info/1, init/3, compute/4, snapshot/3, normalize/3]).
+-include("include/hb.hrl").
+-include_lib("eunit/include/eunit.hrl").
+
+-define(DEVICE, <<"wasm-patch@1.0">>).
+-define(ABI, 1).
+%% Fuel a slot may use when the process does not say. A process constant:
+%% fuel decides results, so it never comes from node options.
+-define(DEFAULT_FUEL, 10000000000).
+-define(STACK_BYTES, 8 * 1024 * 1024).
+-define(CHECKPOINT_CALLS, 1000).
+-define(CHECKPOINT_LOG_BYTES, 64 * 1024 * 1024).
+
+device_info(_Base) ->
+    #{
+        default => fun compute/4,
+        direct_message_keys => true,
+        excludes =>
+            [
+                <<"id">>,
+                <<"commitments">>,
+                <<"committers">>,
+                <<"keys">>,
+                <<"path">>,
+                <<"set">>,
+                <<"remove">>,
+                <<"verify">>,
+                <<"encode">>,
+                <<"decode">>
+            ]
+    }.
+
+%%% Init
+
+%% @doc Validate the image, get it compiled (or not), instantiate, and call
+%% `wp_init' with the process definition. A state already holding an instance
+%% made by this device is returned as it is.
+init(Base, _Req, Opts) ->
+    case hb_private:get(<<"state">>, Base, not_found, Opts) of
+        not_found ->
+            try boot(Base, Opts) of
+                {ok, St} -> {ok, hb_private:set(Base, <<"state">>, St, Opts)};
+                Error -> Error
+            catch throw:{wasm_patch_init, Reason} -> init_error(Reason)
+            end;
+        #{ device := wasm_patch } -> {ok, Base};
+        _ -> init_error(<<"the private state was not created by wasm-patch@1.0">>)
+    end.
+
+init_error(Reason) ->
+    {error, #{
+        <<"status">> => 422,
+        <<"body">> => <<"wasm-patch@1.0 cannot start: ", (hb_util:bin(Reason))/binary>>
+    }}.
+
+boot(Base, Opts) ->
+    {St0, Info} = instance(Base, Opts),
+    Fuel = fuel(Base, Info, Opts),
+    Def = hb_wasm_patch_codec:encode(definition(Base, Opts)),
+    #{ inst := Inst } = St0,
+    case hb_wasm_nif:call(Inst, 0, 0, Def, Fuel) of
+        {ok, Reply, _} ->
+            case hb_wasm_patch_codec:decode_result(Reply) of
+                {ok, [{<<"patches">>, []}, _]} -> ok;
+                {ok, _} -> throw({wasm_patch_init, <<"wp_init may not return patches">>});
+                {error, E} -> throw({wasm_patch_init, error_text(E)});
+                {malformed, M} -> throw({wasm_patch_init, M})
+            end,
+            {ok, 1, Mem, Globals} = hb_wasm_nif:snapshot(Inst),
+            {ok, St0#{
+                gen => 1,
+                fuel => Fuel,
+                ckpt => {1, Mem, Globals},
+                log => [],
+                log_bytes => 0,
+                slot => undefined
+            }};
+        {trap, Reason} -> throw({wasm_patch_init, <<"wp_init trapped: ", Reason/binary>>})
+    end.
+
+%% A loaded and instantiated module, before `wp_init' or a restore.
+instance(Base, Opts) ->
+    Wasm = image(Base, Opts),
+    case lib_abi(Base, Opts) of
+        ?ABI -> ok;
+        Other -> throw({wasm_patch_init, <<"unsupported wasm-patch-abi ", (hb_util:bin(Other))/binary>>})
+    end,
+    case hb_wasm_nif:prepare(Wasm) of
+        ok -> ok;
+        {error, PrepErr} -> throw({wasm_patch_init, hb_util:bin(io_lib:format("~p", [PrepErr]))})
+    end,
+    % Loading the `.wasm' validates it (imports, exports, memory) whatever
+    % mode it then runs in.
+    {WasmMod, Info} =
+        case hb_wasm_nif:load(Wasm) of
+            {ok, M, I} -> {M, I};
+            {error, LoadErr} -> throw({wasm_patch_init, LoadErr})
+        end,
+    MaxPages = hb_util:int(hb_opts:get(<<"wasm-patch-max-pages">>, 65536, Opts)),
+    case maps:get(max_pages, Info) of
+        P when P > MaxPages -> throw({wasm_patch_init, <<"memory maximum above the node's cap">>});
+        _ -> ok
+    end,
+    {Mod, AotKey} =
+        case hb_wasm_aot:get(Wasm, Opts) of
+            {aot, Aot, Key} ->
+                case hb_wasm_nif:load(Aot) of
+                    {ok, AotMod, _} -> {AotMod, Key};
+                    {error, AotErr} ->
+                        ?event(warning, {wasm_patch_aot_load_failed, AotErr}),
+                        {WasmMod, interp}
+                end;
+            {interp, _} -> {WasmMod, interp}
+        end,
+    Stack = hb_util:int(hb_opts:get(<<"wasm-patch-stack-bytes">>, ?STACK_BYTES, Opts)),
+    case hb_wasm_nif:instantiate(Mod, Stack, 0) of
+        {ok, Inst, InstInfo} ->
+            {#{
+                device => wasm_patch,
+                inst => Inst,
+                wasm_sha256 => crypto:hash(sha256, Wasm),
+                aot_key => AotKey
+            }, InstInfo};
+        {error, InstErr} -> throw({wasm_patch_init, InstErr})
+    end.
+
+lib_abi(Base, Opts) ->
+    case find([<<"wasm-patch-abi">>], Base, Opts) of
+        not_found -> ?ABI;
+        Abi -> catch hb_util:int(Abi)
+    end.
+
+%% Fuel per slot: the process's `fuel-per-slot', else the default. A module
+%% the instrumentation pass has not seen has no fuel global and runs only
+%% where the node allows it (`wasm-patch-allow-uninstrumented').
+fuel(Base, #{ fuel := true }, Opts) ->
+    case find([<<"fuel-per-slot">>], Base, Opts) of
+        not_found -> ?DEFAULT_FUEL;
+        F -> hb_util:int(F)
+    end;
+fuel(_Base, #{ fuel := false }, Opts) ->
+    case hb_opts:get(<<"wasm-patch-allow-uninstrumented">>, false, Opts) of
+        true -> -1;
+        <<"true">> -> -1;
+        _ -> throw({wasm_patch_init, <<"the module has no wp_fuel global (not instrumented)">>})
+    end.
+
+%% A key of the process definition: on the base, or under `process'.
+find(Path, Base, Opts) ->
+    case hb_util:deep_get(Path, Base, not_found, Opts) of
+        not_found -> hb_util:deep_get([<<"process">> | Path], Base, not_found, Opts);
+        Value -> Value
+    end.
+
+%% @doc The `.wasm' bytes: the `image' as bytes, as an ID in the cache, or as
+%% a message whose body they are. AOT bytes are refused: a node only runs AOT
+%% code it compiled itself.
+image(Base, Opts) ->
+    Image =
+        case find([<<"image">>], Base, Opts) of
+            not_found -> throw({wasm_patch_init, <<"no image">>});
+            <<0, "asm", _/binary>> = Bin -> Bin;
+            ID when ?IS_ID(ID) ->
+                case hb_cache:read(ID, Opts) of
+                    {ok, Msg} when is_map(Msg) -> body(Msg, Opts);
+                    {ok, Bin} when is_binary(Bin) -> Bin;
+                    _ -> throw({wasm_patch_init, <<"image ", ID/binary, " not found">>})
+                end;
+            Msg when is_map(Msg) -> body(Msg, Opts);
+            Link when ?IS_LINK(Link) -> body(hb_cache:ensure_all_loaded(Link, Opts), Opts);
+            Other -> Other
+        end,
+    case Image of
+        <<0, "asm", _/binary>> -> Image;
+        _ -> throw({wasm_patch_init, <<"the image is not a .wasm module">>})
+    end.
+
+body(Msg, Opts) when is_map(Msg) ->
+    hb_cache:ensure_all_loaded(hb_maps:get(<<"body">>, Msg, not_found, Opts), Opts);
+body(Bin, _Opts) -> Bin.
+
+%% @doc The process definition `wp_init' receives: the process message
+%% without its image, its private and per-slot keys; links loaded, and a
+%% `module' given by ID read from the cache.
+definition(Base, Opts) ->
+    Proc =
+        case hb_maps:get(<<"process">>, Base, not_found, Opts) of
+            P when is_map(P) -> P;
+            _ -> Base
+        end,
+    Def = maps:without(
+        [<<"priv">>, <<"image">>, <<"snapshot">>, <<"results">>, <<"at-slot">>],
+        hb_private:reset(hb_cache:ensure_all_loaded(Proc, Opts))
+    ),
+    lib_patch_exec:encode(module_by_id(Def, Opts), term, Opts).
+
+module_by_id(Def = #{ <<"module">> := ID }, Opts) when ?IS_ID(ID) ->
+    case hb_cache:read(ID, Opts) of
+        {ok, Module} -> Def#{ <<"module">> => hb_cache:ensure_all_loaded(Module, Opts) };
+        _ -> Def
+    end;
+module_by_id(Def, _Opts) -> Def.
+
+%%% Compute
+
+%% @doc One call of `wp_handle' with the slot's request, then `lua-patch@1.0''s
+%% result handling. A failed slot puts the instance back first.
+compute(Key, RawBase, RawReq, Opts) ->
+    T0 = erlang:monotonic_time(microsecond),
+    Req = hb_cache:read_all_commitments(RawReq, Opts),
+    case init(RawBase, Req, Opts) of
+        {ok, Base} -> compute(Key, Base, Req, T0, Opts);
+        Error -> Error
+    end.
+
+compute(Key, Base, Req, T0, Opts) ->
+    Priv = hb_private:from_message(Base),
+    St0 = maps:get(<<"state">>, Priv),
+    InSlot = lib_patch_exec:in_slot(Priv),
+    {_Function, Params} = lib_patch_exec:request(Key, Base, Req, InSlot, Opts),
+    ReqBin =
+        hb_wasm_patch_codec:encode(
+            case lib_patch_exec:encode(Params, term, Opts) of
+                [One] -> One;
+                Many -> Many
+            end
+        ),
+    T1 = erlang:monotonic_time(microsecond),
+    hb_slot_log:note(wasm_patch_prep, T1 - T0),
+    {St, Res} = call(St0, ReqBin, Opts),
+    T2 = erlang:monotonic_time(microsecond),
+    hb_slot_log:note(wasm_patch_call, T2 - T1),
+    ?event(compute_short,
+        {wasm_patch_timing, {prep_us, T1 - T0}, {call_us, T2 - T1}},
+        Opts
+    ),
+    case Res of
+        {ok, Reply} ->
+            {DecodeMicros, Decoded} = timer:tc(fun() -> decode(Reply, Opts) end),
+            case Decoded of
+                {ok, Result} ->
+                    Next = advance(St, ReqBin, lib_patch_exec:slot(Req, Opts), Opts),
+                    Applied =
+                        lib_patch_exec:result(
+                            <<"ok">>,
+                            Result,
+                            DecodeMicros,
+                            Base,
+                            #{
+                                device => ?DEVICE,
+                                timing_event => wasm_patch_timing,
+                                decode_phase => wasm_patch_decode,
+                                apply_phase => wasm_patch_apply,
+                                priv => Priv#{ <<"state">> => Next }
+                            },
+                            Opts
+                        ),
+                    case Applied of
+                        {ok, _} -> Applied;
+                        _ -> rollback(St, Opts), Applied
+                    end;
+                {error, Error} ->
+                    hb_slot_log:note(wasm_patch_decode, DecodeMicros),
+                    rollback(St, Opts),
+                    lib_patch_exec:error_result(Error);
+                {malformed, Reason} ->
+                    hb_slot_log:note(wasm_patch_decode, DecodeMicros),
+                    rollback(St, Opts),
+                    {error, #{ <<"status">> => 422, <<"body">> => Reason }}
+            end;
+        {trap, Reason} ->
+            rollback(St, Opts),
+            {error, #{
+                <<"status">> => 500,
+                <<"body">> => <<"wasm-patch@1.0 trap: ", Reason/binary>>
+            }}
+    end.
+
+decode(Reply, Opts) ->
+    case hb_wasm_patch_codec:decode_result(Reply) of
+        {ok, Result} -> {ok, lib_patch_exec:decode(Result, Opts)};
+        {error, Error} ->
+            {error, try lib_patch_exec:decode(Error, Opts) catch _:_ -> Error end};
+        Malformed -> Malformed
+    end.
+
+%% Call `wp_handle' on an instance at the state's gen. Another holder of the
+%% instance may move it between the check and the call; the NIF refuses that
+%% call and it is retried.
+call(St, ReqBin, Opts) -> call(St, ReqBin, 3, Opts).
+call(St0, ReqBin, Tries, Opts) ->
+    St = #{ inst := Inst, gen := Gen, fuel := Fuel } = ensure_current(St0, Opts),
+    case hb_wasm_nif:call(Inst, 1, Gen, ReqBin, Fuel) of
+        {ok, Reply, _FuelLeft} -> {St, {ok, Reply}};
+        {trap, Reason} -> {St, {trap, Reason}};
+        {error, Busy} when (Busy == stale orelse Busy == dirty), Tries > 1 ->
+            call(St, ReqBin, Tries - 1, Opts);
+        {error, Busy} -> erlang:error({wasm_patch_instance_busy, Busy})
+    end.
+
+%% The state after a successful call: one more gen, the request logged, and a
+%% new in-memory checkpoint when the log is long.
+advance(St = #{ inst := Inst, gen := Gen, log := Log, log_bytes := Bytes }, ReqBin, Slot, Opts) ->
+    Next = St#{
+        gen => Gen + 1,
+        log => [ReqBin | Log],
+        log_bytes => Bytes + byte_size(ReqBin),
+        slot => Slot
+    },
+    Calls = hb_util:int(hb_opts:get(<<"wasm-patch-checkpoint-calls">>, ?CHECKPOINT_CALLS, Opts)),
+    case length(Log) + 1 >= Calls orelse Bytes > ?CHECKPOINT_LOG_BYTES of
+        false -> Next;
+        true ->
+            case hb_wasm_nif:snapshot(Inst) of
+                {ok, G, Mem, Globals} when G == Gen + 1 ->
+                    Next#{ ckpt => {G, Mem, Globals}, log => [], log_bytes => 0 };
+                _ -> Next
+            end
+    end.
+
+%% Put the instance back at the state's gen after a failed slot.
+rollback(St, Opts) ->
+    _ = ensure_current(St, Opts),
+    ok.
+
+%% @doc The instance at the state's gen: as it is, or restored from the
+%% checkpoint with the logged requests replayed.
+ensure_current(St = #{ inst := Inst, gen := Gen }, Opts) ->
+    case hb_wasm_nif:gen(Inst) of
+        Gen -> St;
+        _ -> replay(St, Opts)
+    end.
+
+replay(St = #{ inst := Inst, gen := Gen, ckpt := {CkGen, Mem, Globals}, log := Log, fuel := Fuel }, _Opts) ->
+    {Micros, ok} =
+        timer:tc(fun() ->
+            ok = hb_wasm_nif:restore(Inst, CkGen, Mem, Globals),
+            lists:foldl(
+                fun(ReqBin, G) ->
+                    case hb_wasm_nif:call(Inst, 1, G, ReqBin, Fuel) of
+                        {ok, _, _} -> G + 1;
+                        Other -> erlang:error({wasm_patch_replay_diverged, G, Other})
+                    end
+                end,
+                CkGen,
+                lists:reverse(Log)
+            ),
+            ok
+        end),
+    hb_slot_log:note(wasm_patch_restore, Micros),
+    Gen = hb_wasm_nif:gen(Inst),
+    St.
+
+%%% Snapshot
+
+%% @doc `{abi, wasm_sha256, aot_key, slot, gen, globals, memory}', the memory
+%% compressed. Taken on `process@1.0''s snapshot schedule.
+snapshot(Base, _Req, Opts) ->
+    case hb_private:get(<<"state">>, Base, not_found, Opts) of
+        St = #{ device := wasm_patch } ->
+            #{ inst := Inst } = Cur = ensure_current(St, Opts),
+            {ok, Gen, Mem, Globals} = hb_wasm_nif:snapshot(Inst),
+            Snapshot = #{
+                <<"abi">> => ?ABI,
+                <<"wasm-sha256">> => maps:get(wasm_sha256, Cur),
+                <<"aot-key">> => hb_util:bin(maps:get(aot_key, Cur)),
+                <<"slot">> => maps:get(slot, Cur),
+                <<"gen">> => Gen,
+                <<"globals">> => [{N, atom_to_binary(K), V} || {N, K, V} <- Globals],
+                <<"memory">> => zlib:compress(Mem)
+            },
+            {ok, #{ <<"body">> => term_to_binary(Snapshot, [deterministic]) }};
+        _ ->
+            {error, <<"Cannot snapshot wasm-patch state: not initialized.">>}
+    end.
+
+%% @doc Restore the instance from a snapshot when the state has none.
+normalize(Base, _Req, RawOpts) ->
+    Opts = RawOpts#{ <<"hashpath">> => ignore },
+    case hb_private:get(<<"state">>, Base, not_found, Opts) of
+        not_found ->
+            DeviceKey =
+                case hb_ao:get(<<"device-key">>, {as, <<"message@1.0">>, Base}, Opts) of
+                    not_found -> [];
+                    K -> [K]
+                end,
+            case hb_ao:get([<<"snapshot">>] ++ DeviceKey ++ [<<"body">>],
+                    {as, <<"message@1.0">>, Base}, Opts) of
+                not_found -> throw({error, no_wasm_patch_snapshot_found});
+                Body ->
+                    try restore(Base, Body, Opts) of
+                        St -> {ok, hb_private:set(Base, <<"state">>, St, Opts)}
+                    catch throw:{wasm_patch_init, Reason} -> init_error(Reason)
+                    end
+            end;
+        _ -> {ok, Base}
+    end.
+
+restore(Base, Body, Opts) ->
+    Snapshot =
+        try binary_to_term(Body, [safe])
+        catch _:_ -> throw({wasm_patch_init, <<"the snapshot does not decode">>})
+        end,
+    #{
+        <<"abi">> := ?ABI,
+        <<"wasm-sha256">> := Hash,
+        <<"gen">> := Gen,
+        <<"globals">> := Globals,
+        <<"memory">> := Compressed
+    } = Snapshot,
+    {St0 = #{ inst := Inst, wasm_sha256 := Hash1 }, Info} = instance(Base, Opts),
+    case Hash1 of
+        Hash -> ok;
+        _ -> throw({wasm_patch_init, <<"the snapshot is of another image">>})
+    end,
+    Mem = zlib:uncompress(Compressed),
+    Gl = [{N, Kind, V} || {N, Kind, V} <- Globals, is_binary(N), is_integer(V)],
+    case hb_wasm_nif:restore(Inst, Gen, Mem, Gl) of
+        ok -> ok;
+        {error, Reason} -> throw({wasm_patch_init, Reason})
+    end,
+    St0#{
+        gen => Gen,
+        fuel => fuel(Base, Info, Opts),
+        ckpt => {Gen, Mem, Gl},
+        log => [],
+        log_bytes => 0,
+        slot => maps:get(<<"slot">>, Snapshot, undefined)
+    }.
+
+error_text(E) when is_binary(E) -> E;
+error_text(E) -> hb_util:bin(io_lib:format("~p", [E])).
+
+%%% Tests
+
+test_opts() ->
+    test_opts(#{}).
+test_opts(Extra) ->
+    maps:merge(
+        #{
+            <<"hashpath">> => ignore,
+            <<"wasm-patch-allow-uninstrumented">> => true,
+            <<"wasm-patch-aot">> => false
+        },
+        Extra
+    ).
+
+test_wasm() ->
+    {ok, Wasm} = file:read_file("test/wasm-patch/wp-test.wasm"),
+    Wasm.
+
+test_base() ->
+    #{
+        <<"device">> => ?DEVICE,
+        <<"image">> => test_wasm(),
+        <<"start">> => 10
+    }.
+
+test_request(Action) -> test_request(Action, 1).
+test_request(Action, Number) ->
+    #{
+        <<"path">> => <<"compute">>,
+        <<"body">> => #{ <<"action">> => Action, <<"number">> => Number }
+    }.
+
+run(State, Actions, Opts) ->
+    lists:foldl(
+        fun(Action, Prev) ->
+            {ok, Next} = hb_ao:resolve(Prev, test_request(Action), Opts),
+            Next
+        end,
+        State,
+        Actions
+    ).
+
+count(State, Opts) -> hb_ao:get(<<"count">>, State, Opts).
+
+init_handle_test() ->
+    hb:init(),
+    Opts = test_opts(),
+    {ok, S0} = hb_ao:resolve(test_base(), <<"init">>, Opts),
+    S5 = run(S0, lists:duplicate(5, <<"Increment">>), Opts),
+    ?assertEqual(<<"15">>, count(S5, Opts)),
+    ?assertEqual(<<"Increment">>, hb_ao:get(<<"last-action">>, S5, Opts)),
+    ?assertEqual(<<"15">>, hb_ao:get(<<"results/output/data">>, S5, Opts)),
+    % The request reached the module as sent: the integer comes back as one.
+    ?assertEqual(1, hb_ao:get(<<"echo-number">>, S5, Opts)),
+    S6 = run(S5, [<<"Delete">>], Opts),
+    ?assertEqual(not_found, hb_ao:get(<<"last-action">>, S6, Opts)).
+
+%% A returned error, a trap and a result that does not decode each fail the
+%% slot with the state unchanged, and the next slot computes from it.
+failed_slots_leave_state_test() ->
+    hb:init(),
+    Opts = test_opts(),
+    {ok, S0} = hb_ao:resolve(test_base(), <<"init">>, Opts),
+    S1 = run(S0, [<<"Increment">>], Opts),
+    ?assertEqual(
+        {error, #{ <<"status">> => 500, <<"body">> => <<"boom">> }},
+        hb_ao:resolve(S1, test_request(<<"Fail">>), Opts)
+    ),
+    {error, #{ <<"status">> := 500, <<"body">> := Trap }} =
+        hb_ao:resolve(S1, test_request(<<"Trap">>), Opts),
+    ?assertMatch(<<"wasm-patch@1.0 trap: ", _/binary>>, Trap),
+    ?assertMatch(
+        {error, #{ <<"status">> := 422 }},
+        hb_ao:resolve(S1, test_request(<<"Bad">>), Opts)
+    ),
+    % Not 112 or 1012: neither failure's write survived.
+    S2 = run(S1, [<<"Increment">>], Opts),
+    ?assertEqual(<<"12">>, count(S2, Opts)).
+
+%% A state that is not the instance's newest computes from its own memory:
+%% the instance is restored and replayed to it, then back again.
+stale_base_replays_test() ->
+    hb:init(),
+    Opts = test_opts(),
+    {ok, S0} = hb_ao:resolve(test_base(), <<"init">>, Opts),
+    S1 = run(S0, [<<"Increment">>], Opts),
+    S3 = run(S1, [<<"Increment">>, <<"Increment">>], Opts),
+    ?assertEqual(<<"13">>, count(S3, Opts)),
+    ?assertEqual(<<"12">>, count(run(S1, [<<"Increment">>], Opts), Opts)),
+    ?assertEqual(<<"14">>, count(run(S3, [<<"Increment">>], Opts), Opts)),
+    ?assertEqual(<<"11">>, count(run(S0, [<<"Increment">>], Opts), Opts)).
+
+%% Restore crosses an in-memory checkpoint and memory that grew after it.
+checkpoint_and_growth_test() ->
+    hb:init(),
+    Opts = test_opts(#{ <<"wasm-patch-checkpoint-calls">> => 2 }),
+    {ok, S0} = hb_ao:resolve(test_base(), <<"init">>, Opts),
+    S3 = run(S0, [<<"Increment">>, <<"Increment">>, <<"Increment">>], Opts),
+    S4 = run(S3, [<<"Grow">>], Opts),
+    ?assertEqual(<<"14">>, count(S4, Opts)),
+    {error, _} = hb_ao:resolve(S4, test_request(<<"Trap">>), Opts),
+    ?assertEqual(<<"14">>, count(run(S3, [<<"Increment">>], Opts), Opts)),
+    ?assertEqual(<<"15">>, count(run(S4, [<<"Increment">>], Opts), Opts)).
+
+%% A snapshot restores into a new instance that continues where it was.
+snapshot_restore_test() ->
+    hb:init(),
+    Opts = test_opts(),
+    {ok, S0} = hb_ao:resolve(test_base(), <<"init">>, Opts),
+    S5 = run(S0, lists:duplicate(5, <<"Increment">>), Opts),
+    {ok, Snapshot} = hb_ao:resolve(S5, <<"snapshot">>, Opts),
+    Cold = hb_ao:set(hb_private:reset(S5), <<"snapshot">>, Snapshot, Opts),
+    {ok, Restored} = hb_ao:resolve(Cold, <<"normalize">>, Opts),
+    S6 = run(Restored, [<<"Increment">>], Opts),
+    ?assertEqual(<<"16">>, count(S6, Opts)),
+    % The two instances are independent.
+    ?assertEqual(<<"16">>, count(run(S5, [<<"Increment">>], Opts), Opts)),
+    % A snapshot of another image is refused.
+    Other = hb_ao:set(Cold, <<"image">>, <<0, "asm", 1:32/little>>, Opts),
+    ?assertMatch({error, #{ <<"status">> := 422 }}, hb_ao:resolve(Other, <<"normalize">>, Opts)).
+
+%% longjmp through `invoke_vii' and `throw_longjmp' returns to the caller.
+longjmp_test() ->
+    hb:init(),
+    Opts = test_opts(),
+    {ok, S0} = hb_ao:resolve(test_base(), <<"init">>, Opts),
+    S1 = run(S0, [<<"Jump">>, <<"Increment">>], Opts),
+    ?assertEqual(7, hb_ao:get(<<"jumped">>, S1, Opts)),
+    ?assertEqual(<<"11">>, count(S1, Opts)).
+
+%% The same patches from Lua on `lua-patch@1.0' and from the module give the
+%% same delta, term for term.
+same_terms_as_lua_patch_test() ->
+    hb:init(),
+    Opts = test_opts(),
+    Lua = <<
+        "function compute(req)\n"
+        "  return {\n"
+        "    patches = {\n"
+        "      { path = '/t-int', value = 42 },\n"
+        "      { path = '/t-float', value = 1.5 },\n"
+        "      { path = '/t-true', value = true },\n"
+        "      { path = '/t-false', value = false },\n"
+        "      { path = '/t-map', value = { a = 'x', n = 7 } },\n"
+        "      { path = '/t-list', value = { 'p', 'q' } },\n"
+        "      { path = '/t-empty', value = {} }\n"
+        "    },\n"
+        "    results = {}\n"
+        "  }\n"
+        "end\n"
+    >>,
+    LuaBase = #{
+        <<"device">> => <<"lua-patch@1.0">>,
+        <<"module">> => #{ <<"content-type">> => <<"application/lua">>, <<"body">> => Lua }
+    },
+    {ok, L0} = hb_ao:resolve(LuaBase, <<"init">>, Opts),
+    {ok, L1} = hb_ao:resolve(L0, test_request(<<"Types">>), Opts),
+    {ok, W0} = hb_ao:resolve(test_base(), <<"init">>, Opts),
+    {ok, W1} = hb_ao:resolve(W0, test_request(<<"Types">>), Opts),
+    Delta = fun(S) -> hb_private:get(<<"process-cache-delta">>, S, Opts) end,
+    ?assertEqual(Delta(L1), Delta(W1)),
+    Keys = [<<"t-int">>, <<"t-float">>, <<"t-true">>, <<"t-false">>, <<"t-map">>,
+        <<"t-list">>, <<"t-empty">>],
+    ?assertEqual(maps:with(Keys, L1), maps:with(Keys, W1)).
+
+%% A module importing anything outside the allow-list never starts.
+refuses_imports_test() ->
+    hb:init(),
+    Entries = iolist_to_binary([1, 3, <<"env">>, 5, <<"abort">>, 0, 0]),
+    Type = <<1, 16#60, 0, 0>>,
+    Wasm = iolist_to_binary([
+        <<0, "asm", 1:32/little>>,
+        1, byte_size(Type), Type,
+        2, byte_size(Entries), Entries
+    ]),
+    {error, #{ <<"status">> := 422, <<"body">> := Body }} =
+        hb_ao:resolve((test_base())#{ <<"image">> => Wasm }, <<"init">>, test_opts()),
+    ?assertNotEqual(nomatch, binary:match(Body, <<"env.abort">>)),
+    % An uninstrumented module needs the node's permission.
+    ?assertMatch(
+        {error, #{ <<"status">> := 422 }},
+        hb_ao:resolve(test_base(), <<"init">>,
+            test_opts(#{ <<"wasm-patch-allow-uninstrumented">> => false }))
+    ).
+
+%% AOT and the interpreter give the same deltas. Needs `wamrc' 2.2.0
+%% (`HB_WAMRC' or on the path); without one AOT falls back to the
+%% interpreter and the comparison is trivially equal.
+aot_matches_interp_test_() ->
+    {timeout, 120, fun() ->
+        hb:init(),
+        Dir = "_build/test-wasm-aot-" ++ integer_to_list(erlang:unique_integer([positive])),
+        Interp = test_opts(),
+        Aot = test_opts(#{ <<"wasm-patch-aot">> => true, <<"wasm-patch-aot-dir">> => Dir }),
+        Actions = [<<"Increment">>, <<"Types">>, <<"Jump">>, <<"Fail">>, <<"Grow">>,
+            <<"Increment">>, <<"Trap">>, <<"Delete">>, <<"Increment">>],
+        Deltas =
+            fun(Opts) ->
+                {ok, S0} = hb_ao:resolve(test_base(), <<"init">>, Opts),
+                {_, Rev} =
+                    lists:foldl(
+                        fun(Action, {Prev, Acc}) ->
+                            case hb_ao:resolve(Prev, test_request(Action), Opts) of
+                                {ok, Next} ->
+                                    Delta = hb_private:get(<<"process-cache-delta">>, Next, Opts),
+                                    {Next, [Delta | Acc]};
+                                {error, #{ <<"body">> := <<"wasm-patch@1.0 trap: ", _/binary>> }} ->
+                                    % Only the runtime's wording differs.
+                                    {Prev, [trap | Acc]};
+                                Error -> {Prev, [Error | Acc]}
+                            end
+                        end,
+                        {S0, []},
+                        Actions
+                    ),
+                {maps:get(aot_key, hb_private:get(<<"state">>, S0, Opts)), lists:reverse(Rev)}
+            end,
+        {interp, InterpDeltas} = Deltas(Interp),
+        {AotKey, AotDeltas} = Deltas(Aot),
+        io:format(user, "wasm-patch aot key: ~p~n", [AotKey]),
+        ?assertEqual(InterpDeltas, AotDeltas)
+    end}.
+
+%% A `process@1.0' process on this device: slots stored as deltas, a failed
+%% slot that does not halt it, and old slots read back.
+process_test_() ->
+    {timeout, 120, fun() ->
+        hb:init(),
+        Opts = test_opts(#{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"spawn-worker">> => false,
+            <<"process-workers">> => false,
+            <<"process-delta-cache">> => true,
+            <<"process-snapshot-target">> => false,
+            <<"process-delta-checkpoint-slots">> => 2
+        }),
+        Wallet = hb_opts:get(<<"priv-wallet">>, hb:wallet(), Opts),
+        Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+        Process = hb_message:commit(
+            #{
+                <<"device">> => <<"process@1.0">>,
+                <<"type">> => <<"Process">>,
+                <<"scheduler-device">> => <<"scheduler@1.0">>,
+                <<"execution-device">> => ?DEVICE,
+                <<"image">> => test_wasm(),
+                <<"wasm-patch-abi">> => 1,
+                <<"start">> => 10,
+                <<"authority">> => [Address],
+                <<"scheduler-location">> => Address
+            },
+            Opts
+        ),
+        {ok, _} = hb_cache:write(Process, Opts),
+        ProcID = hb_message:id(Process, all, Opts),
+        Schedule =
+            fun(Action) ->
+                {ok, _} = hb_ao:resolve(Process,
+                    hb_message:commit(
+                        #{
+                            <<"path">> => <<"schedule">>,
+                            <<"method">> => <<"POST">>,
+                            <<"body">> => hb_message:commit(
+                                #{
+                                    <<"target">> => ProcID,
+                                    <<"type">> => <<"Message">>,
+                                    <<"action">> => Action
+                                },
+                                Opts
+                            )
+                        },
+                        Opts
+                    ),
+                    Opts)
+            end,
+        Compute =
+            fun(Slot) ->
+                hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, Opts)
+            end,
+        Schedule(<<"Increment">>),
+        Schedule(<<"Fail">>),
+        Schedule(<<"Increment">>),
+        {ok, State1} = Compute(1),
+        ?assertEqual(<<"11">>, hb_ao:get(<<"count">>, State1, Opts)),
+        {ok, State2} = Compute(2),
+        ?assertEqual(<<"11">>, hb_ao:get(<<"count">>, State2, Opts)),
+        ?assertEqual(<<"error">>, hb_ao:get(<<"results/type">>, State2, Opts)),
+        {ok, State3} = Compute(3),
+        ?assertEqual(<<"12">>, hb_ao:get(<<"count">>, State3, Opts)),
+        Schedule(<<"Increment">>),
+        {ok, State4} = Compute(4),
+        ?assertEqual(<<"13">>, hb_ao:get(<<"count">>, State4, Opts)),
+        {ok, Old} = Compute(1),
+        ?assertEqual(<<"11">>, hb_ao:get(<<"count">>, Old, Opts))
+    end}.
+
+%% @doc Per-slot phase means, run only when asked:
+%% `HB_WASM_PATCH_BENCH=2000 rebar3 device test -d dev_wasm_patch'
+%% (with `HB_WAMRC' set for the AOT rows). A trivial direct call, and a
+%% process slot carrying a signed order-shaped message.
+bench_report_test_() ->
+    {timeout, 600, fun() ->
+        case os:getenv("HB_WASM_PATCH_BENCH") of
+            false -> ok;
+            Spec ->
+                N = list_to_integer(Spec),
+                Dir = "_build/bench-wasm-aot",
+                Rows = [
+                    {Mode, Kind, bench(Kind, N, test_opts(#{
+                        <<"wasm-patch-aot">> => Mode =:= aot,
+                        <<"wasm-patch-aot-dir">> => Dir
+                    }))}
+                 || Mode <- [interp, aot], Kind <- [trivial, process]
+                ],
+                io:format(user, "WASM_PATCH_BENCH ~p~n", [Rows])
+        end
+    end}.
+
+bench(trivial, N, Opts) ->
+    hb:init(),
+    {ok, S0} = hb_ao:resolve(test_base(), <<"init">>, Opts),
+    hb_phase_timer:reset(),
+    {_, Times} =
+        lists:foldl(
+            fun(_, {Prev, Acc}) ->
+                {Us, {ok, Next}} = timer:tc(fun() ->
+                    hb_ao:resolve(Prev, test_request(<<"Increment">>), Opts) end),
+                {Next, [Us | Acc]}
+            end,
+            {S0, []},
+            lists:seq(1, N)
+        ),
+    bench_summary(Times);
+bench(process, N, Opts0) ->
+    hb:init(),
+    Opts = Opts0#{
+        <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"spawn-worker">> => false,
+        <<"process-workers">> => false,
+        <<"process-delta-cache">> => true,
+        <<"process-snapshot-target">> => false
+    },
+    Wallet = hb_opts:get(<<"priv-wallet">>, hb:wallet(), Opts),
+    Address = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Process = hb_message:commit(
+        #{
+            <<"device">> => <<"process@1.0">>,
+            <<"type">> => <<"Process">>,
+            <<"scheduler-device">> => <<"scheduler@1.0">>,
+            <<"execution-device">> => ?DEVICE,
+            <<"image">> => test_wasm(),
+            <<"start">> => 10,
+            <<"authority">> => [Address],
+            <<"scheduler-location">> => Address
+        },
+        Opts
+    ),
+    {ok, _} = hb_cache:write(Process, Opts),
+    ProcID = hb_message:id(Process, all, Opts),
+    lists:foreach(
+        fun(I) ->
+            {ok, _} = hb_ao:resolve(Process,
+                hb_message:commit(
+                    #{
+                        <<"path">> => <<"schedule">>,
+                        <<"method">> => <<"POST">>,
+                        <<"body">> => hb_message:commit(
+                            #{
+                                <<"target">> => ProcID,
+                                <<"type">> => <<"Message">>,
+                                <<"action">> => <<"Order.Place">>,
+                                <<"pair">> => <<"RUNE-PUSD">>,
+                                <<"side">> => <<"buy">>,
+                                <<"price">> => <<"1250000">>,
+                                <<"quantity">> => <<"40000000">>,
+                                <<"client-order-id">> => hb_util:bin(I),
+                                <<"time-in-force">> => <<"GTC">>,
+                                <<"post-only">> => <<"false">>,
+                                <<"reduce-only">> => <<"false">>,
+                                <<"nonce">> => hb_util:bin(I),
+                                <<"recipient">> => Address
+                            },
+                            Opts
+                        )
+                    },
+                    Opts
+                ),
+                Opts)
+        end,
+        lists:seq(1, N)
+    ),
+    {ok, _} = hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => 1 }, Opts),
+    hb_phase_timer:reset(),
+    Times =
+        [ element(1, timer:tc(fun() ->
+            {ok, _} = hb_ao:resolve(Process,
+                #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, Opts)
+          end))
+        || Slot <- lists:seq(2, N) ],
+    bench_summary(Times).
+
+bench_summary(Times) ->
+    Sorted = lists:sort(Times),
+    Len = length(Sorted),
+    Phases =
+        [ {P, Mean}
+        || {P, _T, _C, Mean} <- hb_phase_timer:read(),
+           lists:member(P, [wasm_patch_prep, wasm_patch_call, wasm_patch_decode,
+               wasm_patch_apply, wasm_patch_restore, slot_execution, slot_store])
+        ],
+    #{
+        n => Len,
+        p50_us => lists:nth(max(1, Len div 2), Sorted),
+        p95_us => lists:nth(max(1, (Len * 95) div 100), Sorted),
+        phase_mean_us => Phases
+    }.

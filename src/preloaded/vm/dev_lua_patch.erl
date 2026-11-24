@@ -18,6 +18,7 @@
 %%% worker. The device deliberately does not change `lua@5.3a' semantics.
 -module(dev_lua_patch).
 -implements(<<"lua-patch@1.0">>).
+-device_libraries([lib_patch_exec]).
 -export([device_info/1, init/3, compute/4, snapshot/3, normalize/3, functions/3]).
 -export([head_to_head_benchmark/2, incremental_gc_benchmark/3]).
 -include("include/hb.hrl").
@@ -86,48 +87,15 @@ functions(Base, Req, Opts) ->
     hb_ao:raw(?LEGACY_LUA, <<"functions">>, Base, Req, Opts).
 
 %% @doc Invoke Lua with request-only parameters and apply its explicit patches.
+%% The request and the result handling are `lib_patch_exec''s, shared with
+%% `wasm-patch@1.0'.
 compute(Key, RawBase, RawReq, Opts) ->
     T0 = erlang:monotonic_time(microsecond),
     Req = hb_cache:read_all_commitments(RawReq, Opts),
     {ok, Base} = init(RawBase, Req, Opts),
     OldPriv = #{ <<"state">> := State } = hb_private:from_message(Base),
-    InSlot = in_slot(OldPriv),
-    FunctionSources = case InSlot of
-        true -> [{{as, <<"message@1.0">>, Base}, <<"function">>}];
-        false -> [
-            {Req, <<"body/function">>},
-            {Req, <<"function">>},
-            {{as, <<"message@1.0">>, Base}, <<"function">>}
-        ]
-    end,
-    Function =
-        case InSlot andalso base_literal([<<"function">>], Base, Opts) of
-            {ok, Literal} -> Literal;
-            not_found -> Key;
-            _ ->
-                hb_ao:get_first(
-                    FunctionSources,
-                    Key,
-                    Opts#{ <<"hashpath">> => ignore }
-                )
-        end,
-    % Scheduled messages are input to the contract, never instructions for
-    % choosing another Lua entry point or replacing its execution context.
-    Params = case InSlot of
-        true -> [Req];
-        false -> hb_ao:get_first(
-            [
-                {Req, <<"body/parameters">>},
-                {Req, <<"parameters">>}
-            ],
-            [Req],
-            Opts#{ <<"hashpath">> => ignore }
-        )
-    end,
-    InputParams = case InSlot andalso literal_input_links(Base, Opts) of
-        true -> [literal_request(Req, Opts)];
-        false -> Params
-    end,
+    InSlot = lib_patch_exec:in_slot(OldPriv),
+    {Function, InputParams} = lib_patch_exec:request(Key, Base, Req, InSlot, Opts),
     T1 = erlang:monotonic_time(microsecond),
     % RC7's `ao' library reads the node message from here, as in `dev_lua';
     % `snapshot/3' keeps it out of the snapshot. Outside a process slot, a
@@ -140,7 +108,8 @@ compute(Key, RawBase, RawReq, Opts) ->
             luerl:put_private(<<"node-message">>, Opts, State)
         ),
     Response =
-        try call_lua(Function, encode(InputParams, Opts), CallState, deadline(InSlot, Opts))
+        try call_lua(Function, lib_patch_exec:encode(InputParams, luerl, Opts),
+                CallState, deadline(InSlot, Opts))
         catch
             _:Reason:Stacktrace -> {error, Reason, Stacktrace}
         end,
@@ -154,74 +123,6 @@ compute(Key, RawBase, RawReq, Opts) ->
     hb_slot_log:note(lua_patch_prep, T1 - T0),
     hb_slot_log:note(lua_patch_lua, T2 - T1),
     process_response(collect(InSlot, Base, Req, Response, Opts), Base, OldPriv, Opts).
-
-%% @doc A process can consume tag values as literal URIs. This policy comes
-%% from its signed definition, not the incoming message or node defaults.
-literal_input_links(Base, Opts) ->
-    Paths = [[<<"process">>, <<"lua-input-links">>], [<<"lua-input-links">>]],
-    case first_literal(Paths, Base, Opts) of
-        {ok, Policy} -> Policy =:= <<"literal">>;
-        not_found -> false;
-        resolve ->
-            hb_ao:get_first([
-                {{as, <<"message@1.0">>, Base}, <<"process/lua-input-links">>},
-                {{as, <<"message@1.0">>, Base}, <<"lua-input-links">>}
-            ], <<"resolve">>, Opts) =:= <<"literal">>
-    end.
-
-first_literal([], _Base, _Opts) -> not_found;
-first_literal([Path | Rest], Base, Opts) ->
-    case base_literal(Path, Base, Opts) of
-        not_found -> first_literal(Rest, Base, Opts);
-        Found -> Found
-    end.
-
-%% @doc A binary at `Path' of the base, read as `message@1.0' reads it: each
-%% key lowercased, then matched exactly. The base a device function receives
-%% is already normalised (`hb_ao' resolve stage 2), so this is the value a
-%% resolution through `{as, <<"message@1.0">>, Base}' returns -- after
-%% normalising every published key of the base twice more, once to set the
-%% device and once to read. Anything but a map on the way and a binary at
-%% the end is left to that resolution (`resolve').
-base_literal([], Value, _Opts) when is_binary(Value) -> {ok, Value};
-base_literal([], _Value, _Opts) -> resolve;
-base_literal([Key | Rest], Msg, Opts) when is_map(Msg) ->
-    Lower = hb_util:lowercase_key(Key),
-    case maps:find(Lower, Msg) of
-        {ok, Value} -> base_literal(Rest, Value, Opts);
-        error ->
-            case maps:is_key(<<Lower/binary, "+link">>, Msg) of
-                true -> resolve;
-                false -> not_found
-            end
-    end;
-base_literal(_Path, _Value, _Opts) ->
-    resolve.
-
-%% @doc Load the scheduled header and its signature metadata, then preserve
-%% payload links as strings. An unknown tag must not make execution depend on
-%% retrieval of an arbitrary remote object before the contract can reject it.
-%% The commitments are the ones the scheduled ID names, never every one the
-%% store holds for the same content: two signers' identical messages share an
-%% uncommitted ID, and merging them gives each the other's signature.
-literal_request(Req, Opts) ->
-    Body = hb_cache:ensure_loaded(hb_maps:get(<<"body">>, Req, #{}, Opts), Opts),
-    Commitments = hb_cache:ensure_all_loaded(
-        hb_maps:get(<<"commitments">>, Body, #{}, Opts), Opts),
-    literal_links(Req#{<<"body">> => Body#{<<"commitments">> => Commitments}}, Opts).
-
-%% A `lazy' link is the store's own handle on a value of this message: the
-%% cache writes every value of 60 bytes or more (`?DIRECT_VALUE_LENGTH') as a
-%% `ni:' name and reads it back as a lazy link. Load it, so a long tag reaches
-%% Lua as its bytes and not as `ni:///sha-256;...'. Only a link decoded from a
-%% tag's own text stays a literal URI.
-literal_links(Link = {link, _, #{<<"lazy">> := true}}, Opts) ->
-    literal_links(hb_cache:ensure_loaded(Link, Opts), Opts);
-literal_links({link, URI, _}, _Opts) -> URI;
-literal_links(Map, Opts) when is_map(Map) ->
-    maps:map(fun(_, V) -> literal_links(V, Opts) end, Map);
-literal_links(List, Opts) when is_list(List) -> [literal_links(V, Opts) || V <- List];
-literal_links(Value, _Opts) -> Value.
 
 %% @doc Collect the VM's garbage after every `lua-gc-interval-slots'th slot.
 %% Contracts on this device collect in full only on checkpoint slots
@@ -253,21 +154,7 @@ gc_interval(Base, Opts) ->
         _ -> ?GC_INTERVAL_SLOTS
     end.
 
-slot(Req, Opts) ->
-    case hb_maps:get(<<"slot">>, Req, not_found, Opts) of
-        not_found -> undefined;
-        Raw ->
-            case catch hb_util:int(Raw) of
-                N when is_integer(N) -> N;
-                _ -> undefined
-            end
-    end.
-
-%% @doc Whether the call computes a slot of a `process@1.0' process, which
-%% marks the state it initializes (`dev_process:init/3') privately, out of
-%% reach of a request.
-in_slot(Priv) ->
-    is_map_key(<<"initialized">>, Priv).
+slot(Req, Opts) -> lib_patch_exec:slot(Req, Opts).
 
 %% @doc How long a call may run. A slot has no deadline: it must compute the
 %% same on every node, and a deadline would make the result depend on how
@@ -325,40 +212,21 @@ call_lua(Function, Args, State, Ms) ->
 process_response({ok, [Result], NewState}, Base, Priv, Opts) ->
     process_response({ok, [<<"ok">>, Result], NewState}, Base, Priv, Opts);
 process_response({ok, [Status, Encoded], NewState}, Base, Priv, Opts) ->
-    {DecodeMicros, Decoded} = timer:tc(fun() -> decode(Encoded, Opts) end),
-    case Decoded of
-        Result when is_map(Result) ->
-            {ApplyMicros, Applied} =
-                timer:tc(fun() -> apply_result(Base, Result, Opts) end),
-            ?event(compute_short,
-                {lua_patch_timing,
-                    {decode_us, DecodeMicros},
-                    {apply_us, ApplyMicros}
-                },
-                Opts
-            ),
-            hb_slot_log:note(lua_patch_decode, DecodeMicros),
-            hb_slot_log:note(lua_patch_apply, ApplyMicros),
-            case Applied of
-                {ok, Patched, Delta} ->
-                    {
-                        hb_util:atom(Status),
-                        Patched#{
-                            <<"priv">> => Priv#{
-                                <<"state">> => NewState,
-                                <<"process-cache-delta">> => Delta
-                            }
-                        }
-                    };
-                Error -> Error
-            end;
-        Other ->
-            {error, #{
-                <<"status">> => 422,
-                <<"body">> => <<"lua-patch@1.0 result must be a message.">>,
-                <<"result">> => hb_util:bin(Other)
-            }}
-    end;
+    {DecodeMicros, Decoded} = timer:tc(fun() -> lib_patch_exec:decode(Encoded, Opts) end),
+    lib_patch_exec:result(
+        Status,
+        Decoded,
+        DecodeMicros,
+        Base,
+        #{
+            device => <<"lua-patch@1.0">>,
+            timing_event => lua_patch_timing,
+            decode_phase => lua_patch_decode,
+            apply_phase => lua_patch_apply,
+            priv => Priv#{ <<"state">> => NewState }
+        },
+        Opts
+    );
 process_response({deadline, Ms}, _Base, _Priv, _Opts) ->
     {error, #{
         <<"status">> => 504,
@@ -368,13 +236,10 @@ process_response({deadline, Ms}, _Base, _Priv, _Opts) ->
     }};
 process_response({lua_error, RawError, State}, _Base, _Priv, Opts) ->
     Error =
-        try decode(luerl:decode(RawError, State), Opts)
+        try lib_patch_exec:decode(luerl:decode(RawError, State), Opts)
         catch _:_ -> RawError
         end,
-    {error, #{
-        <<"status">> => 500,
-        <<"body">> => Error
-    }};
+    lib_patch_exec:error_result(Error);
 process_response({error, Reason, Trace}, _Base, _Priv, _Opts) ->
     {error, #{
         <<"status">> => 500,
@@ -383,165 +248,7 @@ process_response({error, Reason, Trace}, _Base, _Priv, _Opts) ->
         <<"trace">> => iolist_to_binary(hb_format:trace(Trace))
     }}.
 
-%% @doc Apply ordered patches, then replace the per-slot result message.
-%% Lua cannot tell an empty array from an empty table, and `decode/2' turns
-%% both into `#{}', so an empty `patches' message is the empty patch list. A
-%% `results' array becomes the equivalent ordered message.
-apply_result(Base, Result, Opts) ->
-    Patches =
-        case hb_ao:get(<<"patches">>, Result, [], Opts) of
-            Empty when Empty =:= #{} -> [];
-            DecodedPatches -> filter_patches(DecodedPatches, Opts)
-        end,
-    Results =
-        case hb_ao:get(<<"results">>, Result, #{}, Opts) of
-            List when is_list(List) -> hb_ao:normalize_keys(List, Opts);
-            DecodedResults -> DecodedResults
-        end,
-    case {is_list(Patches), is_map(Results)} of
-        {true, true} ->
-            case hb_state_patch:apply(Base, Patches, Results, Opts) of
-                {ok, Patched} ->
-                    {ok, Patched, #{
-                        <<"patches">> => Patches,
-                        <<"results">> => Results
-                    }};
-                Error -> Error
-            end;
-        _ ->
-            {error, #{
-                <<"status">> => 422,
-                <<"body">> =>
-                    <<"lua-patch@1.0 requires list `patches' and message `results'.">>
-            }}
-    end.
-
-%% @doc Apply the node's invalid-patch policy. By default an invalid patch
-%% fails the slot with a 422. With `lua-patch-invalid-patches' set to `drop',
-%% invalid patches are removed before they are applied or stored, so a
-%% contract that publishes a key built from untrusted input cannot halt the
-%% process. Replay reads the stored, already filtered, patch list.
-filter_patches(Patches, Opts) when is_list(Patches) ->
-    case hb_opts:get(<<"lua-patch-invalid-patches">>, <<"reject">>, Opts) of
-        <<"drop">> ->
-            case hb_state_patch:partition(Patches, Opts) of
-                {Valid, []} -> Valid;
-                {Valid, Dropped} ->
-                    ?event(warning, {lua_patch_dropped_patches, {dropped, Dropped}}),
-                    Valid
-            end;
-        _ -> Patches
-    end;
-filter_patches(Patches, _Opts) ->
-    Patches.
-
-%% @doc Decode a Lua value and normalize any message commitments it carries.
-decode(Value, Opts) ->
-    hb_message:normalize_commitments(decode_value(Value, Opts), Opts, verify).
-
-decode_value([], _Opts) -> #{};
-decode_value(Value = [{_K, _V} | _], Opts) ->
-    decode_value(decode_table(Value, Opts, #{}), Opts);
-decode_value(Value, Opts) when is_map(Value) ->
-    case hb_util:is_ordered_list(Value, Opts) of
-        true ->
-            lists:map(
-                fun(Item) -> decode_value(Item, Opts) end,
-                hb_util:message_to_ordered_list(Value)
-            );
-        false -> Value
-    end;
-decode_value(Value, _Opts) -> Value.
-
-decode_table([], _Opts, Acc) -> Acc;
-decode_table([{Key, Value} | Rest], Opts, Acc) ->
-    decode_table(Rest, Opts, Acc#{ Key => decode_value(Value, Opts) }).
-
-%% @doc Encode AO-Core maps as Lua tables without eagerly loading whole trees.
-encode(Map, Opts) when is_map(Map) ->
-    Normalized = assign_to_target(Map),
-    case hb_util:is_ordered_list(Normalized, Opts) of
-        true -> encode(hb_util:message_to_ordered_list(Normalized), Opts);
-        false ->
-            maps:to_list(
-                maps:map(
-                    fun(Key, Value) -> encode_value(Key, Value, Opts) end,
-                    Normalized
-                )
-            )
-    end;
-encode(List, Opts) when is_list(List) ->
-    lists:map(fun(Value) -> encode(Value, Opts) end, List);
-encode(Link, Opts) when ?IS_LINK(Link) ->
-    encode(hb_cache:ensure_all_loaded(Link, Opts), Opts);
-encode(Atom, _Opts) when is_atom(Atom) andalso Atom =/= false andalso Atom =/= true ->
-    hb_util:bin(Atom);
-encode(Value, _Opts) -> Value.
-
-%% @doc Lua sees only the signed commitments of a message, each with its
-%% committer as an address, as `lua@5.3a' gives them. v0.11 holds a committer
-%% as a URI (`uri-did-ar-...'); a contract that took that for an account id
-%% would give every player a second, empty account. Unsigned commitments are
-%% hidden because each node makes its own, so a script reading them could
-%% compute differently on two nodes.
-encode_value(<<"commitments">>, Commitments, Opts) when is_map(Commitments) ->
-    Signed =
-        maps:fold(
-            fun(ID, Commitment = #{ <<"committer">> := Committer }, Acc) ->
-                    Acc#{
-                        ID => assign_to_commitment(Commitment#{
-                            <<"committer">> => hb_util:committer_address(Committer)
-                        })
-                    };
-               (_ID, _Unsigned, Acc) ->
-                    Acc
-            end,
-            #{},
-            Commitments
-        ),
-    encode(Signed, Opts);
-encode_value(_Key, Value, Opts) ->
-    encode(Value, Opts).
-
-%% An L1 message uses the signed `Assign-To' tag because a process has no
-%% private key and should not receive AR. The contract door speaks AO-Core and
-%% requires `target'. Expose the single-process form as its equivalent target;
-%% the verified commitment is translated below by the same rule.
-assign_to_target(Map) ->
-    case {maps:is_key(<<"target">>, Map), maps:get(<<"assign-to">>, Map, undefined)} of
-        {false, Target} when is_binary(Target), byte_size(Target) =:= 43 ->
-            Map#{ <<"target">> => Target };
-        _ -> Map
-    end.
-
-assign_to_commitment(Commitment) ->
-    case maps:get(<<"committed">>, Commitment, []) of
-        Committed when is_list(Committed) ->
-            case lists:member(<<"assign-to">>, Committed)
-                    andalso not lists:member(<<"target">>, Committed) of
-                true -> Commitment#{ <<"committed">> => [<<"target">> | Committed] };
-                false -> Commitment
-            end;
-        _ -> Commitment
-    end.
-
 %%% Tests
-
-assign_to_target_test() ->
-    Target = <<"TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT">>,
-    ?assertEqual(Target, maps:get(<<"target">>, assign_to_target(
-        #{ <<"assign-to">> => Target }
-    ))),
-    ?assertEqual(
-        <<"native">>,
-        maps:get(<<"target">>, assign_to_target(
-            #{ <<"assign-to">> => Target, <<"target">> => <<"native">> }
-        ))
-    ),
-    Commitment = assign_to_commitment(
-        #{ <<"committed">> => [<<"assign-to">>, <<"action">>] }
-    ),
-    ?assert(lists:member(<<"target">>, maps:get(<<"committed">>, Commitment))).
 
 %% @doc Compare execution latency at a fixed public-state size. This is kept
 %% out of EUnit so correctness tests do not acquire timing assertions.
