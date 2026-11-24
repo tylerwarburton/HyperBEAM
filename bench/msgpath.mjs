@@ -2,6 +2,7 @@
 //                         [--idle 30] [--msg trivial|pair] [--out file.json]
 //                         [--container name] [--poll-ms 0]
 //                         [--sched-from address|scheduler-address]
+//                         [--keys N]  (the first message publishes N more keys of ~45 bytes)
 //
 // The per-message path of one process (or --procs N at once), on a local node.
 // Each process is lua-patch@1.0 doing a trivial mutation (a counter); with
@@ -33,11 +34,15 @@ import { Worker, isMainThread, parentPort, workerData } from 'node:worker_thread
 import { execFileSync } from 'node:child_process';
 import { signDataItem, generateWallet } from './ans104.mjs';
 
+const KEYS = Number((() => { const i = process.argv.indexOf('--keys'); return i >= 0 ? process.argv[i + 1] : 0; })());
 const LUA = `
 Count = Count or 0
 function compute(req)
   Count = Count + 1
   local patches = {{ path = '/count', value = tostring(Count) }}
+  if Count == 1 then
+    for i = 1, ${KEYS} do patches[#patches + 1] = { path = '/k-' .. i, value = string.rep('v', 40) .. i } end
+  end
   if req.body and req.body.side then
     patches[2] = { path = '/last', value = string.rep('x', 200) .. tostring(Count) }
   end
