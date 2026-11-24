@@ -801,6 +801,9 @@ legacy_slots(ProcID, Opts) ->
 -define(BLOB_NS, <<"pstate">>).
 -define(BLOB_VSN, 1).
 -define(BLOB_CHUNK, 4000).
+%% Chunks of a value written together (~1 MB), each write a separate hold of
+%% the store's write lock (`blob_put/4').
+-define(CHUNKS_PER_WRITE, 256).
 -define(CHUNKED, "pstate-chunks:").
 
 blob_store(Opts) ->
@@ -835,17 +838,20 @@ blob_put(Store, Key, Value, Opts) when byte_size(Value) =< ?BLOB_CHUNK ->
     blob_write(Store, #{ Key => Value }, Key, Opts);
 blob_put(Store, Key, Value, Opts) ->
     Chunks = chunks(Value),
-    % The chunks first, so a key that names chunks always has them.
-    ok =
-        blob_write(
-            Store,
-            maps:from_list(
-                [ {chunk_key(Key, N), C}
-                || {N, C} <- lists:zip(lists:seq(1, length(Chunks)), Chunks) ]
-            ),
-            Key,
-            Opts
-        ),
+    % The chunks first, so a key that names chunks always has them; a few
+    % hundred to a write, as one write holds the store's write lock for all
+    % of its rows: an 81 MB checkpoint (20,000 chunks) in one write held it
+    % for seconds (checkpoint_put p90 4.2 s on the game's 8 shards at
+    % 100,000 players), and every slot of every process waited behind it.
+    lists:foreach(
+        fun(Group) ->
+            ok = blob_write(Store, maps:from_list(Group), Key, Opts)
+        end,
+        groups(
+            [ {chunk_key(Key, N), C}
+            || {N, C} <- lists:zip(lists:seq(1, length(Chunks)), Chunks) ],
+            ?CHUNKS_PER_WRITE)
+    ),
     blob_write(
         Store,
         #{ Key => <<?CHUNKED, (integer_to_binary(length(Chunks)))/binary>> },
@@ -861,6 +867,12 @@ blob_write(Store, Rows, Key, Opts) ->
 
 chunks(<<C:?BLOB_CHUNK/binary, Rest/binary>>) when Rest =/= <<>> -> [C | chunks(Rest)];
 chunks(Last) -> [Last].
+
+groups([], _N) -> [];
+groups(List, N) when length(List) =< N -> [List];
+groups(List, N) ->
+    {Group, Rest} = lists:split(N, List),
+    [Group | groups(Rest, N)].
 
 chunk_key(Key, N) -> <<Key/binary, ".", (integer_to_binary(N))/binary>>.
 
