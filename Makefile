@@ -1,4 +1,4 @@
-.PHONY: compile buildinfo clean-generated preloaded-store wamrc wasm-patch-instrument wasm-patch-instrument-test
+.PHONY: compile buildinfo clean-generated preloaded-store wamrc wasm-patch-instrument wasm-patch-instrument-test wasm-patch-prewarm
 
 compile:
 	rebar3 compile
@@ -172,6 +172,16 @@ wasm-patch-instrument:
 	@mkdir -p priv
 	install -m 0755 $(WPI_DIR)/target/release/wasm-patch-instrument $(WPI_BIN)
 	$(WPI_BIN) --version
+
+# Compile the approved wasm-patch@1.0 modules (sha256 + source, in
+# $(WASM_PATCH_PREWARM)) into the build's priv/wasm-aot, the node's default AOT
+# cache, so an image ships them compiled. Run it after `rebar3 release' in an
+# image build; it uses the release's code when there is one.
+WASM_PATCH_PREWARM ?= config/wasm-patch-prewarm.json
+wasm-patch-prewarm: wamrc wasm-patch-instrument
+	erl -noshell -pa $(wildcard _build/default/rel/hb/lib/*/ebin) $(wildcard _build/default/lib/*/ebin) \
+		-eval 'R = hb_wasm_aot:prewarm(<<"$(WASM_PATCH_PREWARM)">>, #{}), io:format("~p~n", [R]), \
+			halt(case lists:all(fun({_, {ok, _}}) -> true; (_) -> false end, R) of true -> 0; false -> 1 end).'
 
 # Unit tests, then interpreter-vs-AOT equivalence on the node's own runtime build.
 wasm-patch-instrument-test: wamr wamrc wasm-patch-instrument

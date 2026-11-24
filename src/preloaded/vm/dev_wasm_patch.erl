@@ -116,6 +116,7 @@ boot(Base, Opts) ->
             {ok, St0#{
                 gen => 1,
                 fuel => Fuel,
+                literal_links => lib_patch_exec:literal_input_links(Base, Opts),
                 ckpt => {1, Mem, Globals},
                 log => [],
                 log_bytes => 0,
@@ -276,11 +277,13 @@ compute(Key, RawBase, RawReq, Opts) ->
         Error -> Error
     end.
 
-compute(Key, Base, Req, T0, Opts) ->
+compute(_Key, Base, Req, T0, Opts) ->
     Priv = hb_private:from_message(Base),
-    St0 = maps:get(<<"state">>, Priv),
     InSlot = lib_patch_exec:in_slot(Priv),
-    {_Function, Params} = lib_patch_exec:request(Key, Base, Req, InSlot, Opts),
+    % The module has one entry point, so no function is looked up; the input
+    % link policy is the process's, read once (`literal_links/4').
+    {Literal, St0} = literal_links(InSlot, maps:get(<<"state">>, Priv), Base, Opts),
+    Params = lib_patch_exec:params(Req, InSlot, Literal, Opts),
     ReqBin =
         hb_wasm_patch_codec:encode(
             case lib_patch_exec:encode(Params, term, Opts) of
@@ -365,6 +368,16 @@ decode_general(Reply, Opts) ->
             {error, try lib_patch_exec:decode(Error, Opts) catch _:_ -> Error end};
         Malformed -> Malformed
     end.
+
+%% Whether the process consumes tag values as literal URIs
+%% (`lua-input-links'): a property of its signed definition, so it is worked
+%% out at init or restore and kept with the instance's state. The lookup can
+%% resolve through the whole state, and cost 0.9 ms a slot.
+literal_links(false, St, _Base, _Opts) -> {false, St};
+literal_links(true, St = #{ literal_links := Literal }, _Base, _Opts) -> {Literal, St};
+literal_links(true, St, Base, Opts) ->
+    Literal = lib_patch_exec:literal_input_links(Base, Opts),
+    {Literal, St#{ literal_links => Literal }}.
 
 %% Call `wp_handle' on an instance at the state's gen. Another holder of the
 %% instance may move it between the check and the call; the NIF refuses that
@@ -512,6 +525,7 @@ restore(Base, Body, Opts) ->
     St0#{
         gen => Gen,
         fuel => fuel(<<"fuel-per-slot">>, ?DEFAULT_FUEL, Base, Info, Opts),
+        literal_links => lib_patch_exec:literal_input_links(Base, Opts),
         ckpt => {Gen, Mem, Gl},
         log => [],
         log_bytes => 0,

@@ -13,7 +13,7 @@
 %%% module runs under the interpreter: bit-identical results, only slower.
 -module(hb_wasm_aot).
 -export([get/2, key/2, flags/1, wamrc/1, wamr_tag/0]).
--export([instrument/3, instrument_version/1]).
+-export([instrument/3, instrument_version/1, prewarm/2]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -56,8 +56,57 @@ get(Wasm, Opts) ->
             end
     end.
 
+%% The cache directory: `wasm-patch-aot-dir', else `priv/wasm-aot' of the
+%% build, which an image pre-warms (`prewarm/2') and ships with.
 dir(Opts) ->
-    hb_util:list(hb_opts:get(<<"wasm-patch-aot-dir">>, <<"cache-wasm-aot">>, Opts)).
+    case hb_opts:get(<<"wasm-patch-aot-dir">>, not_found, Opts) of
+        not_found -> filename:join(code:priv_dir(hb), "wasm-aot");
+        Dir -> hb_util:list(Dir)
+    end.
+
+%% @doc Compile the approved modules ahead of time, as the node would at a
+%% process's first init, so a node starts with them cached. `File' is JSON:
+%% `{"modules": [{"sha256": <hex of the .wasm>, "source": <path or URL>}]}';
+%% a path is relative to the working directory. Each module is fetched,
+%% checked against its hash, instrumented under the node's memory cap and
+%% compiled. Returns `[{Sha256, Result}]'; nothing here is ever loaded from
+%% outside the node's own compiler. `make wasm-patch-prewarm' runs it.
+prewarm(File, Opts) ->
+    {ok, Json} = file:read_file(File),
+    #{ <<"modules">> := Modules } = json:decode(Json),
+    Cap = hb_util:int(hb_opts:get(<<"wasm-patch-max-pages">>, 65536, Opts)),
+    [ {Sha, prewarm_one(Sha, Source, Cap, Opts)}
+    || #{ <<"sha256">> := Sha, <<"source">> := Source } <- Modules ].
+
+prewarm_one(Sha, Source, Cap, Opts) ->
+    case fetch(Source) of
+        {ok, Wasm} ->
+            case hex(crypto:hash(sha256, Wasm)) of
+                Sha ->
+                    case instrument(Wasm, Cap, Opts) of
+                        {ok, Instrumented, _Version} ->
+                            case get(Instrumented, Opts#{ <<"wasm-patch-aot">> => true }) of
+                                {aot, _, Key} -> {ok, Key};
+                                {interp, Reason} -> {error, Reason}
+                            end;
+                        Other -> Other
+                    end;
+                Got -> {error, {sha256_mismatch, Got}}
+            end;
+        Error -> Error
+    end.
+
+fetch(<<"http://", _/binary>> = URL) -> http_get(URL);
+fetch(<<"https://", _/binary>> = URL) -> http_get(URL);
+fetch(Path) -> file:read_file(Path).
+
+http_get(URL) ->
+    {ok, _} = application:ensure_all_started([inets, ssl]),
+    case httpc:request(get, {hb_util:list(URL), []}, [{timeout, 60000}],
+            [{body_format, binary}]) of
+        {ok, {{_, 200, _}, _, Body}} -> {ok, Body};
+        Other -> {error, {fetch_failed, URL, Other}}
+    end.
 
 %% One compile at a time on this node; a second caller for the same module
 %% finds the first one's output when it gets the lock.
@@ -223,6 +272,30 @@ key_test() ->
     [Hash, Tag, _] = binary:split(K1, <<"/">>, [global]),
     ?assertEqual(64, byte_size(Hash)),
     ?assertEqual(?WAMR_TAG, Tag).
+
+prewarm_test_() ->
+    {timeout, 120, fun() ->
+        Dir = "_build/test-wasm-aot-prewarm",
+        {ok, Wasm} = file:read_file("test/wasm-patch/wp-test.wasm"),
+        Sha = hex(crypto:hash(sha256, Wasm)),
+        File = Dir ++ "/prewarm.json",
+        ok = filelib:ensure_dir(File),
+        ok = file:write_file(File, json:encode(#{ <<"modules">> => [
+            #{ <<"sha256">> => Sha, <<"source">> => <<"test/wasm-patch/wp-test.wasm">> },
+            #{ <<"sha256">> => binary:copy(<<"0">>, 64), <<"source">> => <<"test/wasm-patch/wp-test.wasm">> }
+        ]})),
+        Opts = #{ <<"wasm-patch-aot-dir">> => Dir },
+        [{Sha, First}, {_, Bad}] = prewarm(File, Opts),
+        ?assertMatch({error, {sha256_mismatch, _}}, Bad),
+        case wamrc(Opts) of
+            {ok, _} ->
+                {ok, Key} = First,
+                {ok, Instrumented, _} = instrument(Wasm, 65536, Opts),
+                ?assertMatch({aot, _, Key}, get(Instrumented, Opts));
+            {error, _} ->
+                ?assertMatch({error, _}, First)
+        end
+    end}.
 
 disabled_test() ->
     ?assertEqual({interp, disabled}, get(<<"x">>, #{ <<"wasm-patch-aot">> => false })),

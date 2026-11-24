@@ -5,7 +5,7 @@
 %%% terms, or `hb_wasm_patch_codec'); both hand `decode/2' the Luerl shape, so a
 %%% contract publishes the same terms on either.
 -module(lib_patch_exec).
--export([in_slot/1, slot/2, request/5, encode/3]).
+-export([in_slot/1, slot/2, request/5, params/4, literal_input_links/2, encode/3]).
 -export([decode/2, result/6, error_result/1, apply_result/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -52,22 +52,23 @@ request(Key, Base, Req, InSlot, Opts) ->
                     Opts#{ <<"hashpath">> => ignore }
                 )
         end,
-    Params = case InSlot of
-        true -> [Req];
-        false -> hb_ao:get_first(
-            [
-                {Req, <<"body/parameters">>},
-                {Req, <<"parameters">>}
-            ],
-            [Req],
-            Opts#{ <<"hashpath">> => ignore }
-        )
-    end,
-    InputParams = case InSlot andalso literal_input_links(Base, Opts) of
-        true -> [literal_request(Req, Opts)];
-        false -> Params
-    end,
-    {Function, InputParams}.
+    {Function, params(Req, InSlot, InSlot andalso literal_input_links(Base, Opts), Opts)}.
+
+%% @doc The parameters of a call, for a runtime with one entry point. In a slot
+%% they are the scheduled message alone, with literal links when the process
+%% asks for them (`Literal', from `literal_input_links/2', which a caller may
+%% work out once per process: it reads only the signed definition).
+params(Req, true, true, Opts) -> [literal_request(Req, Opts)];
+params(Req, true, false, _Opts) -> [Req];
+params(Req, false, _Literal, Opts) ->
+    hb_ao:get_first(
+        [
+            {Req, <<"body/parameters">>},
+            {Req, <<"parameters">>}
+        ],
+        [Req],
+        Opts#{ <<"hashpath">> => ignore }
+    ).
 
 %% @doc A process can consume tag values as literal URIs. This policy comes
 %% from its signed definition, not the incoming message or node defaults.
