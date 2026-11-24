@@ -521,12 +521,14 @@ snapshot(Base, _Req, Opts) ->
             hb_slot_log:note(wasm_snapshot_copy, T1 - T0),
             hb_slot_log:note(wasm_snapshot_bytes, byte_size(Mem)),
             % A checkpoint written off the slot (`lib_process_cache') is
-            % compressed whole there: the memory goes in as it is, and the
-            % slot only copies it.
-            Raw = hb_opts:get(<<"snapshot-deferred-compression">>, false, Opts) == true,
+            % compressed whole there, so the slot only copies the memory: it
+            % goes next to the body (`memory-encoding' separate), not into it,
+            % as encoding it into the body was a second copy of the whole
+            % instance in the slot (~1.5 s of a 2 GB one).
+            Deferred = hb_opts:get(<<"snapshot-deferred-compression">>, false, Opts) == true,
             {Encoding, Memory} =
-                case Raw of
-                    true -> {<<"raw">>, Mem};
+                case Deferred of
+                    true -> {<<"separate">>, <<>>};
                     false -> {<<"zlib">>, compress(Mem)}
                 end,
             T2 = erlang:monotonic_time(microsecond),
@@ -545,7 +547,10 @@ snapshot(Base, _Req, Opts) ->
             Body = term_to_binary(Snapshot, [deterministic]),
             hb_slot_log:note(wasm_snapshot_t2b, erlang:monotonic_time(microsecond) - T2),
             hb_slot_log:note(wasm_snapshot_compressed_bytes, byte_size(Body)),
-            {ok, #{ <<"body">> => Body }};
+            case Deferred of
+                true -> {ok, #{ <<"body">> => Body, <<"memory">> => Mem }};
+                false -> {ok, #{ <<"body">> => Body }}
+            end;
         _ ->
             {error, <<"Cannot snapshot wasm-patch state: not initialized.">>}
     end.
@@ -578,7 +583,11 @@ normalize(Base, _Req, RawOpts) ->
                     {as, <<"message@1.0">>, Base}, Opts) of
                 not_found -> throw({error, no_wasm_patch_snapshot_found});
                 Body ->
-                    try restore(Base, Body, Opts) of
+                    Separate = fun() ->
+                        hb_ao:get([<<"snapshot">>] ++ DeviceKey ++ [<<"memory">>],
+                            {as, <<"message@1.0">>, Base}, Opts)
+                    end,
+                    try restore(Base, Body, Separate, Opts) of
                         St -> {ok, hb_private:set(Base, <<"state">>, St, Opts)}
                     catch throw:{wasm_patch_init, Reason} -> init_error(Reason)
                     end
@@ -586,7 +595,7 @@ normalize(Base, _Req, RawOpts) ->
         _ -> {ok, Base}
     end.
 
-restore(Base, Body, Opts) ->
+restore(Base, Body, Separate, Opts) ->
     Snapshot =
         try binary_to_term(Body, [safe])
         catch _:_ -> throw({wasm_patch_init, <<"the snapshot does not decode">>})
@@ -611,6 +620,12 @@ restore(Base, Body, Opts) ->
     end,
     Mem =
         case maps:get(<<"memory-encoding">>, Snapshot, <<"zlib">>) of
+            <<"separate">> ->
+                case Separate() of
+                    Bin when is_binary(Bin) -> Bin;
+                    _ -> throw({wasm_patch_init, <<"the snapshot's memory is missing">>})
+                end;
+            % As df9322fde wrote them: the memory uncompressed in the body.
             <<"raw">> -> Memory;
             <<"zlib">> -> zlib:uncompress(Memory)
         end,
@@ -751,15 +766,28 @@ snapshot_restore_test() ->
     ?assertEqual(<<"16">>, count(S6, Opts)),
     % The two instances are independent.
     ?assertEqual(<<"16">>, count(run(S5, [<<"Increment">>], Opts), Opts)),
-    % A snapshot left uncompressed for a checkpoint written off the slot
-    % restores the same.
-    {ok, RawSnapshot} = hb_ao:resolve(S5, <<"snapshot">>,
+    % A snapshot for a checkpoint written off the slot keeps the memory next
+    % to the body, uncompressed, and restores the same; so does one with the
+    % memory uncompressed in the body (as df9322fde wrote them).
+    {ok, Deferred} = hb_ao:resolve(S5, <<"snapshot">>,
         Opts#{ <<"snapshot-deferred-compression">> => true }),
-    ?assertMatch(#{ <<"memory-encoding">> := <<"raw">> },
-        binary_to_term(hb_ao:get(<<"body">>, RawSnapshot, Opts))),
-    {ok, RawRestored} = hb_ao:resolve(
-        hb_ao:set(hb_private:reset(S5), <<"snapshot">>, RawSnapshot, Opts), <<"normalize">>, Opts),
-    ?assertEqual(<<"16">>, count(run(RawRestored, [<<"Increment">>], Opts), Opts)),
+    DeferredBody = binary_to_term(hb_ao:get(<<"body">>, Deferred, Opts)),
+    ?assertMatch(#{ <<"memory-encoding">> := <<"separate">>, <<"memory">> := <<>> }, DeferredBody),
+    Mem = hb_ao:get(<<"memory">>, Deferred, Opts),
+    ?assert(byte_size(Mem) > 0),
+    Raw = #{ <<"body">> => term_to_binary(DeferredBody#{
+        <<"memory-encoding">> => <<"raw">>, <<"memory">> => Mem }) },
+    lists:foreach(
+        fun(Snap) ->
+            {ok, R} = hb_ao:resolve(
+                hb_ao:set(hb_private:reset(S5), <<"snapshot">>, Snap, Opts), <<"normalize">>, Opts),
+            ?assertEqual(<<"16">>, count(run(R, [<<"Increment">>], Opts), Opts))
+        end,
+        [Deferred, Raw]),
+    % Without its memory, a separate snapshot is refused.
+    ?assertMatch({error, #{ <<"status">> := 422 }},
+        hb_ao:resolve(hb_ao:set(hb_private:reset(S5), <<"snapshot">>,
+            maps:remove(<<"memory">>, Deferred), Opts), <<"normalize">>, Opts)),
     % A snapshot of another image is refused.
     Other = hb_ao:set(Cold, <<"image">>, <<0, "asm", 1:32/little>>, Opts),
     ?assertMatch({error, #{ <<"status">> := 422 }}, hb_ao:resolve(Other, <<"normalize">>, Opts)).
