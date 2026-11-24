@@ -17,6 +17,8 @@
  *   env.getTempRet0 / env.setTempRet0
  *   env.wp_bls_fav          BLS12-381 fast aggregate verify (blst).
  *   env.wp_rsa_pss_sha256   RSA-PSS-SHA256 verify, as `rsa_pss:verify/4'.
+ *   env.wp_rng_bls, env.wp_rng_reveal, env.wp_rng_crack
+ *                           `rng@1.0''s checks (dev_rng.erl), for the RNG beacons.
  * The last two serve `bridge-root@1.0''s checks to the Lua runtime: pure,
  * fixed fuel per call (see "verification natives").
  *
@@ -301,6 +303,254 @@ done:
     return ok;
 }
 
+/* ---------- rng@1.0 natives ----------
+ *
+ * The Lua runtime's own `rng@1.0' (rng_device.lua) serves `ao.resolve' for
+ * the RNG beacons over these three, the way `dev_rng.erl' serves them under
+ * lua-patch@1.0. Each is one of the device's checks, step for step, so every
+ * answer matches it. Same rules as the verification natives above: pure,
+ * fixed fuel first, pointers checked, malformed bytes are an answer. */
+
+/* A slot of the order book is ~1e8 fuel for ~1 ms; one pairing check is
+ * ~1.5 ms, a 2048-bit time-lock check 0.3-1 ms. */
+#define FUEL_RNG_BLS 1000000000LL
+#define FUEL_RNG_REVEAL 200000000LL
+#define FUEL_RNG_CRACK 300000000LL
+#define RNG_MAX_MSG (1 << 20)
+#define RNG_MAX_ELEMENT_HEX 512
+#define RNG_MAX_ALPHA_HEX 128
+#define RNG_MAX_T 4294967296LL
+
+/* The built-in RSA-2048 group (dev_rng.erl ?N_HEX, ?G_HEX). */
+static const char RNG_N_HEX[] =
+    "c7970ceedcc3b0754490201a7aa613cd73911081c790f5f1a8726f463550bb5b"
+    "7ff0db8e1ea1189ec72f93d1650011bd721aeeacc2acde32a04107f0648c2813"
+    "a31f5b0b7765ff8b44b4b6ffc93384b646eb09c7cf5e8592d40ea33c80039f35"
+    "b4f14a04b51f7bfd781be4d1673164ba8eb991c2c4d730bbbe35f592bdef524a"
+    "f7e8daefd26c66fc02c479af89d64d373f442709439de66ceb955f3ea37d5159"
+    "f6135809f85334b5cb1813addc80cd05609f10ac6a95ad65872c909525bdad32"
+    "bc729592642920f24c61dc5b3c3b7923e56b16a4d9d373d8721f24a3fc0f1b31"
+    "31f55615172866bccc30f95054c824e733a5eb6817f7bc16399d48c6361cc7e5";
+static const char RNG_G_HEX[] =
+    "af837d388770d250471f03e561cef2f1d2793a166c01b582123ab1d418a26533"
+    "1ffbe5bcf204f7d4d1a9d880feac19f16f45e7d03a6df66a763cc524106e1b88"
+    "1afbb78b92994e69f0bcaee1ceb87688447e19e643cad5de61dcb6039d0f84a8"
+    "1ebe1372e718fdd42447b48b0df11e6a7d704279a01b2eb7083769b38fea7b1f"
+    "b35c161137e9b570ce49d6eb9185c424ad8e79b06a9e1edfc185982efc755c9e"
+    "4cdf4961ddea042df9aa94383fb8aa720df097a738e3b6b6f5a331077a8d878a"
+    "e424892a911fb0cb8030f29fb3edd3115af0fc88e1c00fafca3d6f10b0a28cf3"
+    "dbcecff52398f6b53f00ac1622a0d72696aeba05ad8d817ebc31b8e3e159a2e8";
+static const char BLS_NUL_DST[] = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+
+/* env.wp_rng_bls(pk, pk_len, msg, msg_len, sig, sig_len) -> code
+ * `blst_nif:verify/3' (the NUL ciphersuite) as one code: 1 true, 0 false,
+ * and its error atoms as -1 bad_public_key_size, -2 bad_public_key,
+ * -3 public_key_is_infinity, -4 public_key_not_in_group, -5
+ * bad_signature_size, -6 bad_signature, -7 signature_not_in_group, checked
+ * in that order. Messages up to 1 MiB. */
+static int32_t n_rng_bls(wasm_exec_env_t e, uint32_t pk_ptr, uint32_t pk_len,
+        uint32_t msg, uint32_t msg_len, uint32_t sig_ptr, uint32_t sig_len) {
+    if (!charge(e, FUEL_RNG_BLS)) return 0;
+    if (msg_len > RNG_MAX_MSG) return 0;
+    const uint8_t *k, *m, *s;
+    if (!(k = app_bytes(e, pk_ptr, pk_len)) || !(m = app_bytes(e, msg, msg_len))
+            || !(s = app_bytes(e, sig_ptr, sig_len)))
+        return 0;
+    blst_p1_affine pk;
+    blst_p2_affine sg;
+    if (pk_len != BLS_PK) return -1;
+    if (blst_p1_uncompress(&pk, k) != BLST_SUCCESS) return -2;
+    if (blst_p1_affine_is_inf(&pk)) return -3;
+    if (!blst_p1_affine_in_g1(&pk)) return -4;
+    if (sig_len != BLS_SIG) return -5;
+    if (blst_p2_uncompress(&sg, s) != BLST_SUCCESS) return -6;
+    if (!blst_p2_affine_in_g2(&sg)) return -7;
+    return blst_core_verify_pk_in_g1(&pk, &sg, true, m, msg_len,
+        (const byte *)BLS_NUL_DST, sizeof BLS_NUL_DST - 1, NULL, 0) == BLST_SUCCESS;
+}
+
+/* Lowercase hex digits only, 1 to `max' of them. The caller (rng_device.lua)
+ * has already refused anything else; this only keeps the native total. */
+static int rng_hex_ok(const uint8_t *h, uint32_t n, uint32_t max) {
+    if (n < 1 || n > max) return 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (!((h[i] >= '0' && h[i] <= '9') || (h[i] >= 'a' && h[i] <= 'f'))) return 0;
+    return 1;
+}
+
+static BIGNUM *rng_bn_hex(const uint8_t *h, uint32_t n) {
+    char buf[RNG_MAX_ELEMENT_HEX + 1];
+    if (n > RNG_MAX_ELEMENT_HEX) return NULL;
+    memcpy(buf, h, n);
+    buf[n] = 0;
+    BIGNUM *b = NULL;
+    if (BN_hex2bn(&b, buf) != (int)n) { BN_free(b); return NULL; }
+    return b;
+}
+
+/* canonical(Y) = min(Y, N - Y) as lowercase hex without leading zeros (as
+ * `integer_to_binary(_, 16)' lowercased) into out (512 bytes). Returns its
+ * length, or -1. */
+static int32_t rng_put_canonical(wasm_exec_env_t e, uint32_t out_ptr, const BIGNUM *y,
+        const BIGNUM *n) {
+    uint8_t *out = (uint8_t *)app_bytes(e, out_ptr, RNG_MAX_ELEMENT_HEX);
+    if (!out) return -1;
+    BIGNUM *other = BN_new();
+    if (!other || !BN_sub(other, n, y)) { BN_free(other); return -1; }
+    const BIGNUM *c = BN_cmp(y, other) <= 0 ? y : other;
+    uint8_t bin[RNG_MAX_ELEMENT_HEX / 2];
+    if (BN_num_bytes(c) > (int)sizeof bin) { BN_free(other); return -1; }
+    int len = BN_bn2bin(c, bin);
+    static const char D[] = "0123456789abcdef";
+    int k = 0;
+    if (len == 0) out[k++] = '0';
+    for (int i = 0; i < len; i++) {
+        if (i > 0 || bin[i] >> 4) out[k++] = D[bin[i] >> 4];
+        out[k++] = D[bin[i] & 15];
+    }
+    BN_free(other);
+    return k;
+}
+
+/* env.wp_rng_reveal(c, c_len, alpha, alpha_len, h, h_len, out) -> len | -1
+ * dev_rng:check_reveal/3: g^alpha = c (mod N), then canonical(h^alpha mod N)
+ * as hex into out. Inputs are lowercase hex (c and h at most 512 digits,
+ * alpha at most 128); -1 is the device's `verify-failed'. */
+static int32_t n_rng_reveal(wasm_exec_env_t e, uint32_t c_ptr, uint32_t c_len,
+        uint32_t a_ptr, uint32_t a_len, uint32_t h_ptr, uint32_t h_len, uint32_t out) {
+    if (!charge(e, FUEL_RNG_REVEAL)) return -1;
+    const uint8_t *cb, *ab, *hb;
+    if (!(cb = app_bytes(e, c_ptr, c_len)) || !(ab = app_bytes(e, a_ptr, a_len))
+            || !(hb = app_bytes(e, h_ptr, h_len)))
+        return -1;
+    if (!rng_hex_ok(cb, c_len, RNG_MAX_ELEMENT_HEX) || !rng_hex_ok(ab, a_len, RNG_MAX_ALPHA_HEX)
+            || !rng_hex_ok(hb, h_len, RNG_MAX_ELEMENT_HEX))
+        return -1;
+    int32_t ret = -1;
+    BN_CTX *ctx = BN_CTX_new();
+    BIGNUM *n = rng_bn_hex((const uint8_t *)RNG_N_HEX, sizeof RNG_N_HEX - 1);
+    BIGNUM *g = rng_bn_hex((const uint8_t *)RNG_G_HEX, sizeof RNG_G_HEX - 1);
+    BIGNUM *c = rng_bn_hex(cb, c_len), *a = rng_bn_hex(ab, a_len), *h = rng_bn_hex(hb, h_len);
+    BIGNUM *r = BN_new();
+    if (!ctx || !n || !g || !c || !a || !h || !r) goto done;
+    if (!BN_mod_exp(r, g, a, n, ctx) || BN_cmp(r, c) != 0) goto done;
+    if (!BN_mod_exp(r, h, a, n, ctx)) goto done;
+    ret = rng_put_canonical(e, out, r, n);
+done:
+    BN_free(n); BN_free(g); BN_free(c); BN_free(a); BN_free(h); BN_free(r);
+    BN_CTX_free(ctx);
+    return ret;
+}
+
+/* The primes below 1000 (dev_rng:small_primes/0). */
+static const uint16_t RNG_SMALL_PRIMES[] = {
+    2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71,
+    73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163,
+    167, 173, 179, 181, 191, 193, 197, 199, 211, 223, 227, 229, 233, 239, 241, 251, 257,
+    263, 269, 271, 277, 281, 283, 293, 307, 311, 313, 317, 331, 337, 347, 349, 353, 359,
+    367, 373, 379, 383, 389, 397, 401, 409, 419, 421, 431, 433, 439, 443, 449, 457, 461,
+    463, 467, 479, 487, 491, 499, 503, 509, 521, 523, 541, 547, 557, 563, 569, 571, 577,
+    587, 593, 599, 601, 607, 613, 617, 619, 631, 641, 643, 647, 653, 659, 661, 673, 677,
+    683, 691, 701, 709, 719, 727, 733, 739, 743, 751, 757, 761, 769, 773, 787, 797, 809,
+    811, 821, 823, 827, 829, 839, 853, 857, 859, 863, 877, 881, 883, 887, 907, 911, 919,
+    929, 937, 941, 947, 953, 967, 971, 977, 983, 991, 997,
+};
+#define RNG_N_SMALL (sizeof RNG_SMALL_PRIMES / sizeof *RNG_SMALL_PRIMES)
+
+/* dev_rng:is_probable_prime/2 for a candidate >= 2^127: trial division by
+ * the primes below 1000, then Miller-Rabin with the first 20 primes as bases.
+ * 1 prime, 0 composite, -1 an allocation failed. */
+static int rng_probable_prime(const BIGNUM *c, BN_CTX *ctx) {
+    for (size_t i = 0; i < RNG_N_SMALL; i++) {
+        BN_ULONG rem = BN_mod_word(c, RNG_SMALL_PRIMES[i]);
+        if (rem == (BN_ULONG)-1) return -1;
+        if (rem == 0) return 0;
+    }
+    int ret = -1;
+    BIGNUM *nm1 = BN_dup(c), *d = BN_new(), *a = BN_new(), *x = BN_new();
+    if (!nm1 || !d || !a || !x || !BN_sub_word(nm1, 1) || !BN_copy(d, nm1)) goto done;
+    int s = 0;
+    while (!BN_is_odd(d)) { if (!BN_rshift1(d, d)) goto done; s++; }
+    ret = 1;
+    for (int i = 0; i < 20 && ret == 1; i++) {
+        if (!BN_set_word(a, RNG_SMALL_PRIMES[i]) || !BN_mod_exp(x, a, d, c, ctx)) { ret = -1; break; }
+        if (BN_is_one(x) || BN_cmp(x, nm1) == 0) continue;
+        int found = 0;
+        for (int left = s - 1; left > 0 && !found; left--) {
+            if (!BN_mod_sqr(x, x, c, ctx)) { ret = -1; break; }
+            found = BN_cmp(x, nm1) == 0;
+        }
+        if (ret == 1 && !found) ret = 0;
+    }
+done:
+    BN_free(nm1); BN_free(d); BN_free(a); BN_free(x);
+    return ret;
+}
+
+/* env.wp_rng_crack(x, x_len, y, y_len, t, t_len, proof, proof_len, out) -> len | -1
+ * dev_rng:check_crack/6: with l the Wesolowski challenge prime (the first
+ * prime at or above the first 128 bits of
+ * SHA-256("rng/wesolowski|" x "|" y "|" t), bits 127 and 0 set), checks
+ * proof^l * x^(2^t mod l) = y (mod N) and writes canonical(y) as hex into
+ * out. x, y, proof: lowercase hex, at most 512 digits; t: its decimal
+ * without leading zeros, at most 2^32. -1 is `verify-failed'. */
+static int32_t n_rng_crack(wasm_exec_env_t e, uint32_t x_ptr, uint32_t x_len,
+        uint32_t y_ptr, uint32_t y_len, uint32_t t_ptr, uint32_t t_len,
+        uint32_t p_ptr, uint32_t p_len, uint32_t out) {
+    if (!charge(e, FUEL_RNG_CRACK)) return -1;
+    const uint8_t *xb, *yb, *tb, *pb;
+    if (!(xb = app_bytes(e, x_ptr, x_len)) || !(yb = app_bytes(e, y_ptr, y_len))
+            || !(tb = app_bytes(e, t_ptr, t_len)) || !(pb = app_bytes(e, p_ptr, p_len)))
+        return -1;
+    if (!rng_hex_ok(xb, x_len, RNG_MAX_ELEMENT_HEX) || !rng_hex_ok(yb, y_len, RNG_MAX_ELEMENT_HEX)
+            || !rng_hex_ok(pb, p_len, RNG_MAX_ELEMENT_HEX) || t_len < 1 || t_len > 10)
+        return -1;
+    int64_t t = 0;
+    for (uint32_t i = 0; i < t_len; i++) {
+        if (tb[i] < '0' || tb[i] > '9' || (i == 0 && tb[i] == '0' && t_len > 1)) return -1;
+        t = t * 10 + (tb[i] - '0');
+    }
+    if (t > RNG_MAX_T) return -1;
+    /* The challenge's preimage, then its first 128 bits with bits 127 and 0 set. */
+    uint8_t pre[15 + RNG_MAX_ELEMENT_HEX * 2 + 2 + 10], digest[32];
+    size_t k = 0;
+    memcpy(pre + k, "rng/wesolowski|", 15); k += 15;
+    memcpy(pre + k, xb, x_len); k += x_len;
+    pre[k++] = '|';
+    memcpy(pre + k, yb, y_len); k += y_len;
+    pre[k++] = '|';
+    memcpy(pre + k, tb, t_len); k += t_len;
+    sha256_of(pre, k, digest);
+    digest[0] |= 0x80;
+    digest[15] |= 0x01;
+    int32_t ret = -1;
+    BN_CTX *ctx = BN_CTX_new();
+    BIGNUM *n = rng_bn_hex((const uint8_t *)RNG_N_HEX, sizeof RNG_N_HEX - 1);
+    BIGNUM *x = rng_bn_hex(xb, x_len), *y = rng_bn_hex(yb, y_len), *p = rng_bn_hex(pb, p_len);
+    BIGNUM *l = BN_bin2bn(digest, 16, NULL), *two = BN_new(), *te = BN_new(), *r = BN_new();
+    BIGNUM *a = BN_new(), *b = BN_new();
+    if (!ctx || !n || !x || !y || !p || !l || !two || !te || !r || !a || !b) goto done;
+    for (;;) {
+        int prime = rng_probable_prime(l, ctx);
+        if (prime < 0) goto done;
+        if (prime) break;
+        if (!BN_add_word(l, 2)) goto done;
+    }
+    /* t may be 2^32, past a 32-bit BN_ULONG: build it from two halves. */
+    if (!BN_set_word(two, 2) || !BN_set_word(te, (BN_ULONG)(t >> 16)) || !BN_lshift(te, te, 16)
+            || !BN_add_word(te, (BN_ULONG)(t & 0xFFFF)))
+        goto done;
+    if (!BN_mod_exp(r, two, te, l, ctx)) goto done;
+    if (!BN_mod_exp(a, p, l, n, ctx) || !BN_mod_exp(b, x, r, n, ctx)) goto done;
+    if (!BN_mod_mul(a, a, b, n, ctx) || BN_cmp(a, y) != 0) goto done;
+    ret = rng_put_canonical(e, out, y, n);
+done:
+    BN_free(n); BN_free(x); BN_free(y); BN_free(p); BN_free(l); BN_free(two);
+    BN_free(te); BN_free(r); BN_free(a); BN_free(b);
+    BN_CTX_free(ctx);
+    return ret;
+}
+
 static NativeSymbol FIXED_NATIVES[] = {
     { "throw_longjmp", (void *)n_throw_longjmp, "()", NULL },
     { "setThrew", (void *)n_set_threw, "(ii)", NULL },
@@ -308,6 +558,9 @@ static NativeSymbol FIXED_NATIVES[] = {
     { "setTempRet0", (void *)n_set_temp_ret0, "(i)", NULL },
     { "wp_bls_fav", (void *)n_bls_fav, "(iiiiiii)i", NULL },
     { "wp_rsa_pss_sha256", (void *)n_rsa_pss_sha256, "(iiiii)i", NULL },
+    { "wp_rng_bls", (void *)n_rng_bls, "(iiiiii)i", NULL },
+    { "wp_rng_reveal", (void *)n_rng_reveal, "(iiiiiii)i", NULL },
+    { "wp_rng_crack", (void *)n_rng_crack, "(iiiiiiiii)i", NULL },
 };
 
 static int allowed_import(const char *module, const char *name) {

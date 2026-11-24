@@ -130,7 +130,10 @@ fn allowlisted_imports_accepted() {
         (import "env" "invoke_vii" (func (param i32 i32 i32)))
         (import "env" "throw_longjmp" (func))
         (import "env" "wp_bls_fav" (func (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
-        (import "env" "wp_rsa_pss_sha256" (func (param i32 i32 i32 i32 i32) (result i32))))"#)
+        (import "env" "wp_rsa_pss_sha256" (func (param i32 i32 i32 i32 i32) (result i32)))
+        (import "env" "wp_rng_bls" (func (param i32 i32 i32 i32 i32 i32) (result i32)))
+        (import "env" "wp_rng_reveal" (func (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+        (import "env" "wp_rng_crack" (func (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32))))"#)
     .unwrap();
 }
 
@@ -144,6 +147,7 @@ fn refuses_imports_outside_the_allowlist() {
     refused(r#"(module (import "env" "throw_longjmp" (func (param i32))))"#, "wrong signature");
     refused(r#"(module (import "env" "wp_bls_fav" (func (param i32 i32 i32 i32 i32 i32 i32))))"#, "wrong signature");
     refused(r#"(module (import "env" "wp_rsa_pss_sha256" (func (param i64 i64 i64 i64 i64) (result i32))))"#, "wrong signature");
+    refused(r#"(module (import "env" "wp_rng_crack" (func (param i32 i32 i32 i32 i64 i32 i32 i32 i32) (result i32))))"#, "wrong signature");
     refused(r#"(module (import "env" "memory" (memory 1 2)))"#, "not a function");
     refused(r#"(module (import "env" "g" (global i32)))"#, "not a function");
     refused(r#"(module (import "env" "t" (table 1 funcref)))"#, "not a function");

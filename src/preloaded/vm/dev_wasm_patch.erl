@@ -1561,6 +1561,221 @@ br_vectors() ->
     ],
     Possession ++ Verify.
 
+%% `rng@1.0' through `ao.resolve': the Lua runtime's own rng_device.lua, over
+%% this NIF's rng natives (`wp_rng_bls', `wp_rng_reveal', `wp_rng_crack'),
+%% against the Erlang device (dev_rng) under `lua-patch@1.0'. Every key the
+%% RNG beacons use, valid and refused, and the device's own interop vectors,
+%% give the same status and the same value as Lua sees it, under the
+%% interpreter and AOT, instrumented. Runs when `HB_WASM_LUA' names the
+%% runtime's `.wasm'; `HB_RNG_VECTORS' also writes the vectors and
+%% lua-patch's answers as JSON, for the runtime's own host test.
+rng_matches_lua_patch_test_() ->
+    {timeout, 900, fun() ->
+        case os:getenv("HB_WASM_LUA") of
+            false -> ok;
+            Path ->
+                hb:init(),
+                {ok, Runtime} = file:read_file(Path),
+                Vectors = rng_vectors(),
+                Module = #{ <<"content-type">> => <<"application/lua">>,
+                    <<"body">> => rng_script() },
+                Interp = test_opts(#{ <<"wasm-patch-allow-uninstrumented">> => false }),
+                Aot = Interp#{ <<"wasm-patch-aot">> => true,
+                    <<"wasm-patch-aot-dir">> => "_build/test-wasm-aot-rng" },
+                Run =
+                    fun(Base, Opts) ->
+                        {ok, S0} = hb_ao:resolve(Base, <<"init">>, Opts),
+                        lists:map(
+                            fun({Name, _Valid, Call}) ->
+                                {ok, S} = hb_ao:resolve(S0,
+                                    #{ <<"path">> => <<"compute">>,
+                                        <<"body">> => #{ <<"call">> => Call } }, Opts),
+                                {Name, hb_ao:get(<<"r">>, S, Opts)}
+                            end,
+                            Vectors
+                        )
+                    end,
+                Lua = Run(#{ <<"device">> => <<"lua-patch@1.0">>, <<"module">> => Module }, Interp),
+                % Each vector says whether the Erlang device answers valid, so a
+                % vector that stopped testing what it names fails here.
+                lists:foreach(
+                    fun({{Name, Valid, _}, {Name, Out}}) ->
+                        Got = binary:match(Out, <<"s76616c6964=boolean:true">>) =/= nomatch,
+                        ?assertEqual({Name, Valid}, {Name, Got})
+                    end,
+                    lists:zip(Vectors, Lua)
+                ),
+                case os:getenv("HB_RNG_VECTORS") of
+                    false -> ok;
+                    Out ->
+                        ok = file:write_file(Out, hb_json:encode(#{
+                            <<"script">> => rng_script(),
+                            <<"vectors">> => [
+                                #{ <<"name">> => Name, <<"call">> => br_json(Call),
+                                    <<"expect">> => Result }
+                            || {{Name, _, Call}, {Name, Result}} <- lists:zip(Vectors, Lua)]
+                        }))
+                end,
+                WasmBase = #{ <<"device">> => ?DEVICE, <<"image">> => Runtime, <<"module">> => Module },
+                lists:foreach(
+                    fun(Opts) ->
+                        lists:foreach(
+                            fun({Expected, Got}) -> ?assertEqual(Expected, Got) end,
+                            lists:zip(Lua, Run(WasmBase, Opts))
+                        )
+                    end,
+                    [Interp, Aot]
+                ),
+                % A native charges its fixed fuel before it runs: a slot that
+                % cannot pay traps as out of fuel, the same under both.
+                [{_, true, BlsValid} | _] = [V || {<<"bls-", _/binary>>, true, _} = V <- Vectors],
+                lists:foreach(
+                    fun(Opts) ->
+                        {ok, Low} = hb_ao:resolve(WasmBase#{ <<"fuel-per-slot">> => 500000000 },
+                            <<"init">>, Opts),
+                        ?assertMatch(
+                            {error, #{ <<"body">> := <<"wasm-patch@1.0 trap: out of fuel">> }},
+                            hb_ao:resolve(Low, #{ <<"path">> => <<"compute">>,
+                                <<"body">> => #{ <<"call">> => BlsValid } }, Opts))
+                    end,
+                    [Interp, Aot]
+                )
+        end
+    end}.
+
+%% Calls `ao.resolve' with the request in the slot's body, as the beacons do
+%% (one table, its `path' naming the key), and publishes the answer
+%% serialised canonically (br_script's `ser').
+rng_script() ->
+    binary:replace(br_script(),
+        <<"ao.resolve({ device = 'bridge-root@1.0' }, body.call)">>,
+        <<"ao.resolve(body.call)">>).
+
+%% {Name, Valid, Call}: Call is the table a beacon hands `ao.resolve'.
+rng_vectors() ->
+    P = fun(Key, Inputs) -> Inputs#{ <<"path">> => <<"/~rng@1.0/", Key/binary>> } end,
+    Timelock = [
+        {<<"tl-", Name/binary>>, maps:get(<<"valid">>, Expected), P(Key, Inputs)}
+    ||
+        {Name, Key, Inputs, Expected} <- dev_rng_timelock_test_vectors:timelock_vectors()
+    ],
+    {_, _, Reveal, _} = hd([V || {_, <<"verify-reveal">>, _, #{ <<"valid">> := true }} = V
+        <- dev_rng_timelock_test_vectors:timelock_vectors()]),
+    {_, _, Crack, _} = hd([V || {_, <<"verify-crack">>, _, #{ <<"valid">> := true }} = V
+        <- dev_rng_timelock_test_vectors:timelock_vectors()]),
+    #{ <<"t">> := T } = Crack,
+    TInt = hb_util:int(T),
+    Bls = [
+        {<<"bls-", Name/binary>>, Valid, P(<<"verify-bls">>, Inputs)}
+    ||
+        {Name, Inputs, Valid} <-
+            dev_rng_test_vectors:bls_vectors() ++ dev_rng_timelock_test_vectors:bls_vectors()
+    ],
+    [{_, BlsIn, true} | _] = dev_rng_test_vectors:bls_vectors(),
+    Upper = fun(K, M) -> M#{ K => string:uppercase(maps:get(K, M)) } end,
+    Without = fun(K, M) -> maps:remove(K, M) end,
+    Edit = [
+        {<<"reveal-t-ignored">>, true, P(<<"verify-reveal">>, Reveal#{ <<"t">> => 5 })},
+        {<<"reveal-c-upper">>, false, P(<<"verify-reveal">>, Upper(<<"c">>, Reveal))},
+        {<<"reveal-c-leading-zero">>, false,
+            P(<<"verify-reveal">>, Reveal#{ <<"c">> => <<"0", (maps:get(<<"c">>, Reveal))/binary>> })},
+        {<<"reveal-c-zero">>, false, P(<<"verify-reveal">>, Reveal#{ <<"c">> => <<"0">> })},
+        {<<"reveal-c-n">>, false, P(<<"verify-reveal">>, Reveal#{ <<"c">> => rng_n_hex() })},
+        {<<"reveal-c-long">>, false,
+            P(<<"verify-reveal">>, Reveal#{ <<"c">> => binary:copy(<<"f">>, 513) })},
+        {<<"reveal-c-int">>, false, P(<<"verify-reveal">>, Reveal#{ <<"c">> => 7 })},
+        {<<"reveal-c-missing">>, false, P(<<"verify-reveal">>, Without(<<"c">>, Reveal))},
+        {<<"reveal-h-missing">>, false, P(<<"verify-reveal">>, Without(<<"h">>, Reveal))},
+        {<<"reveal-alpha-missing">>, false, P(<<"verify-reveal">>, Without(<<"alpha">>, Reveal))},
+        {<<"reveal-alpha-zero">>, false, P(<<"verify-reveal">>, Reveal#{ <<"alpha">> => <<"0">> })},
+        {<<"reveal-alpha-zero-c-one">>, true,
+            P(<<"verify-reveal">>, Reveal#{ <<"alpha">> => <<"0">>, <<"c">> => <<"1">> })},
+        {<<"reveal-alpha-long">>, false,
+            P(<<"verify-reveal">>, Reveal#{ <<"alpha">> => binary:copy(<<"1">>, 129) })},
+        {<<"reveal-alpha-bad">>, false, P(<<"verify-reveal">>, Reveal#{ <<"alpha">> => <<"xyz">> })},
+        {<<"reveal-mixed-case-key">>, true,
+            P(<<"verify-reveal">>, maps:put(<<"C">>, maps:get(<<"c">>, Reveal), Without(<<"c">>, Reveal)))},
+        {<<"crack-t-int">>, true, P(<<"verify-crack">>, Crack#{ <<"t">> => TInt })},
+        {<<"crack-t-float">>, false, P(<<"verify-crack">>, Crack#{ <<"t">> => TInt * 1.0 })},
+        {<<"crack-t-neg">>, false, P(<<"verify-crack">>, Crack#{ <<"t">> => -1 })},
+        {<<"crack-t-leading-zero">>, false, P(<<"verify-crack">>, Crack#{ <<"t">> => <<"0", T/binary>> })},
+        {<<"crack-t-plus">>, false, P(<<"verify-crack">>, Crack#{ <<"t">> => <<"+", T/binary>> })},
+        {<<"crack-t-max">>, false, P(<<"verify-crack">>, Crack#{ <<"t">> => <<"4294967296">> })},
+        {<<"crack-t-max-int">>, false, P(<<"verify-crack">>, Crack#{ <<"t">> => 4294967296 })},
+        {<<"crack-t-over">>, false, P(<<"verify-crack">>, Crack#{ <<"t">> => <<"4294967297">> })},
+        {<<"crack-t-long">>, false, P(<<"verify-crack">>, Crack#{ <<"t">> => <<"123456789012">> })},
+        {<<"crack-t-long-bad">>, false, P(<<"verify-crack">>, Crack#{ <<"t">> => <<"12345678901x">> })},
+        {<<"crack-t-zero">>, false, P(<<"verify-crack">>, Crack#{ <<"t">> => <<"0">> })},
+        {<<"crack-t-empty">>, false, P(<<"verify-crack">>, Crack#{ <<"t">> => <<>> })},
+        {<<"crack-t-missing">>, false, P(<<"verify-crack">>, Without(<<"t">>, Crack))},
+        {<<"crack-t-other">>, false, P(<<"verify-crack">>, Crack#{ <<"t">> => TInt + 1 })},
+        {<<"crack-proof-missing">>, false, P(<<"verify-crack">>, Without(<<"proof">>, Crack))},
+        {<<"crack-y-upper">>, false, P(<<"verify-crack">>, Upper(<<"y">>, Crack))},
+        {<<"crack-x-zero">>, false, P(<<"verify-crack">>, Crack#{ <<"x">> => <<"0">> })},
+        {<<"bls-upper-hex">>, true,
+            P(<<"verify-bls">>, Upper(<<"signature">>, Upper(<<"public-key">>, BlsIn)))},
+        {<<"bls-odd-hex">>, false,
+            P(<<"verify-bls">>, BlsIn#{ <<"public-key">> => <<"abc">> })},
+        {<<"bls-empty-key">>, false, P(<<"verify-bls">>, BlsIn#{ <<"public-key">> => <<>> })},
+        {<<"bls-short-key">>, false,
+            P(<<"verify-bls">>, BlsIn#{ <<"public-key">> => binary:copy(<<"ab">>, 47) })},
+        {<<"bls-garbage-key">>, false,
+            P(<<"verify-bls">>, BlsIn#{ <<"public-key">> => binary:copy(<<"07">>, 48) })},
+        {<<"bls-infinity-key">>, false,
+            P(<<"verify-bls">>, BlsIn#{ <<"public-key">> => binary:encode_hex(<<16#c0, 0:376>>, lowercase) })},
+        {<<"bls-off-subgroup-key">>, false,
+            P(<<"verify-bls">>, BlsIn#{ <<"public-key">> => binary:encode_hex(br_g1_off(1), lowercase) })},
+        {<<"bls-short-sig">>, false,
+            P(<<"verify-bls">>, BlsIn#{ <<"signature">> => binary:copy(<<"ab">>, 95) })},
+        {<<"bls-garbage-sig">>, false,
+            P(<<"verify-bls">>, BlsIn#{ <<"signature">> => binary:copy(<<"07">>, 96) })},
+        {<<"bls-off-subgroup-sig">>, false,
+            P(<<"verify-bls">>, BlsIn#{ <<"signature">> => binary:encode_hex(br_g2_off(1), lowercase) })},
+        {<<"bls-message-int">>, false, P(<<"verify-bls">>, BlsIn#{ <<"message">> => 5 })},
+        {<<"bls-message-missing">>, false, P(<<"verify-bls">>, Without(<<"message">>, BlsIn))},
+        {<<"bls-other-message">>, false,
+            P(<<"verify-bls">>, BlsIn#{ <<"message">> => <<(maps:get(<<"message">>, BlsIn))/binary, "x">> })},
+        {<<"generator">>, true, P(<<"generator">>, #{})}
+    ],
+    Seed = <<"hyperbeam/rng/v1|beacon|7">>,
+    D = fun(Fields) -> P(<<"derive">>, maps:merge(#{ <<"seed">> => Seed }, Fields)) end,
+    Derive = [
+        {<<"derive-", Name/binary>>, Valid, D(Fields)}
+    ||
+        {Name, Valid, Fields} <- [
+            {<<"c0-b32">>, true, #{ <<"counter">> => 0, <<"bytes">> => 32 }},
+            {<<"c1-b1">>, true, #{ <<"counter">> => 1, <<"bytes">> => 1 }},
+            {<<"c-str-b33">>, true, #{ <<"counter">> => <<"7">>, <<"bytes">> => 33 }},
+            {<<"c-plus">>, true, #{ <<"counter">> => <<"+3">>, <<"bytes">> => <<"64">> }},
+            {<<"c-zeros">>, true, #{ <<"counter">> => <<"007">>, <<"bytes">> => 16 }},
+            {<<"c-minus-zero">>, true, #{ <<"counter">> => <<"-0">>, <<"bytes">> => 16 }},
+            {<<"c-2^64">>, true, #{ <<"counter">> => <<"18446744073709551615">>, <<"bytes">> => 100 }},
+            {<<"c-max-int">>, true, #{ <<"counter">> => 9223372036854775807, <<"bytes">> => 64 }},
+            {<<"b1024">>, true, #{ <<"counter">> => 9, <<"bytes">> => 1024 }},
+            {<<"b1025">>, false, #{ <<"counter">> => 9, <<"bytes">> => 1025 }},
+            {<<"b0">>, false, #{ <<"counter">> => 9, <<"bytes">> => 0 }},
+            {<<"b-neg">>, false, #{ <<"counter">> => 9, <<"bytes">> => -5 }},
+            {<<"c-neg">>, false, #{ <<"counter">> => -1, <<"bytes">> => 8 }},
+            {<<"c-neg-str">>, false, #{ <<"counter">> => <<"-2">>, <<"bytes">> => 8 }},
+            {<<"c-float">>, false, #{ <<"counter">> => 1.5, <<"bytes">> => 8 }},
+            {<<"c-bad">>, false, #{ <<"counter">> => <<"1x">>, <<"bytes">> => 8 }},
+            {<<"c-empty">>, false, #{ <<"counter">> => <<>>, <<"bytes">> => 8 }},
+            {<<"c-missing">>, false, #{ <<"bytes">> => 8 }},
+            {<<"b-missing">>, false, #{ <<"counter">> => 1 }}
+        ]
+    ] ++ [
+        {<<"derive-seed-missing">>, false, P(<<"derive">>, #{ <<"counter">> => 1, <<"bytes">> => 8 })},
+        {<<"derive-seed-int">>, false,
+            P(<<"derive">>, #{ <<"seed">> => 4, <<"counter">> => 1, <<"bytes">> => 8 })},
+        {<<"derive-seed-empty">>, true,
+            P(<<"derive">>, #{ <<"seed">> => <<>>, <<"counter">> => 1, <<"bytes">> => 8 })}
+    ],
+    Timelock ++ Bls ++ Edit ++ Derive.
+
+rng_n_hex() ->
+    {ok, #{ <<"n">> := N }} = dev_rng:generator(#{}, #{}, #{}),
+    N.
+
 %% @doc Per-slot phase means, run only when asked:
 %% `HB_WASM_PATCH_BENCH=2000 rebar3 device test -d dev_wasm_patch'
 %% (with `HB_WAMRC' set for the AOT rows). A trivial direct call, and a

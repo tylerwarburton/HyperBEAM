@@ -192,18 +192,24 @@ mr_square(X, N, Left) ->
         Sq -> mr_square(Sq, N, Left - 1)
     end.
 
-%% @doc The primes below 1000.
+%% @doc The primes below 1000, as a literal: building them by trial
+%% division on every call cost ~1 ms of each reveal and ~2 ms of each crack
+%% (`small_primes_test' checks the list).
 small_primes() ->
-    lists:foldl(
-        fun(K, Acc) ->
-            case lists:any(fun(P) -> K rem P =:= 0 end, Acc) of
-                true -> Acc;
-                false -> Acc ++ [K]
-            end
-        end,
-        [],
-        lists:seq(2, 999)
-    ).
+    [
+        2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67,
+        71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139,
+        149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199, 211, 223,
+        227, 229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283, 293,
+        307, 311, 313, 317, 331, 337, 347, 349, 353, 359, 367, 373, 379, 383,
+        389, 397, 401, 409, 419, 421, 431, 433, 439, 443, 449, 457, 461, 463,
+        467, 479, 487, 491, 499, 503, 509, 521, 523, 541, 547, 557, 563, 569,
+        571, 577, 587, 593, 599, 601, 607, 613, 617, 619, 631, 641, 643, 647,
+        653, 659, 661, 673, 677, 683, 691, 701, 709, 719, 727, 733, 739, 743,
+        751, 757, 761, 769, 773, 787, 797, 809, 811, 821, 823, 827, 829, 839,
+        853, 857, 859, 863, 877, 881, 883, 887, 907, 911, 919, 929, 937, 941,
+        947, 953, 967, 971, 977, 983, 991, 997
+    ].
 
 %% @doc B^E mod M on non-negative integers.
 mod_pow(_B, _E, 1) -> 0;
@@ -485,6 +491,13 @@ params_test() ->
     ?assertEqual(?N_HEX, to_hex(N)),
     ?assert(G > 1 andalso G < N),
     ?assertEqual(168, length(Small)).
+
+%% @doc The literal is exactly the primes below 1000.
+small_primes_test() ->
+    ?assertEqual(
+        [K || K <- lists:seq(2, 999), lists:all(fun(P) -> K rem P =/= 0 end, lists:seq(2, K - 1))],
+        small_primes()
+    ).
 
 %% @doc The primality test refuses Carmichael numbers and small composites,
 %% and accepts small and large primes.
