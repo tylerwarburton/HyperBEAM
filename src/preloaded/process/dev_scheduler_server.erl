@@ -706,8 +706,16 @@ commit(ProcID, Writes, Opts) ->
             fun() ->
                 lists:foreach(
                     fun({Assignment, IDs, Slot}) ->
+                        % This server's own assignment, just signed, and its
+                        % body, the message it verified before assigning it
+                        % (`dev_scheduler:post_schedule'), cut to its
+                        % committed keys: written as verified, not verified
+                        % again (`hb_cache:prepare_write/2').
+                        Verified =
+                            [Assignment | [ B || B <- [maps:get(<<"body">>, Assignment, none)], is_map(B) ]],
                         hb_phase_timer:time(sched_write, fun() ->
-                            ok = dev_scheduler_cache:write(ProcID, Assignment, Opts),
+                            ok = dev_scheduler_cache:write(ProcID, Assignment,
+                                Opts#{ <<"cache-verified">> => Verified }),
                             ok = dev_scheduler_cache:write_message_slot(ProcID, IDs, Slot, Opts)
                         end)
                     end,
