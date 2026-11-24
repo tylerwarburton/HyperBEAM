@@ -70,7 +70,10 @@ write_stored(ProcID, Slot, Msg, RawOpts) ->
                 write_full_blob(ProcID, Slot, Msg, Store, Opts);
             {not_found, _} -> write_full(ProcID, Slot, Msg, Opts)
         end,
-    hot_put(ProcID, Slot, Public, Opts),
+    % A VM snapshot is only ever restored from its stored row: the hot cache
+    % does not keep one (left uncompressed for a checkpoint written off the
+    % slot, it is the whole instance's memory).
+    hot_put(ProcID, Slot, maps:remove(<<"snapshot">>, Public), Opts),
     % The published-key view `now' reads are answered from.
     hb_process_view:update(ProcID, Slot, Public,
         case delta(Msg, Opts) of
@@ -943,7 +946,7 @@ write_blob(ProcID, Slot, Msg, Patches, Results, Store, Opts) ->
         case checkpoint_due(ProcID, Slot, Msg, Opts) of
             false -> write_delta_blob(ProcID, Slot, Patches, LoadedResults, Store, Opts);
             true ->
-                case Slot > 0 andalso async_checkpoints(Opts)
+                case Slot > 0 andalso async_ok(Opts)
                         andalso base_exists(ProcID, Slot - 1, Opts) of
                     true ->
                         D = write_delta_blob(ProcID, Slot, Patches, LoadedResults, Store, Opts),
@@ -982,7 +985,11 @@ write_delta_blob(ProcID, Slot, Patches, LoadedResults, Store, Opts) ->
 %%% checkpoint due while the last is still being written is left to the
 %%% next one. `process-async-checkpoints' false writes them in the slot.
 
-async_checkpoints(Opts) ->
+%% @doc Whether checkpoints of a process run with `RawOpts' are written off
+%% the slot (`dev_process' then leaves a VM snapshot uncompressed).
+async_checkpoints(RawOpts) -> async_ok(lib_process:cache_opts(RawOpts)).
+
+async_ok(Opts) ->
     blob_store(Opts) =/= none andalso
         hb_util:atom(hb_opts:get(<<"process-async-checkpoints">>, true, Opts)) =/= false.
 

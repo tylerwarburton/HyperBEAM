@@ -14,6 +14,9 @@ opts(Dir, Wallet) ->
         <<"spawn-worker">> => false,
         <<"process-workers">> => false,
         <<"process-delta-cache">> => true,
+        % The production layout (state rows), so checkpoints are written off
+        % the slot (`lib_process_cache' async checkpoints).
+        <<"process-state-blobs">> => true,
         <<"process-snapshot-target">> => false,
         <<"process_snapshot_slots">> => 20,
         <<"process-delta-checkpoint-slots">> => 20,
