@@ -104,9 +104,8 @@ boot(Base, Opts) ->
     #{ inst := Inst } = St0,
     case hb_wasm_nif:call(Inst, 0, 0, Def, InitFuel) of
         {ok, Reply, _} ->
-            case hb_wasm_patch_codec:decode_result(Reply) of
-                {ok, [{<<"patches">>, []}, _]} -> ok;
-                {ok, _} -> throw({wasm_patch_init, <<"wp_init may not return patches">>});
+            case hb_wasm_patch_codec:decode_init(Reply) of
+                ok -> ok;
                 {error, E} -> throw({wasm_patch_init, error_text(E)});
                 {malformed, M} -> throw({wasm_patch_init, M})
             end,
@@ -758,6 +757,89 @@ aot_matches_interp_test_() ->
         ?assertEqual(InterpDeltas, AotDeltas)
     end}.
 
+%% The Lua runtime (paralith-mono backend/native/wasm-lua) against
+%% `lua-patch@1.0' on the same script: same published values and the same
+%% delta every slot, under the interpreter and AOT, instrumented. Runs when
+%% `HB_WASM_LUA' names the runtime's `.wasm'.
+lua_runtime_matches_lua_patch_test_() ->
+    {timeout, 300, fun() ->
+        case os:getenv("HB_WASM_LUA") of
+            false -> ok;
+            Path ->
+                hb:init(),
+                {ok, Runtime} = file:read_file(Path),
+                Script = lua_equivalent_script(),
+                Module = #{ <<"content-type">> => <<"application/lua">>, <<"body">> => Script },
+                Interp = test_opts(#{ <<"wasm-patch-allow-uninstrumented">> => false }),
+                Aot = Interp#{ <<"wasm-patch-aot">> => true,
+                    <<"wasm-patch-aot-dir">> => "_build/test-wasm-aot-lua" },
+                Run =
+                    fun(Base, Opts) ->
+                        {ok, S0} = hb_ao:resolve(Base, <<"init">>, Opts),
+                        {_, Rev} =
+                            lists:foldl(
+                                fun(N, {Prev, Acc}) ->
+                                    Action = case N rem 5 of 0 -> <<"Fail">>; _ -> <<"Increment">> end,
+                                    case hb_ao:resolve(Prev, test_request(Action, N), Opts) of
+                                        {ok, Next} ->
+                                            {Next, [{maps:with([<<"count">>, <<"last-action">>,
+                                                    <<"results">>], Next),
+                                                hb_private:get(<<"process-cache-delta">>, Next, Opts)}
+                                                | Acc]};
+                                        {error, #{ <<"status">> := Status }} ->
+                                            {Prev, [{error, Status} | Acc]}
+                                    end
+                                end,
+                                {S0, []},
+                                lists:seq(1, 25)
+                            ),
+                        lists:reverse(Rev)
+                    end,
+                Lua = Run(#{ <<"device">> => <<"lua-patch@1.0">>, <<"module">> => Module }, Interp),
+                WasmBase = #{ <<"device">> => ?DEVICE, <<"image">> => Runtime, <<"module">> => Module },
+                ?assertEqual(Lua, Run(WasmBase, Interp)),
+                ?assertEqual(Lua, Run(WasmBase, Aot))
+        end
+    end}.
+
+lua_equivalent_script() ->
+    <<
+        "Count = Count or 0
+"
+        "function compute(req)
+"
+        "  local body = req.body or req
+"
+        "  local action = tostring(body.action or '')
+"
+        "  if action == 'Fail' then Count = Count + 100; error('refused') end
+"
+        "  Count = Count + 1
+"
+        "  local t = {}
+"
+        "  for i = 1, 50 do t[i] = { n = i, s = tostring(i * Count) } end
+"
+        "  return {
+"
+        "    patches = {
+"
+        "      { path = '/count', value = tostring(Count) },
+"
+        "      { path = '/last-action', value = action },
+"
+        "      { path = '/rows', value = { first = t[1].s, last = t[50].s } }
+"
+        "    },
+"
+        "    results = { output = { data = tostring(Count) } }
+"
+        "  }
+"
+        "end
+"
+    >>.
+
 %% A `process@1.0' process on this device: slots stored as deltas, a failed
 %% slot that does not halt it, and old slots read back.
 process_test_() ->
@@ -858,7 +940,7 @@ bench_report_test_() ->
 
 bench(trivial, N, Opts) ->
     hb:init(),
-    {ok, S0} = hb_ao:resolve(test_base(), <<"init">>, Opts),
+    {ok, S0} = hb_ao:resolve(bench_base(), <<"init">>, Opts),
     hb_phase_timer:reset(),
     {_, Times} =
         lists:foldl(
@@ -889,11 +971,10 @@ bench(process, N, Opts0) ->
             <<"type">> => <<"Process">>,
             <<"scheduler-device">> => <<"scheduler@1.0">>,
             <<"execution-device">> => ?DEVICE,
-            <<"image">> => test_wasm(),
-            <<"start">> => 10,
             <<"authority">> => [Address],
             <<"scheduler-location">> => Address
-        },
+        }#{ <<"image">> => maps:get(<<"image">>, bench_base()) }
+            #{ <<"module">> => maps:get(<<"module">>, bench_base(), <<"none">>) },
         Opts
     ),
     {ok, _} = hb_cache:write(Process, Opts),
@@ -939,6 +1020,22 @@ bench(process, N, Opts0) ->
           end))
         || Slot <- lists:seq(2, N) ],
     bench_summary(Times).
+
+%% The test module, or the Lua runtime running `lua_equivalent_script/0'.
+bench_base() ->
+    case os:getenv("HB_WASM_LUA") of
+        false -> test_base();
+        Path ->
+            {ok, Runtime} = file:read_file(Path),
+            #{
+                <<"device">> => ?DEVICE,
+                <<"image">> => Runtime,
+                <<"module">> => #{
+                    <<"content-type">> => <<"application/lua">>,
+                    <<"body">> => lua_equivalent_script()
+                }
+            }
+    end.
 
 bench_summary(Times) ->
     Sorted = lists:sort(Times),

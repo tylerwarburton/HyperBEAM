@@ -28,8 +28,10 @@ load(_Bytes) -> ?NIF.
 %% @doc `{ok, Instance, #{ fuel, wide, initialize }}' or `{error, Reason}'.
 instantiate(_Module, _StackBytes, _HeapBytes) -> ?NIF.
 %% @doc `Which' 0 runs `_initialize' (when exported) then `wp_init'; 1 runs
-%% `wp_handle'. `{ok, Reply, FuelLeft}', `{trap, Reason}' or
-%% `{error, stale | dirty}'.
+%% `wp_handle', with `wp_fuel' set to `Fuel' (unless negative) and `wp_depth'
+%% to 0. `{ok, Reply, FuelLeft}'; `{trap, Reason}' (a deterministic slot
+%% failure: a trap, out of fuel, too deep); `{fault, Reason}' (a runtime stack
+%% overflow, never a slot result); or `{error, stale | dirty}'.
 call(_Inst, _Which, _ExpectedGen, _Request, _Fuel) -> ?NIF.
 %% @doc `{ok, Gen, Memory, [{Name, Kind, Bits}]}' or `{error, dirty}'.
 snapshot(_Inst) -> ?NIF.

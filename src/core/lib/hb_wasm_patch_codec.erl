@@ -14,16 +14,19 @@
 %%% u8 status    0 = ok, then the patches and the results
 %%%              1 = error, then one value: the error
 %%% u32 n        patch count
-%%% n x (u8 op, u32 len, path bytes, value if op = 1)    op 1 = set, 2 = delete
+%%% n x (u8 op, path, value if op = 1)    op 1 = set, 2 = delete; path a binary value
 %%% value        the results tree
 %%% '''
+%%%
+%%% `wp_init' answers `[u8 status][value]': 0 and the init's result (unused),
+%%% or 1 and the error.
 %%%
 %%% `decode_result/1' returns what `luerl:decode/2' returns for the same Lua
 %%% value -- a table is a list of `{Key, Value}', an empty table `[]' -- so the
 %%% one normalisation `lua-patch@1.0' applies (`lib_patch_exec:decode/2') turns
 %%% both runtimes' results into the same terms.
 -module(hb_wasm_patch_codec).
--export([encode/1, decode_result/1, decode_value/1]).
+-export([encode/1, decode_result/1, decode_init/1, decode_value/1]).
 -include_lib("eunit/include/eunit.hrl").
 
 -define(BIN, 1).
@@ -43,8 +46,8 @@ encode(Term) ->
     iolist_to_binary(enc(Term)).
 
 enc(Bin) when is_binary(Bin) -> [?BIN, <<(byte_size(Bin)):32/little>>, Bin];
-enc(true) -> ?TRUE;
-enc(false) -> ?FALSE;
+enc(true) -> <<?TRUE>>;
+enc(false) -> <<?FALSE>>;
 enc(Int) when is_integer(Int), Int >= -16#8000000000000000, Int =< 16#7fffffffffffffff ->
     <<?I64, Int:64/little-signed>>;
 enc(Int) when is_integer(Int) -> enc(float(Int));
@@ -81,13 +84,25 @@ decode_result(_) ->
     {malformed, <<"wasm-patch result has an unknown status">>}.
 
 patches(0, _I, Rest, Acc) -> {lists:reverse(Acc), Rest};
-patches(N, I, <<?SET, Len:32/little, Path:Len/binary, Rest/binary>>, Acc) ->
+patches(N, I, <<?SET, ?BIN, Len:32/little, Path:Len/binary, Rest/binary>>, Acc) ->
     {Value, Rest1} = value(Rest),
     patches(N - 1, I + 1, Rest1,
         [{I, [{<<"path">>, Path}, {<<"value">>, Value}]} | Acc]);
-patches(N, I, <<?DELETE, Len:32/little, Path:Len/binary, Rest/binary>>, Acc) ->
+patches(N, I, <<?DELETE, ?BIN, Len:32/little, Path:Len/binary, Rest/binary>>, Acc) ->
     patches(N - 1, I + 1, Rest,
         [{I, [{<<"path">>, Path}, {<<"delete">>, true}]} | Acc]).
+
+%% @doc Decode `wp_init''s answer: `ok', `{error, Value}' or
+%% `{malformed, Reason}'.
+decode_init(<<Status, Rest/binary>>) when Status == 0; Status == 1 ->
+    try value(Rest) of
+        {_, <<>>} when Status == 0 -> ok;
+        {Error, <<>>} -> {error, Error};
+        _ -> {malformed, <<"wp_init answer has trailing bytes">>}
+    catch _:_ -> {malformed, <<"wp_init answer does not decode">>}
+    end;
+decode_init(_) ->
+    {malformed, <<"wp_init answer has no status">>}.
 
 %% @doc Decode one value: `{Term, Rest}'.
 decode_value(Bin) -> value(Bin).
@@ -136,8 +151,8 @@ map_and_list_test() ->
 result_test() ->
     Ok = iolist_to_binary([
         0, <<2:32/little>>,
-        ?SET, <<2:32/little>>, <<"/a">>, encode(1),
-        ?DELETE, <<2:32/little>>, <<"/b">>,
+        ?SET, encode(<<"/a">>), encode(1),
+        ?DELETE, encode(<<"/b">>),
         encode(#{ <<"output">> => #{ <<"data">> => <<"x">> } })
     ]),
     ?assertEqual(
@@ -154,4 +169,7 @@ result_test() ->
     ?assertMatch({malformed, _}, decode_result(<<0, 1:32/little, 9>>)),
     ?assertMatch({malformed, _}, decode_result(<<0, 0:32/little, (encode(1))/binary, 0>>)),
     ?assertMatch({malformed, _}, decode_result(<<>>)),
-    ?assertMatch({malformed, _}, decode_result(<<7>>)).
+    ?assertMatch({malformed, _}, decode_result(<<7>>)),
+    ?assertEqual(ok, decode_init(<<0, (encode(#{}))/binary>>)),
+    ?assertEqual({error, <<"no">>}, decode_init(<<1, (encode(<<"no">>))/binary>>)),
+    ?assertMatch({malformed, _}, decode_init(<<0, 0:32/little>>)).

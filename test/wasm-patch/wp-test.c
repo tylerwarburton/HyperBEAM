@@ -81,7 +81,7 @@ static void dec(i64 v) {
     if (neg) b[--i] = '-';
     str(b + i);
 }
-static void set(const char *path) { put32(slen(path)); put(path, slen(path)); }
+static void set(const char *path) { put8(1); put32(slen(path)); put(path, slen(path)); }
 static u32 finish(void) {
     memcpy((u8 *)(u_ptr)out_at, &out_len, 4);
     return out_at;
@@ -152,7 +152,7 @@ __attribute__((export_name("wp_init"))) u32 wp_init(u32 ptr, u32 len) {
         memcpy(&v, start + 1, 8);
         count = v;
     }
-    put8(0); put32(0);
+    put8(0);
     put8(6); put32(0);
     return finish();
 }
