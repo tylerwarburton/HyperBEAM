@@ -121,7 +121,7 @@
 -export([read_target/2, recently_missing/2, remember_missing/2]).
 -export([augment_message/3, apply_security/4, normalize_message/2, origin/3]).
 -export([remote_schedule_result/3, find_type/2, parse_redirect/2]).
--export([classify/3, is_scheduler/2]).
+-export([classify/3, is_scheduler/2, sign_opts/2]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -198,23 +198,43 @@ definition(ProcID, _, Opts) ->
 
 %% The same test the scheduler device makes before it schedules a process
 %% here (`dev_scheduler:is_local_scheduler/4').
-is_scheduler(Process, Opts) ->
+is_scheduler(Process, Opts) -> held_schedulers(Process, Opts) =/= [].
+
+%% The schedulers the process names whose keys this node holds, in the order
+%% it names them.
+held_schedulers(Process, Opts) ->
     Location =
         hb_ao:get_first(
             [{Process, <<"scheduler">>}, {Process, <<"scheduler-location">>}],
             not_found,
             Opts#{ <<"hashpath">> => ignore }
         ),
-    lists:any(
-        fun(Scheduler) -> element(1, hb_opts:as(Scheduler, Opts)) == ok end,
-        case Location of
-            L when is_list(L) -> L;
-            B when is_binary(B) ->
-                binary:split(binary:replace(B, <<"\"">>, <<>>, [global]),
-                    <<",">>, [global, trim_all]);
-            _ -> []
-        end
-    ).
+    [ Scheduler
+    || Scheduler <-
+            case Location of
+                L when is_list(L) -> L;
+                B when is_binary(B) ->
+                    binary:split(binary:replace(B, <<"\"">>, <<>>, [global]),
+                        <<",">>, [global, trim_all]);
+                _ -> []
+            end,
+        element(1, hb_opts:as(Scheduler, Opts)) == ok ].
+
+%% @doc The options a push of the process is signed under
+%% (`apply_security/4'): its own scheduler's key, the first it names that this
+%% node holds, the key its assignments carry. That key signs whenever the
+%% target names no key this node holds. A receiving door admits a
+%% `from-process' only from a signer the sender's definition names as its
+%% scheduler (`dev_scheduler_admission'), and the node's own key is that only
+%% when the node schedules under it: with a scheduling key of its own
+%% (`scheduler-key-type') every cross-node push went unadmitted.
+sign_opts(Process, Opts) ->
+    case held_schedulers(Process, Opts) of
+        [Scheduler | _] ->
+            {ok, SignOpts} = hb_opts:as(Scheduler, Opts),
+            SignOpts;
+        [] -> Opts
+    end.
 
 %% @doc A slot of `ProcID' was stored with an outbox: hand it to the process's
 %% deliverer, starting one when there is none. Never blocks the caller.
@@ -446,6 +466,7 @@ start_state(ProcID, Opts) ->
                         #{
                             proc_id => ProcID,
                             origin => origin(ProcID, Process, Opts),
+                            sign_opts => sign_opts(Process, Opts),
                             opts => Opts,
                             store => Store
                         }}
@@ -1152,7 +1173,7 @@ sign_entry(TargetProcess, RawMsg, Slot, Key, Codec, Location, State = #{ origin 
                 undefined -> augment_message(Origin, MsgToPush, Opts);
                 _ -> normalize_message(augment_message(Origin, MsgToPush, Opts), Opts)
             end,
-        Signed = apply_security(Augmented, TargetProcess, Codec, Opts),
+        Signed = apply_security(Augmented, TargetProcess, Codec, maps:get(sign_opts, State, Opts)),
         case hb_message:signers(Signed, Opts) of
             [] -> {terminal, no_signer};
             _ ->
