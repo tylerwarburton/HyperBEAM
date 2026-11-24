@@ -180,8 +180,7 @@ wasm-patch-instrument:
 WASM_PATCH_PREWARM ?= config/wasm-patch-prewarm.json
 wasm-patch-prewarm: wamrc wasm-patch-instrument
 	erl -noshell -pa $(wildcard _build/default/rel/hb/lib/*/ebin) $(wildcard _build/default/lib/*/ebin) \
-		-eval 'R = hb_wasm_aot:prewarm(<<"$(WASM_PATCH_PREWARM)">>, #{}), io:format("~p~n", [R]), \
-			halt(case lists:all(fun({_, {ok, _}}) -> true; (_) -> false end, R) of true -> 0; false -> 1 end).'
+		-eval 'hb_wasm_aot:prewarm_cli("$(WASM_PATCH_PREWARM)").'
 
 # Unit tests, then interpreter-vs-AOT equivalence on the node's own runtime build.
 wasm-patch-instrument-test: wamr wamrc wasm-patch-instrument
