@@ -1022,9 +1022,13 @@ write_delta_blob(ProcID, Slot, Patches, LoadedResults, Store, Opts) ->
 %%% queued behind it. Until the full row is on disk the slot reads as its
 %%% delta, back to the previous checkpoint; a crash before it is written
 %%% loses only the shortcut, as a restart then restores from the previous
-%%% snapshot and replays. A process has at most one such writer: a
-%%% checkpoint due while the last is still being written is left to the
-%%% next one. `process-async-checkpoints' false writes them in the slot.
+%%% snapshot and replays. The node has at most one such writer, at low
+%%% priority: a checkpoint due while one is being written is left to the
+%%% process's next. Large-state processes made every overlapping writer a
+%%% multi-GB encode at once (8 game shards of 100,000 players: the round trip
+%%% p50 of every shard rose 33 -> 418 ms); one at a time bounds what the
+%%% writers take from the slots, at the cost of longer delta chains.
+%%% `process-async-checkpoints' false writes them in the slot.
 
 %% @doc Whether checkpoints of a process run with `RawOpts' are written off
 %% the slot (`dev_process' then leaves a VM snapshot uncompressed).
@@ -1036,27 +1040,49 @@ async_ok(Opts) ->
 
 checkpoint_async(ProcID, Slot, Msg, Store, Opts) ->
     Tab = checkpoint_table(),
-    case ets:lookup(Tab, ProcID) of
-        [{_, Pid, _}] when is_pid(Pid) ->
-            case is_process_alive(Pid) of
-                true ->
-                    ?event(warning, {checkpoint_skipped, {proc_id, ProcID}, {slot, Slot}}),
-                    ok;
-                false -> start_checkpoint(Tab, ProcID, Slot, Msg, Store, Opts)
-            end;
-        _ -> start_checkpoint(Tab, ProcID, Slot, Msg, Store, Opts)
-    end.
-
-start_checkpoint(Tab, ProcID, Slot, Msg, Store, Opts) ->
+    % The writer starts once it holds the claim, so the claim is always a
+    % writer's, and it gives it up when it ends (a killed one leaves a dead
+    % claim, which the next claim replaces).
     Pid = spawn(fun() ->
-        try full_blob(ProcID, Slot, Msg, Store, Opts)
-        catch Class:Reason ->
-            ?event(warning, {checkpoint_failed, {proc_id, ProcID}, {slot, Slot},
-                {class, Class}, {reason, Reason}})
+        receive
+            go ->
+                process_flag(priority, low),
+                try full_blob(ProcID, Slot, Msg, Store, Opts)
+                catch Class:Reason ->
+                    ?event(warning, {checkpoint_failed, {proc_id, ProcID}, {slot, Slot},
+                        {class, Class}, {reason, Reason}})
+                after
+                    ets:delete_object(Tab, {writer, self()})
+                end;
+            skip -> ok
         end
     end),
-    ets:insert(Tab, {ProcID, Pid, Slot}),
-    ok.
+    case claim_writer(Tab, Pid) of
+        true ->
+            ets:insert(Tab, {ProcID, Pid, Slot}),
+            Pid ! go,
+            ok;
+        false ->
+            Pid ! skip,
+            ?event(warning, {checkpoint_skipped, {proc_id, ProcID}, {slot, Slot}}),
+            ok
+    end.
+
+%% Give `Pid' the node's one checkpoint writer claim, unless a live writer
+%% holds it.
+claim_writer(Tab, Pid) ->
+    case ets:insert_new(Tab, {writer, Pid}) of
+        true -> true;
+        false ->
+            case ets:lookup(Tab, writer) of
+                [{writer, Holder} = Held] ->
+                    case is_process_alive(Holder) of
+                        true -> false;
+                        false -> ets:delete_object(Tab, Held), claim_writer(Tab, Pid)
+                    end;
+                [] -> claim_writer(Tab, Pid)
+            end
+    end.
 
 %% @doc Wait for the checkpoint a process is writing, if any.
 await_checkpoint(ProcID) ->
@@ -1818,6 +1844,7 @@ state_blobs_layout_test() ->
                 {ok, Next} = hb_state_patch:apply(Prev, Patches, Results, N, Opts),
                 Msg = case N of 3 -> Next#{ <<"snapshot">> => <<"vm3">> }; _ -> Next end,
                 {ok, _} = write(ProcID, N, Delta(Msg, Patches, Results), Opts),
+                ok = await_checkpoint(ProcID),
                 [Next | Acc]
             end,
             [State0],
@@ -1873,6 +1900,7 @@ async_checkpoint_test() ->
                 {ok, Next} = hb_state_patch:apply(Prev, Patches, Results, N, Opts),
                 {ok, _} = write(ProcID, N, Delta(Next, Patches, Results), Opts),
                 {ok, Read} = read(ProcID, N, Opts),
+                ok = await_checkpoint(ProcID),
                 ?assertEqual(Bin, hb_maps:get(<<"count">>, Read)),
                 Next
             end,
