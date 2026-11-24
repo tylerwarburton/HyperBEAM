@@ -32,7 +32,8 @@ const pid = (await post('/~scheduler@1.0/schedule', { data: LUA, tags: tags({ de
   'content-type': 'application/lua', 'random-seed': crypto.randomBytes(8).toString('hex') }) })).get('process');
 const IGNORE = new Set(['date', 'server-timing', 'connection', 'keep-alive', 'content-length', 'transfer-encoding']);
 const snap = async (key, generic) => {
-  const res = await fetch(`${node}/${pid}~process@1.0/now/${key}`, { headers: generic ? { 'only-if-cached': 'true' } : {} });
+  const path = key.startsWith('compute&') ? key : `now/${key}`;
+  const res = await fetch(`${node}/${pid}~process@1.0/${path}`, { headers: generic ? { 'only-if-cached': 'true' } : {} });
   const h = {}; for (const [k, v] of res.headers) if (!IGNORE.has(k)) h[k] = v;
   return { status: res.status, body: Buffer.from(await res.arrayBuffer()).toString('base64'), h };
 };
@@ -41,7 +42,10 @@ const until = async (slot) => { for (let i = 0; i < 400; i++) { const r = await 
 for (let i = 1; i <= N; i++) {
   const h = await post(`/${pid}~process@1.0/schedule`, { target: pid, data: '', tags: tags({ type: 'Message', action: 'Tick', 'random-seed': crypto.randomBytes(8).toString('hex') }) });
   await until(Number(h.get('slot')));
-  for (const key of ['count', 'nested', 'flip', 'absent-key', 'Count', 'at-slot', 'results']) {
+  const s = Number(h.get('slot'));
+  for (const key of ['count', 'nested', 'flip', 'absent-key', 'Count', 'at-slot', 'results',
+    `compute&slot=${s}/results/output/data`, `compute&slot=${s}/results/output`, `compute&slot=${Math.max(1, s - 3)}/results/output/data`,
+    `compute&slot=${s}/results/absent`]) {
     const [fast, slow] = [await snap(key, false), await snap(key, true)];
     compared++;
     if (JSON.stringify(fast) !== JSON.stringify(slow)) {
