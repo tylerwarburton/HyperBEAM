@@ -74,6 +74,11 @@
 %%% Debugging tools:
 -export([print/1]).
 -include("include/hb.hrl").
+%% Node-wide memo of verified messages and unsigned commitments.
+-define(VERIFIED, hb_message_verified).
+-define(VERIFIED_MAX, 200000).
+-define(MEMO_MAX_BYTES, 65536).
+-define(MEMO_MAX_MEMORY, 128 * 1024 * 1024).
 -include_lib("eunit/include/eunit.hrl").
 
 %% @doc Convert a message from one format to another. Taking a message in the
@@ -493,7 +498,27 @@ commit(Msg, NotOpts, CodecName) when not is_map(NotOpts) ->
     error({deprecated_commit_call, {arg_must_be_node_msg, NotOpts}});
 commit(Msg, Opts, CodecName) when is_binary(CodecName) ->
     commit(Msg, Opts, #{ <<"commitment-device">> => CodecName });
-commit(Msg, GivenOpts, Spec) ->
+commit(Msg, GivenOpts, Spec = #{ <<"type">> := <<"unsigned">> }) ->
+    % An unsigned commitment is a function of the term, the spec and the
+    % commitment device: each normalisation added it again to the same term.
+    % Remembered for messages up to `?MEMO_MAX_BYTES' (the result is kept).
+    case erlang:external_size(Msg) =< ?MEMO_MAX_BYTES of
+        false -> commit_now(Msg, GivenOpts, Spec);
+        true ->
+            Device = hb_opts:get(commitment_device, no_viable_commitment_device, GivenOpts),
+            % The whole term, private keys too: the result carries them.
+            Key = {unsigned, crypto:hash(sha256,
+                term_to_binary({Spec, Device, Msg}, [deterministic]))},
+            try ets:lookup_element(?VERIFIED, Key, 2)
+            catch error:badarg ->
+                Committed = commit_now(Msg, GivenOpts, Spec),
+                remember(Key, Committed),
+                Committed
+            end
+    end;
+commit(Msg, GivenOpts, Spec) -> commit_now(Msg, GivenOpts, Spec).
+
+commit_now(Msg, GivenOpts, Spec) ->
     % Only a signed commitment takes the node's key material.
     Opts =
         case Spec of
@@ -593,7 +618,7 @@ verify(Msg, Spec, Opts) ->
         false ->
             {ok, Res} =
                 hb_ao:raw(<<"message@1.0">>, <<"verify">>, Msg, Spec, Opts),
-            Res =:= true andalso remember_verified(Key),
+            Res =:= true andalso remember(Key, true),
             Res
     end.
 
@@ -607,8 +632,6 @@ verify(Msg, Spec, Opts) ->
 %%% aside, as `normalization_fast_hash/1' does), and any other term, a single
 %%% bit different, is verified in full. Only `true' is remembered. The table
 %%% is cleared whole when it reaches `?VERIFIED_MAX' entries.
--define(VERIFIED, hb_message_verified).
--define(VERIFIED_MAX, 200000).
 
 verified_key(Msg, Spec) ->
     crypto:hash(sha256,
@@ -619,13 +642,14 @@ verified(Key) ->
     catch error:badarg -> false
     end.
 
-remember_verified(Key) ->
+remember(Key, Value) ->
     Tab = verified_table(),
-    case ets:info(Tab, size) >= ?VERIFIED_MAX of
+    case ets:info(Tab, size) >= ?VERIFIED_MAX orelse
+            ets:info(Tab, memory) * erlang:system_info(wordsize) >= ?MEMO_MAX_MEMORY of
         true -> ets:delete_all_objects(Tab);
         false -> ok
     end,
-    ets:insert(Tab, {Key}).
+    ets:insert(Tab, {Key, Value}).
 
 verified_table() ->
     case ets:whereis(?VERIFIED) of
