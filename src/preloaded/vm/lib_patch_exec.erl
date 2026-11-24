@@ -290,12 +290,12 @@ apply_result(Base, Result, Opts) ->
     apply_result(Base, Result, <<"lua-patch@1.0">>, Opts).
 apply_result(Base, Result, Device, Opts) ->
     Patches =
-        case hb_ao:get(<<"patches">>, Result, [], Opts) of
+        case field(<<"patches">>, Result, [], Opts) of
             Empty when Empty =:= #{} -> [];
             DecodedPatches -> filter_patches(DecodedPatches, Opts)
         end,
     Results =
-        case hb_ao:get(<<"results">>, Result, #{}, Opts) of
+        case field(<<"results">>, Result, #{}, Opts) of
             List when is_list(List) -> hb_ao:normalize_keys(List, Opts);
             DecodedResults -> DecodedResults
         end,
@@ -315,6 +315,14 @@ apply_result(Base, Result, Device, Opts) ->
                 <<"body">> =>
                     <<Device/binary, " requires list `patches' and message `results'.">>
             }}
+    end.
+
+%% A field of a decoded result: a plain map key, which is what `message@1.0'
+%% resolves it to; anything else is left to AO-Core.
+field(Key, Result, Default, Opts) ->
+    case maps:find(Key, Result) of
+        {ok, Value} when not ?IS_LINK(Value) -> Value;
+        _ -> hb_ao:get(Key, Result, Default, Opts)
     end.
 
 %% @doc Apply the node's invalid-patch policy. By default an invalid patch

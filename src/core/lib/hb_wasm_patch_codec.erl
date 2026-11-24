@@ -26,7 +26,7 @@
 %%% one normalisation `lua-patch@1.0' applies (`lib_patch_exec:decode/2') turns
 %%% both runtimes' results into the same terms.
 -module(hb_wasm_patch_codec).
--export([encode/1, decode_result/1, decode_init/1, decode_value/1]).
+-export([encode/1, decode_result/1, decode_init/1, decode_value/1, decode_terms/1]).
 -include_lib("eunit/include/eunit.hrl").
 
 -define(BIN, 1).
@@ -91,6 +91,79 @@ patches(N, I, <<?SET, ?BIN, Len:32/little, Path:Len/binary, Rest/binary>>, Acc) 
 patches(N, I, <<?DELETE, ?BIN, Len:32/little, Path:Len/binary, Rest/binary>>, Acc) ->
     patches(N - 1, I + 1, Rest,
         [{I, [{<<"path">>, Path}, {<<"delete">>, true}]} | Acc]).
+
+%% @doc Decode an ok result straight into the terms `lua-patch@1.0' publishes,
+%% in one walk: `{ok, Patches, Results}'. They are what `decode_result/1' and
+%% `lib_patch_exec:decode/2' give, except that no unsigned commitment is added
+%% to each nested message (`hb_message:normalize_commitments/3'), which the
+%% process strips again before the state is used or stored
+%% (`lib_process:normalize_changed/3'). A table is a map, or a list when its
+%% keys are 1..n, with the same rule (`hb_util:is_ordered_list/2'); an empty
+%% table is `#{}'. A result naming `commitments' or a private key anywhere,
+%% or holding an empty table in a list, gives `fallback': the caller takes the
+%% general path for it.
+decode_terms(<<0, N:32/little, Rest/binary>>) ->
+    try
+        {Patches, Rest1} = tpatches(N, Rest, []),
+        {Results, <<>>} = tvalue(Rest1),
+        {ok, Patches, Results}
+    catch
+        throw:fallback -> fallback;
+        _:_ -> {malformed, <<"wasm-patch result does not decode">>}
+    end;
+decode_terms(_) ->
+    fallback.
+
+tpatches(0, Rest, Acc) -> {lists:reverse(Acc), Rest};
+tpatches(N, <<?SET, ?BIN, Len:32/little, Path:Len/binary, Rest/binary>>, Acc) ->
+    {Value, Rest1} = tvalue(Rest),
+    tpatches(N - 1, Rest1, [#{ <<"path">> => Path, <<"value">> => Value } | Acc]);
+tpatches(N, <<?DELETE, ?BIN, Len:32/little, Path:Len/binary, Rest/binary>>, Acc) ->
+    tpatches(N - 1, Rest, [#{ <<"path">> => Path, <<"delete">> => true } | Acc]).
+
+tvalue(<<?MAP, 0:32/little, Rest/binary>>) -> {#{}, Rest};
+tvalue(<<?MAP, N:32/little, Rest/binary>>) -> tpairs(N, Rest, #{}, plain);
+tvalue(<<?LIST, 0:32/little, Rest/binary>>) -> {#{}, Rest};
+tvalue(<<?LIST, N:32/little, Rest/binary>>) -> titems(N, Rest, []);
+tvalue(Bin) -> value(Bin).
+
+titems(0, Rest, Acc) -> {lists:reverse(Acc), Rest};
+titems(N, Bin, Acc) ->
+    {V, R} = tvalue(Bin),
+    titems(N - 1, R, [in_list(V) | Acc]).
+
+%% An empty table in a list leaves the general path's normalisation as `[]',
+%% not `#{}' (the unsigned commitment's codec round trip); rare enough to send
+%% the whole result there rather than reproduce it.
+in_list(V) when V =:= #{} -> throw(fallback);
+in_list(V) -> V.
+
+tpairs(0, Rest, Map, plain) -> {Map, Rest};
+tpairs(0, Rest, Map, check) ->
+    case hb_util:is_ordered_list(Map, #{}) of
+        true -> {[in_list(V) || V <- hb_util:message_to_ordered_list(Map, #{})], Rest};
+        false -> {Map, Rest}
+    end;
+tpairs(N, Bin, Map, Mode) ->
+    {K, R1} = value(Bin),
+    Mode1 =
+        case K of
+            _ when is_binary(K) -> key_mode(K, Mode);
+            _ when is_number(K) -> check
+        end,
+    {V, R2} = tvalue(R1),
+    tpairs(N - 1, R2, Map#{ K => V }, Mode1).
+
+%% A key that may make the table a list (`check'), or that the general path
+%% treats apart (`fallback').
+key_mode(<<"commitments">>, _Mode) -> throw(fallback);
+key_mode(<<"ao-types">>, _Mode) -> check;
+key_mode(<<C, _/binary>>, _Mode) when C >= $0, C =< $9 -> check;
+key_mode(Key, Mode) ->
+    case hb_private:is_private(Key) of
+        true -> throw(fallback);
+        false -> Mode
+    end.
 
 %% @doc Decode `wp_init''s answer: `ok', `{error, Value}' or
 %% `{malformed, Reason}'.

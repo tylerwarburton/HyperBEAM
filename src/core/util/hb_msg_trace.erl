@@ -416,6 +416,8 @@ computing() ->
 
 json(Seq, {c, P, Slot, Mid, Act, Status, Sched, Start, End, Next, Prep, Exec,
         Store, ExecNotes, StoreNotes, Backlog, Mailbox, Inflight, RunQ}) ->
+    % The VM columns hold either runtime's phases (`hb_slot_log:vm_phases/1').
+    VM = hb_slot_log:vm_phases(ExecNotes),
     #{
         <<"q">> => Seq, <<"k">> => <<"c">>, <<"pid">> => P, <<"slot">> => Slot,
         <<"mid">> => Mid, <<"act">> => Act, <<"st">> => atom_to_binary(Status),
@@ -424,11 +426,11 @@ json(Seq, {c, P, Slot, Mid, Act, Status, Sched, Start, End, Next, Prep, Exec,
             <<"next">> => Next,
             <<"prep">> => Prep,
             <<"exec">> => Exec,
-            <<"lua_prep">> => maps:get(lua_patch_prep, ExecNotes, 0),
-            <<"lua">> => maps:get(lua_patch_lua, ExecNotes, 0),
-            <<"decode">> => maps:get(lua_patch_decode, ExecNotes, 0),
-            <<"apply">> => maps:get(lua_patch_apply, ExecNotes, 0),
-            <<"gc">> => maps:get(lua_patch_gc, ExecNotes, 0),
+            <<"lua_prep">> => maps:get(prep, VM),
+            <<"lua">> => maps:get(run, VM),
+            <<"decode">> => maps:get(decode, VM),
+            <<"apply">> => maps:get(apply, VM),
+            <<"gc">> => maps:get(gc, VM),
             <<"exec_lmdb">> =>
                 maps:get(lmdb_put, ExecNotes, 0) + maps:get(lmdb_commit, ExecNotes, 0)
                     + maps:get(lmdb_scan, ExecNotes, 0),

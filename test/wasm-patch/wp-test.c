@@ -180,7 +180,7 @@ __attribute__((export_name("wp_handle"))) u32 wp_handle(u32 ptr, u32 len) {
         return finish();
     }
     if (bin_is(action, "Types")) {
-        put8(0); put32(7);
+        put8(0); put32(8);
         put8(1); set("/t-int"); int64(42);
         put8(1); set("/t-float"); { double d = 1.5; put8(3); put(&d, 8); }
         put8(1); set("/t-true"); put8(4);
@@ -188,6 +188,11 @@ __attribute__((export_name("wp_handle"))) u32 wp_handle(u32 ptr, u32 len) {
         put8(1); set("/t-map"); put8(6); put32(2); str("a"); str("x"); str("n"); int64(7);
         put8(1); set("/t-list"); put8(7); put32(2); str("p"); str("q");
         put8(1); set("/t-empty"); put8(7); put32(0);
+        /* { B = { { true }, { x = 1 } }, [3] = 42, x = 'y' } */
+        put8(1); set("/t-mixed"); put8(6); put32(3);
+        str("B"); put8(7); put32(2); put8(7); put32(1); put8(4); put8(6); put32(1); str("x"); int64(1);
+        int64(3); int64(42);
+        str("x"); str("y");
         put8(6); put32(0);
         return finish();
     }

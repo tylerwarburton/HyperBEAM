@@ -25,7 +25,7 @@
 %%% Keys and actions are binaries, never atoms.
 -module(hb_slot_log).
 -export([configure/1, new_table/0, run/1, note/2, end_slot/8]).
--export([report/1, sweep/0, sweep/1, reset/0, action/1, memo/3]).
+-export([report/1, sweep/0, sweep/1, reset/0, action/1, memo/3, vm_phases/1]).
 -include_lib("eunit/include/eunit.hrl").
 
 -define(T, hb_slot_log).
@@ -39,12 +39,13 @@
 
 %% Counter row: {{Proc, c}, Slots, ErrorSlots, PrepUs, ExecUs, StoreUs,
 %% LuaPrepUs, LuaUs, DecodeUs, ApplyUs, GcUs, Seq, Actions, LastSlot, LastMs}.
+%% The five VM columns are the runtime's, whichever device runs the process
+%% (`vm_phases/1'): `lua-patch@1.0''s prep, Lua, decode, apply and GC, or
+%% `wasm-patch@1.0''s prep, call, decode, apply and instance restore.
 -define(SEQ, 12).
 -define(NACTIONS, 13).
 -define(LAST_SLOT, 14).
 -define(LAST_MS, 15).
--define(LUA_PHASES,
-    [lua_patch_prep, lua_patch_lua, lua_patch_decode, lua_patch_apply, lua_patch_gc]).
 
 %% @doc Read the slot-log options. Called by `hb_phase_timer:configure/1'.
 configure(Opts) ->
@@ -112,6 +113,20 @@ note(Phase, Micros) ->
         _ -> hb_phase_timer:record(Phase, Micros)
     end.
 
+%% @doc A slot's VM phases from its notes, the same five columns for either
+%% runtime: `prep', `run' (Lua, or the WebAssembly call), `decode', `apply'
+%% and `gc' (Luerl's collection, or a WebAssembly instance restore).
+vm_phases(Notes) ->
+    #{
+        prep => vm(lua_patch_prep, wasm_patch_prep, Notes),
+        run => vm(lua_patch_lua, wasm_patch_call, Notes),
+        decode => vm(lua_patch_decode, wasm_patch_decode, Notes),
+        apply => vm(lua_patch_apply, wasm_patch_apply, Notes),
+        gc => vm(lua_patch_gc, wasm_patch_restore, Notes)
+    }.
+
+vm(Lua, Wasm, Notes) -> maps:get(Lua, Notes, 0) + maps:get(Wasm, Notes, 0).
+
 %% @doc Account one computed slot of `ProcID'. `Status' is `ok', `error' or
 %% `failure'; `Notes' is what `run/1' returned.
 end_slot(ProcID, Slot, Action, Status, PrepUs, ExecUs, StoreUs, Notes) ->
@@ -151,7 +166,11 @@ log(ProcID, _Slot, _Action, failure, _PrepUs, _ExecUs, _StoreUs, _Notes, _Size, 
                 {?LAST_MS, erlang:system_time(millisecond)})
     end;
 log(ProcID, Slot, Action, Status, PrepUs, ExecUs, StoreUs, Notes, Size, Cap) ->
-    [LuaPrep, Lua, Decode, Apply, Gc] = [ maps:get(P, Notes, 0) || P <- ?LUA_PHASES ],
+    LuaPrep = vm(lua_patch_prep, wasm_patch_prep, Notes),
+    Lua = vm(lua_patch_lua, wasm_patch_call, Notes),
+    Decode = vm(lua_patch_decode, wasm_patch_decode, Notes),
+    Apply = vm(lua_patch_apply, wasm_patch_apply, Notes),
+    Gc = vm(lua_patch_gc, wasm_patch_restore, Notes),
     Err = case Status of ok -> 0; _ -> 1 end,
     Incr =
         [{2, 1}, {3, Err}, {4, PrepUs}, {5, ExecUs}, {6, StoreUs}, {7, LuaPrep},
@@ -412,6 +431,9 @@ exactly_once_test() ->
                 note(lua_patch_lua, 40), note(lua_patch_lua, 2),
                 note(lua_patch_decode, 5), ok end),
         ?assertEqual(#{ lua_patch_lua => 42, lua_patch_decode => 5 }, Notes),
+        ?assertMatch(#{ run := 42, decode := 5, prep := 0 }, vm_phases(Notes)),
+        ?assertMatch(#{ run := 9, prep := 3, gc := 4 },
+            vm_phases(#{ wasm_patch_call => 9, wasm_patch_prep => 3, wasm_patch_restore => 4 })),
         end_slot(?P(1), 1, <<"A">>, ok, 1, 100, 1, Notes),
         {_, ok, Notes2} = run(fun() -> ok end),
         ?assertEqual(#{}, Notes2),

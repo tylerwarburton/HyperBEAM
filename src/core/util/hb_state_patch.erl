@@ -40,6 +40,12 @@
 %% the runtime-added messages that `dev_lua_patch' decoding produces.
 -define(RESERVED_SEGMENT_KEYS, [<<"ao-types">>, <<"commitments">>, <<"device">>]).
 
+%% Keys `dev_message:set/3' never sets from a new value (its `DEVICE_KEYS').
+-define(SET_IGNORED_KEYS, [<<"id">>, <<"commitments">>, <<"committers">>, <<"keys">>,
+    <<"path">>, <<"set">>, <<"remove">>, <<"verify">>]).
+%% Keys that make a level more than a plain message for `plain_merge/2'.
+-define(NON_PLAIN_KEYS, [<<"commitments">>, <<"device">>, <<"ao-types">>] ++ ?SET_IGNORED_KEYS).
+
 %% @doc Apply application patches and replace the per-slot result. `Slot' is
 %% optional so the Lua device can patch before process@1.0 assigns the slot.
 apply(Base, Patches, Results, Opts) ->
@@ -125,8 +131,9 @@ set_in(Msg, [Key], delete, Opts) ->
         false -> message_set(Msg, Key, unset, <<"deep">>, Opts)
     end;
 set_in(Msg, [Key], {set, Value}, Opts) ->
-    case is_plain(Msg, Key) andalso not is_map(Value) andalso not is_list(Value) of
-        true -> {ok, Msg#{ Key => Value }};
+    case is_plain(Msg, Key) of
+        true when not is_map(Value), not is_list(Value) -> {ok, Msg#{ Key => Value }};
+        true -> narrow_set(Msg, Key, Value, Opts);
         false -> message_set(Msg, Key, Value, <<"deep">>, Opts)
     end;
 set_in(Msg, [Key | Rest], Op, Opts) ->
@@ -183,6 +190,71 @@ base_set(Base, Key, Value, Opts) ->
         true -> Base#{ Key => Value };
         false -> hb_ao:set(Base, Key, Value, Opts)
     end.
+
+%% @doc `message@1.0''s deep set of a message or list value, on the key alone.
+%% On a plain level (`is_plain/2') the set reads and writes only `Key': with no
+%% commitments there are no committed keys to check, and the deep merge folds
+%% over the new value's keys. Running it on the whole level walked every key of
+%% the process state (0.7 ms a patch at 400 keys) for the same result
+%% (`fast_set_matches_message_set_test').
+narrow_set(Msg, Key, Value, Opts) ->
+    case maps:find(Key, Msg) of
+        {ok, Old} when is_map(Old), is_map(Value) ->
+            case plain_tree(Old) andalso plain_tree(Value) of
+                true -> {ok, Msg#{ Key => plain_merge(Old, Value) }};
+                false -> narrow_message_set(Msg, Key, #{ Key => Old }, Value, Opts)
+            end;
+        {ok, Old} -> narrow_message_set(Msg, Key, #{ Key => Old }, Value, Opts);
+        error -> narrow_message_set(Msg, Key, #{}, Value, Opts)
+    end.
+
+narrow_message_set(Msg, Key, Narrow, Value, Opts) ->
+    case message_set(Narrow, Key, Value, <<"deep">>, Opts) of
+        {ok, Set} ->
+            case maps:find(Key, Set) of
+                {ok, New} -> {ok, Msg#{ Key => New }};
+                error -> {ok, maps:remove(Key, Msg)}
+            end;
+        Error -> Error
+    end.
+
+%% @doc `message@1.0''s deep merge of one message into another, as
+%% `dev_message:set/3' does it level by level (`hb_ao:resolve' of the new
+%% value with `path => set' on the old one): the new value's device keys and
+%% private keys are not set, a message over a message merges, anything else
+%% replaces. Only for trees `plain_tree/1' accepts, where resolving a level has
+%% nothing else to do; the resolution cost 0.7 ms a patch, mostly hashing and
+%% store lookups for a two-key value (`plain_merge_matches_message_set_test').
+plain_merge(Old, New) ->
+    maps:fold(
+        fun(K, V, Acc) ->
+            case lists:member(K, ?SET_IGNORED_KEYS) orelse hb_private:is_private(K) of
+                true -> Acc;
+                false ->
+                    case maps:find(K, Acc) of
+                        {ok, O} when is_map(O), is_map(V) -> Acc#{ K => plain_merge(O, V) };
+                        _ -> Acc#{ K => V }
+                    end
+            end
+        end,
+        Old,
+        New
+    ).
+
+%% @doc A tree of plain messages: no commitments, devices, type annotations,
+%% links or private keys at any depth.
+plain_tree(Map) when is_map(Map) ->
+    maps:fold(
+        fun(K, V, Acc) ->
+            Acc andalso is_binary(K) andalso not lists:member(K, ?NON_PLAIN_KEYS)
+                andalso not hb_private:is_private(K) andalso not is_link_key(K)
+                andalso plain_tree(V)
+        end,
+        true,
+        Map
+    );
+plain_tree(List) when is_list(List) -> lists:all(fun plain_tree/1, List);
+plain_tree(Value) -> not ?IS_LINK(Value).
 
 message_set(Msg, Key, Value, Mode, Opts) ->
     hb_ao:raw(
@@ -400,6 +472,12 @@ fast_set_matches_message_set_test() ->
         [set(<<"/nested/inner">>, <<"changed">>)],
         [#{ <<"path">> => <<"/nested/other">>, <<"delete">> => true }],
         [set(<<"/fresh/deep/key">>, <<"v">>)],
+        [set(<<"/nested">>, #{ <<"inner">> => <<"merged">>, <<"new">> => <<"n">> })],
+        [set(<<"/fresh-map">>, #{ <<"a">> => #{ <<"b">> => 1 }, <<"l">> => [<<"x">>] })],
+        [set(<<"/nested">>, [<<"p">>, <<"q">>])],
+        [set(<<"/count">>, #{ <<"x">> => 1 })],
+        [set(<<"/nested">>, #{ <<"inner">> => #{ <<"deeper">> => <<"d">> } }),
+            set(<<"/nested">>, #{ <<"inner">> => #{ <<"more">> => <<"m">> } })],
         [set(<<"/player-a">>, <<"x">>), set(<<"/player-a">>, <<"y">>),
             #{ <<"path">> => <<"/keep">>, <<"delete">> => true }]
     ],
@@ -411,6 +489,38 @@ fast_set_matches_message_set_test() ->
         end,
         Patches
     ).
+
+%% `plain_merge/2' against `message@1.0''s own set on generated trees.
+plain_merge_matches_message_set_test() ->
+    Opts = #{ <<"hashpath">> => ignore },
+    rand:seed(exsss, {3, 5, 7}),
+    lists:foreach(
+        fun(_) ->
+            Old = gen_tree(3),
+            New = gen_tree(3),
+            {ok, Ref} = message_set(#{ <<"k">> => Old }, <<"k">>, New, <<"deep">>, Opts),
+            ?assertEqual({Old, New, maps:get(<<"k">>, Ref)}, {Old, New, plain_merge(Old, New)})
+        end,
+        lists:seq(1, 300)
+    ).
+
+gen_tree(0) -> gen_leaf();
+gen_tree(D) ->
+    maps:from_list([{gen_tree_key(), gen_node(D - 1)} || _ <- lists:seq(1, rand:uniform(4))]).
+
+gen_node(D) ->
+    case rand:uniform(4) of
+        1 -> gen_tree(D);
+        2 -> [gen_leaf(), gen_leaf()];
+        3 -> #{};
+        4 -> gen_leaf()
+    end.
+
+gen_tree_key() ->
+    lists:nth(rand:uniform(6), [<<"a">>, <<"b">>, <<"c">>, <<"d-e">>, <<"1">>, <<"x">>]).
+
+gen_leaf() ->
+    lists:nth(rand:uniform(4), [<<"v">>, <<"w">>, 7, true]).
 
 %% The same patches applied through `message@1.0' alone, as before the fast
 %% path existed.

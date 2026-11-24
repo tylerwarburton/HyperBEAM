@@ -45,11 +45,14 @@
 -define(ABI, 1).
 %% Fuel a slot (and `wp_init') may use when the process does not say
 %% (`fuel-per-slot', `fuel-init'). Process constants: fuel decides results, so
-%% it never comes from node options. A 1,500-account pair seed plus 1,000 pair
-%% messages measured ~9.4e11 units in all; a slot gets about 100x a heavy
-%% message, and init 100x that.
--define(DEFAULT_FUEL, 1000000000000).
--define(DEFAULT_INIT_FUEL, 100000000000000).
+%% it never comes from node options. Measured on pair.lua (1,500 accounts, 300
+%% resting, 600 trades, then 1,000 stream messages): Order.Place, Cancel and a
+%% one-fill take 1.1-2.1e8 at p50, at most 1.0e9; an Order.CancelAll of 50
+%% orders 2.3e8; a taker sweeping every ask level 5.9e9; Admin.Checkpoint 6.4e9
+%% (it grows with the state); loading pair.lua in wp_init 3.7e8. A slot gets
+%% 100x the heaviest ordinary message; init 100x that.
+-define(DEFAULT_FUEL, 100000000000).
+-define(DEFAULT_INIT_FUEL, 10000000000000).
 -define(STACK_BYTES, 8 * 1024 * 1024).
 -define(CHECKPOINT_CALLS, 1000).
 -define(CHECKPOINT_LOG_BYTES, 64 * 1024 * 1024).
@@ -345,7 +348,17 @@ compute(Key, Base, Req, T0, Opts) ->
             }}
     end.
 
+%% One walk of the binary into the published terms; a result carrying
+%% `commitments' or private keys, and an error, take `lua-patch@1.0''s own
+%% normalisation.
 decode(Reply, Opts) ->
+    case hb_wasm_patch_codec:decode_terms(Reply) of
+        {ok, Patches, Results} -> {ok, #{ <<"patches">> => Patches, <<"results">> => Results }};
+        fallback -> decode_general(Reply, Opts);
+        Malformed -> Malformed
+    end.
+
+decode_general(Reply, Opts) ->
     case hb_wasm_patch_codec:decode_result(Reply) of
         {ok, Result} -> {ok, lib_patch_exec:decode(Result, Opts)};
         {error, Error} ->
@@ -645,7 +658,98 @@ longjmp_test() ->
 same_terms_as_lua_patch_test() ->
     hb:init(),
     Opts = test_opts(),
-    Lua = <<
+    Lua = types_script(),
+    LuaBase = #{
+        <<"device">> => <<"lua-patch@1.0">>,
+        <<"module">> => #{ <<"content-type">> => <<"application/lua">>, <<"body">> => Lua }
+    },
+    {ok, L0} = hb_ao:resolve(LuaBase, <<"init">>, Opts),
+    {ok, L1} = hb_ao:resolve(L0, test_request(<<"Types">>), Opts),
+    {ok, W0} = hb_ao:resolve(test_base(), <<"init">>, Opts),
+    {ok, W1} = hb_ao:resolve(W0, test_request(<<"Types">>), Opts),
+    Delta = fun(S) -> published(hb_private:get(<<"process-cache-delta">>, S, Opts), Opts) end,
+    ?assertEqual(Delta(L1), Delta(W1)).
+
+%% Terms as published: the unsigned commitments `lua-patch@1.0''s decode adds
+%% to every nested message, which the process strips, removed.
+without_commitments(Map) when is_map(Map) ->
+    maps:map(fun(_, V) -> without_commitments(V) end, maps:remove(<<"commitments">>, Map));
+without_commitments(List) when is_list(List) -> [without_commitments(V) || V <- List];
+without_commitments(Tuple) when is_tuple(Tuple) ->
+    list_to_tuple(without_commitments(tuple_to_list(Tuple)));
+without_commitments(V) -> V.
+
+%% A decoded result as a process publishes it: its patches and results
+%% applied, the keys they changed normalised by `structured@1.0'
+%% (`lib_process:normalize_changed/3'), and the unsigned commitments gone.
+published(#{ <<"patches">> := Patches, <<"results">> := Results }, Opts) ->
+    PatchList = case Patches of #{} -> []; _ -> Patches end,
+    ResultMsg = case Results of L when is_list(L) -> hb_ao:normalize_keys(L, Opts); M -> M end,
+    {ok, State} = hb_state_patch:apply(#{}, PatchList, ResultMsg, Opts),
+    {ok, Decoded} = hb_ao:raw(<<"structured@1.0">>, <<"to">>, State, #{}, Opts),
+    without_commitments(hb_ao:execution_input(Decoded, Opts)).
+
+%% The one-walk decode publishes what `lua-patch@1.0''s decode publishes, on
+%% generated values: nested tables, lists, empty tables, mixed-case,
+%% integer- and string-numbered keys, every scalar.
+decode_terms_matches_general_test() ->
+    hb:init(),
+    Opts = test_opts(),
+    rand:seed(exsss, {7, 11, 13}),
+    Paths = lists:map(
+        fun(_) ->
+            Patches = [{rand:uniform(2), <<"/k", (integer_to_binary(I))/binary>>, gen_value(3)}
+                || I <- lists:seq(1, rand:uniform(4))],
+            Results = maps:from_list([{gen_key(), gen_value(2)} || _ <- lists:seq(1, rand:uniform(3))]),
+            Bin = iolist_to_binary([
+                0, <<(length(Patches)):32/little>>,
+                [case Op of
+                    1 -> [1, hb_wasm_patch_codec:encode(P), hb_wasm_patch_codec:encode(V)];
+                    2 -> [2, hb_wasm_patch_codec:encode(P)]
+                 end || {Op, P, V} <- Patches],
+                hb_wasm_patch_codec:encode(Results)
+            ]),
+            {ok, General} = decode_general(Bin, Opts),
+            case hb_wasm_patch_codec:decode_terms(Bin) of
+                fallback -> fallback;
+                {ok, P1, R1} ->
+                    ?assertEqual(
+                        published(General, Opts),
+                        published(#{ <<"patches">> => P1, <<"results">> => R1 }, Opts)
+                    ),
+                    fast
+            end
+        end,
+        lists:seq(1, 300)
+    ),
+    % Most take the one walk; an empty table in a list takes the general path.
+    ?assert(length([ x || fast <- Paths ]) > 100),
+    ?assert(lists:member(fallback, Paths)),
+    % `commitments' anywhere takes the general path.
+    WithC = iolist_to_binary([0, <<0:32/little>>,
+        hb_wasm_patch_codec:encode(#{ <<"commitments">> => #{} })]),
+    ?assertEqual(fallback, hb_wasm_patch_codec:decode_terms(WithC)).
+
+gen_value(0) -> gen_scalar();
+gen_value(D) ->
+    case rand:uniform(6) of
+        1 -> [gen_value(D - 1) || _ <- lists:seq(1, rand:uniform(3))];
+        2 -> #{};
+        3 -> maps:from_list([{I, gen_value(D - 1)} || I <- lists:seq(1, rand:uniform(3))]);
+        4 -> maps:from_list([{integer_to_binary(I), gen_value(D - 1)} || I <- lists:seq(1, rand:uniform(3))]);
+        5 -> maps:from_list([{gen_key(), gen_value(D - 1)} || _ <- lists:seq(1, rand:uniform(4))]);
+        6 -> gen_scalar()
+    end.
+
+gen_key() ->
+    lists:nth(rand:uniform(6), [<<"a">>, <<"B">>, <<"x-y">>, <<"2">>, 3, <<"0">>]).
+
+gen_scalar() ->
+    lists:nth(rand:uniform(6), [<<"s">>, <<>>, 42, -7, 1.5, true]).
+
+%% The `Types' action of the test module, in Lua.
+types_script() ->
+    <<
         "function compute(req)\n"
         "  return {\n"
         "    patches = {\n"
@@ -655,25 +759,13 @@ same_terms_as_lua_patch_test() ->
         "      { path = '/t-false', value = false },\n"
         "      { path = '/t-map', value = { a = 'x', n = 7 } },\n"
         "      { path = '/t-list', value = { 'p', 'q' } },\n"
-        "      { path = '/t-empty', value = {} }\n"
+        "      { path = '/t-empty', value = {} },\n"
+        "      { path = '/t-mixed', value = { B = { { true }, { x = 1 } }, [3] = 42, x = 'y' } }\n"
         "    },\n"
         "    results = {}\n"
         "  }\n"
         "end\n"
-    >>,
-    LuaBase = #{
-        <<"device">> => <<"lua-patch@1.0">>,
-        <<"module">> => #{ <<"content-type">> => <<"application/lua">>, <<"body">> => Lua }
-    },
-    {ok, L0} = hb_ao:resolve(LuaBase, <<"init">>, Opts),
-    {ok, L1} = hb_ao:resolve(L0, test_request(<<"Types">>), Opts),
-    {ok, W0} = hb_ao:resolve(test_base(), <<"init">>, Opts),
-    {ok, W1} = hb_ao:resolve(W0, test_request(<<"Types">>), Opts),
-    Delta = fun(S) -> hb_private:get(<<"process-cache-delta">>, S, Opts) end,
-    ?assertEqual(Delta(L1), Delta(W1)),
-    Keys = [<<"t-int">>, <<"t-float">>, <<"t-true">>, <<"t-false">>, <<"t-map">>,
-        <<"t-list">>, <<"t-empty">>],
-    ?assertEqual(maps:with(Keys, L1), maps:with(Keys, W1)).
+    >>.
 
 %% A module importing anything outside the allow-list never starts.
 refuses_imports_test() ->
@@ -782,9 +874,8 @@ lua_runtime_matches_lua_patch_test_() ->
                                     Action = case N rem 5 of 0 -> <<"Fail">>; _ -> <<"Increment">> end,
                                     case hb_ao:resolve(Prev, test_request(Action, N), Opts) of
                                         {ok, Next} ->
-                                            {Next, [{maps:with([<<"count">>, <<"last-action">>,
-                                                    <<"results">>], Next),
-                                                hb_private:get(<<"process-cache-delta">>, Next, Opts)}
+                                            {Next, [published(hb_private:get(
+                                                    <<"process-cache-delta">>, Next, Opts), Opts)
                                                 | Acc]};
                                         {error, #{ <<"status">> := Status }} ->
                                             {Prev, [{error, Status} | Acc]}
@@ -839,6 +930,64 @@ lua_equivalent_script() ->
         "end
 "
     >>.
+
+%% Through `process@1.0', the module's values publish exactly as the same
+%% values from Lua on `lua-patch@1.0' do: both processes' states after the
+%% slot, key by key, as computed and as `now' reads them.
+process_publishes_like_lua_patch_test_() ->
+    {timeout, 120, fun() ->
+        hb:init(),
+        Opts = test_opts(#{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"spawn-worker">> => false,
+            <<"process-workers">> => false,
+            <<"process-delta-cache">> => true,
+            <<"process-snapshot-target">> => false
+        }),
+        Address = hb_util:human_id(ar_wallet:to_address(hb_opts:get(<<"priv-wallet">>, hb:wallet(), Opts))),
+        Run =
+            fun(Fields) ->
+                Process = hb_message:commit(
+                    Fields#{
+                        <<"device">> => <<"process@1.0">>,
+                        <<"type">> => <<"Process">>,
+                        <<"scheduler-device">> => <<"scheduler@1.0">>,
+                        <<"authority">> => [Address],
+                        <<"scheduler-location">> => Address
+                    },
+                    Opts
+                ),
+                {ok, _} = hb_cache:write(Process, Opts),
+                ProcID = hb_message:id(Process, all, Opts),
+                {ok, _} = hb_ao:resolve(Process,
+                    hb_message:commit(#{
+                        <<"path">> => <<"schedule">>,
+                        <<"method">> => <<"POST">>,
+                        <<"body">> => hb_message:commit(#{ <<"target">> => ProcID,
+                            <<"type">> => <<"Message">>, <<"action">> => <<"Types">> }, Opts)
+                    }, Opts),
+                    Opts),
+                {ok, State} = hb_ao:resolve(Process,
+                    #{ <<"path">> => <<"compute">>, <<"slot">> => 0 }, Opts),
+                Keys = [ K || K <- maps:keys(State), is_binary(K),
+                    binary:match(K, <<"t-">>) =:= {0, 2} ],
+                {ok, Now} = hb_ao:resolve(Process, #{ <<"path">> => <<"now">> }, Opts),
+                {
+                    hb_cache:ensure_all_loaded(maps:with(Keys, State), Opts),
+                    hb_cache:ensure_all_loaded(maps:with(Keys, Now), Opts)
+                }
+            end,
+        {Lua, LuaNow} = Run(#{
+            <<"execution-device">> => <<"lua-patch@1.0">>,
+            <<"module">> => #{ <<"content-type">> => <<"application/lua">>,
+                <<"body">> => types_script() }
+        }),
+        {Wasm, WasmNow} = Run(#{ <<"execution-device">> => ?DEVICE, <<"image">> => test_wasm() }),
+        ?assertEqual(8, map_size(Lua)),
+        ?assertEqual(Lua, Wasm),
+        ?assertEqual(LuaNow, WasmNow)
+    end}.
 
 %% A `process@1.0' process on this device: slots stored as deltas, a failed
 %% slot that does not halt it, and old slots read back.
