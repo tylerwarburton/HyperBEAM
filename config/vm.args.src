@@ -4,3 +4,6 @@
 +sbwt none
 +sbwtdcpu none
 +sbwtdio none
+## Dirty CPU schedulers run wasm-patch@1.0 slots (hb_wasm_nif): AOT code
+## and its natives use the native stack, so give them 2048 kilowords (16 MB).
++sssdcpu 2048
