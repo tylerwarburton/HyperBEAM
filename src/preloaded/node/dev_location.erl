@@ -361,7 +361,27 @@ generate_new_location(URL, Nonce, TTL, Codec, Opts) ->
             <<"nonce">> => Nonce,
             <<"time-to-live">> => TTL
         },
-    Signed = hb_message:commit(NewSchedulerLocation, Opts, Codec),
+    Signed = publish_location(NewSchedulerLocation, Codec, Opts),
+    % The node's own scheduling key (`scheduler-key-type') is found at the
+    % same URL, by a record of its own: a location record has one signer.
+    % HTTP message signatures here are RSA only, so another key signs ANS-104.
+    case hb_opts:as(<<"scheduler">>, Opts) of
+        {ok, SchedulerOpts} ->
+            SchedulerCodec =
+                case hb_opts:get(priv_wallet, undefined, SchedulerOpts) of
+                    #{ <<"type">> := ?RSA_SIGN_TYPE } -> Codec;
+                    _ -> <<"ans104@1.0">>
+                end,
+            publish_location(NewSchedulerLocation, SchedulerCodec, SchedulerOpts);
+        {error, not_found} -> ok
+    end,
+    {ok, Signed}.
+
+%% @doc Sign a location record with the key of `Opts', store it in the cache,
+%% asynchronously upload it to Arweave, and notify the peers specified in the
+%% `location_notify' option. Returns the signed record.
+publish_location(Record, Codec, Opts) ->
+    Signed = hb_message:commit(Record, Opts, Codec),
     dev_location_cache:write(Signed, Opts),
     ?event(location,
         {uploading_signed_scheduler_location, Signed}
@@ -396,7 +416,7 @@ generate_new_location(URL, Nonce, TTL, Codec, Opts) ->
             {foreign_peers_notified, length(Results)}
         }
     ),
-    {ok, Signed}.
+    Signed.
 
 %% @doc Verify and write a location record for a foreign peer to the cache.
 write_foreign(Base, RawReq, Opts) ->
@@ -690,6 +710,51 @@ unsigned_get_node_is_idempotent_test() ->
         #{ <<"url">> := <<"https://new.example">> },
         hb_ao:get(<<"body">>, ThirdRes, ThirdRes, #{})
     ).
+
+%% @doc A node with a scheduling key of its own (`scheduler-key-type') gives
+%% that key a location record beside its own: at the same URL, signed by the
+%% key alone, as an ANS-104 item for an Ed25519 key, and taken by the peers
+%% the node notifies. The node publishes the key's address as its
+%% `scheduler-address'; a node without one publishes its own address.
+scheduler_key_location_test() ->
+    SchedWallet = ar_wallet:new(?EDDSA_KEY_TYPE),
+    SchedAddr = hb_util:human_id(ar_wallet:to_address(SchedWallet)),
+    PeerWallet = ar_wallet:new(),
+    Peer =
+        hb_http_server:start_node(#{
+            <<"priv-wallet">> => PeerWallet,
+            <<"store">> => [hb_test_utils:test_store()]
+        }),
+    Opts = #{
+        <<"store">> => [hb_test_utils:test_store()],
+        <<"priv-wallet">> => ar_wallet:new(),
+        <<"identities">> =>
+            #{ <<"scheduler">> => #{ <<"priv-wallet">> => SchedWallet } },
+        <<"location-notify">> => [Peer]
+    },
+    Node = hb_http_server:start_node(Opts),
+    {ok, Res} = hb_http:get(Node, <<"/~location@1.0/node">>, #{}),
+    NodeLocation = hb_ao:get(<<"body">>, Res, Res, #{}),
+    {ok, SchedLocation} = dev_location_cache:read(SchedAddr, Opts),
+    ?assertEqual([hb_test_utils:committer(SchedWallet)],
+        hb_message:signers(SchedLocation, Opts)),
+    ?assert(hb_message:verify(SchedLocation, all, Opts)),
+    ?assert(lists:member(<<"ans104@1.0">>,
+        hb_message:commitment_devices(SchedLocation, Opts))),
+    ?assertEqual(
+        hb_maps:get(<<"url">>, NodeLocation, not_found, #{}),
+        hb_maps:get(<<"url">>, SchedLocation, not_found, #{})
+    ),
+    {ok, PeerCopy} = hb_http:get(Peer, <<"/~location@1.0/", SchedAddr/binary>>, #{}),
+    ?assertEqual(
+        hb_maps:get(<<"url">>, NodeLocation, not_found, #{}),
+        hb_maps:get(<<"url">>, PeerCopy, not_found, #{})
+    ),
+    ?assertMatch({ok, SchedAddr},
+        hb_http:get(Node, <<"/~meta@1.0/info/scheduler-address">>, #{})),
+    PeerAddr = hb_util:human_id(ar_wallet:to_address(PeerWallet)),
+    ?assertMatch({ok, PeerAddr},
+        hb_http:get(Peer, <<"/~meta@1.0/info/scheduler-address">>, #{})).
 
 %% @doc Test that a scheduler location is registered on boot.
 register_location_on_boot_test() ->

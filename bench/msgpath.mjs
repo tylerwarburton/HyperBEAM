@@ -1,6 +1,7 @@
 // node bench/msgpath.mjs <node-url> [--procs 1] [--clients 32] [--seconds 30]
 //                         [--idle 30] [--msg trivial|pair] [--out file.json]
 //                         [--container name] [--poll-ms 0]
+//                         [--sched-from address|scheduler-address]
 //
 // The per-message path of one process (or --procs N at once), on a local node.
 // Each process is lua-patch@1.0 doing a trivial mutation (a counter); with
@@ -122,7 +123,7 @@ async function main() {
   }
   const phases = async () => JSON.parse((await getText('/~hyperbuddy@1.0/phases')).text);
 
-  const sched = (await getText('/~meta@1.0/info/address')).text.trim();
+  const sched = (await getText(`/~meta@1.0/info/${opt('sched-from', 'address')}`)).text.trim();
   async function spawn() {
     const body = await signDataItem(jwk, { data: LUA, tags: [
       ['device', 'process@1.0'], ['type', 'Process'], ['scheduler-device', 'scheduler@1.0'],

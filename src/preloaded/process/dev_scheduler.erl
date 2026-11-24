@@ -2317,6 +2317,86 @@ http_cache_remote_schedule() ->
     ?assertMatch({ok, _}, dev_scheduler_cache:read(ProcID, 0, Opts2)),
     ?assertEqual(not_found, dev_scheduler_cache:read(ProcID, 1, Opts2)).
 
+%% @doc As `http_cache_remote_schedule', with the scheduler signing under an
+%% Ed25519 key of its own (`scheduler-key-type'), which the process names: a
+%% replica takes the assignments that key signed, and stops at one another
+%% Ed25519 key signed.
+http_cache_remote_ed25519_schedule_test_parallel_() ->
+    {timeout, 30, fun http_cache_remote_ed25519_schedule/0}.
+http_cache_remote_ed25519_schedule() ->
+    SchedWallet = ar_wallet:new(?EDDSA_KEY_TYPE),
+    SchedAddr = hb_util:human_id(ar_wallet:to_address(SchedWallet)),
+    {SchedNode, SchedOpts} =
+        http_init(#{
+            <<"identities">> =>
+                #{ <<"scheduler">> => #{ <<"priv-wallet">> => SchedWallet } },
+            <<"scheduler-default-commitment-spec">> => <<"ans104@1.0">>
+        }),
+    {Node2, Opts2} =
+        http_init(
+            #{
+                <<"scheduler-async-remote-cache">> => false,
+                <<"hosts-block-internal">> => false
+            }
+        ),
+    PMsg = hb_message:commit(test_process(SchedAddr), SchedOpts),
+    ProcID = hb_util:human_id(hb_message:id(PMsg, all, SchedOpts)),
+    {ok, _} =
+        hb_ao:resolve(
+            PMsg,
+            #{
+                <<"path">> => <<"schedule">>,
+                <<"method">> => <<"POST">>,
+                <<"body">> => PMsg
+            },
+            SchedOpts
+        ),
+    {ok, Assignment} = dev_scheduler_cache:read(ProcID, 0, SchedOpts),
+    ?assertEqual([?EDDSA_SIGN_TYPE],
+        [ T || #{ <<"type">> := T } <- hb_maps:values(
+            hb_maps:get(<<"commitments">>, Assignment, #{}, SchedOpts), SchedOpts),
+            T =/= <<"unsigned-sha256">>, T =/= <<"hmac-sha256">> ]),
+    Forged =
+        hb_message:commit(
+            #{
+                <<"variant">> => <<"ao.N.1">>,
+                <<"process">> => ProcID,
+                <<"slot">> => 1
+            },
+            #{ <<"priv-wallet">> => ar_wallet:new(?EDDSA_KEY_TYPE) },
+            <<"ans104@1.0">>
+        ),
+    ok = dev_scheduler_cache:write(ProcID, Forged, SchedOpts),
+    ok = dev_scheduler_cache:set_durable(ProcID, 1),
+    % The scheduler key's own location record, signed by it.
+    Location =
+        hb_message:commit(
+            #{
+                <<"type">> => <<"location">>,
+                <<"url">> => SchedNode,
+                <<"nonce">> => 1,
+                <<"time-to-live">> => 60 * 60 * 1000
+            },
+            #{ <<"priv-wallet">> => SchedWallet },
+            <<"ans104@1.0">>
+        ),
+    {ok, _} = hb_http:post(Node2, <<"/~location@1.0/known">>, Location, #{}),
+    {ok, _} = hb_cache:write(PMsg, Opts2),
+    {ok, Schedule} = http_get_schedule(Node2, PMsg, 0, 1),
+    ?assertEqual(
+        {[<<"0">>], true},
+        {
+            hb_maps:keys(
+                hb_private:reset(
+                    hb_ao:get(<<"assignments">>, Schedule, Opts2)
+                )
+            ),
+            hb_ao:get(<<"continues">>, Schedule, Opts2)
+        }
+    ),
+    ?assertMatch({ok, _}, dev_scheduler_cache:read(ProcID, 0, Opts2)),
+    ?assertEqual(not_found, dev_scheduler_cache:read(ProcID, 1, Opts2)).
+
 %%% Benchmarks
 
 single_resolution(Opts) ->

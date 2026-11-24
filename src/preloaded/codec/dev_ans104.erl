@@ -42,7 +42,7 @@ deserialize(TX, Req, Opts) when is_record(TX, tx) ->
 commit(Msg, Req = #{ <<"type">> := <<"unsigned">> }, Opts) ->
     commit(Msg, Req#{ <<"type">> => <<"unsigned-sha256">> }, Opts);
 commit(Msg, Req = #{ <<"type">> := <<"signed">> }, Opts) ->
-    commit(Msg, Req#{ <<"type">> => ?RSA_SIGN_TYPE }, Opts);
+    commit(Msg, Req#{ <<"type">> => signed_type(Req) }, Opts);
 commit(Msg, Req = #{ <<"type">> := Type }, Opts)
         when Type =:= ?RSA_SIGN_TYPE
         orelse Type =:= ?EDDSA_SIGN_TYPE
@@ -64,6 +64,15 @@ commit(Msg, #{ <<"type">> := <<"unsigned-sha256">> }, Opts) ->
             Opts
         )
     }.
+
+%% @doc The signature type of a `signed' request: that of the committer's key
+%% when an ANS-104 item can carry it (Ed25519, type 2; Ethereum, type 3), else
+%% RSA, which a key of another type then refuses to sign.
+signed_type(#{ <<"committer">> := #{ <<"type">> := Type } })
+        when Type =:= ?EDDSA_SIGN_TYPE orelse Type =:= ?ETHEREUM_SIGN_TYPE ->
+    Type;
+signed_type(_Req) ->
+    ?RSA_SIGN_TYPE.
 
 %% @doc Sign `TX', the item of `Msg', with the committer of the request, and
 %% add its commitment to those of `Msg'.
@@ -1145,3 +1154,27 @@ negative_count_tags_item() ->
         "bWVzdGFtcCI6MTc5MTIzNTU4N319fQ"
     >>).
 
+%% @doc A `signed' commitment is of the committer's key type, for each key an
+%% ANS-104 item carries: RSA (type 1), Ed25519 (type 2) and Ethereum (type
+%% 3). It verifies as its key's, and as no other key's.
+signed_takes_committer_key_type_test() ->
+    lists:foreach(
+        fun(KeyType) ->
+            Wallet = ar_wallet:new(KeyType),
+            Opts = #{ <<"priv-wallet">> => Wallet },
+            Signed =
+                hb_message:commit(
+                    #{ <<"type">> => <<"Assignment">>, <<"slot">> => 7 },
+                    Opts,
+                    <<"ans104@1.0">>
+                ),
+            Types =
+                [ T || #{ <<"type">> := T } <- maps:values(
+                    maps:get(<<"commitments">>, Signed)), T =/= <<"unsigned-sha256">> ],
+            ?assertEqual([ar_tx:serialize_sig_type(KeyType)], Types),
+            ?assert(hb_message:verify(Signed, [hb_test_utils:committer(Wallet)], Opts)),
+            ?assertNot(hb_message:verify(Signed,
+                [hb_test_utils:committer(ar_wallet:new(KeyType))], Opts))
+        end,
+        [?RSA_KEY_TYPE, ?EDDSA_KEY_TYPE, ?ETHEREUM_KEY_TYPE]
+    ).

@@ -91,6 +91,7 @@
 -export([read/1, read/2, debug_wait/4]).
 %%% Node wallet and address management:
 -export([address/0, address/1, wallet/0, wallet/1]).
+-export([scheduler_wallet/1, scheduler_key_type/1]).
 -include("include/hb.hrl").
 
 %% @doc Initialize system-wide settings for the hyperbeam node.
@@ -239,6 +240,9 @@ wallet() ->
 wallet(Location) ->
     wallet(Location, #{}).
 wallet(Location, Opts) ->
+    wallet(Location, ?DEFAULT_KEY_TYPE, Opts).
+%% @doc The key at `Location', created as a key of `KeyType' if there is none.
+wallet(Location, KeyType, Opts) ->
     CacheKey = {?MODULE, wallet, Location},
     case persistent_term:get(CacheKey, not_found) of
         not_found ->
@@ -247,7 +251,7 @@ wallet(Location, Opts) ->
                     {ok, _} ->
                         ar_wallet:load_keyfile(Location, Opts);
                     {error, _} ->
-                        Res = ar_wallet:new_keyfile(?DEFAULT_KEY_TYPE, Location),
+                        Res = ar_wallet:new_keyfile(KeyType, Location),
                         ?event({created_new_keyfile, Location, address(Res)}),
                         Res
                 end,
@@ -256,6 +260,42 @@ wallet(Location, Opts) ->
         Wallet ->
             Wallet
     end.
+
+%% @doc The node's scheduling key: with `scheduler-key-type' set, a key of
+%% that type of its own at `scheduler-key-location' (created on first start),
+%% else `undefined' (the node's key schedules). A key file of another type
+%% than the configured one stops the node: an address is what a process
+%% names, so it may never change under it.
+scheduler_wallet(Opts) ->
+    case hb_opts:get(scheduler_key_type, undefined, Opts) of
+        undefined -> undefined;
+        Name ->
+            KeyType = scheduler_key_type(Name),
+            Location =
+                hb_opts:get(
+                    scheduler_key_location,
+                    <<"hyperbeam-scheduler-key.json">>,
+                    Opts
+                ),
+            Wallet = wallet(Location, KeyType, Opts),
+            case ar_tx:deserialize_sig_type(maps:get(<<"type">>, Wallet)) of
+                KeyType -> Wallet;
+                Found ->
+                    throw({scheduler_key_type_mismatch, Location,
+                        {configured, Name}, {key_file, Found}})
+            end
+    end.
+
+%% @doc The key type of a `scheduler-key-type' name. secp256k1 is not one: an
+%% ANS-104 item carries it only as an Ethereum key (signature type 3), whose
+%% address is a 42-character `0x' account, not the 43-character address that
+%% processes and their contracts compare a scheduler against, and it signs no
+%% faster than Ed25519 at this scale (both ~0.1 ms against RSA-4096's 4-8 ms).
+scheduler_key_type(Name) when is_atom(Name) ->
+    scheduler_key_type(atom_to_binary(Name));
+scheduler_key_type(<<"rsa4096">>) -> ?RSA_KEY_TYPE;
+scheduler_key_type(<<"ed25519">>) -> ?EDDSA_KEY_TYPE;
+scheduler_key_type(Other) -> throw({unsupported_scheduler_key_type, Other}).
 
 %% @doc Get the address of a wallet. Defaults to the address of the wallet
 %% specified by the `priv_key_location' configuration key. It can also take a

@@ -117,6 +117,12 @@ start(ProcID, Proc, Opts) ->
                     Caller ! {error, Ref, Class, Reason, Stacktrace},
                     exit(normal)
                 end,
+            {Wallets, CommitmentSpec} =
+                try signing(Proc, Opts)
+                catch SignClass:SignReason:SignStack ->
+                    Caller ! {error, Ref, SignClass, SignReason, SignStack},
+                    exit(normal)
+                end,
             ?event(
                 {scheduler_got_process_info,
                     {proc_id, ProcID},
@@ -139,8 +145,8 @@ start(ProcID, Proc, Opts) ->
                     current => CurrentSlot,
                     base_state_hashpath => BaseStateHashpath,
                     hashpath_alg => HashpathAlg,
-                    wallets => commitment_wallets(Proc, Opts),
-                    committment_spec => commitment_spec(Proc, Opts),
+                    wallets => Wallets,
+                    committment_spec => CommitmentSpec,
                     mode => mode(Opts, remote_confirmation),
                     opts => Opts,
                     proc => Proc,
@@ -156,12 +162,15 @@ start(ProcID, Proc, Opts) ->
                     appender => undefined,
                     % Publishes each confirmed slot to Arweave, off this
                     % loop (`dev_scheduler_uploader'), for a process on the
-                    % node's upload list.
+                    % node's upload list. Its windows are signed by the key
+                    % that signs the assignments: a follower finds them on
+                    % Arweave by that owner.
                     uploader =>
                         case hb_opts:get(scheduler_publish_remote, true, Opts) of
                             false -> undefined;
                             _ ->
-                                case dev_scheduler_uploader:start(ProcID, Opts) of
+                                case dev_scheduler_uploader:start(ProcID,
+                                        signer_opts(Wallets, Opts)) of
                                     undefined -> undefined;
                                     Uploader ->
                                         Uploader ! {durable, CurrentSlot, none},
@@ -255,6 +264,27 @@ commitment_spec(Proc, Opts) ->
         Spec when is_binary(Spec) -> Spec;
         _ -> Default
     end.
+
+%% @doc The keys that sign a process's assignments, and the codec they sign
+%% with. A key the codec cannot carry stops the server before it assigns
+%% anything: HTTP message signatures here are RSA only, so a scheduler key of
+%% another type (`scheduler-key-type') signs ANS-104 items.
+signing(Proc, Opts) ->
+    Wallets = commitment_wallets(Proc, Opts),
+    Spec = commitment_spec(Proc, Opts),
+    case [ Type || #{ <<"type">> := Type } <- Wallets, not can_sign(Spec, Type) ] of
+        [] -> {Wallets, Spec};
+        Types -> throw({scheduler_key_cannot_sign, {codec, Spec}, {key_types, Types}})
+    end.
+
+can_sign(<<"ans104@1.0">>, _Type) -> true;
+can_sign(_Spec, ?RSA_SIGN_TYPE) -> true;
+can_sign(_Spec, _Type) -> false.
+
+%% @doc Options that sign as the process's scheduler: its first commitment
+%% key, the one its assignments carry.
+signer_opts([Wallet | _], Opts) -> Opts#{ <<"priv-wallet">> => Wallet };
+signer_opts([], Opts) -> Opts.
 
 %% @doc Call the appropriate scheduling server to assign a message.
 schedule(AOProcID, Message) when is_binary(AOProcID) ->
@@ -1050,13 +1080,15 @@ count_calls(N, Parent) ->
 
 %%% A message is assigned at most once per process.
 
-dedupe_setup(Tag) ->
+dedupe_setup(Tag) -> dedupe_setup(Tag, rsa).
+dedupe_setup(Tag, KeyType) ->
     Wallet = hb:wallet(),
     Store = small_store(hb_test_utils:test_store(hb_store_lmdb, Tag)),
     % These tests count the store's reads: no follow-up computes.
-    Opts = #{ <<"priv-wallet">> => Wallet, <<"store">> => [Store],
+    Opts = with_scheduler_key(KeyType,
+            #{ <<"priv-wallet">> => Wallet, <<"store">> => [Store],
               <<"scheduling-mode">> => local_confirmation,
-              <<"process-compute-on-schedule">> => false },
+              <<"process-compute-on-schedule">> => false }),
     ok = hb_store:start([Store], #{}, Opts),
     Proc = dedupe_proc(Opts),
     ProcID = hb_util:human_id(hb_message:id(Proc, all, Opts)),
@@ -1066,9 +1098,48 @@ dedupe_proc(Opts) ->
     hb_message:commit(#{
         <<"device">> => <<"process@1.0">>, <<"type">> => <<"Process">>,
         <<"scheduler-device">> => <<"scheduler@1.0">>,
-        <<"scheduler-location">> =>
-            hb_util:human_id(ar_wallet:to_address(hb_opts:get(priv_wallet, x, Opts))),
+        <<"scheduler-location">> => test_scheduler(Opts),
         <<"test-random-seed">> => rand:uniform(1 bsl 40) }, Opts).
+
+%% @doc Options whose scheduling key is of `KeyType': the node's own key for
+%% `rsa', else a `scheduler' identity of that type signing ANS-104 items, as
+%% `scheduler-key-type' sets a node up (`hb_http_server').
+with_scheduler_key(rsa, Opts) -> Opts;
+with_scheduler_key(KeyType, Opts) ->
+    Opts#{
+        <<"identities">> =>
+            #{ <<"scheduler">> => #{ <<"priv-wallet">> => ar_wallet:new(KeyType) } },
+        <<"scheduler-default-commitment-spec">> => <<"ans104@1.0">>
+    }.
+
+%% @doc The scheduling key of test options, and the address a test process
+%% names as its scheduler.
+test_scheduler_wallet(Opts) ->
+    case maps:get(<<"identities">>, Opts, #{}) of
+        #{ <<"scheduler">> := #{ <<"priv-wallet">> := Wallet } } -> Wallet;
+        _ -> hb_opts:get(priv_wallet, x, Opts)
+    end.
+test_scheduler(Opts) ->
+    hb_util:human_id(ar_wallet:to_address(test_scheduler_wallet(Opts))).
+
+%% @doc An assignment is signed once, by the test scheduler, with its key's
+%% type (an RSA key's HTTP message signature is `rsa-pss-sha512').
+assert_signed_by_scheduler(Assignment, Opts) ->
+    #{ <<"type">> := KeyType } = test_scheduler_wallet(Opts),
+    Types =
+        case KeyType of
+            ?RSA_SIGN_TYPE -> [?RSA_SIGN_TYPE, <<"rsa-pss-sha512">>];
+            _ -> [KeyType]
+        end,
+    Signed =
+        [ T || #{ <<"type">> := T } <- hb_maps:values(
+            hb_maps:get(<<"commitments">>, Assignment, #{}, Opts), Opts),
+            T =/= <<"unsigned-sha256">>, T =/= <<"hmac-sha256">> ],
+    ?assertMatch([T] when is_binary(T), Signed),
+    ?assert(lists:member(hd(Signed), Types)),
+    ?assert(hb_message:verify(Assignment, [test_scheduler(Opts)], Opts)),
+    ?assertNot(hb_message:verify(Assignment, [hb_util:human_id(ar_wallet:to_address(
+        ar_wallet:new(ar_tx:deserialize_sig_type(KeyType))))], Opts)).
 
 slot_of(Assignment) -> hb_util:int(hb_ao:get(<<"slot">>, Assignment, #{})).
 
@@ -1077,6 +1148,35 @@ ids(Msg, Opts) -> dev_scheduler_cache:signature_ids(Msg, Opts).
 %% @doc A test LMDB store maps 1 GiB, not the default 2 TiB: a VM's address
 %% space holds about 60 of the default, and a full test run opens more.
 small_store(Store) -> Store#{ <<"capacity">> => 1 bsl 30 }.
+
+%% @doc With a scheduling key of another type than the node's (Ed25519,
+%% `scheduler-key-type'), each assignment is an ANS-104 item of that key,
+%% chained to the one before by `base-hashpath' exactly as an RSA one is, and
+%% nothing else signs it. A process whose codec cannot carry the key (HTTP
+%% message signatures are RSA only here) is refused before any slot is taken.
+ed25519_scheduler_key_test_() ->
+    {timeout, 60, fun() ->
+        {Opts, ProcID, Proc, Server} = dedupe_setup(<<"sched-ed25519">>, ?EDDSA_KEY_TYPE),
+        Msgs = [ hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => I }, Opts)
+                 || I <- lists:seq(1, 5) ],
+        #{ current := C } = info(Server),
+        Slots = [ slot_of(schedule(Server, M)) || M <- Msgs ],
+        ?assertEqual(lists:seq(C + 1, C + 5), Slots),
+        Read = fun(S) -> {ok, A} = dev_scheduler_cache:read(ProcID, S, Opts), A end,
+        [ assert_signed_by_scheduler(Read(S), Opts) || S <- Slots ],
+        State = #{ hashpath_alg => hb_path:hashpath_alg(Proc, Opts), opts => Opts },
+        [ ?assertEqual(
+            next_hashpath(hb_ao:get(<<"base-hashpath">>, Read(S - 1), Opts), Read(S - 1), State),
+            hb_ao:get(<<"base-hashpath">>, Read(S), Opts))
+          || S <- tl(Slots) ],
+        % The same key cannot sign an HTTP message signature.
+        HttpsigOpts = Opts#{ <<"scheduler-default-commitment-spec">> => <<"httpsig@1.0">> },
+        Proc2 = dedupe_proc(HttpsigOpts),
+        ProcID2 = hb_util:human_id(hb_message:id(Proc2, all, HttpsigOpts)),
+        ?assertThrow({scheduler_key_cannot_sign, {codec, <<"httpsig@1.0">>}, _},
+            start(ProcID2, Proc2, HttpsigOpts)),
+        ?assertEqual(not_found, dev_scheduler_cache:latest(ProcID2, Opts))
+    end}.
 
 %% @doc Posting a signed message again is refused with the slot it already
 %% has, also as another encoding of the same signature, and with a second
@@ -1756,7 +1856,8 @@ flush_error_after_confirmed_ignored_test() ->
 
 %% A journaled scheduler whose inner store commits only when told to (no
 %% flusher, no size trigger) and is checkpointed only by the test.
-wal_server(Tag) ->
+wal_server(Tag) -> wal_server(Tag, rsa).
+wal_server(Tag, KeyType) ->
     case ets:whereis(hb_store_offsite_journal_synced) of
         undefined ->
             ets:new(hb_store_offsite_journal_synced, [named_table, public, set,
@@ -1765,9 +1866,10 @@ wal_server(Tag) ->
     end,
     Inner = wal_inner(hb_test_utils:test_store(hb_store_lmdb, Tag)),
     Store = wal_wrap(Inner),
-    Opts = #{ <<"priv-wallet">> => hb:wallet(), <<"store">> => [Store],
+    Opts = with_scheduler_key(KeyType,
+            #{ <<"priv-wallet">> => hb:wallet(), <<"store">> => [Store],
               <<"scheduling-mode">> => local_confirmation,
-              <<"process-compute-on-schedule">> => false },
+              <<"process-compute-on-schedule">> => false }),
     ok = hb_store:start([Store], #{}, Opts),
     Proc = dedupe_proc(Opts),
     ProcID = hb_util:human_id(hb_message:id(Proc, all, Opts)),
@@ -1856,6 +1958,11 @@ wal_check(Image, Opts0, ProcID, Proc, First, Confirmed) ->
     ?assertEqual(lists:seq(First, Current), [ S || S <- Slots, S >= First ]),
     Bodies = [ Read(S) || S <- lists:seq(First, Current) ],
     ?assertEqual(length(Bodies), length(lists:usort(Bodies))),
+    [ begin
+        {ok, A} = dev_scheduler_cache:read(ProcID, S, Opts),
+        assert_signed_by_scheduler(A, Opts)
+      end
+    || S <- lists:seq(First, Current) ],
     Next = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => <<"next">> }, Opts),
     ?assertEqual(Current + 1, slot_of(schedule(Server, Next))),
     exit(Server, kill),
@@ -1870,8 +1977,9 @@ wal_confirm(Server, Msgs) -> [ {M, slot_of(schedule(Server, M))} || M <- Msgs ].
 
 %% Confirm four slots, checkpoint (the image's inner store is this one), then
 %% confirm six more, which only the journal holds.
-wal_setup(Tag) ->
-    {Opts, ProcID, Proc, Server, Store} = wal_server(Tag),
+wal_setup(Tag) -> wal_setup(Tag, rsa).
+wal_setup(Tag, KeyType) ->
+    {Opts, ProcID, Proc, Server, Store} = wal_server(Tag, KeyType),
     #{ current := C } = info(Server),
     Before = wal_confirm(Server, wal_msgs(Opts, 1, 4)),
     ?assertMatch({_, _}, ?OJ:checkpoint_now(Store)),
@@ -1890,36 +1998,46 @@ wal_in_flight(Server, Opts) ->
 %% order, and nothing of the round in flight: the server goes on at the slot
 %% after the last confirmed one.
 wal_power_loss_keeps_every_confirmed_slot_test_() ->
-    {timeout, 120, fun() ->
-        {Opts, ProcID, Proc, Server, Store, First, Confirmed, Snap} = wal_setup(<<"wal-power">>),
+    {timeout, 120, fun() -> wal_power_loss(<<"wal-power">>, rsa) end}.
+
+%% @doc (1) with an Ed25519 scheduling key (`scheduler-key-type').
+wal_power_loss_ed25519_test_() ->
+    {timeout, 120, fun() -> wal_power_loss(<<"wal-power-ed">>, ?EDDSA_KEY_TYPE) end}.
+
+wal_power_loss(Tag, KeyType) ->
+        {Opts, ProcID, Proc, Server, Store, First, Confirmed, Snap} = wal_setup(Tag, KeyType),
         Image =
             with_sync_delay(1500, fun() ->
                 wal_in_flight(Server, Opts),
-                I = wal_crash_image(Store, Snap, power, <<"wal-power-img">>),
+                I = wal_crash_image(Store, Snap, power, <<Tag/binary, "-img">>),
                 exit(Server, kill),
                 I
             end),
         timer:sleep(100),
         ?assertEqual(lists:max([ S || {_, S} <- Confirmed ]),
-            wal_check(Image, Opts, ProcID, Proc, First, Confirmed))
-    end}.
+            wal_check(Image, Opts, ProcID, Proc, First, Confirmed)).
 
 %% @doc (2) A `kill -9' of the node mid-round: the journal keeps every byte
 %% written, the round's own included. Every confirmed slot is restored; the
 %% round's may be too (its `flushed' marker was written), never twice.
 wal_kill_mid_round_keeps_every_confirmed_slot_test_() ->
-    {timeout, 120, fun() ->
-        {Opts, ProcID, Proc, Server, Store, First, Confirmed, Snap} = wal_setup(<<"wal-kill">>),
+    {timeout, 120, fun() -> wal_kill_mid_round(<<"wal-kill">>, rsa) end}.
+
+%% @doc (2) with an Ed25519 scheduling key (`scheduler-key-type').
+wal_kill_mid_round_ed25519_test_() ->
+    {timeout, 120, fun() -> wal_kill_mid_round(<<"wal-kill-ed">>, ?EDDSA_KEY_TYPE) end}.
+
+wal_kill_mid_round(Tag, KeyType) ->
+        {Opts, ProcID, Proc, Server, Store, First, Confirmed, Snap} = wal_setup(Tag, KeyType),
         Image =
             with_sync_delay(1500, fun() ->
                 wal_in_flight(Server, Opts),
-                I = wal_crash_image(Store, Snap, kill, <<"wal-kill-img">>),
+                I = wal_crash_image(Store, Snap, kill, <<Tag/binary, "-img">>),
                 exit(Server, kill),
                 I
             end),
         timer:sleep(100),
-        wal_check(Image, Opts, ProcID, Proc, First, Confirmed)
-    end}.
+        wal_check(Image, Opts, ProcID, Proc, First, Confirmed).
 
 %% @doc (3) A crash in the middle of the replay itself, after part of it was
 %% committed: the start after it replays again and ends the same.
