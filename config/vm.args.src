@@ -4,3 +4,9 @@
 +sbwt none
 +sbwtdcpu none
 +sbwtdio none
+## Dirty IO threads: every LMDB scan, synced commit and env sync is a
+## DirtyIo NIF, and a synced commit holds its thread through an fsync (and
+## the env's one write lock). With the default 10, fifteen busy processes
+## queued scans behind commits: lmdb_scan 4.5 ms mean. 64: 2.3-3.6 ms,
+## +37% node-wide msg/s, -12% CPU per message (bench/msgpath.mjs, 15 procs).
++SDio 64
