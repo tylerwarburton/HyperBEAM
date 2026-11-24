@@ -8,7 +8,8 @@
 //! Validation refuses: SIMD, threads/atomics/shared memory, reference types,
 //! tail calls, exceptions, multi-memory, GC, any non-function import, any
 //! function import outside the allowlist (`env.invoke_vii`,
-//! `env.throw_longjmp`, exact signatures), a start function that can reach an
+//! `env.throw_longjmp`, `env.wp_bls_fav`, `env.wp_rsa_pss_sha256`, exact
+//! signatures), a start function that can reach an
 //! import, a memory without a maximum or with one above the cap, an export
 //! already named `wp_fuel`/`wp_depth`/`wp_g*`, and an already instrumented
 //! module.
@@ -74,6 +75,10 @@ pub fn version() -> String {
 const ALLOWED_IMPORTS: &[(&str, &str, &[ValType], &[ValType])] = &[
     ("env", "invoke_vii", &[ValType::I32, ValType::I32, ValType::I32], &[]),
     ("env", "throw_longjmp", &[], &[]),
+    // Verification natives (hb_wasm_nif.c): pure, fixed fuel charged by the
+    // native itself. wasm32 pointers and lengths.
+    ("env", "wp_bls_fav", &[ValType::I32; 7], &[ValType::I32]),
+    ("env", "wp_rsa_pss_sha256", &[ValType::I32; 5], &[ValType::I32]),
 ];
 
 pub struct Config {
