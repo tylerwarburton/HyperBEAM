@@ -515,7 +515,22 @@ snapshot(Base, _Req, Opts) ->
     case hb_private:get(<<"state">>, Base, not_found, Opts) of
         St = #{ device := wasm_patch } ->
             #{ inst := Inst } = Cur = ensure_current(St, Opts),
+            T0 = erlang:monotonic_time(microsecond),
             {ok, Gen, Mem, Globals} = hb_wasm_nif:snapshot(Inst),
+            T1 = erlang:monotonic_time(microsecond),
+            hb_slot_log:note(wasm_snapshot_copy, T1 - T0),
+            hb_slot_log:note(wasm_snapshot_bytes, byte_size(Mem)),
+            % A checkpoint written off the slot (`lib_process_cache') is
+            % compressed whole there: the memory goes in as it is, and the
+            % slot only copies it.
+            Raw = hb_opts:get(<<"snapshot-deferred-compression">>, false, Opts) == true,
+            {Encoding, Memory} =
+                case Raw of
+                    true -> {<<"raw">>, Mem};
+                    false -> {<<"zlib">>, compress(Mem)}
+                end,
+            T2 = erlang:monotonic_time(microsecond),
+            hb_slot_log:note(wasm_snapshot_zlib, T2 - T1),
             Snapshot = #{
                 <<"abi">> => ?ABI,
                 <<"wasm-sha256">> => maps:get(wasm_sha256, Cur),
@@ -524,11 +539,29 @@ snapshot(Base, _Req, Opts) ->
                 <<"slot">> => maps:get(slot, Cur),
                 <<"gen">> => Gen,
                 <<"globals">> => [{N, atom_to_binary(K), V} || {N, K, V} <- Globals],
-                <<"memory">> => zlib:compress(Mem)
+                <<"memory">> => Memory,
+                <<"memory-encoding">> => Encoding
             },
-            {ok, #{ <<"body">> => term_to_binary(Snapshot, [deterministic]) }};
+            Body = term_to_binary(Snapshot, [deterministic]),
+            hb_slot_log:note(wasm_snapshot_t2b, erlang:monotonic_time(microsecond) - T2),
+            hb_slot_log:note(wasm_snapshot_compressed_bytes, byte_size(Body)),
+            {ok, #{ <<"body">> => Body }};
         _ ->
             {error, <<"Cannot snapshot wasm-patch state: not initialized.">>}
+    end.
+
+%% The memory, zlib-compressed at level 1. `zlib:compress/1' (level 6) took
+%% 1.8-4 s of a 64 MB instance, inside the slot that takes the snapshot, with
+%% the process's next messages waiting behind it; level 1 is several times
+%% faster for a slightly larger image, and `zlib:uncompress/1' reads either.
+compress(Mem) ->
+    Z = zlib:open(),
+    try
+        ok = zlib:deflateInit(Z, 1),
+        Out = iolist_to_binary(zlib:deflate(Z, Mem, finish)),
+        ok = zlib:deflateEnd(Z),
+        Out
+    after zlib:close(Z)
     end.
 
 %% @doc Restore the instance from a snapshot when the state has none.
@@ -563,7 +596,7 @@ restore(Base, Body, Opts) ->
         <<"wasm-sha256">> := Hash,
         <<"gen">> := Gen,
         <<"globals">> := Globals,
-        <<"memory">> := Compressed
+        <<"memory">> := Memory
     } = Snapshot,
     {St0 = #{ inst := Inst, wasm_sha256 := Hash1, instrument := Pass }, Info} =
         instance(Base, Opts),
@@ -576,7 +609,11 @@ restore(Base, Body, Opts) ->
         Pass -> ok;
         _ -> throw({wasm_patch_init, <<"the snapshot was taken under another instrumentation pass">>})
     end,
-    Mem = zlib:uncompress(Compressed),
+    Mem =
+        case maps:get(<<"memory-encoding">>, Snapshot, <<"zlib">>) of
+            <<"raw">> -> Memory;
+            <<"zlib">> -> zlib:uncompress(Memory)
+        end,
     Gl = [{N, Kind, V} || {N, Kind, V} <- Globals, is_binary(N), is_integer(V)],
     case hb_wasm_nif:restore(Inst, Gen, Mem, Gl) of
         ok -> ok;
@@ -714,6 +751,15 @@ snapshot_restore_test() ->
     ?assertEqual(<<"16">>, count(S6, Opts)),
     % The two instances are independent.
     ?assertEqual(<<"16">>, count(run(S5, [<<"Increment">>], Opts), Opts)),
+    % A snapshot left uncompressed for a checkpoint written off the slot
+    % restores the same.
+    {ok, RawSnapshot} = hb_ao:resolve(S5, <<"snapshot">>,
+        Opts#{ <<"snapshot-deferred-compression">> => true }),
+    ?assertMatch(#{ <<"memory-encoding">> := <<"raw">> },
+        binary_to_term(hb_ao:get(<<"body">>, RawSnapshot, Opts))),
+    {ok, RawRestored} = hb_ao:resolve(
+        hb_ao:set(hb_private:reset(S5), <<"snapshot">>, RawSnapshot, Opts), <<"normalize">>, Opts),
+    ?assertEqual(<<"16">>, count(run(RawRestored, [<<"Increment">>], Opts), Opts)),
     % A snapshot of another image is refused.
     Other = hb_ao:set(Cold, <<"image">>, <<0, "asm", 1:32/little>>, Opts),
     ?assertMatch({error, #{ <<"status">> := 422 }}, hb_ao:resolve(Other, <<"normalize">>, Opts)).

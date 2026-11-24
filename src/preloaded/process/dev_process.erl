@@ -945,7 +945,14 @@ store_result(ForceSnapshot, ProcID, Slot, Res, Req, RawOpts) ->
                     {snapshotting, {proc_id, ProcID}, {slot, Slot}},
                     Opts
                 ),
-                {ok, Snapshot} = snapshot(Res, Req, Opts),
+                TS = erlang:monotonic_time(microsecond),
+                {ok, Snapshot} =
+                    snapshot(Res, Req,
+                        case lib_process_cache:async_checkpoints(Opts) of
+                            true -> Opts#{ <<"snapshot-deferred-compression">> => true };
+                            false -> Opts
+                        end),
+                hb_slot_log:note(process_snapshot, erlang:monotonic_time(microsecond) - TS),
 				?event(snapshot,
 					{got_snapshot,
 						{storing_as_slot, Slot},

@@ -10,6 +10,7 @@
 -export([delivery_store/1, blob_key/3, blob_put/4, blob_get/3, blob_slots/3]).
 -export([blob_commit/3, has_outbox/3]).
 -export([blob_encode/1, blob_decode/1, outbox_entries/2]).
+-export([async_checkpoints/1, await_checkpoint/1]).
 -include_lib("eunit/include/eunit.hrl").
 -include("include/hb.hrl").
 
@@ -69,7 +70,10 @@ write_stored(ProcID, Slot, Msg, RawOpts) ->
                 write_full_blob(ProcID, Slot, Msg, Store, Opts);
             {not_found, _} -> write_full(ProcID, Slot, Msg, Opts)
         end,
-    hot_put(ProcID, Slot, Public, Opts),
+    % A VM snapshot is only ever restored from its stored row: the hot cache
+    % does not keep one (left uncompressed for a checkpoint written off the
+    % slot, it is the whole instance's memory).
+    hot_put(ProcID, Slot, maps:remove(<<"snapshot">>, Public), Opts),
     % The published-key view `now' reads are answered from.
     hb_process_view:update(ProcID, Slot, Public,
         case delta(Msg, Opts) of
@@ -940,21 +944,107 @@ write_blob(ProcID, Slot, Msg, Patches, Results, Store, Opts) ->
     LoadedResults = hb_cache:ensure_all_loaded(Results, Opts),
     Key =
         case checkpoint_due(ProcID, Slot, Msg, Opts) of
-            false ->
-                Envelope = #{
-                    <<"cache-format">> => ?DELTA_FORMAT,
-                    <<"slot">> => Slot,
-                    <<"base-slot">> => Slot - 1,
-                    <<"patches">> => hb_cache:ensure_all_loaded(Patches, Opts),
-                    <<"results">> => LoadedResults
-                },
-                K = blob_key(ProcID, <<"d">>, Slot),
-                ok = blob_put(Store, K, blob_encode(Envelope), Opts),
-                K;
-            true -> full_blob(ProcID, Slot, Msg, Store, Opts)
+            false -> write_delta_blob(ProcID, Slot, Patches, LoadedResults, Store, Opts);
+            true ->
+                case Slot > 0 andalso async_ok(Opts)
+                        andalso base_exists(ProcID, Slot - 1, Opts) of
+                    true ->
+                        D = write_delta_blob(ProcID, Slot, Patches, LoadedResults, Store, Opts),
+                        checkpoint_async(ProcID, Slot, Msg, Store, Opts),
+                        D;
+                    false -> full_blob(ProcID, Slot, Msg, Store, Opts)
+                end
         end,
     ok = refresh(ProcID, Slot, Opts),
     {ok, Key}.
+
+write_delta_blob(ProcID, Slot, Patches, LoadedResults, Store, Opts) ->
+    Envelope = #{
+        <<"cache-format">> => ?DELTA_FORMAT,
+        <<"slot">> => Slot,
+        <<"base-slot">> => Slot - 1,
+        <<"patches">> => hb_cache:ensure_all_loaded(Patches, Opts),
+        <<"results">> => LoadedResults
+    },
+    K = blob_key(ProcID, <<"d">>, Slot),
+    ok = blob_put(Store, K, blob_encode(Envelope), Opts),
+    K.
+
+%%% Checkpoints off the slot.
+%%%
+%%% A checkpoint slot of a delta process with its previous slot stored is
+%%% written as a delta like any other, so the chain is whole the moment the
+%%% slot returns, and its full state (`f', and `s' with a VM snapshot) is
+%%% written by a process of its own: the next slots no longer wait for it.
+%%% On a dedicated 16-core box that write was 3-4 s of a wasm-patch pair's
+%%% 64 MB image (Hetzner, 2026-11-24), with the pair's next ~100 messages
+%%% queued behind it. Until the full row is on disk the slot reads as its
+%%% delta, back to the previous checkpoint; a crash before it is written
+%%% loses only the shortcut, as a restart then restores from the previous
+%%% snapshot and replays. A process has at most one such writer: a
+%%% checkpoint due while the last is still being written is left to the
+%%% next one. `process-async-checkpoints' false writes them in the slot.
+
+%% @doc Whether checkpoints of a process run with `RawOpts' are written off
+%% the slot (`dev_process' then leaves a VM snapshot uncompressed).
+async_checkpoints(RawOpts) -> async_ok(lib_process:cache_opts(RawOpts)).
+
+async_ok(Opts) ->
+    blob_store(Opts) =/= none andalso
+        hb_util:atom(hb_opts:get(<<"process-async-checkpoints">>, true, Opts)) =/= false.
+
+checkpoint_async(ProcID, Slot, Msg, Store, Opts) ->
+    Tab = checkpoint_table(),
+    case ets:lookup(Tab, ProcID) of
+        [{_, Pid, _}] when is_pid(Pid) ->
+            case is_process_alive(Pid) of
+                true ->
+                    ?event(warning, {checkpoint_skipped, {proc_id, ProcID}, {slot, Slot}}),
+                    ok;
+                false -> start_checkpoint(Tab, ProcID, Slot, Msg, Store, Opts)
+            end;
+        _ -> start_checkpoint(Tab, ProcID, Slot, Msg, Store, Opts)
+    end.
+
+start_checkpoint(Tab, ProcID, Slot, Msg, Store, Opts) ->
+    Pid = spawn(fun() ->
+        try full_blob(ProcID, Slot, Msg, Store, Opts)
+        catch Class:Reason ->
+            ?event(warning, {checkpoint_failed, {proc_id, ProcID}, {slot, Slot},
+                {class, Class}, {reason, Reason}})
+        end
+    end),
+    ets:insert(Tab, {ProcID, Pid, Slot}),
+    ok.
+
+%% @doc Wait for the checkpoint a process is writing, if any.
+await_checkpoint(ProcID) ->
+    case ets:whereis(lib_process_cache_checkpoints) of
+        undefined -> ok;
+        Tab ->
+            case ets:lookup(Tab, ProcID) of
+                [{_, Pid, _}] ->
+                    Ref = erlang:monitor(process, Pid),
+                    receive {'DOWN', Ref, process, _, _} -> ok end;
+                [] -> ok
+            end
+    end.
+
+checkpoint_table() ->
+    case ets:whereis(lib_process_cache_checkpoints) of
+        undefined ->
+            Self = self(),
+            Ref = make_ref(),
+            spawn(fun() ->
+                try ets:new(lib_process_cache_checkpoints, [named_table, public, set]) of
+                    _ -> Self ! Ref, receive never -> ok end
+                catch error:badarg -> Self ! Ref
+                end
+            end),
+            receive Ref -> ok end,
+            ets:whereis(lib_process_cache_checkpoints);
+        Tab -> Tab
+    end.
 
 %% @doc Write a slot of a full-state process (one without patches: `lua@5.3a',
 %% WASM, native devices) as one full-state row. Each row stands alone, so
@@ -974,7 +1064,10 @@ full_blob_row(ProcID, Slot, Msg, Store, Opts) ->
     Loaded = hb_cache:ensure_all_loaded(hb_private:reset(Msg), Opts),
     K = blob_key(ProcID, <<"f">>, Slot),
     Encoded = blob_encode(Loaded),
+    hb_slot_log:note(checkpoint_bytes, byte_size(Encoded)),
+    TP = erlang:monotonic_time(microsecond),
     ok = blob_put(Store, K, Encoded, Opts),
+    hb_slot_log:note(checkpoint_put, erlang:monotonic_time(microsecond) - TP),
     case is_map_key(<<"snapshot">>, Loaded) of
         true -> ok = blob_put(Store, blob_key(ProcID, <<"s">>, Slot), marker(Encoded, Opts), Opts);
         false -> ok
@@ -1634,10 +1727,13 @@ state_blobs_layout_test() ->
             end,
             [State0],
             lists:seq(1, 5)),
+    % Slot 3's full state is written off the slot; slot 3 is also a delta,
+    % so the chain is whole before it lands.
+    ok = await_checkpoint(ProcID),
     Keys =
         lists:sort(
             [ K || K <- element(2, hb_store:list([Store], <<"pstate/", ProcID/binary, "/d">>, #{})) ]),
-    ?assertEqual([pad_slot(N) || N <- [1, 2, 4, 5]], Keys),
+    ?assertEqual([pad_slot(N) || N <- [1, 2, 3, 4, 5]], Keys),
     ?assertEqual([0, 3], blob_slots(ProcID, <<"s">>, Store)),
     ?assertEqual([0, 3], blob_slots(ProcID, <<"f">>, Store)),
     % Nothing of it went through the content-addressed layout.
@@ -1652,6 +1748,53 @@ state_blobs_layout_test() ->
                  latest(ProcID, [<<"snapshot">>], undefined, Opts)),
     ?assertMatch({ok, 0, _}, latest(ProcID, [<<"snapshot">>], 2, Opts)),
     ?assertEqual({ok, 5}, latest_slot(ProcID, Opts)).
+
+%% @doc A checkpoint written off the slot: before it lands, every slot reads
+%% back through the deltas; a checkpoint due while one is being written is
+%% left to the next; with `process-async-checkpoints' false it is written in
+%% the slot, with no delta row.
+async_checkpoint_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb),
+    Base = #{
+        <<"store">> => Store,
+        <<"process-delta-cache">> => true,
+        <<"process-state-blobs">> => true,
+        <<"process-delta-checkpoint-slots">> => 2,
+        <<"process-hot-cache-slots">> => 0
+    },
+    Delta = fun(Msg, P, R) ->
+        Msg#{ <<"priv">> => #{ <<"process-cache-delta">> =>
+            #{ <<"patches">> => P, <<"results">> => R } } }
+    end,
+    Run = fun(Opts) ->
+        ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+        State0 = #{ <<"count">> => <<"0">>, <<"at-slot">> => 0 },
+        {ok, _} = write(ProcID, 0, Delta(State0, [], #{}), Opts),
+        lists:foldl(
+            fun(N, Prev) ->
+                Bin = integer_to_binary(N),
+                Patches = [#{ <<"path">> => <<"/count">>, <<"value">> => Bin }],
+                Results = #{ <<"output">> => #{ <<"data">> => Bin } },
+                {ok, Next} = hb_state_patch:apply(Prev, Patches, Results, N, Opts),
+                {ok, _} = write(ProcID, N, Delta(Next, Patches, Results), Opts),
+                {ok, Read} = read(ProcID, N, Opts),
+                ?assertEqual(Bin, hb_maps:get(<<"count">>, Read)),
+                Next
+            end,
+            State0,
+            lists:seq(1, 4)),
+        ok = await_checkpoint(ProcID),
+        {ProcID, blob_slots(ProcID, <<"f">>, Store), blob_slots(ProcID, <<"d">>, Store)}
+    end,
+    {P1, F1, D1} = Run(Base),
+    % Each checkpoint lands, and its slot is a delta as well.
+    ?assertEqual([0, 2, 4], F1),
+    ?assertEqual([1, 2, 3, 4], D1),
+    {ok, Read4} = read(P1, 4, Base),
+    ?assertEqual(<<"4">>, hb_maps:get(<<"count">>, Read4)),
+    {_, F2, D2} = Run(Base#{ <<"process-async-checkpoints">> => false }),
+    ?assertEqual([0, 2, 4], F2),
+    ?assertEqual([1, 3], D2).
 
 %% @doc With `process-state-blobs', a full-state process (no patches) writes
 %% each slot as one `f' row too, never RC7's content-addressed layout.
