@@ -587,9 +587,62 @@ verify(Msg, Committers, Opts) when not is_map(Committers) ->
     verify(Msg, #{ <<"committers">> => Committers }, Opts);
 verify(Msg, Spec, Opts) ->
     ?event(verify, {verify, {spec, Spec}}),
-    {ok, Res} =
-        hb_ao:raw(<<"message@1.0">>, <<"verify">>, Msg, Spec, Opts),
-    Res.
+    Key = verified_key(Msg, Spec),
+    case verified(Key) of
+        true -> true;
+        false ->
+            {ok, Res} =
+                hb_ao:raw(<<"message@1.0">>, <<"verify">>, Msg, Spec, Opts),
+            Res =:= true andalso remember_verified(Key),
+            Res
+    end.
+
+%%% Verified messages, node-wide. A message is verified when it arrives,
+%%% then normalised on its way through the cache, the scheduler, the worker
+%%% and the results -- and each normalisation verified its signatures again:
+%%% a conversion to ANS-104, a deep hash and an RSA verify, ~4.6 times a
+%%% message (perf, bench/msgpath.mjs). Verification is a function of the
+%%% message term, so a term that verified once verifies again: a `true' is
+%%% remembered under the SHA-256 of the exact term and the spec (private keys
+%%% aside, as `normalization_fast_hash/1' does), and any other term, a single
+%%% bit different, is verified in full. Only `true' is remembered. The table
+%%% is cleared whole when it reaches `?VERIFIED_MAX' entries.
+-define(VERIFIED, hb_message_verified).
+-define(VERIFIED_MAX, 200000).
+
+verified_key(Msg, Spec) ->
+    crypto:hash(sha256,
+        term_to_binary({Spec, hb_private:reset(Msg)}, [deterministic])).
+
+verified(Key) ->
+    try ets:member(?VERIFIED, Key)
+    catch error:badarg -> false
+    end.
+
+remember_verified(Key) ->
+    Tab = verified_table(),
+    case ets:info(Tab, size) >= ?VERIFIED_MAX of
+        true -> ets:delete_all_objects(Tab);
+        false -> ok
+    end,
+    ets:insert(Tab, {Key}).
+
+verified_table() ->
+    case ets:whereis(?VERIFIED) of
+        undefined ->
+            Self = self(),
+            Ref = make_ref(),
+            spawn(fun() ->
+                try ets:new(?VERIFIED, [named_table, public, set,
+                        {read_concurrency, true}, {write_concurrency, true}]) of
+                    _ -> Self ! Ref, receive never -> ok end
+                catch error:badarg -> Self ! Ref
+                end
+            end),
+            receive Ref -> ok end,
+            ets:whereis(?VERIFIED);
+        Tab -> Tab
+    end.
 
 %% @doc Verify a message and its loaded children, without traversing links.
 paranoid_verify(Msg, Opts) ->
