@@ -265,12 +265,25 @@ wallet(Location, KeyType, Opts) ->
 %% that type of its own at `scheduler-key-location' (created on first start),
 %% else `undefined' (the node's key schedules). A key file of another type
 %% than the configured one stops the node: an address is what a process
-%% names, so it may never change under it.
+%% names, so it may never change under it. So does a key that the node's
+%% `scheduler-default-commitment-spec' cannot sign with: HTTP message
+%% signatures here are RSA only, and assignments and pushes signed under that
+%% spec by another key would fail on every slot instead of at start.
 scheduler_wallet(Opts) ->
     case hb_opts:get(scheduler_key_type, undefined, Opts) of
         undefined -> undefined;
         Name ->
             KeyType = scheduler_key_type(Name),
+            Spec = hb_opts:get(scheduler_default_commitment_spec, <<"httpsig@1.0">>, Opts),
+            case KeyType =:= ?RSA_KEY_TYPE orelse Spec =:= <<"ans104@1.0">> of
+                true -> ok;
+                false ->
+                    throw({scheduler_key_cannot_sign,
+                        {scheduler_key_type, Name},
+                        {scheduler_default_commitment_spec, Spec},
+                        <<"an Ed25519 scheduling key signs ANS-104 items only: "
+                          "set scheduler-default-commitment-spec to ans104@1.0">>})
+            end,
             Location =
                 hb_opts:get(
                     scheduler_key_location,
