@@ -28,8 +28,17 @@
 %%% client reading what its own slot answered -- is answered without
 %%% copying slot n's whole state out of the hot cache and resolving on it.
 %%%
+%%% A results read of a slot the view does not hold yet, but which is durable
+%%% and will be computed here anyway (the process's worker runs and its
+%%% scheduler computes every slot it assigns, `process-compute-on-schedule'),
+%%% waits for the view to reach the slot, up to `process-view-wait-ms'. The
+%%% client polling for its reply otherwise went the generic way on every
+%%% early poll: loading the process definition and resolving a compute that
+%%% the worker was already doing (~10% of a 15-pair order book's CPU). A wait
+%%% that times out is `miss', so the generic path still answers it.
+%%%
 %%% Rows: `{{ProcID, Key}, Value}', `{{ProcID, {results, Slot}}, Results}'
-%%% and `{{ProcID, '$slot'}, Slot}'.
+%%% and `{{ProcID, '$slot'}, Slot}'. Waiters: `{ProcID, Slot, Pid}'.
 -module(hb_process_view).
 -export([update/5, read/3, slot/1, forget/1, enabled/1]).
 -include("include/hb.hrl").
@@ -42,6 +51,7 @@
 %% Never published by `now' (`dev_process:without_snapshot').
 -define(UNSERVED, [<<"snapshot">>, <<"priv">>]).
 -define(RESULTS_KEEP, 512).
+-define(WAITERS, hb_process_view_waiters).
 
 enabled(Opts) ->
     hb_util:atom(hb_opts:get(<<"process-now-view">>, true, Opts)) =/= false.
@@ -77,7 +87,7 @@ update(RawProcID, Slot, Public, Patches, Opts) when is_integer(Slot), is_map(Pub
                     end,
                     ets:delete(Tab, {ProcID, {results, Slot - ?RESULTS_KEEP}}),
                     ets:insert(Tab, {{ProcID, ?SLOT}, Slot}),
-                    ok
+                    wake(ProcID, Slot)
             end
     end;
 update(_ProcID, _Slot, _Public, _Patches, _Opts) -> ok.
@@ -139,17 +149,77 @@ read(Path, Req, Opts) ->
 %% newest: what the generic path reads from the slot's stored state.
 read_results(ProcID, Slot, Parts, Req, Opts) ->
     case enabled(Opts) andalso unforced(Req) andalso slot(ProcID) of
-        Held when is_integer(Held), Slot =< Held ->
-            try ets:lookup(?TABLE, {ProcID, {results, Slot}}) of
-                [{_, Results}] ->
-                    case walk(Parts, Results) of
-                        {ok, Value} -> hb_ao:force_message({ok, Value}, Opts);
-                        miss -> miss
-                    end;
-                [] -> miss
-            catch error:badarg -> miss
+        Held when is_integer(Held), Slot =< Held -> lookup_results(ProcID, Slot, Parts, Opts);
+        Held when is_integer(Held) ->
+            case await(ProcID, Slot, Opts) of
+                ok -> lookup_results(ProcID, Slot, Parts, Opts);
+                timeout -> miss
             end;
         _ -> miss
+    end.
+
+lookup_results(ProcID, Slot, Parts, Opts) ->
+    try ets:lookup(?TABLE, {ProcID, {results, Slot}}) of
+        [{_, Results}] ->
+            case walk(Parts, Results) of
+                {ok, Value} -> hb_ao:force_message({ok, Value}, Opts);
+                miss -> miss
+            end;
+        [] -> miss
+    catch error:badarg -> miss
+    end.
+
+%% Wait for the view to reach `Slot', when it is certain to be computed here
+%% without this request asking: durable, the worker running, and the
+%% scheduler computing every slot it assigns.
+await(ProcID, Slot, Opts) ->
+    Wait = hb_util:int(hb_opts:get(<<"process-view-wait-ms">>, 30000, Opts)),
+    case Wait > 0 andalso computed_on_schedule(Opts) andalso Slot =< durable(ProcID)
+            andalso is_pid(hb_name:lookup({process_worker, ProcID})) of
+        false -> timeout;
+        true ->
+            Tab = waiters(),
+            Waiter = {ProcID, Slot, self()},
+            ets:insert(Tab, Waiter),
+            Res =
+                case slot(ProcID) of
+                    Held when is_integer(Held), Held >= Slot -> ok;
+                    _ ->
+                        receive {?MODULE, ProcID, _} -> ok
+                        after Wait -> timeout
+                        end
+                end,
+            ets:delete_object(Tab, Waiter),
+            receive {?MODULE, ProcID, _} -> ok after 0 -> ok end,
+            Res
+    end.
+
+wake(ProcID, Slot) ->
+    case ets:whereis(?WAITERS) of
+        undefined -> ok;
+        Tab ->
+            lists:foreach(
+                fun({_, S, Pid} = Waiter) when S =< Slot ->
+                        ets:delete_object(Tab, Waiter),
+                        Pid ! {?MODULE, ProcID, Slot};
+                   (_) -> ok
+                end,
+                ets:lookup(Tab, ProcID)
+            )
+    end.
+
+computed_on_schedule(Opts) ->
+    hb_util:atom(hb_opts:get(<<"process-compute-on-schedule">>, true, Opts)) =/= false
+        andalso (hb_opts:get(<<"process-workers">>, false, Opts) == true orelse
+            hb_opts:get(<<"process-worker-spawn">>, false, Opts) == true).
+
+%% The newest durable slot of a process scheduled here (`dev_scheduler_cache'
+%% keeps the table), or -1.
+durable(ProcID) ->
+    try ets:lookup(dev_scheduler_durable, ProcID) of
+        [{_, Slot}] when is_integer(Slot) -> Slot;
+        _ -> -1
+    catch error:badarg -> -1
     end.
 
 walk([], Value) -> {ok, Value};
@@ -200,21 +270,23 @@ parse(<<"/", ID:43/binary, "~process@1.0/compute&slot=", Rest/binary>>) ->
     end;
 parse(_) -> miss.
 
-%% The table is owned by a process that never exits.
-table() ->
-    case ets:whereis(?TABLE) of
+%% The tables are owned by a process that never exits.
+table() -> table(?TABLE, [set, {read_concurrency, true}, {write_concurrency, true}]).
+waiters() -> table(?WAITERS, [duplicate_bag, {write_concurrency, true}]).
+
+table(Name, Kind) ->
+    case ets:whereis(Name) of
         undefined ->
             Self = self(),
             Ref = make_ref(),
             spawn(fun() ->
-                try ets:new(?TABLE, [named_table, public, set,
-                        {read_concurrency, true}, {write_concurrency, true}]) of
+                try ets:new(Name, [named_table, public | Kind]) of
                     _ -> Self ! Ref, receive never -> ok end
                 catch error:badarg -> Self ! Ref
                 end
             end),
             receive Ref -> ok end,
-            ets:whereis(?TABLE);
+            ets:whereis(Name);
         Tab -> Tab
     end.
 
@@ -267,6 +339,42 @@ results_test() ->
     % A full rewrite of the keys keeps the slots' results.
     ok = update(P, 9, #{ <<"results">> => R(9), <<"at-slot">> => 9 }, full, Opts),
     ?assertEqual(Body(<<"2">>), read(Path(2, <<"output/data">>), #{}, Opts)),
+    forget(P).
+
+%% A read of a durable slot the view has not reached waits for it; one the
+%% scheduler has not made durable, or with no worker to compute it, does not.
+await_test() ->
+    P = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Opts = #{ <<"process-workers">> => true, <<"process-view-wait-ms">> => 5000 },
+    R = fun(N) -> #{ <<"output">> => #{ <<"data">> => integer_to_binary(N) } } end,
+    Path = fun(N) -> <<"/", P/binary, "~process@1.0/compute&slot=",
+        (integer_to_binary(N))/binary, "/results/output/data">> end,
+    ok = update(P, 1, #{ <<"results">> => R(1), <<"at-slot">> => 1 }, full, Opts),
+    Durable = table(dev_scheduler_durable, [set]),
+    ets:insert(Durable, {P, 3}),
+    % No worker: no wait.
+    ?assertEqual(miss, read(Path(2), #{}, Opts)),
+    Worker = spawn(fun() -> hb_name:register({process_worker, P}), receive stop -> ok end end),
+    timer:sleep(20),
+    % Not durable: no wait.
+    ?assertEqual(miss, read(Path(4), #{}, Opts)),
+    Self = self(),
+    spawn(fun() -> Self ! {read, read(Path(3), #{}, Opts)} end),
+    timer:sleep(50),
+    ok = update(P, 2, #{ <<"results">> => R(2), <<"at-slot">> => 2 }, full, Opts),
+    receive {read, _} -> ?assert(false) after 50 -> ok end,
+    ok = update(P, 3, #{ <<"results">> => R(3), <<"at-slot">> => 3 }, full, Opts),
+    receive {read, Res} ->
+        ?assertEqual({ok, #{ <<"ao-result">> => <<"body">>, <<"body">> => <<"3">> }}, Res)
+    after 2000 -> ?assert(false)
+    end,
+    ?assertEqual([], ets:lookup(waiters(), P)),
+    % A wait that times out is a miss.
+    ets:insert(Durable, {P, 5}),
+    ?assertEqual(miss, read(Path(5), #{}, Opts#{ <<"process-view-wait-ms">> => 30 })),
+    ?assertEqual([], ets:lookup(waiters(), P)),
+    ets:delete(Durable, P),
+    Worker ! stop,
     forget(P).
 
 parse_test() ->
