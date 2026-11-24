@@ -974,7 +974,10 @@ full_blob_row(ProcID, Slot, Msg, Store, Opts) ->
     Loaded = hb_cache:ensure_all_loaded(hb_private:reset(Msg), Opts),
     K = blob_key(ProcID, <<"f">>, Slot),
     Encoded = blob_encode(Loaded),
+    hb_slot_log:note(checkpoint_bytes, byte_size(Encoded)),
+    TP = erlang:monotonic_time(microsecond),
     ok = blob_put(Store, K, Encoded, Opts),
+    hb_slot_log:note(checkpoint_put, erlang:monotonic_time(microsecond) - TP),
     case is_map_key(<<"snapshot">>, Loaded) of
         true -> ok = blob_put(Store, blob_key(ProcID, <<"s">>, Slot), marker(Encoded, Opts), Opts);
         false -> ok
