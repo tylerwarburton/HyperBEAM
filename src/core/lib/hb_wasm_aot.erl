@@ -13,7 +13,7 @@
 %%% module runs under the interpreter: bit-identical results, only slower.
 -module(hb_wasm_aot).
 -export([get/2, key/2, flags/1, wamrc/1, wamr_tag/0]).
--export([instrument/3, instrument_version/1, prewarm/2]).
+-export([instrument/3, instrument_version/1, prewarm/2, prewarm_cli/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -95,6 +95,16 @@ prewarm_one(Sha, Source, Cap, Opts) ->
             end;
         Error -> Error
     end.
+
+%% @doc `make wasm-patch-prewarm': print the results, halt 0 only when every
+%% module compiled.
+prewarm_cli(File) ->
+    Results = prewarm(hb_util:bin(File), #{}),
+    io:format("~p~n", [Results]),
+    halt(case lists:all(fun({_, {ok, _}}) -> true; (_) -> false end, Results) of
+        true -> 0;
+        false -> 1
+    end).
 
 fetch(<<"http://", _/binary>> = URL) -> http_get(URL);
 fetch(<<"https://", _/binary>> = URL) -> http_get(URL);
