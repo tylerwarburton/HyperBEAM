@@ -1293,13 +1293,23 @@ no_confirmation_before_its_flush_test_() ->
         Tracer = spawn(fun() -> collect_trace([], Parent) end),
         Msgs = queue_requests(Server, 6, Opts),
         erlang:trace_pattern({CacheMod, write, 3}, true, [global]),
-        erlang:trace(Server, true, [call, send, 'receive', {tracer, Tracer}]),
+        % The server's appender writes (`commit/3'): every process's calls,
+        % the server's messages, in time order.
+        Flags = [{tracer, Tracer}, monotonic_timestamp],
+        erlang:trace(all, true, [call | Flags]),
+        erlang:trace(Server, true, [send, 'receive' | Flags]),
         erlang:resume_process(Server),
         Confirmed = confirmations(Msgs, Opts),
-        erlang:trace(Server, false, [call, send, 'receive']),
+        erlang:trace(all, false, [call]),
+        erlang:trace(Server, false, [send, 'receive']),
         erlang:trace_pattern({CacheMod, '_', '_'}, false, [global]),
         Tracer ! {done, self()},
-        Events = receive {events, E} -> E after 5000 -> [] end,
+        Events =
+            [ erlang:delete_element(tuple_size(Ev), setelement(1, Ev, trace))
+            || {_, Ev} <- lists:keysort(1,
+                   [ {element(tuple_size(Ev), Ev), Ev}
+                   || Ev <- receive {events, E} -> E after 5000 -> [] end,
+                      element(1, Ev) == trace_ts ]) ],
         % Walk the server's events: a write makes its slot pending, a flush
         % that returns makes every pending slot durable, and a confirmation
         % is only allowed for a durable slot.
@@ -1605,15 +1615,15 @@ concurrent_schedules_once_and_durable_test_() ->
         ?assert(lists:all(fun([{assigned, S}, {refused, S}]) -> true; (_) -> false end, PerMsg)),
         ?assertEqual(lists:seq(C + 1, C + M), lists:sort([ S || [{assigned, S}, _] <- PerMsg ])),
         % Durable before told: walk the events in time order. A batch's slots
-        % are held when the server writes them, journaled when the appender
-        % commits them, and count as written when it then starts the flush; a
-        % sync that starts after that covers them once it returns.
+        % are held when the appender writes them, journaled when it commits
+        % them, and count as written when it then starts the flush; a sync
+        % that starts after that covers them once it returns.
         Sorted = lists:keysort(1, [ {element(tuple_size(Ev), Ev), Ev} || Ev <- Events ]),
         Walk =
             fun W([], _Written, _Syncing, _Durable) -> ok;
                 W([{_, Ev} | Rest], Written, Syncing, Durable) ->
                     case Ev of
-                        {trace_ts, Server, call, {CacheMod, write, [_, A, _]}, _} ->
+                        {trace_ts, _, call, {CacheMod, write, [_, A, _]}, _} ->
                             W(Rest, [{pending, slot_of(A)} | Written], Syncing, Durable);
                         {trace_ts, _, call, {hb_store_offsite_journal, write_groups, [_, Groups]}, _} ->
                             Slots = [ S || {<<"~scheduler@1.0/assignments/", K/binary>>, _}
