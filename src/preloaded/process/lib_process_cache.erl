@@ -802,9 +802,11 @@ legacy_slots(ProcID, Opts) ->
 -define(BLOB_NS, <<"pstate">>).
 -define(BLOB_VSN, 1).
 -define(BLOB_CHUNK, 4000).
-%% Chunks of a value written together (~1 MB), each write a separate hold of
-%% the store's write lock (`blob_put/4').
--define(CHUNKS_PER_WRITE, 256).
+%% Chunks of a value written together (~256 KB), each write a separate hold
+%% of the store's write lock, with a pause after it (`blob_put/4'): an 81 MB
+%% row is ~320 writes and ~0.3 s of pauses.
+-define(CHUNKS_PER_WRITE, 64).
+-define(CHUNK_PAUSE_MS, 1).
 -define(CHUNKED, "pstate-chunks:").
 
 blob_store(Opts) ->
@@ -844,9 +846,14 @@ blob_put(Store, Key, Value, Opts) ->
     % of its rows: an 81 MB checkpoint (20,000 chunks) in one write held it
     % for seconds (checkpoint_put p90 4.2 s on the game's 8 shards at
     % 100,000 players), and every slot of every process waited behind it.
+    % A checkpoint writer (low priority) pauses after each write, leaving the
+    % lock to the slots waiting on it: nothing else stops it taking the lock
+    % straight back. A slot writing its own row does not.
+    Pause = erlang:process_info(self(), priority) == {priority, low},
     lists:foreach(
         fun(Group) ->
-            ok = blob_write(Store, maps:from_list(Group), Key, Opts)
+            ok = blob_write(Store, maps:from_list(Group), Key, Opts),
+            Pause andalso timer:sleep(?CHUNK_PAUSE_MS)
         end,
         groups(
             [ {chunk_key(Key, N), C}
@@ -1074,9 +1081,12 @@ checkpoint_async(ProcID, Slot, Msg, Store, Opts) ->
     Checkpointer ! {due, ProcID, Slot, Writer, checkpoint_slots(Opts), checkpoint_writers(Opts)},
     ok.
 
-%% Writers that may run at once: `process-checkpoint-writers', default 2.
+%% Writers that may run at once: `process-checkpoint-writers', default 1. Two
+%% on the game's 8 shards at 100,000 players stored every checkpoint but
+%% contended for the store's write lock: round trip p95 37 -> 624 ms,
+%% lmdb_commit 3.9 -> 12.4 ms.
 checkpoint_writers(Opts) ->
-    case hb_util:int(hb_opts:get(<<"process-checkpoint-writers">>, 2, Opts)) of
+    case hb_util:int(hb_opts:get(<<"process-checkpoint-writers">>, 1, Opts)) of
         N when N >= 1 -> N;
         _ -> 1
     end.
@@ -1095,7 +1105,7 @@ await_checkpoint(ProcID) ->
 %%% The checkpointer: one process on the node that decides which waiting
 %%% checkpoint is written next. Every process keeps at most its newest
 %%% checkpoint waiting (a newer one supersedes it: only the newest state is
-%%% worth writing). At most `process-checkpoint-writers' are written at once,
+%%% worth writing). At most `process-checkpoint-writers' (1) are written at once,
 %%% one per process, the stalest first: the process with the most slots since
 %%% its last stored checkpoint -- what a restart would replay -- and before
 %%% all of those, any past three cadences without one. Its last stored slot
@@ -1111,7 +1121,7 @@ checkpointer() ->
                 try register(?CHECKPOINTER, self()) of
                     true ->
                         checkpointer_loop(#{ pending => #{}, running => #{},
-                            busy => #{}, last => #{}, writers => 2, waiters => [] })
+                            busy => #{}, last => #{}, writers => 1, waiters => [] })
                 catch error:badarg -> ok
                 end
             end),
@@ -2041,7 +2051,7 @@ checkpointer_order_test() ->
     after 5000 -> ?assert(false)
     end,
     % The node-wide writer count returns to its default.
-    Checkpointer ! {due, P1, 11, spawn(fun() -> receive _ -> ok end end), 100, 2},
+    Checkpointer ! {due, P1, 11, spawn(fun() -> receive _ -> ok end end), 100, 1},
     ok = await_checkpoint(P1).
 
 %% @doc With `process-state-blobs', a full-state process (no patches) writes
