@@ -6,5 +6,5 @@ set -eu
 D=$(dirname "$0")
 ${CC:-clang} --target=wasm32 -O2 -mcpu=mvp -mmutable-globals -fno-builtin -nostdlib \
     -Wl,--no-entry -Wl,--export=__stack_pointer -Wl,--export=__heap_base \
-    -Wl,-z,stack-size=65536 \
+    -Wl,-z,stack-size=65536 -Wl,--max-memory=16777216 \
     -o "$D/wp-test.wasm" "$D/wp-test.c"

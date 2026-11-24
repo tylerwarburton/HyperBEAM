@@ -8,8 +8,15 @@
 %%% contract publishes the same terms on either device.
 %%%
 %%% Process fields: `image' (the `.wasm', an ID or a message with it as its
-%%% body), `wasm-patch-abi' (1), optional `fuel-per-slot', and whatever the
-%%% module reads from its definition (the Lua runtime: `module').
+%%% body), `wasm-patch-abi' (1), optional `fuel-per-slot' and `fuel-init',
+%%% and whatever the module reads from its definition (the Lua runtime:
+%%% `module').
+%%%
+%%% At spawn the image goes through the pinned validation and instrumentation
+%%% pass (`hb_wasm_aot:instrument/3'), which refuses what may not run and adds
+%%% the fuel and call-depth counters; the instrumented module is what is
+%%% compiled and run. A node may run modules as they are, without fuel, only
+%%% with `wasm-patch-allow-uninstrumented' (tests).
 %%%
 %%% A process never halts. A slot that fails -- an error the module returns,
 %%% a trap, out of fuel, a result that does not decode or apply -- leaves the
@@ -36,9 +43,13 @@
 
 -define(DEVICE, <<"wasm-patch@1.0">>).
 -define(ABI, 1).
-%% Fuel a slot may use when the process does not say. A process constant:
-%% fuel decides results, so it never comes from node options.
--define(DEFAULT_FUEL, 10000000000).
+%% Fuel a slot (and `wp_init') may use when the process does not say
+%% (`fuel-per-slot', `fuel-init'). Process constants: fuel decides results, so
+%% it never comes from node options. A 1,500-account pair seed plus 1,000 pair
+%% messages measured ~9.4e11 units in all; a slot gets about 100x a heavy
+%% message, and init 100x that.
+-define(DEFAULT_FUEL, 1000000000000).
+-define(DEFAULT_INIT_FUEL, 100000000000000).
 -define(STACK_BYTES, 8 * 1024 * 1024).
 -define(CHECKPOINT_CALLS, 1000).
 -define(CHECKPOINT_LOG_BYTES, 64 * 1024 * 1024).
@@ -87,10 +98,11 @@ init_error(Reason) ->
 
 boot(Base, Opts) ->
     {St0, Info} = instance(Base, Opts),
-    Fuel = fuel(Base, Info, Opts),
+    Fuel = fuel(<<"fuel-per-slot">>, ?DEFAULT_FUEL, Base, Info, Opts),
+    InitFuel = fuel(<<"fuel-init">>, ?DEFAULT_INIT_FUEL, Base, Info, Opts),
     Def = hb_wasm_patch_codec:encode(definition(Base, Opts)),
     #{ inst := Inst } = St0,
-    case hb_wasm_nif:call(Inst, 0, 0, Def, Fuel) of
+    case hb_wasm_nif:call(Inst, 0, 0, Def, InitFuel) of
         {ok, Reply, _} ->
             case hb_wasm_patch_codec:decode_result(Reply) of
                 {ok, [{<<"patches">>, []}, _]} -> ok;
@@ -107,12 +119,26 @@ boot(Base, Opts) ->
                 log_bytes => 0,
                 slot => undefined
             }};
-        {trap, Reason} -> throw({wasm_patch_init, <<"wp_init trapped: ", Reason/binary>>})
+        {trap, Reason} -> throw({wasm_patch_init, <<"wp_init trapped: ", Reason/binary>>});
+        {fault, Reason} -> throw({wasm_patch_init, <<"wp_init failed on this node: ", Reason/binary>>})
     end.
 
 %% A loaded and instantiated module, before `wp_init' or a restore.
 instance(Base, Opts) ->
-    Wasm = image(Base, Opts),
+    Image = image(Base, Opts),
+    MaxPages = hb_util:int(hb_opts:get(<<"wasm-patch-max-pages">>, 65536, Opts)),
+    {Wasm, Pass} =
+        case allow_uninstrumented(Opts) of
+            true -> {Image, <<"none">>};
+            false ->
+                case hb_wasm_aot:instrument(Image, MaxPages, Opts) of
+                    {ok, Instrumented, Version} -> {Instrumented, Version};
+                    {refused, Why} -> throw({wasm_patch_init, Why});
+                    {error, Why} ->
+                        throw({wasm_patch_init,
+                            <<"no instrumentation pass on this node: ", (error_text(Why))/binary>>})
+                end
+        end,
     case lib_abi(Base, Opts) of
         ?ABI -> ok;
         Other -> throw({wasm_patch_init, <<"unsupported wasm-patch-abi ", (hb_util:bin(Other))/binary>>})
@@ -128,7 +154,6 @@ instance(Base, Opts) ->
             {ok, M, I} -> {M, I};
             {error, LoadErr} -> throw({wasm_patch_init, LoadErr})
         end,
-    MaxPages = hb_util:int(hb_opts:get(<<"wasm-patch-max-pages">>, 65536, Opts)),
     case maps:get(max_pages, Info) of
         P when P > MaxPages -> throw({wasm_patch_init, <<"memory maximum above the node's cap">>});
         _ -> ok
@@ -150,7 +175,8 @@ instance(Base, Opts) ->
             {#{
                 device => wasm_patch,
                 inst => Inst,
-                wasm_sha256 => crypto:hash(sha256, Wasm),
+                wasm_sha256 => crypto:hash(sha256, Image),
+                instrument => Pass,
                 aot_key => AotKey
             }, InstInfo};
         {error, InstErr} -> throw({wasm_patch_init, InstErr})
@@ -162,19 +188,22 @@ lib_abi(Base, Opts) ->
         Abi -> catch hb_util:int(Abi)
     end.
 
-%% Fuel per slot: the process's `fuel-per-slot', else the default. A module
-%% the instrumentation pass has not seen has no fuel global and runs only
-%% where the node allows it (`wasm-patch-allow-uninstrumented').
-fuel(Base, #{ fuel := true }, Opts) ->
-    case find([<<"fuel-per-slot">>], Base, Opts) of
-        not_found -> ?DEFAULT_FUEL;
+%% A fuel budget from the process (`Key'), else the default. A module without
+%% the pass's fuel global (allowed only with `wasm-patch-allow-uninstrumented')
+%% runs unmetered.
+fuel(Key, Default, Base, #{ fuel := true }, Opts) ->
+    case find([Key], Base, Opts) of
+        not_found -> Default;
         F -> hb_util:int(F)
     end;
-fuel(_Base, #{ fuel := false }, Opts) ->
+fuel(_Key, _Default, _Base, #{ fuel := false }, _Opts) ->
+    -1.
+
+allow_uninstrumented(Opts) ->
     case hb_opts:get(<<"wasm-patch-allow-uninstrumented">>, false, Opts) of
-        true -> -1;
-        <<"true">> -> -1;
-        _ -> throw({wasm_patch_init, <<"the module has no wp_fuel global (not instrumented)">>})
+        true -> true;
+        <<"true">> -> true;
+        _ -> false
     end.
 
 %% A key of the process definition: on the base, or under `process'.
@@ -305,6 +334,15 @@ compute(Key, Base, Req, T0, Opts) ->
             {error, #{
                 <<"status">> => 500,
                 <<"body">> => <<"wasm-patch@1.0 trap: ", Reason/binary>>
+            }};
+        {fault, Reason} ->
+            % Not a result of the computation (a runtime stack overflow before
+            % the pass's depth limit): nothing of it is stored, and the slot is
+            % computed again later.
+            rollback(St, Opts),
+            {failure, #{
+                <<"status">> => 500,
+                <<"body">> => <<"wasm-patch@1.0 node fault: ", Reason/binary>>
             }}
     end.
 
@@ -325,6 +363,7 @@ call(St0, ReqBin, Tries, Opts) ->
     case hb_wasm_nif:call(Inst, 1, Gen, ReqBin, Fuel) of
         {ok, Reply, _FuelLeft} -> {St, {ok, Reply}};
         {trap, Reason} -> {St, {trap, Reason}};
+        {fault, Reason} -> {St, {fault, Reason}};
         {error, Busy} when (Busy == stale orelse Busy == dirty), Tries > 1 ->
             call(St, ReqBin, Tries - 1, Opts);
         {error, Busy} -> erlang:error({wasm_patch_instance_busy, Busy})
@@ -395,6 +434,7 @@ snapshot(Base, _Req, Opts) ->
             Snapshot = #{
                 <<"abi">> => ?ABI,
                 <<"wasm-sha256">> => maps:get(wasm_sha256, Cur),
+                <<"instrument">> => maps:get(instrument, Cur),
                 <<"aot-key">> => hb_util:bin(maps:get(aot_key, Cur)),
                 <<"slot">> => maps:get(slot, Cur),
                 <<"gen">> => Gen,
@@ -440,10 +480,16 @@ restore(Base, Body, Opts) ->
         <<"globals">> := Globals,
         <<"memory">> := Compressed
     } = Snapshot,
-    {St0 = #{ inst := Inst, wasm_sha256 := Hash1 }, Info} = instance(Base, Opts),
+    {St0 = #{ inst := Inst, wasm_sha256 := Hash1, instrument := Pass }, Info} =
+        instance(Base, Opts),
     case Hash1 of
         Hash -> ok;
         _ -> throw({wasm_patch_init, <<"the snapshot is of another image">>})
+    end,
+    % Another pass counts fuel differently and exports other globals.
+    case maps:get(<<"instrument">>, Snapshot, <<"none">>) of
+        Pass -> ok;
+        _ -> throw({wasm_patch_init, <<"the snapshot was taken under another instrumentation pass">>})
     end,
     Mem = zlib:uncompress(Compressed),
     Gl = [{N, Kind, V} || {N, Kind, V} <- Globals, is_binary(N), is_integer(V)],
@@ -453,7 +499,7 @@ restore(Base, Body, Opts) ->
     end,
     St0#{
         gen => Gen,
-        fuel => fuel(Base, Info, Opts),
+        fuel => fuel(<<"fuel-per-slot">>, ?DEFAULT_FUEL, Base, Info, Opts),
         ckpt => {Gen, Mem, Gl},
         log => [],
         log_bytes => 0,
@@ -518,7 +564,9 @@ init_handle_test() ->
     % The request reached the module as sent: the integer comes back as one.
     ?assertEqual(1, hb_ao:get(<<"echo-number">>, S5, Opts)),
     S6 = run(S5, [<<"Delete">>], Opts),
-    ?assertEqual(not_found, hb_ao:get(<<"last-action">>, S6, Opts)).
+    % Not `hb_ao:get': a key the state lacks is a call into the module.
+    ?assertNot(maps:is_key(<<"last-action">>, S6)),
+    ?assertEqual(<<"15">>, maps:get(<<"count">>, S6)).
 
 %% A returned error, a trap and a result that does not decode each fail the
 %% slot with the state unchanged, and the next slot computes from it.
@@ -527,8 +575,8 @@ failed_slots_leave_state_test() ->
     Opts = test_opts(),
     {ok, S0} = hb_ao:resolve(test_base(), <<"init">>, Opts),
     S1 = run(S0, [<<"Increment">>], Opts),
-    ?assertEqual(
-        {error, #{ <<"status">> => 500, <<"body">> => <<"boom">> }},
+    ?assertMatch(
+        {error, #{ <<"status">> := 500, <<"body">> := <<"boom">> }},
         hb_ao:resolve(S1, test_request(<<"Fail">>), Opts)
     ),
     {error, #{ <<"status">> := 500, <<"body">> := Trap }} =
@@ -640,13 +688,36 @@ refuses_imports_test() ->
     ]),
     {error, #{ <<"status">> := 422, <<"body">> := Body }} =
         hb_ao:resolve((test_base())#{ <<"image">> => Wasm }, <<"init">>, test_opts()),
-    ?assertNotEqual(nomatch, binary:match(Body, <<"env.abort">>)),
-    % An uninstrumented module needs the node's permission.
+    ?assertNotEqual(nomatch, binary:match(Body, <<"env.abort">>)).
+
+%% The production path: the module goes through the instrumentation pass
+%% and runs metered. Out of fuel is a failed slot like any other trap; the
+%% next slot computes from the state before it.
+instrumented_fuel_test() ->
+    hb:init(),
+    Opts = test_opts(#{ <<"wasm-patch-allow-uninstrumented">> => false }),
+    {ok, S0} = hb_ao:resolve((test_base())#{ <<"fuel-per-slot">> => 100000 }, <<"init">>, Opts),
+    #{ instrument := Pass } = hb_private:get(<<"state">>, S0, Opts),
+    ?assertMatch(<<"wasm-patch-instrument/", _/binary>>, Pass),
+    S2 = run(S0, [<<"Increment">>, <<"Jump">>], Opts),
+    ?assertEqual(<<"11">>, count(S2, Opts)),
+    ?assertEqual(7, hb_ao:get(<<"jumped">>, S2, Opts)),
     ?assertMatch(
-        {error, #{ <<"status">> := 422 }},
-        hb_ao:resolve(test_base(), <<"init">>,
-            test_opts(#{ <<"wasm-patch-allow-uninstrumented">> => false }))
-    ).
+        {error, #{ <<"status">> := 500, <<"body">> := <<"wasm-patch@1.0 trap: out of fuel">> }},
+        hb_ao:resolve(S2, test_request(<<"Loop">>), Opts)
+    ),
+    ?assertEqual(<<"12">>, count(run(S2, [<<"Increment">>], Opts), Opts)),
+    % A snapshot carries the pass version and restores under the same pass.
+    {ok, Snapshot} = hb_ao:resolve(S2, <<"snapshot">>, Opts),
+    Cold = hb_ao:set(hb_private:reset(S2), <<"snapshot">>, Snapshot, Opts),
+    {ok, Restored} = hb_ao:resolve(Cold, <<"normalize">>, Opts),
+    ?assertEqual(<<"12">>, count(run(Restored, [<<"Increment">>], Opts), Opts)),
+    % ...and is refused under none.
+    ?assertMatch({error, #{ <<"status">> := 422 }},
+        hb_ao:resolve(Cold, <<"normalize">>, test_opts())),
+    % The pass refuses what may not run: here, a memory above the cap.
+    ?assertMatch({error, #{ <<"status">> := 422 }},
+        hb_ao:resolve(test_base(), <<"init">>, Opts#{ <<"wasm-patch-max-pages">> => 8 })).
 
 %% AOT and the interpreter give the same deltas. Needs `wamrc' 2.2.0
 %% (`HB_WAMRC' or on the path); without one AOT falls back to the
@@ -655,13 +726,14 @@ aot_matches_interp_test_() ->
     {timeout, 120, fun() ->
         hb:init(),
         Dir = "_build/test-wasm-aot-" ++ integer_to_list(erlang:unique_integer([positive])),
-        Interp = test_opts(),
-        Aot = test_opts(#{ <<"wasm-patch-aot">> => true, <<"wasm-patch-aot-dir">> => Dir }),
+        Interp = test_opts(#{ <<"wasm-patch-allow-uninstrumented">> => false }),
+        Aot = Interp#{ <<"wasm-patch-aot">> => true, <<"wasm-patch-aot-dir">> => Dir },
         Actions = [<<"Increment">>, <<"Types">>, <<"Jump">>, <<"Fail">>, <<"Grow">>,
-            <<"Increment">>, <<"Trap">>, <<"Delete">>, <<"Increment">>],
+            <<"Increment">>, <<"Trap">>, <<"Loop">>, <<"Delete">>, <<"Increment">>],
         Deltas =
             fun(Opts) ->
-                {ok, S0} = hb_ao:resolve(test_base(), <<"init">>, Opts),
+                {ok, S0} = hb_ao:resolve((test_base())#{ <<"fuel-per-slot">> => 1000000 },
+                    <<"init">>, Opts),
                 {_, Rev} =
                     lists:foldl(
                         fun(Action, {Prev, Acc}) ->
@@ -742,20 +814,22 @@ process_test_() ->
             fun(Slot) ->
                 hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, Opts)
             end,
+        % Slots count from 0.
         Schedule(<<"Increment">>),
         Schedule(<<"Fail">>),
         Schedule(<<"Increment">>),
+        {ok, State0} = Compute(0),
+        ?assertEqual(<<"11">>, hb_ao:get(<<"count">>, State0, Opts)),
         {ok, State1} = Compute(1),
         ?assertEqual(<<"11">>, hb_ao:get(<<"count">>, State1, Opts)),
+        ?assertEqual(<<"error">>, hb_ao:get(<<"results/type">>, State1, Opts)),
+        ?assertEqual(<<"boom">>, hb_ao:get(<<"results/error/body">>, State1, Opts)),
         {ok, State2} = Compute(2),
-        ?assertEqual(<<"11">>, hb_ao:get(<<"count">>, State2, Opts)),
-        ?assertEqual(<<"error">>, hb_ao:get(<<"results/type">>, State2, Opts)),
-        {ok, State3} = Compute(3),
-        ?assertEqual(<<"12">>, hb_ao:get(<<"count">>, State3, Opts)),
+        ?assertEqual(<<"12">>, hb_ao:get(<<"count">>, State2, Opts)),
         Schedule(<<"Increment">>),
-        {ok, State4} = Compute(4),
-        ?assertEqual(<<"13">>, hb_ao:get(<<"count">>, State4, Opts)),
-        {ok, Old} = Compute(1),
+        {ok, State3} = Compute(3),
+        ?assertEqual(<<"13">>, hb_ao:get(<<"count">>, State3, Opts)),
+        {ok, Old} = Compute(0),
         ?assertEqual(<<"11">>, hb_ao:get(<<"count">>, Old, Opts))
     end}.
 
@@ -772,6 +846,7 @@ bench_report_test_() ->
                 Dir = "_build/bench-wasm-aot",
                 Rows = [
                     {Mode, Kind, bench(Kind, N, test_opts(#{
+                        <<"wasm-patch-allow-uninstrumented">> => false,
                         <<"wasm-patch-aot">> => Mode =:= aot,
                         <<"wasm-patch-aot-dir">> => Dir
                     }))}

@@ -6,13 +6,14 @@
 %%%
 %%%   `<wasm-patch-aot-dir>/<sha256(wasm)>/<wamr-tag>/<sha256(flags)>.aot'
 %%%
-%%% The flags include the instrumentation pass version
-%%% (`wasm-patch-instrument-version'), so a new pass never reuses old code.
+%%% The module is the instrumented one, which embeds the pass version, so a
+%%% new pass never reuses old code.
 %%% One compile runs at a time on a node. When there is no usable `wamrc'
 %%% (missing, or not the runtime's WAMR version) or a compile fails, the
 %%% module runs under the interpreter: bit-identical results, only slower.
 -module(hb_wasm_aot).
 -export([get/2, key/2, flags/1, wamrc/1, wamr_tag/0]).
+-export([instrument/3, instrument_version/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -31,10 +32,8 @@
 %% @doc The WAMR release the runtime and `wamrc' are built from.
 wamr_tag() -> ?WAMR_TAG.
 
-%% @doc The `wamrc' flags, the instrumentation pass version last.
-flags(Opts) ->
-    ?FLAGS ++ ["instrument=" ++ hb_util:list(hb_util:bin(
-        hb_opts:get(<<"wasm-patch-instrument-version">>, <<"none">>, Opts)))].
+%% @doc The `wamrc' flags.
+flags(_Opts) -> ?FLAGS.
 
 %% @doc The cache key of a module under the node's flags.
 key(Wasm, Opts) ->
@@ -50,7 +49,7 @@ get(Wasm, Opts) ->
         <<"false">> -> {interp, disabled};
         _ ->
             Key = key(Wasm, Opts),
-            Path = filename:join(dir(Opts), <<Key/binary, ".aot">>),
+            Path = filename:join(dir(Opts), hb_util:list(<<Key/binary, ".aot">>)),
             case file:read_file(Path) of
                 {ok, Aot} -> {aot, Aot, Key};
                 {error, _} -> compile(Wasm, Key, Path, Opts)
@@ -104,14 +103,71 @@ run_wamrc(Wamrc, Wasm, Key, Path, Opts) ->
             {interp, {wamrc_failed, Status}}
     end.
 
-%% @doc The `wamrc' to use: `wasm-patch-wamrc', else `HB_WAMRC', else `wamrc'
-%% on the path, and only if it reports the runtime's WAMR version.
+%% @doc Validate and instrument a module with the pinned pass
+%% (`native/wasm_patch_instrument', `make wasm-patch-instrument'):
+%% `{ok, Instrumented, PassVersion}', `{refused, Reason}' (the module may not
+%% run) or `{error, Reason}' (no usable pass on this node). The output runs
+%% under both the interpreter and AOT, so fuel and depth count the same.
+instrument(Wasm, CapPages, Opts) ->
+    case instrument_version(Opts) of
+        {error, _} = Error -> Error;
+        {ok, Pass, Version} ->
+            Dir = dir(Opts),
+            Base = filename:join(Dir, "instrument-" ++
+                integer_to_list(erlang:unique_integer([positive]))),
+            In = Base ++ ".in.wasm",
+            Out = Base ++ ".out.wasm",
+            ok = filelib:ensure_dir(In),
+            ok = file:write_file(In, Wasm),
+            Res = exec(Pass, ["--memory-cap-pages", integer_to_list(CapPages), In, Out]),
+            file:delete(In),
+            Read = file:read_file(Out),
+            file:delete(Out),
+            case {Res, Read} of
+                {{0, _}, {ok, Instrumented}} -> {ok, Instrumented, Version};
+                {{1, Reason}, _} -> {refused, string:trim(Reason)};
+                {{Status, Output}, _} -> {error, {instrument_failed, Status, Output}}
+            end
+    end.
+
+%% @doc The pass binary and its version: `wasm-patch-instrument' option, else
+%% `HB_WASM_PATCH_INSTRUMENT', else the build's `priv/wasm-patch-instrument'.
+instrument_version(Opts) ->
+    Pass =
+        case hb_opts:get(<<"wasm-patch-instrument">>, not_found, Opts) of
+            not_found ->
+                case os:getenv("HB_WASM_PATCH_INSTRUMENT") of
+                    false -> filename:join(code:priv_dir(hb), "wasm-patch-instrument");
+                    Env -> Env
+                end;
+            Configured -> hb_util:list(Configured)
+        end,
+    case filelib:is_regular(Pass) of
+        false -> {error, {no_instrument_pass, Pass}};
+        true ->
+            Cached = {?MODULE, pass, Pass},
+            case persistent_term:get(Cached, undefined) of
+                undefined ->
+                    Res =
+                        case exec(Pass, ["--version"]) of
+                            {0, Out} -> {ok, Pass, string:trim(Out)};
+                            Other -> {error, {instrument_version, Other}}
+                        end,
+                    persistent_term:put(Cached, Res),
+                    Res;
+                Res -> Res
+            end
+    end.
+
+%% @doc The `wamrc' to use: `wasm-patch-wamrc', else `HB_WAMRC', else the
+%% build's `priv/wamrc' (`make wamrc'), and only if it reports the runtime's
+%% WAMR version.
 wamrc(Opts) ->
     Candidate =
         case hb_opts:get(<<"wasm-patch-wamrc">>, not_found, Opts) of
             not_found ->
                 case os:getenv("HB_WAMRC") of
-                    false -> os:find_executable("wamrc");
+                    false -> filename:join(code:priv_dir(hb), "wamrc");
                     Env -> Env
                 end;
             Configured -> hb_util:list(Configured)
@@ -164,7 +220,6 @@ key_test() ->
     K1 = key(<<"a">>, #{}),
     ?assertEqual(K1, key(<<"a">>, #{})),
     ?assertNotEqual(K1, key(<<"b">>, #{})),
-    ?assertNotEqual(K1, key(<<"a">>, #{ <<"wasm-patch-instrument-version">> => <<"1">> })),
     [Hash, Tag, _] = binary:split(K1, <<"/">>, [global]),
     ?assertEqual(64, byte_size(Hash)),
     ?assertEqual(?WAMR_TAG, Tag).

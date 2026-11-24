@@ -29,6 +29,8 @@
 #define SENTINEL "wasm-patch-longjmp"
 #define ERRLEN 256
 #define MAX_SIG 48
+/* The instrumentation pass's call-depth limit (DEPTH_LIMIT). */
+#define DEPTH_LIMIT 4096
 
 typedef struct {
     uint8_t *bytes;
@@ -48,8 +50,8 @@ typedef struct {
     int32_t temp_ret0;
     int wide;                       /* memory64 ABI: pointers are i64 */
     wasm_function_inst_t f_alloc, f_init, f_handle, f_initialize;
-    wasm_global_inst_t sp, fuel, threw, threw_value;
-    int has_sp, has_fuel, has_threw;
+    wasm_global_inst_t sp, fuel, depth, threw, threw_value;
+    int has_sp, has_fuel, has_depth, has_threw;
 } wp_inst;
 
 static ErlNifResourceType *MODULE_RES;
@@ -60,7 +62,7 @@ static int RUNTIME_READY = 0;
 typedef struct reg_node { char *name; struct reg_node *next; } reg_node;
 static reg_node *REGISTERED = NULL;
 
-static ERL_NIF_TERM A_OK, A_ERROR, A_TRAP, A_STALE, A_DIRTY, A_I32, A_I64, A_F32, A_F64;
+static ERL_NIF_TERM A_OK, A_ERROR, A_TRAP, A_FAULT, A_STALE, A_DIRTY, A_I32, A_I64, A_F32, A_F64;
 
 /* ---------- helpers ---------- */
 
@@ -363,6 +365,7 @@ static int inst_build(wp_inst *w, char *err, uint32_t errlen) {
     w->wide = pk[0] == WASM_I64;
     w->has_sp = lookup_global(w, "__stack_pointer", &w->sp);
     w->has_fuel = lookup_global(w, "wp_fuel", &w->fuel);
+    w->has_depth = lookup_global(w, "wp_depth", &w->depth);
     w->has_threw = lookup_global(w, "__THREW__", &w->threw)
         && lookup_global(w, "__threwValue", &w->threw_value);
     w->temp_ret0 = 0;
@@ -404,15 +407,25 @@ static ERL_NIF_TERM nif_instantiate(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     return enif_make_tuple3(env, A_OK, res, info);
 }
 
-/* A trap's reason; a trap with the fuel global at zero is out of fuel. */
+/* A failed call. Out of fuel (wp_fuel < 0) and too deep (wp_depth above the
+ * pass's limit) are counted by wasm code, identically under the interpreter
+ * and AOT: `{trap, Reason}', a slot result. A native or operand stack overflow
+ * before the depth limit depends on the runtime and the thread: `{fault,
+ * Reason}', a node fault that must never become a slot result. */
 static ERL_NIF_TERM trap(ErlNifEnv *env, wp_inst *w) {
     const char *x = wasm_runtime_get_exception(w->inst);
     char msg[ERRLEN];
-    if (w->has_fuel && global_signed(&w->fuel) <= 0) snprintf(msg, sizeof msg, "out of fuel");
-    else snprintf(msg, sizeof msg, "%s", x ? x : "trap");
+    ERL_NIF_TERM kind = A_TRAP;
+    if (w->has_fuel && global_signed(&w->fuel) < 0) snprintf(msg, sizeof msg, "out of fuel");
+    else if (w->has_depth && global_signed(&w->depth) > DEPTH_LIMIT)
+        snprintf(msg, sizeof msg, "call depth limit exceeded");
+    else {
+        snprintf(msg, sizeof msg, "%s", x ? x : "trap");
+        if (x && strstr(x, "stack overflow")) kind = A_FAULT;
+    }
     wasm_runtime_clear_exception(w->inst);
     w->gen = -1;
-    return enif_make_tuple2(env, A_TRAP, mk_bin(env, msg));
+    return enif_make_tuple2(env, kind, mk_bin(env, msg));
 }
 
 static int call_fn(wp_inst *w, wasm_function_inst_t f, uint32_t argc, uint32_t *args) {
@@ -421,7 +434,8 @@ static int call_fn(wp_inst *w, wasm_function_inst_t f, uint32_t argc, uint32_t *
 }
 
 /* call(Inst, Which, ExpectedGen, Request, Fuel) ->
- *   {ok, Reply, FuelLeft} | {trap, Reason} | {error, stale | dirty | Msg}
+ *   {ok, Reply, FuelLeft} | {trap, Reason} | {fault, Reason}
+ *   | {error, stale | dirty | Msg}
  * Which: 0 = `_initialize' (if any) then wp_init, 1 = wp_handle. Fuel < 0
  * leaves the fuel global alone. */
 static ERL_NIF_TERM nif_call(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
@@ -445,6 +459,7 @@ static ERL_NIF_TERM nif_call(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         goto done;
     }
     if (w->has_fuel && fuel >= 0) global_set(&w->fuel, (uint64_t)fuel);
+    if (w->has_depth) global_set(&w->depth, 0);
     uint32_t a[4];
     if (which == 0 && w->f_initialize) {
         if (!call_fn(w, w->f_initialize, 0, a)) { out = trap(env, w); goto done; }
@@ -619,6 +634,7 @@ static int load(ErlNifEnv *env, void **priv, ERL_NIF_TERM info) {
     A_OK = enif_make_atom(env, "ok");
     A_ERROR = enif_make_atom(env, "error");
     A_TRAP = enif_make_atom(env, "trap");
+    A_FAULT = enif_make_atom(env, "fault");
     A_STALE = enif_make_atom(env, "stale");
     A_DIRTY = enif_make_atom(env, "dirty");
     A_I32 = enif_make_atom(env, "i32");
