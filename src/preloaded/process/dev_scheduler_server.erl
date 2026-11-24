@@ -523,46 +523,40 @@ assign_batch(State = #{ mode := aggressive, current := Before }, Requests) ->
         Now -> compute_on_schedule(After, Now)
     end;
 assign_batch(State = #{ current := First, opts := Opts, unwritten := Unwritten }, Requests) ->
-    % The batch's writes are held (`dev_scheduler_cache:hold/2') and made by
-    % the appender after it ends: nothing of this batch, nor of one still in
-    % flight, can be read back before, so a message assigned in either is
-    % found in `Pending', which starts as `unwritten'.
-    Assign =
-        fun() ->
-            lists:foldl(
-                fun({Message, Reply, AbortTime}, {S, Acc, Pending}) ->
-                    case too_old(AbortTime) of
-                        true -> {S, Acc, Pending};
-                        false ->
-                            try write_assignment(S, Message, First, Pending) of
-                                {refused, Error} ->
-                                    {S, [{refused, Reply, Message, Error} | Acc],
-                                        Pending};
-                                {S2, Assignment, Pending2} ->
-                                    % Queued when the client asked:
-                                    % its deadline less the timeout.
-                                    hb_msg_trace:scheduled(Assignment,
-                                        {Message, AbortTime - ?DEFAULT_TIMEOUT}),
-                                    {S2, [{Reply, Message, Assignment} | Acc],
-                                        Pending2}
-                            catch
-                                _Class:Reason:Stack ->
-                                    ?event({error_scheduling,
-                                        {reason, Reason}, {trace, Stack}}),
-                                    {S, Acc, Pending}
-                            end
-                    end
-                end,
-                {State, [], Unwritten},
-                Requests
-            )
-        end,
-    {{Assigned, Written, Pending}, Commit} =
-        try dev_scheduler_cache:hold(Assign, Opts)
-        catch Class:Reason ->
-            ?event(error, {scheduler_write_failed, {class, Class}, {reason, Reason}}),
-            exit({scheduler_write_failed, Reason})
-        end,
+    % The batch's assignments are built and signed here, in slot order; the
+    % appender encodes and writes them after the batch ends (`commit/3'), so
+    % only signing is on this serial path. Nothing of this batch, nor of one
+    % still in flight, can be read back before its write, so a message
+    % assigned in either is found in `Pending', which starts as `unwritten'.
+    {Assigned, Written, Pending, Writes} =
+        lists:foldl(
+            fun({Message, Reply, AbortTime}, {S, Acc, Pending, Ws}) ->
+                case too_old(AbortTime) of
+                    true -> {S, Acc, Pending, Ws};
+                    false ->
+                        try new_assignment(S, Message, First, Pending) of
+                            {refused, Error} ->
+                                {S, [{refused, Reply, Message, Error} | Acc],
+                                    Pending, Ws};
+                            {S2, Assignment, Pending2, Write} ->
+                                % Queued when the client asked:
+                                % its deadline less the timeout.
+                                hb_msg_trace:scheduled(Assignment,
+                                    {Message, AbortTime - ?DEFAULT_TIMEOUT}),
+                                {S2, [{Reply, Message, Assignment} | Acc],
+                                    Pending2, [Write | Ws]}
+                        catch
+                            _Class:Reason:Stack ->
+                                ?event({error_scheduling,
+                                    {reason, Reason}, {trace, Stack}}),
+                                {S, Acc, Pending, Ws}
+                        end
+                end
+            end,
+            {State, [], Unwritten, []},
+            Requests
+        ),
+    Commit = fun() -> commit(maps:get(id, State), lists:reverse(Writes), Opts) end,
     case Written of
         [] -> Assigned;
         _ ->
@@ -585,8 +579,8 @@ assign_batch(State = #{ current := First, opts := Opts, unwritten := Unwritten }
             }
     end.
 
-%% @doc The server's appender: it makes each batch's held writes, in batch
-%% order, then starts that batch's flush, which answers the server
+%% @doc The server's appender: it encodes and writes each batch (`commit/3'),
+%% in batch order, then starts that batch's flush, which answers the server
 %% (`{flushed, Ref, Result}'). The server goes on assigning meanwhile: the
 %% writer call (one per batch, behind every other scheduler's) is no longer
 %% on its path. A refused write is reported as the batch's failed flush, and
@@ -599,8 +593,9 @@ with_appender(State = #{ opts := Opts }) ->
     Pid =
         spawn_link(
             fun() ->
-                % A few microseconds of work for each batch: ahead of the
-                % node's request handlers, not behind them.
+                % Each batch's encoding and write (~2 ms an assignment) is
+                % on its clients' confirmation path: ahead of the node's
+                % request handlers, not behind them.
                 process_flag(priority, high),
                 erlang:monitor(process, Server),
                 appender(Server, Opts)
@@ -646,28 +641,52 @@ too_old(AbortTime) ->
         false -> false
     end.
 
-%% @doc Build, sign and write the next assignment, and its message index row
-%% right after it; return the next state and `Pending' with the message's
-%% IDs. A signed message is assigned at most once per process (anyone can
-%% post a public message again, and it would run again): one already
-%% assigned is `{refused, Error}'. The store holds the slots up to `First',
-%% where the batch began, but those of batches still in flight; `Pending'
-%% holds theirs and the batch's own (ID => slot).
-write_assignment(State, Message, First, Pending) ->
+%% @doc Build and sign the next assignment; return the next state, `Pending'
+%% with the message's IDs, and what `commit/3' writes for it (the assignment,
+%% then its message index row). A signed message is assigned at most once
+%% per process (anyone can post a public message again, and it would run
+%% again): one already assigned is `{refused, Error}'. The store holds the
+%% slots up to `First', where the batch began, but those of batches still in
+%% flight; `Pending' holds theirs and the batch's own (ID => slot).
+new_assignment(State, Message, First, Pending) ->
     Opts = maps:get(opts, State),
     ProcID = maps:get(id, State),
-    {ok, OnlyAttested} = hb_message:with_only_committed(Message, Opts),
-    IDs = message_ids(Message, OnlyAttested, Opts),
-    case assigned(ProcID, IDs, First, Pending, Opts) of
+    {ok, OnlyAttested} =
+        hb_phase_timer:time(sched_committed, fun() ->
+            hb_message:with_only_committed(Message, Opts) end),
+    IDs = hb_phase_timer:time(sched_ids, fun() -> message_ids(Message, OnlyAttested, Opts) end),
+    case hb_phase_timer:time(sched_dedupe, fun() -> assigned(ProcID, IDs, First, Pending, Opts) end) of
         {ok, Slot, ID} -> {refused, refusal(State, Slot, ID)};
         not_found ->
             {Assignment, Next} = build_assignment(State, Message, OnlyAttested),
             NextSlot = maps:get(current, Next),
-            ok = dev_scheduler_cache:write(ProcID, Assignment, Opts),
-            ok = dev_scheduler_cache:write_message_slot(ProcID, IDs, NextSlot, Opts),
             {Next, Assignment,
-                maps:merge(Pending, maps:from_keys(IDs, NextSlot))}
+                maps:merge(Pending, maps:from_keys(IDs, NextSlot)),
+                {Assignment, IDs, NextSlot}}
     end.
+
+%% @doc Write a batch's assignments, each with its message index row right
+%% after it, in slot order, as one held write (`dev_scheduler_cache:hold/2':
+%% a journaled store takes them in one writer call). The appender runs it.
+%% `ok', or the store's refusal; a write that fails raises, which the
+%% appender reports as the batch's failed flush.
+commit(ProcID, Writes, Opts) ->
+    {ok, Commit} =
+        dev_scheduler_cache:hold(
+            fun() ->
+                lists:foreach(
+                    fun({Assignment, IDs, Slot}) ->
+                        hb_phase_timer:time(sched_write, fun() ->
+                            ok = dev_scheduler_cache:write(ProcID, Assignment, Opts),
+                            ok = dev_scheduler_cache:write_message_slot(ProcID, IDs, Slot, Opts)
+                        end)
+                    end,
+                    Writes
+                )
+            end,
+            Opts
+        ),
+    Commit().
 
 %% @doc The IDs a message is assigned at most once under: its signatures,
 %% and the outbox entry its admission names (`dev_scheduler_admission'), so
@@ -764,7 +783,7 @@ build_assignment(State, Message, OnlyAttested) ->
     NextSlot = maps:get(current, State) + 1,
     {Timestamp, Height, Hash} = ar_timestamp:get(),
     Assignment =
-        commit_assignment(
+        hb_phase_timer:time(sched_sign, fun() -> commit_assignment(
             % The door's admission (`admit-*'), if any: signed with the rest,
             % so the process reads it as its own scheduler's word.
             (dev_scheduler_admission:keys(Message, Opts))#{
@@ -786,20 +805,21 @@ build_assignment(State, Message, OnlyAttested) ->
                 <<"type">> => <<"Assignment">>
             },
             State
-        ),
-    ?event(scheduling,
+        ) end),
+    hb_phase_timer:time(sched_event, fun() -> ?event(scheduling,
         {assigned,
             {proc_id, maps:get(id, State)},
             {slot, NextSlot},
             {assignment, hb_message:id(Assignment, all)}
         }
-    ),
+    ) end),
     {
         Assignment,
         State#{
             current := NextSlot,
             base_state_hashpath :=
-                next_hashpath(BaseStateHashpath, Assignment, State)
+                hb_phase_timer:time(sched_hashpath, fun() ->
+                    next_hashpath(BaseStateHashpath, Assignment, State) end)
         }
     }.
 
@@ -1273,13 +1293,23 @@ no_confirmation_before_its_flush_test_() ->
         Tracer = spawn(fun() -> collect_trace([], Parent) end),
         Msgs = queue_requests(Server, 6, Opts),
         erlang:trace_pattern({CacheMod, write, 3}, true, [global]),
-        erlang:trace(Server, true, [call, send, 'receive', {tracer, Tracer}]),
+        % The server's appender writes (`commit/3'): every process's calls,
+        % the server's messages, in time order.
+        Flags = [{tracer, Tracer}, monotonic_timestamp],
+        erlang:trace(all, true, [call | Flags]),
+        erlang:trace(Server, true, [send, 'receive' | Flags]),
         erlang:resume_process(Server),
         Confirmed = confirmations(Msgs, Opts),
-        erlang:trace(Server, false, [call, send, 'receive']),
+        erlang:trace(all, false, [call]),
+        erlang:trace(Server, false, [send, 'receive']),
         erlang:trace_pattern({CacheMod, '_', '_'}, false, [global]),
         Tracer ! {done, self()},
-        Events = receive {events, E} -> E after 5000 -> [] end,
+        Events =
+            [ erlang:delete_element(tuple_size(Ev), setelement(1, Ev, trace))
+            || {_, Ev} <- lists:keysort(1,
+                   [ {element(tuple_size(Ev), Ev), Ev}
+                   || Ev <- receive {events, E} -> E after 5000 -> [] end,
+                      element(1, Ev) == trace_ts ]) ],
         % Walk the server's events: a write makes its slot pending, a flush
         % that returns makes every pending slot durable, and a confirmation
         % is only allowed for a durable slot.
@@ -1554,7 +1584,7 @@ concurrent_schedules_once_and_durable_test_() ->
         Tracer = spawn(fun() -> collect_trace([], Parent) end),
         {module, CacheMod} = erlang:fun_info(fun dev_scheduler_cache:flush/1, module),
         Flags = [call, {tracer, Tracer}, monotonic_timestamp],
-        erlang:trace_pattern({hb_store_offsite_journal, datasync, 1},
+        erlang:trace_pattern({hb_store_offsite_journal, datasync, 2},
             [{'_', [], [{return_trace}]}], [local]),
         erlang:trace_pattern({CacheMod, write, 3}, true, [global]),
         erlang:trace_pattern({CacheMod, flush_async, 3}, true, [global]),
@@ -1585,15 +1615,15 @@ concurrent_schedules_once_and_durable_test_() ->
         ?assert(lists:all(fun([{assigned, S}, {refused, S}]) -> true; (_) -> false end, PerMsg)),
         ?assertEqual(lists:seq(C + 1, C + M), lists:sort([ S || [{assigned, S}, _] <- PerMsg ])),
         % Durable before told: walk the events in time order. A batch's slots
-        % are held when the server writes them, journaled when the appender
-        % commits them, and count as written when it then starts the flush; a
-        % sync that starts after that covers them once it returns.
+        % are held when the appender writes them, journaled when it commits
+        % them, and count as written when it then starts the flush; a sync
+        % that starts after that covers them once it returns.
         Sorted = lists:keysort(1, [ {element(tuple_size(Ev), Ev), Ev} || Ev <- Events ]),
         Walk =
             fun W([], _Written, _Syncing, _Durable) -> ok;
                 W([{_, Ev} | Rest], Written, Syncing, Durable) ->
                     case Ev of
-                        {trace_ts, Server, call, {CacheMod, write, [_, A, _]}, _} ->
+                        {trace_ts, _, call, {CacheMod, write, [_, A, _]}, _} ->
                             W(Rest, [{pending, slot_of(A)} | Written], Syncing, Durable);
                         {trace_ts, _, call, {hb_store_offsite_journal, write_groups, [_, Groups]}, _} ->
                             Slots = [ S || {<<"~scheduler@1.0/assignments/", K/binary>>, _}
@@ -1612,7 +1642,7 @@ concurrent_schedules_once_and_durable_test_() ->
                         {trace_ts, P, call, {hb_store_offsite_journal, datasync, _}, _} ->
                             Covered = [ S || {written, S} <- Written ],
                             W(Rest, Written, Syncing#{ P => Covered }, Durable);
-                        {trace_ts, P, return_from, {hb_store_offsite_journal, datasync, 1}, ok, _} ->
+                        {trace_ts, P, return_from, {hb_store_offsite_journal, datasync, 2}, ok, _} ->
                             W(Rest, Written, maps:remove(P, Syncing),
                                 maps:get(P, Syncing, []) ++ Durable);
                         {trace_ts, Server, send, {scheduled, _, A}, _, _} ->
@@ -1712,3 +1742,230 @@ flush_error_after_confirmed_ignored_test() ->
     Ref = make_ref(),
     ?assertExit({scheduler_flush_failed, eio},
         flushed(State#{ flushing := #{ Ref => 1 } }, Ref, {error, eio})).
+
+%%% Crash recovery of a journaled scheduler store, the journal being the
+%%% inner store's write-ahead log: a round confirms on the journal alone and
+%%% the inner store is made durable by checkpoints. Each test confirms slots,
+%%% crashes, and starts a new store and server on the disk the crash left
+%%% (`wal_crash_image/4'). The inner store is the worst a crash may leave
+%%% it: as of its last checkpoint (its data file copied then), with nothing
+%%% committed since. Every test fails if the start does not replay the
+%%% journal (`skip_replay').
+
+-define(OJ, hb_store_offsite_journal).
+
+%% A journaled scheduler whose inner store commits only when told to (no
+%% flusher, no size trigger) and is checkpointed only by the test.
+wal_server(Tag) ->
+    case ets:whereis(hb_store_offsite_journal_synced) of
+        undefined ->
+            ets:new(hb_store_offsite_journal_synced, [named_table, public, set,
+                                                      {heir, whereis(init), none}]);
+        _ -> ok
+    end,
+    Inner = wal_inner(hb_test_utils:test_store(hb_store_lmdb, Tag)),
+    Store = wal_wrap(Inner),
+    Opts = #{ <<"priv-wallet">> => hb:wallet(), <<"store">> => [Store],
+              <<"scheduling-mode">> => local_confirmation,
+              <<"process-compute-on-schedule">> => false },
+    ok = hb_store:start([Store], #{}, Opts),
+    Proc = dedupe_proc(Opts),
+    ProcID = hb_util:human_id(hb_message:id(Proc, all, Opts)),
+    {Opts, ProcID, Proc, start(ProcID, Proc, Opts), Store}.
+
+wal_inner(Store) ->
+    (small_store(Store))#{ <<"flush-every">> => 0, <<"batch-size">> => 1000000000 }.
+
+wal_wrap(Inner) ->
+    ?OJ:wrap(Inner, #{ <<"path">> => <<(maps:get(<<"name">>, Inner))/binary, "-export">>,
+                       <<"fsync-ms">> => 600000, <<"checkpoint-ms">> => 600000 }).
+
+wal_journal(Store) ->
+    hb_util:list(maps:get(<<"name">>, maps:get(<<"inner">>, Store))) ++ "-journal".
+
+%% A copy of the inner store's data file: what its last commit left on disk.
+wal_snapshot(Store) ->
+    Dir = hb_util:list(maps:get(<<"name">>, maps:get(<<"inner">>, Store))),
+    {ok, Bin} = file:read_file(filename:join(Dir, "data.mdb")),
+    Bin.
+
+%% @doc The disk a crash leaves, as a new store on new paths: the inner
+%% store's data file `Snap', and the journal. After a `power' loss each
+%% segment keeps what a sync covered, with the zero fill a host crash leaves
+%% after an open one, and a segment no sync covered is gone; after a `kill'
+%% (the OS survives) every byte written is there.
+wal_crash_image(Store, Snap, Mode, Tag) ->
+    JDir = wal_journal(Store),
+    Inner = wal_inner(hb_test_utils:test_store(hb_store_lmdb, Tag)),
+    Dir = hb_util:list(maps:get(<<"name">>, Inner)),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    ok = file:write_file(filename:join(Dir, "data.mdb"), Snap),
+    NewJ = Dir ++ "-journal",
+    ok = filelib:ensure_dir(filename:join(NewJ, "x")),
+    {ok, Names} = file:list_dir(JDir),
+    lists:foreach(
+        fun(Name) ->
+            {ok, Bin} = file:read_file(filename:join(JDir, Name)),
+            Seg =
+                case string:split(Name, "-") of
+                    [K, Rest] when K == "seg"; K == "open" ->
+                        {K, list_to_integer(hd(string:split(Rest, ".log")))};
+                    _ -> other
+                end,
+            Kept =
+                case {Mode, Seg} of
+                    {kill, _} -> Bin;
+                    {power, other} -> Bin;
+                    {power, {Kind, N}} ->
+                        case ets:lookup(hb_store_offsite_journal_synced, {JDir, N}) of
+                            [] -> none;
+                            [{_, Size}] ->
+                                Synced = binary:part(Bin, 0, min(Size, byte_size(Bin))),
+                                case Kind of
+                                    "open" -> <<Synced/binary, 0:(8 * 4096)>>;
+                                    "seg" -> Synced
+                                end
+                        end
+                end,
+            case Kept of
+                none -> ok;
+                _ -> ok = file:write_file(filename:join(NewJ, Name), Kept)
+            end
+        end,
+        Names),
+    wal_wrap(Inner).
+
+%% @doc Start a server on the image. Every confirmed `{Msg, Slot}' must be
+%% there, with that message; the assignments run without a gap from the
+%% first slot to the server's current one, with no message twice; and the
+%% next message is assigned the slot after. Returns the server's current
+%% slot before that message.
+wal_check(Image, Opts0, ProcID, Proc, First, Confirmed) ->
+    Opts = Opts0#{ <<"store">> => [Image] },
+    ok = hb_store:start([Image], #{}, Opts),
+    Server = start(ProcID, Proc, Opts),
+    #{ current := Current } = info(Server),
+    Read =
+        fun(S) ->
+            {ok, A} = dev_scheduler_cache:read(ProcID, S, Opts),
+            ids(hb_maps:get(<<"body">>, A, #{}, Opts), Opts)
+        end,
+    [ ?assertEqual({S, ids(M, Opts)}, {S, Read(S)}) || {M, S} <- Confirmed ],
+    ?assert(Current >= lists:max([ S || {_, S} <- Confirmed ])),
+    Slots = lists:sort([ hb_util:int(S) || S <- dev_scheduler_cache:list(ProcID, Opts) ]),
+    ?assertEqual(lists:seq(First, Current), [ S || S <- Slots, S >= First ]),
+    Bodies = [ Read(S) || S <- lists:seq(First, Current) ],
+    ?assertEqual(length(Bodies), length(lists:usort(Bodies))),
+    Next = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => <<"next">> }, Opts),
+    ?assertEqual(Current + 1, slot_of(schedule(Server, Next))),
+    exit(Server, kill),
+    timer:sleep(100),
+    Current.
+
+wal_msgs(Opts, From, To) ->
+    [ hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => I }, Opts)
+    || I <- lists:seq(From, To) ].
+
+wal_confirm(Server, Msgs) -> [ {M, slot_of(schedule(Server, M))} || M <- Msgs ].
+
+%% Confirm four slots, checkpoint (the image's inner store is this one), then
+%% confirm six more, which only the journal holds.
+wal_setup(Tag) ->
+    {Opts, ProcID, Proc, Server, Store} = wal_server(Tag),
+    #{ current := C } = info(Server),
+    Before = wal_confirm(Server, wal_msgs(Opts, 1, 4)),
+    ?assertMatch({_, _}, ?OJ:checkpoint_now(Store)),
+    Snap = wal_snapshot(Store),
+    After = wal_confirm(Server, wal_msgs(Opts, 5, 10)),
+    {Opts, ProcID, Proc, Server, Store, C + 1, Before ++ After, Snap}.
+
+%% Two more requests, whose round is still syncing at the crash.
+wal_in_flight(Server, Opts) ->
+    Abort = scheduler_time() + ?DEFAULT_TIMEOUT,
+    [ Server ! {schedule, M, self(), Abort} || M <- wal_msgs(Opts, 11, 12) ],
+    timer:sleep(300).
+
+%% @doc (1) A power loss: the inner store is back at its checkpoint and the
+%% journal keeps only what was synced. Every confirmed slot is restored, in
+%% order, and nothing of the round in flight: the server goes on at the slot
+%% after the last confirmed one.
+wal_power_loss_keeps_every_confirmed_slot_test_() ->
+    {timeout, 120, fun() ->
+        {Opts, ProcID, Proc, Server, Store, First, Confirmed, Snap} = wal_setup(<<"wal-power">>),
+        Image =
+            with_sync_delay(1500, fun() ->
+                wal_in_flight(Server, Opts),
+                I = wal_crash_image(Store, Snap, power, <<"wal-power-img">>),
+                exit(Server, kill),
+                I
+            end),
+        timer:sleep(100),
+        ?assertEqual(lists:max([ S || {_, S} <- Confirmed ]),
+            wal_check(Image, Opts, ProcID, Proc, First, Confirmed))
+    end}.
+
+%% @doc (2) A `kill -9' of the node mid-round: the journal keeps every byte
+%% written, the round's own included. Every confirmed slot is restored; the
+%% round's may be too (its `flushed' marker was written), never twice.
+wal_kill_mid_round_keeps_every_confirmed_slot_test_() ->
+    {timeout, 120, fun() ->
+        {Opts, ProcID, Proc, Server, Store, First, Confirmed, Snap} = wal_setup(<<"wal-kill">>),
+        Image =
+            with_sync_delay(1500, fun() ->
+                wal_in_flight(Server, Opts),
+                I = wal_crash_image(Store, Snap, kill, <<"wal-kill-img">>),
+                exit(Server, kill),
+                I
+            end),
+        timer:sleep(100),
+        wal_check(Image, Opts, ProcID, Proc, First, Confirmed)
+    end}.
+
+%% @doc (3) A crash in the middle of the replay itself, after part of it was
+%% committed: the start after it replays again and ends the same.
+wal_crash_during_replay_test_() ->
+    {timeout, 120, fun() ->
+        {Opts, ProcID, Proc, Server, Store, First, Confirmed, Snap} = wal_setup(<<"wal-replay">>),
+        Image = wal_crash_image(Store, Snap, power, <<"wal-replay-img">>),
+        exit(Server, kill),
+        timer:sleep(100),
+        persistent_term:put({?OJ, replay_crash_after}, 2),
+        try ok = hb_store:start([Image], #{}, Opts)
+        after persistent_term:erase({?OJ, replay_crash_after})
+        end,
+        % The replay stopped short: the last confirmed slot is not there.
+        LastSlot = lists:max([ S || {_, S} <- Confirmed ]),
+        Path = <<"~scheduler@1.0/assignments/", ProcID/binary, "/",
+                 (integer_to_binary(LastSlot))/binary>>,
+        ?assertMatch({error, _},
+            hb_store:read([maps:get(<<"inner">>, Image)], Path, #{})),
+        Again = wal_crash_image(Image, wal_snapshot(Image), kill, <<"wal-replay-img2">>),
+        wal_check(Again, Opts, ProcID, Proc, First, Confirmed)
+    end}.
+
+%% @doc (4) A crash in the middle of a checkpoint: after its synced commit,
+%% with its record written but not renamed into place. The inner store is
+%% then as of that commit, or, had the crash come before the commit, as of
+%% the last checkpoint; and a record a crash tore is no record. Each start
+%% replays from the last whole record and restores every confirmed slot.
+wal_crash_during_checkpoint_test_() ->
+    {timeout, 180, fun() ->
+        {Opts, ProcID, Proc, Server, Store, First, Confirmed, Snap} = wal_setup(<<"wal-ckpt">>),
+        #{ shipper := #{ durable := Durable } } = ?OJ:status(Store),
+        persistent_term:put({?OJ, checkpoint_crash}, after_tmp),
+        try ?assertEqual(Durable, ?OJ:checkpoint_now(Store))
+        after persistent_term:erase({?OJ, checkpoint_crash})
+        end,
+        exit(Server, kill),
+        timer:sleep(100),
+        JDir = wal_journal(Store),
+        ?assert(filelib:is_regular(filename:join(JDir, "durable.shipper.tmp"))),
+        Committed = wal_snapshot(Store),
+        Before = wal_crash_image(Store, Snap, power, <<"wal-ckpt-before">>),
+        wal_check(Before, Opts, ProcID, Proc, First, Confirmed),
+        After = wal_crash_image(Store, Committed, power, <<"wal-ckpt-after">>),
+        wal_check(After, Opts, ProcID, Proc, First, Confirmed),
+        Torn = wal_crash_image(Store, Snap, power, <<"wal-ckpt-torn">>),
+        ok = file:write_file(filename:join(wal_journal(Torn), "durable"), <<131, 104, 3, 0, 0>>),
+        wal_check(Torn, Opts, ProcID, Proc, First, Confirmed)
+    end}.

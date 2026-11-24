@@ -74,6 +74,11 @@
 %%% Debugging tools:
 -export([print/1]).
 -include("include/hb.hrl").
+%% Node-wide memo of verified messages and unsigned commitments.
+-define(VERIFIED, hb_message_verified).
+-define(VERIFIED_MAX, 200000).
+-define(MEMO_MAX_BYTES, 65536).
+-define(MEMO_MAX_MEMORY, 128 * 1024 * 1024).
 -include_lib("eunit/include/eunit.hrl").
 
 %% @doc Convert a message from one format to another. Taking a message in the
@@ -493,7 +498,27 @@ commit(Msg, NotOpts, CodecName) when not is_map(NotOpts) ->
     error({deprecated_commit_call, {arg_must_be_node_msg, NotOpts}});
 commit(Msg, Opts, CodecName) when is_binary(CodecName) ->
     commit(Msg, Opts, #{ <<"commitment-device">> => CodecName });
-commit(Msg, GivenOpts, Spec) ->
+commit(Msg, GivenOpts, Spec = #{ <<"type">> := <<"unsigned">> }) ->
+    % An unsigned commitment is a function of the term, the spec and the
+    % commitment device: each normalisation added it again to the same term.
+    % Remembered for messages up to `?MEMO_MAX_BYTES' (the result is kept).
+    case erlang:external_size(Msg) =< ?MEMO_MAX_BYTES of
+        false -> commit_now(Msg, GivenOpts, Spec);
+        true ->
+            Device = hb_opts:get(commitment_device, no_viable_commitment_device, GivenOpts),
+            % The whole term, private keys too: the result carries them.
+            Key = {unsigned, crypto:hash(sha256,
+                term_to_binary({Spec, Device, Msg}, [deterministic]))},
+            try ets:lookup_element(?VERIFIED, Key, 2)
+            catch error:badarg ->
+                Committed = commit_now(Msg, GivenOpts, Spec),
+                remember(Key, Committed),
+                Committed
+            end
+    end;
+commit(Msg, GivenOpts, Spec) -> commit_now(Msg, GivenOpts, Spec).
+
+commit_now(Msg, GivenOpts, Spec) ->
     % Only a signed commitment takes the node's key material.
     Opts =
         case Spec of
@@ -587,9 +612,61 @@ verify(Msg, Committers, Opts) when not is_map(Committers) ->
     verify(Msg, #{ <<"committers">> => Committers }, Opts);
 verify(Msg, Spec, Opts) ->
     ?event(verify, {verify, {spec, Spec}}),
-    {ok, Res} =
-        hb_ao:raw(<<"message@1.0">>, <<"verify">>, Msg, Spec, Opts),
-    Res.
+    Key = verified_key(Msg, Spec),
+    case verified(Key) of
+        true -> true;
+        false ->
+            {ok, Res} =
+                hb_ao:raw(<<"message@1.0">>, <<"verify">>, Msg, Spec, Opts),
+            Res =:= true andalso remember(Key, true),
+            Res
+    end.
+
+%%% Verified messages, node-wide. A message is verified when it arrives,
+%%% then normalised on its way through the cache, the scheduler, the worker
+%%% and the results -- and each normalisation verified its signatures again:
+%%% a conversion to ANS-104, a deep hash and an RSA verify, ~4.6 times a
+%%% message (perf, bench/msgpath.mjs). Verification is a function of the
+%%% message term, so a term that verified once verifies again: a `true' is
+%%% remembered under the SHA-256 of the exact term and the spec (private keys
+%%% aside, as `normalization_fast_hash/1' does), and any other term, a single
+%%% bit different, is verified in full. Only `true' is remembered. The table
+%%% is cleared whole when it reaches `?VERIFIED_MAX' entries.
+
+verified_key(Msg, Spec) ->
+    crypto:hash(sha256,
+        term_to_binary({Spec, hb_private:reset(Msg)}, [deterministic])).
+
+verified(Key) ->
+    try ets:member(?VERIFIED, Key)
+    catch error:badarg -> false
+    end.
+
+remember(Key, Value) ->
+    Tab = verified_table(),
+    case ets:info(Tab, size) >= ?VERIFIED_MAX orelse
+            ets:info(Tab, memory) * erlang:system_info(wordsize) >= ?MEMO_MAX_MEMORY of
+        true -> ets:delete_all_objects(Tab);
+        false -> ok
+    end,
+    ets:insert(Tab, {Key, Value}).
+
+verified_table() ->
+    case ets:whereis(?VERIFIED) of
+        undefined ->
+            Self = self(),
+            Ref = make_ref(),
+            spawn(fun() ->
+                try ets:new(?VERIFIED, [named_table, public, set,
+                        {read_concurrency, true}, {write_concurrency, true}]) of
+                    _ -> Self ! Ref, receive never -> ok end
+                catch error:badarg -> Self ! Ref
+                end
+            end),
+            receive Ref -> ok end,
+            ets:whereis(?VERIFIED);
+        Tab -> Tab
+    end.
 
 %% @doc Verify a message and its loaded children, without traversing links.
 paranoid_verify(Msg, Opts) ->

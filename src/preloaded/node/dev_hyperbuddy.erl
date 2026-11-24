@@ -1,7 +1,7 @@
 %%% @doc A device that renders a REPL-like interface for AO-Core via HTML.
 -module(dev_hyperbuddy).
 -export([device_info/1, format/3, return_file/2]).
--export([metrics/3, events/3, slots/3, trace/3]).
+-export([metrics/3, events/3, slots/3, trace/3, phases/3]).
 -export([throw/3]).
 -include_lib("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -102,6 +102,52 @@ slots(_, Req, _Opts) ->
         <<"cache-control">> => <<"no-store">>,
         <<"body">> => Encoded
     }}.
+
+%% @doc Every node-wide phase timer (`hb_phase_timer') as JSON: per phase its
+%% count, total and mean, and the p50, p90, p99 of its log2 histogram (each
+%% the upper bound of its bucket, so exact to a factor of two), with the
+%% scheduler run queues as they are now. Reads ETS only.
+-spec phases(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, #{ _ => _ }}.
+phases(_, _Req, _Opts) ->
+    {ok, #{
+        <<"content-type">> => <<"application/json">>,
+        <<"cache-control">> => <<"no-store">>,
+        <<"body">> => hb_json:encode(phases_body())
+    }}.
+
+phases_body() ->
+    Normal = erlang:system_info(schedulers),
+    Queues = erlang:statistics(run_queue_lengths_all),
+    {Sched, Dirty} = lists:split(min(Normal, length(Queues)), Queues),
+    #{
+        <<"v">> => 1,
+        <<"at">> => erlang:system_time(millisecond),
+        <<"uptime_s">> => element(1, erlang:statistics(wall_clock)) div 1000,
+        % Work done by every process since the node started: per message, a
+        % measure of the Erlang-side cost that other load on the host does
+        % not inflate, as CPU time does. NIF time (RSA, LMDB) is not in it.
+        <<"reductions">> => element(1, erlang:statistics(exact_reductions)),
+        <<"run_queue">> => #{
+            <<"schedulers">> => lists:sum(Sched),
+            <<"dirty_cpu">> => lists:nth(1, Dirty ++ [0]),
+            <<"dirty_io">> => lists:nth(2, Dirty ++ [0, 0])
+        },
+        <<"phases">> =>
+            maps:from_list(
+                [ {hb_util:bin(P), phase_stats(T, N, Buckets)}
+                || {P, T, N, Buckets} <- hb_phase_timer:read_hist() ])
+    }.
+
+phase_stats(T, N, Buckets) ->
+    [P50, P90, P99] = hb_phase_timer:percentiles(Buckets, [0.5, 0.9, 0.99]),
+    #{
+        <<"count">> => N,
+        <<"total_us">> => T,
+        <<"mean_us">> => T div max(N, 1),
+        <<"p50_us">> => P50,
+        <<"p90_us">> => P90,
+        <<"p99_us">> => P99
+    }.
 
 %% @doc The message trace (`hb_msg_trace') as JSON: the rows after cursor
 %% `since' (default 0), oldest first, at most `limit' (1-5000, default
@@ -430,6 +476,26 @@ trace_endpoint_test() ->
         Read(#{ <<"limit">> => <<"2">> }),
     #{ <<"rows">> := [#{ <<"slot">> := 3, <<"k">> := <<"c">> }], <<"next">> := 3 } =
         Read(#{ <<"since">> => <<"2">>, <<"limit">> => <<"bad">> }),
+    hb_phase_timer:reset().
+
+phases_endpoint_test() ->
+    hb_phase_timer:record(phases_endpoint_test, 0),
+    hb_phase_timer:configure(#{}),
+    hb_phase_timer:reset(),
+    [ hb_phase_timer:record(lua_patch_lua, U) || U <- [10, 20, 3000] ],
+    hb_phase_timer:record_node({http, now, resolve}, 5),
+    {ok, Res} = hb_ao:resolve(
+        #{ <<"device">> => <<"hyperbuddy@1.0">> },
+        #{ <<"path">> => <<"phases">> },
+        #{}
+    ),
+    ?assertEqual(<<"application/json">>, maps:get(<<"content-type">>, Res)),
+    #{ <<"phases">> := Phases, <<"run_queue">> := #{ <<"schedulers">> := _ } } =
+        hb_json:decode(maps:get(<<"body">>, Res)),
+    ?assertMatch(#{ <<"count">> := 3, <<"total_us">> := 3030, <<"p50_us">> := 32,
+            <<"p99_us">> := 4096 },
+        maps:get(<<"lua_patch_lua">>, Phases)),
+    ?assertMatch(#{ <<"count">> := 1 }, maps:get(<<"http_now_resolve">>, Phases)),
     hb_phase_timer:reset().
 
 %% The slots endpoint reports the same delivery backlog as the metrics

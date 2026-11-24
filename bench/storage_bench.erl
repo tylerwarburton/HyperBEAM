@@ -26,8 +26,18 @@
 %%%       same stores: every scheduled slot is there in order, the head
 %%%       recomputed from the irreplaceable store alone matches the stored
 %%%       head, and a pruned slot is rebuilt by replay (timed).
+%%%
+%%% The confirmed-slot crash test (the journal as the irreplaceable store's
+%%% write-ahead log, `hb_store_offsite_journal'), the same way:
+%%%   -eval 'storage_bench:burst_load("<dir>")'   8 concurrent clients per
+%%%       process schedule (never compute) until killed; each slot is logged
+%%%       only once its schedule call returned it confirmed
+%%%   -eval 'storage_bench:burst_verify("<dir>")' restarts on the same stores
+%%%       (the journal replays into the inner store before anything reads):
+%%%       every logged slot is present, naming its slot, and each process's
+%%%       schedule is contiguous from 0 to its head.
 -module(storage_bench).
--export([crash_load/1, crash_verify/1, opts/1, census/1]).
+-export([crash_load/1, crash_verify/1, burst_load/1, burst_verify/1, opts/1, census/1]).
 -include_lib("eunit/include/eunit.hrl").
 
 bench_test_() ->
@@ -463,6 +473,89 @@ crash_verify_one(Name, P, Ack, Opts, Dir) ->
        head_from_irreplaceable_ms => TFresh div 1000,
        old_slot => Old, old_slot_equal => OldRes =:= OldFresh, old_slot_replay_ms => TOld div 1000,
        ok => Top >= Ack andalso InOrder andalso Head =:= FromIrr andalso OldRes =:= OldFresh }.
+
+%%% The confirmed-slot crash test.
+
+-define(BURST_CLIENTS, 8).
+
+burst_load(Dir) ->
+    hb:init(),
+    Opts = opts(Dir),
+    _ = hb_http_server:start_node(Opts),
+    Counter = <<(rnd())/binary,
+        "Count = Count or 0
+"
+        "function compute(req)
+"
+        "  Count = Count + 1
+"
+        "  return { patches = {{ path = '/count', value = tostring(Count) }} }
+"
+        "end
+">>,
+    Procs = [ {Name, spawn_process(process(<<"lua-patch@1.0">>, Counter, Opts), Opts)}
+            || Name <- [b1, b2, b3, b4] ],
+    ok = file:write_file(Dir ++ "/burst-procs.bin", term_to_binary(Procs)),
+    Logger = spawn_link(fun() ->
+        {ok, Log} = file:open(Dir ++ "/burst-acked.log", [append, raw, binary]),
+        burst_logger(Log)
+    end),
+    say("BURST loading ~p", [[ {N, pid(P, Opts)} || {N, P} <- Procs ]]),
+    [ spawn_link(fun() -> burst_client(Name, P, C, 0, Opts, Logger) end)
+    || {Name, P} <- Procs, C <- lists:seq(1, ?BURST_CLIENTS) ],
+    receive after infinity -> ok end.
+
+burst_logger(Log) ->
+    receive {acked, Name, Slot} ->
+        ok = file:write(Log, [atom_to_list(Name), $\s, integer_to_list(Slot), $
+]),
+        burst_logger(Log)
+    end.
+
+%% Schedule, and log the slot once the call returned it: a confirmation.
+burst_client(Name, P, C, I, Opts, Logger) ->
+    {ok, Res} = schedule(P, <<"Burst">>, C * 1000000 + I, Opts),
+    Logger ! {acked, Name, hb_util:int(hb_ao:get(<<"slot">>, Res, Opts))},
+    burst_client(Name, P, C, I + 1, Opts, Logger).
+
+burst_verify(Dir) ->
+    hb:init(),
+    Opts = opts(Dir),
+    {ok, Bin} = file:read_file(Dir ++ "/burst-procs.bin"),
+    Procs = binary_to_term(Bin),
+    {ok, LogBin} = file:read_file(Dir ++ "/burst-acked.log"),
+    Acked =
+        lists:foldl(
+            fun(<<>>, A) -> A;
+               (Line, A) ->
+                case binary:split(Line, <<" ">>) of
+                    [N, S] ->
+                        K = binary_to_atom(N),
+                        A#{ K => [binary_to_integer(S) | maps:get(K, A, [])] };
+                    _ -> A % a line the kill cut short
+                end
+            end, #{}, binary:split(LogBin, <<"
+">>, [global])),
+    Results = [ burst_verify_one(Name, P, maps:get(Name, Acked, []), Opts) || {Name, P} <- Procs ],
+    say("BURST ~p", [Results]),
+    halt(case lists:all(fun(R) -> maps:get(ok, R) end, Results) of true -> 0; false -> 1 end).
+
+burst_verify_one(Name, P, Acked, Opts) ->
+    Pid = pid(P, Opts),
+    {ok, Current} = hb_ao:resolve(P, #{ <<"path">> => <<"slot/current">> }, Opts),
+    Top = hb_util:int(Current),
+    Read = fun(S) ->
+        case catch (sched_cache()):read(Pid, S, Opts) of
+            {ok, A} -> hb_util:int(hb_ao:get(<<"slot">>, A, Opts)) =:= S;
+            _ -> false
+        end
+    end,
+    Missing = [ S || S <- lists:usort(Acked), not Read(S) ],
+    Gaps = [ S || S <- lists:seq(0, Top), not Read(S) ],
+    MaxAcked = lists:max([-1 | Acked]),
+    #{ name => Name, acked => length(Acked), max_acked => MaxAcked, head => Top,
+       acked_missing => Missing, gaps => Gaps,
+       ok => Missing =:= [] andalso Gaps =:= [] andalso Top >= MaxAcked }.
 
 %% A slot's state, waiting out a rebuild of an old slot (202, `hb_history').
 await(P, N, Opts) ->
