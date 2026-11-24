@@ -656,15 +656,19 @@ too_old(AbortTime) ->
 write_assignment(State, Message, First, Pending) ->
     Opts = maps:get(opts, State),
     ProcID = maps:get(id, State),
-    {ok, OnlyAttested} = hb_message:with_only_committed(Message, Opts),
-    IDs = message_ids(Message, OnlyAttested, Opts),
-    case assigned(ProcID, IDs, First, Pending, Opts) of
+    {ok, OnlyAttested} =
+        hb_phase_timer:time(sched_committed, fun() ->
+            hb_message:with_only_committed(Message, Opts) end),
+    IDs = hb_phase_timer:time(sched_ids, fun() -> message_ids(Message, OnlyAttested, Opts) end),
+    case hb_phase_timer:time(sched_dedupe, fun() -> assigned(ProcID, IDs, First, Pending, Opts) end) of
         {ok, Slot, ID} -> {refused, refusal(State, Slot, ID)};
         not_found ->
             {Assignment, Next} = build_assignment(State, Message, OnlyAttested),
             NextSlot = maps:get(current, Next),
-            ok = dev_scheduler_cache:write(ProcID, Assignment, Opts),
-            ok = dev_scheduler_cache:write_message_slot(ProcID, IDs, NextSlot, Opts),
+            hb_phase_timer:time(sched_write, fun() ->
+                ok = dev_scheduler_cache:write(ProcID, Assignment, Opts),
+                ok = dev_scheduler_cache:write_message_slot(ProcID, IDs, NextSlot, Opts)
+            end),
             {Next, Assignment,
                 maps:merge(Pending, maps:from_keys(IDs, NextSlot))}
     end.
@@ -764,7 +768,7 @@ build_assignment(State, Message, OnlyAttested) ->
     NextSlot = maps:get(current, State) + 1,
     {Timestamp, Height, Hash} = ar_timestamp:get(),
     Assignment =
-        commit_assignment(
+        hb_phase_timer:time(sched_sign, fun() -> commit_assignment(
             % The door's admission (`admit-*'), if any: signed with the rest,
             % so the process reads it as its own scheduler's word.
             (dev_scheduler_admission:keys(Message, Opts))#{
@@ -786,20 +790,21 @@ build_assignment(State, Message, OnlyAttested) ->
                 <<"type">> => <<"Assignment">>
             },
             State
-        ),
-    ?event(scheduling,
+        ) end),
+    hb_phase_timer:time(sched_event, fun() -> ?event(scheduling,
         {assigned,
             {proc_id, maps:get(id, State)},
             {slot, NextSlot},
             {assignment, hb_message:id(Assignment, all)}
         }
-    ),
+    ) end),
     {
         Assignment,
         State#{
             current := NextSlot,
             base_state_hashpath :=
-                next_hashpath(BaseStateHashpath, Assignment, State)
+                hb_phase_timer:time(sched_hashpath, fun() ->
+                    next_hashpath(BaseStateHashpath, Assignment, State) end)
         }
     }.
 
