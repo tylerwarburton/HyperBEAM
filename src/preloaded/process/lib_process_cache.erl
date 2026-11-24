@@ -4,7 +4,7 @@
 %%% message ID.
 -module(lib_process_cache).
 -export([fresh/3, fresh/4]).
--export([latest/2, latest/3, latest/4, latest_slot/2]).
+-export([latest/2, latest/3, latest/4, latest_slot/2, hot_head/2]).
 -export([read/2, read/3, refresh/3, write/4]).
 -export([read_results/3, stored_floor/2, pruned/2]).
 -export([delivery_store/1, blob_key/3, blob_put/4, blob_get/3, blob_slots/3]).
@@ -379,6 +379,16 @@ hot_get(ProcID, Slot) ->
         [{_, Msg}] -> {ok, Msg};
         [] -> not_found
     catch error:badarg -> not_found
+    end.
+
+%% @doc The newest slot of a process the hot cache holds, from memory only:
+%% `{ok, Slot}' or `not_found' (no hot cache, or nothing in it yet). Every
+%% stored slot goes through it (`refresh/3'), so while it holds any slot of
+%% a process it holds the newest one stored since the node started.
+hot_head(ProcID, RawOpts) ->
+    case hot_latest(ProcID, undefined, lib_process:cache_opts(RawOpts)) of
+        {ok, Slot, _} -> {ok, Slot};
+        _ -> not_found
     end.
 
 %% @doc The newest hot slot of a process, at or below `Limit'.

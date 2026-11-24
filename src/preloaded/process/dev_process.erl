@@ -259,10 +259,19 @@ compute(Base, Req, Opts) ->
             end;
         Slot ->
             CacheRead =
-                hb_phase_timer:time(compute_cache_read, fun() ->
-                    lib_process_cache:read(ProcID, Slot, Opts)
-                end),
+                case worker_ahead(ProcID, Base, Slot, Opts) of
+                    true -> ahead;
+                    false ->
+                        hb_phase_timer:time(compute_cache_read, fun() ->
+                            lib_process_cache:read(ProcID, Slot, Opts)
+                        end)
+                end,
             case CacheRead of
+                ahead ->
+                    % The worker's own state is the newest stored slot and the
+                    % slot is past it: nothing can be stored for it, and the
+                    % worker computes it (`compute_uncached/5' ends here too).
+                    compute_here(ProcID, ProcBase, Req, Slot, Opts);
                 {ok, Result} ->
                     % The result is already cached, so we can return it.
                     ?event(
@@ -277,6 +286,20 @@ compute(Base, Req, Opts) ->
                     compute_uncached(ProcID, ProcBase, Req, Slot, Opts)
             end
     end.
+
+%% @doc Whether the calling process worker holds the live state at the
+%% newest slot stored (the hot cache's head, in memory) and the slot is past
+%% it. Only the worker stores slots beyond the head, so such a slot is not
+%% stored, and neither the cache read nor the head lookup that would say so
+%% is needed. Anything else (no hot head yet, after a restart; a state that
+%% is not the head) reads as before.
+worker_ahead(ProcID, Base, Slot, Opts) ->
+    hb_opts:get(<<"is-worker">>, false, Opts) == true andalso
+        case maps:get(<<"at-slot">>, Base, undefined) of
+            Held when is_integer(Held), Held < Slot ->
+                lib_process_cache:hot_head(ProcID, Opts) == {ok, Held};
+            _ -> false
+        end.
 
 %% @doc Compute a slot that is not stored. A process's state only moves
 %% forward: a slot at or below the newest stored slot (the head) that is not
