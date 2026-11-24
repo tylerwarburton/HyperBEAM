@@ -476,8 +476,7 @@ writer_init(Store) ->
             ?event(error, {offsite_journal_refusing, {poisoned, Reason}}),
             % What the journal confirmed is still the inner store's: replay
             % it, so reads see it while every write is refused.
-            {PSealed, PMarks, _} = read_marks(Dir),
-            _ = (catch recover_local(Dir, PSealed, PMarks, read_durable(Dir), Store)),
+            _ = (catch replay_poisoned(Dir, read_durable(Dir), Store)),
             writer_refusing(Store, {journal_poisoned, Reason});
         none ->
             Clean = hb_file:is_regular(filename:join(Dir, "clean")),
@@ -1586,6 +1585,40 @@ token_bin(T) -> hb_util:bin(T).
 recover_local(Dir, Sealed, Marks) -> recover_local(Dir, Sealed, Marks, none, undefined).
 
 recover_local(Dir, Sealed, Marks, Durable, Store) ->
+    {Max, Replay, Seals, Drop, Inner} = scan_log(Dir, Sealed, Marks, Durable, Store),
+    % What follows the end goes first, durably: a later start must not find
+    % the cut file whole with them still after it.
+    case Drop of
+        [] -> ok;
+        _ ->
+            ?event(warning, {offsite_journal_dropped_after_end, {files, Drop}}),
+            lists:foreach(fun(F) -> ok = hb_file:delete(F) end, Drop),
+            recovery_sync(Dir, sync_dir(Dir))
+    end,
+    lists:foreach(fun(Seal) -> recover_seal(Dir, Seal) end, lists:reverse(Seals)),
+    recovery_sync(Dir, sync_dir(Dir)),
+    replayed(Inner, Durable),
+    {Max, replay_finish(Replay)}.
+
+%% @doc A poisoned journal's start: what it confirmed after the last
+%% checkpoint goes into the inner store again, so reads see it, and nothing
+%% else is done: no file is cut, sealed, dropped or synced.
+replay_poisoned(Dir, Durable, Store) ->
+    {Sealed, Marks, _} = read_marks(Dir),
+    {_, _, _, _, Inner} = scan_log(Dir, Sealed, Marks, Durable, Store),
+    replayed(Inner, Durable).
+
+replayed(Inner, Durable) ->
+    case replay_finish(Inner) of
+        0 -> ok;
+        Frames -> ?event(warning, {offsite_journal_replayed, {frames, Frames}, {from, Durable}})
+    end.
+
+%% @doc Read the local log, in segment order, changing nothing on disk (the
+%% inner replay writes the inner store). Returns the highest segment seen,
+%% the marks replay, the `open-' files to seal, the files after the end of
+%% the log to drop, and the inner replay.
+scan_log(Dir, Sealed, Marks, Durable, Store) ->
     {Max, Replay, Seals, Drop, _End, Inner} =
         lists:foldl(
             fun({N, open, File}, {Max, R, Seals, Drop, End, I}) when End =/= false ->
@@ -1619,22 +1652,7 @@ recover_local(Dir, Sealed, Marks, Durable, Store) ->
                  replay_init(replay_inner(Store), 0)},
             local_files(Dir)
         ),
-    % What follows the end goes first, durably: a later start must not find
-    % the cut file whole with them still after it.
-    case Drop of
-        [] -> ok;
-        _ ->
-            ?event(warning, {offsite_journal_dropped_after_end, {files, Drop}}),
-            lists:foreach(fun(F) -> ok = hb_file:delete(F) end, Drop),
-            recovery_sync(Dir, sync_dir(Dir))
-    end,
-    lists:foreach(fun(Seal) -> recover_seal(Dir, Seal) end, lists:reverse(Seals)),
-    recovery_sync(Dir, sync_dir(Dir)),
-    case replay_finish(Inner) of
-        0 -> ok;
-        Frames -> ?event(warning, {offsite_journal_replayed, {frames, Frames}, {from, Durable}})
-    end,
-    {Max, replay_finish(Replay)}.
+    {Max, Replay, Seals, Drop, Inner}.
 
 %% Whether a file ends the local log if anything follows it: an `open-' one
 %% that is not whole frames ending in its own `{closed, N}' (the last file
@@ -1702,7 +1720,9 @@ replay_inner(Store) ->
     fun(_Pairs, C) when Skip -> C;
        (_Pairs, C) when C == CrashAfter ->
             ok = hb_store:flush(Inner, #{}),
-            exit(replay_crash_test_hook);
+            % Killed, as a crash would: an exit the writer's recovery
+            % catches is refused and poisons the journal for good.
+            exit(self(), kill);
        (Pairs, C) ->
             case write_inner(Mod, Inner, [Pairs]) of
                 ok -> C + 1;
