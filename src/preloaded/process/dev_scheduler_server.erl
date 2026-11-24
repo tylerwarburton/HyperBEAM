@@ -523,46 +523,40 @@ assign_batch(State = #{ mode := aggressive, current := Before }, Requests) ->
         Now -> compute_on_schedule(After, Now)
     end;
 assign_batch(State = #{ current := First, opts := Opts, unwritten := Unwritten }, Requests) ->
-    % The batch's writes are held (`dev_scheduler_cache:hold/2') and made by
-    % the appender after it ends: nothing of this batch, nor of one still in
-    % flight, can be read back before, so a message assigned in either is
-    % found in `Pending', which starts as `unwritten'.
-    Assign =
-        fun() ->
-            lists:foldl(
-                fun({Message, Reply, AbortTime}, {S, Acc, Pending}) ->
-                    case too_old(AbortTime) of
-                        true -> {S, Acc, Pending};
-                        false ->
-                            try write_assignment(S, Message, First, Pending) of
-                                {refused, Error} ->
-                                    {S, [{refused, Reply, Message, Error} | Acc],
-                                        Pending};
-                                {S2, Assignment, Pending2} ->
-                                    % Queued when the client asked:
-                                    % its deadline less the timeout.
-                                    hb_msg_trace:scheduled(Assignment,
-                                        {Message, AbortTime - ?DEFAULT_TIMEOUT}),
-                                    {S2, [{Reply, Message, Assignment} | Acc],
-                                        Pending2}
-                            catch
-                                _Class:Reason:Stack ->
-                                    ?event({error_scheduling,
-                                        {reason, Reason}, {trace, Stack}}),
-                                    {S, Acc, Pending}
-                            end
-                    end
-                end,
-                {State, [], Unwritten},
-                Requests
-            )
-        end,
-    {{Assigned, Written, Pending}, Commit} =
-        try dev_scheduler_cache:hold(Assign, Opts)
-        catch Class:Reason ->
-            ?event(error, {scheduler_write_failed, {class, Class}, {reason, Reason}}),
-            exit({scheduler_write_failed, Reason})
-        end,
+    % The batch's assignments are built and signed here, in slot order; the
+    % appender encodes and writes them after the batch ends (`commit/3'), so
+    % only signing is on this serial path. Nothing of this batch, nor of one
+    % still in flight, can be read back before its write, so a message
+    % assigned in either is found in `Pending', which starts as `unwritten'.
+    {Assigned, Written, Pending, Writes} =
+        lists:foldl(
+            fun({Message, Reply, AbortTime}, {S, Acc, Pending, Ws}) ->
+                case too_old(AbortTime) of
+                    true -> {S, Acc, Pending, Ws};
+                    false ->
+                        try new_assignment(S, Message, First, Pending) of
+                            {refused, Error} ->
+                                {S, [{refused, Reply, Message, Error} | Acc],
+                                    Pending, Ws};
+                            {S2, Assignment, Pending2, Write} ->
+                                % Queued when the client asked:
+                                % its deadline less the timeout.
+                                hb_msg_trace:scheduled(Assignment,
+                                    {Message, AbortTime - ?DEFAULT_TIMEOUT}),
+                                {S2, [{Reply, Message, Assignment} | Acc],
+                                    Pending2, [Write | Ws]}
+                        catch
+                            _Class:Reason:Stack ->
+                                ?event({error_scheduling,
+                                    {reason, Reason}, {trace, Stack}}),
+                                {S, Acc, Pending, Ws}
+                        end
+                end
+            end,
+            {State, [], Unwritten, []},
+            Requests
+        ),
+    Commit = fun() -> commit(maps:get(id, State), lists:reverse(Writes), Opts) end,
     case Written of
         [] -> Assigned;
         _ ->
@@ -585,8 +579,8 @@ assign_batch(State = #{ current := First, opts := Opts, unwritten := Unwritten }
             }
     end.
 
-%% @doc The server's appender: it makes each batch's held writes, in batch
-%% order, then starts that batch's flush, which answers the server
+%% @doc The server's appender: it encodes and writes each batch (`commit/3'),
+%% in batch order, then starts that batch's flush, which answers the server
 %% (`{flushed, Ref, Result}'). The server goes on assigning meanwhile: the
 %% writer call (one per batch, behind every other scheduler's) is no longer
 %% on its path. A refused write is reported as the batch's failed flush, and
@@ -599,8 +593,9 @@ with_appender(State = #{ opts := Opts }) ->
     Pid =
         spawn_link(
             fun() ->
-                % A few microseconds of work for each batch: ahead of the
-                % node's request handlers, not behind them.
+                % Each batch's encoding and write (~2 ms an assignment) is
+                % on its clients' confirmation path: ahead of the node's
+                % request handlers, not behind them.
                 process_flag(priority, high),
                 erlang:monitor(process, Server),
                 appender(Server, Opts)
@@ -646,14 +641,14 @@ too_old(AbortTime) ->
         false -> false
     end.
 
-%% @doc Build, sign and write the next assignment, and its message index row
-%% right after it; return the next state and `Pending' with the message's
-%% IDs. A signed message is assigned at most once per process (anyone can
-%% post a public message again, and it would run again): one already
-%% assigned is `{refused, Error}'. The store holds the slots up to `First',
-%% where the batch began, but those of batches still in flight; `Pending'
-%% holds theirs and the batch's own (ID => slot).
-write_assignment(State, Message, First, Pending) ->
+%% @doc Build and sign the next assignment; return the next state, `Pending'
+%% with the message's IDs, and what `commit/3' writes for it (the assignment,
+%% then its message index row). A signed message is assigned at most once
+%% per process (anyone can post a public message again, and it would run
+%% again): one already assigned is `{refused, Error}'. The store holds the
+%% slots up to `First', where the batch began, but those of batches still in
+%% flight; `Pending' holds theirs and the batch's own (ID => slot).
+new_assignment(State, Message, First, Pending) ->
     Opts = maps:get(opts, State),
     ProcID = maps:get(id, State),
     {ok, OnlyAttested} =
@@ -665,13 +660,33 @@ write_assignment(State, Message, First, Pending) ->
         not_found ->
             {Assignment, Next} = build_assignment(State, Message, OnlyAttested),
             NextSlot = maps:get(current, Next),
-            hb_phase_timer:time(sched_write, fun() ->
-                ok = dev_scheduler_cache:write(ProcID, Assignment, Opts),
-                ok = dev_scheduler_cache:write_message_slot(ProcID, IDs, NextSlot, Opts)
-            end),
             {Next, Assignment,
-                maps:merge(Pending, maps:from_keys(IDs, NextSlot))}
+                maps:merge(Pending, maps:from_keys(IDs, NextSlot)),
+                {Assignment, IDs, NextSlot}}
     end.
+
+%% @doc Write a batch's assignments, each with its message index row right
+%% after it, in slot order, as one held write (`dev_scheduler_cache:hold/2':
+%% a journaled store takes them in one writer call). The appender runs it.
+%% `ok', or the store's refusal; a write that fails raises, which the
+%% appender reports as the batch's failed flush.
+commit(ProcID, Writes, Opts) ->
+    {ok, Commit} =
+        dev_scheduler_cache:hold(
+            fun() ->
+                lists:foreach(
+                    fun({Assignment, IDs, Slot}) ->
+                        hb_phase_timer:time(sched_write, fun() ->
+                            ok = dev_scheduler_cache:write(ProcID, Assignment, Opts),
+                            ok = dev_scheduler_cache:write_message_slot(ProcID, IDs, Slot, Opts)
+                        end)
+                    end,
+                    Writes
+                )
+            end,
+            Opts
+        ),
+    Commit().
 
 %% @doc The IDs a message is assigned at most once under: its signatures,
 %% and the outbox entry its admission names (`dev_scheduler_admission'), so
