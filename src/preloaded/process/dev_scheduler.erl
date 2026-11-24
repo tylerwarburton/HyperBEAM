@@ -20,7 +20,7 @@
 %%% AO-Core API functions:
 -export([device_info/0]).
 %%% Local scheduling functions:
--export([schedule/3, router/4]).
+-export([schedule/3, router/4, direct/3]).
 %%% CU-flow functions:
 -export([slot/3, status/3, next/3]).
 -export([start/0, checkpoint/1]).
@@ -56,7 +56,8 @@ device_info() ->
                 <<"schedule">>,
                 <<"slot">>,
                 <<"init">>,
-                <<"checkpoint">>
+                <<"checkpoint">>,
+                <<"direct">>
             ],
         excludes => [committers, set, keys],
         default => fun router/4
@@ -400,6 +401,36 @@ schedule(Base, Req, Opts) ->
         get -> get_schedule(Base, Req, Opts)
     end.
 
+%% @doc Schedule a message that HTTP ingress has just decoded and verified
+%% (`hb_http_server'), on this node's running server for the process the
+%% request's path names, without resolving `process@1.0' around it. `ProcID'
+%% is that process; `Req' is the verified request; `Opts' carry
+%% `schedule_verified_by_ingress', which only the node sets, never a request. The
+%% scheduling is `post_local_schedule/4''s: the same admission, policy and
+%% server, the message verified once, at ingress. Anything else -- no local
+%% server running (it would need the definition to start one), a hint, a
+%% message whose type is not `Message' or whose target is not `ProcID' --
+%% is `{ok, miss}', and the request is resolved the generic way.
+direct(ProcID, Req, Opts) ->
+    case is_binary(ProcID) andalso ?IS_ID(ProcID) andalso
+            dev_scheduler_registry:find(ProcID, false, Opts) of
+        PID when is_pid(PID) ->
+            ToSched = hb_cache:ensure_all_loaded(find_message_to_schedule(#{}, Req, Opts), Opts),
+            Type = hb_maps:get(<<"type">>, ToSched, not_found, Opts),
+            Target = hb_maps:get(<<"target">>, ToSched, not_found, Opts),
+            case Type == <<"Message">> andalso is_binary(Target) andalso
+                    ?IS_ID(Target) andalso hb_util:human_id(Target) == ProcID of
+                false -> {ok, miss};
+                true ->
+                    case hb_message:with_only_committed(ToSched, Opts) of
+                        {ok, OnlyCommitted} ->
+                            post_local_schedule(ProcID, PID, OnlyCommitted, Opts);
+                        {error, _} -> {ok, miss}
+                    end
+            end;
+        _ -> {ok, miss}
+    end.
+
 %% @doc Schedules a new message on the SU. Searches Base for the appropriate ID,
 %% then uses the wallet address of the scheduler to determine if the message is
 %% for this scheduler. If so, it schedules the message and returns the assignment.
@@ -482,7 +513,12 @@ do_post_schedule(Base, Req, ToSched, Opts) ->
 post_local_schedule(ProcID, PID, Req, Opts) ->
     % Should we verify the message again before scheduling?
     Verified =
-        case hb_opts:get(verify_assignments, true, Opts) of
+        case maps:get(schedule_verified_by_ingress, Opts, false) == true orelse
+                hb_opts:get(verify_assignments, true, Opts) of
+            % HTTP ingress verified this request a moment ago (`direct/3'):
+            % an atom key, which no configuration file or request can set.
+            true when map_get(schedule_verified_by_ingress, Opts) =:= true ->
+                length(hb_message:signers(Req, Opts)) > 0;
             true ->
                 ?event(debug_scheduler_verify,
                     {verifying_message_before_scheduling, Req}

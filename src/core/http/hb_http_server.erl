@@ -1114,7 +1114,11 @@ resolve_request(Path, Singleton, NodeMsg) ->
             case hb_opts:get(hashpath, update, ResolveOpts) == ignore andalso
                     hb_process_view:read(RequestPath, Request, ResolveOpts) of
                 {ok, _} = Viewed -> Viewed;
-                _ -> hb_ao:resolve_many(PreProcessedMsgs, ResolveOpts)
+                _ ->
+                    case direct_schedule(RequestPath, Singleton, Request, ResolveOpts) of
+                        {ok, _} = Scheduled -> Scheduled;
+                        _ -> hb_ao:resolve_many(PreProcessedMsgs, ResolveOpts)
+                    end
             end,
         % The result keeps its Erlang status unless the `response' hook returns
         % an error.
@@ -1128,6 +1132,29 @@ resolve_request(Path, Singleton, NodeMsg) ->
                 )},
         {Request, {ErlStatus, Body}}
     end.
+
+%% @doc `POST /<pid>~process@1.0/schedule' straight to the process's running
+%% scheduler server (`dev_scheduler:direct/3'), without resolving
+%% `process@1.0' around it. `req_to_tabm_singleton/3' has decoded and
+%% verified the request (`hb_message:deep_verify/2', private keys reset
+%% first), so it goes with `schedule_verified_by_ingress': an atom key of the
+%% options, which no request and no configuration file can set. Only the
+%% request as it arrived (no `request' hook changed it), and only for an
+%% unsigned reply. Anything `direct/3' does not take is `miss'.
+direct_schedule(<<"/", ID:43/binary, "~process@1.0/schedule">>, Singleton, Request, Opts)
+        when Request =:= Singleton ->
+    case hb_maps:get(<<"method">>, Request, <<"GET">>, Opts) == <<"POST">> andalso
+            hb_opts:get(<<"process-direct-schedule">>, true, Opts) =/= false andalso
+            hb_opts:get(force_signed, false, accept_signature(Request, Opts)) =/= true of
+        false -> miss;
+        true ->
+            case hb_ao:raw(<<"scheduler@1.0">>, <<"direct">>, ID, Request,
+                    Opts#{ schedule_verified_by_ingress => true }) of
+                {ok, miss} -> miss;
+                Res -> hb_ao:force_message(Res, Opts)
+            end
+    end;
+direct_schedule(_Path, _Singleton, _Request, _Opts) -> miss.
 
 %% @doc The options a request resolves under. A hashpath has two consumers:
 %% the node's signature on a reply (`force-signed', or the request's
