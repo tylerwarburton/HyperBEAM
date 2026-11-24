@@ -216,46 +216,87 @@ find(Path, Base, Opts) ->
         Value -> Value
     end.
 
-%% @doc The `.wasm' bytes: the `image' as bytes, as an ID in the cache, or as
-%% a message whose body they are. AOT bytes are refused: a node only runs AOT
-%% code it compiled itself.
+%% @doc The `.wasm' bytes. `image' is the bytes, a message whose `body' (or,
+%% fetched from a gateway, `data') they are, or that message's ID; AOT bytes
+%% are refused, as a node only runs AOT code it compiled itself.
+%%
+%% `image-sha256' pins the bytes: a process naming its image by ID must name
+%% it, and any image whose hash differs from the one named is refused. With a
+%% hash named, a copy the node holds as approved (`hb_wasm_aot:approved/2',
+%% written by the image build's prewarm) is used without fetching the ID.
 image(Base, Opts) ->
+    Pinned =
+        case find([<<"image-sha256">>], Base, Opts) of
+            not_found -> not_found;
+            Hex -> string:lowercase(hb_util:bin(Hex))
+        end,
     Image =
-        case find([<<"image">>], Base, Opts) of
-            not_found -> throw({wasm_patch_init, <<"no image">>});
-            <<0, "asm", _/binary>> = Bin -> Bin;
-            ID when ?IS_ID(ID) ->
-                case hb_cache:read(ID, Opts) of
-                    {ok, Msg} when is_map(Msg) -> body(Msg, Opts);
-                    {ok, Bin} when is_binary(Bin) -> Bin;
-                    _ -> throw({wasm_patch_init, <<"image ", ID/binary, " not found">>})
-                end;
-            Msg when is_map(Msg) -> body(Msg, Opts);
-            Link when ?IS_LINK(Link) -> body(hb_cache:ensure_all_loaded(Link, Opts), Opts);
-            Other -> Other
+        case Pinned =/= not_found andalso hb_wasm_aot:approved(Pinned, Opts) of
+            {ok, Approved} -> Approved;
+            _ -> image_bytes(find([<<"image">>], Base, Opts), Pinned, Opts)
         end,
     case Image of
-        <<0, "asm", _/binary>> -> Image;
+        <<0, "asm", _/binary>> -> ok;
         _ -> throw({wasm_patch_init, <<"the image is not a .wasm module">>})
+    end,
+    case Pinned of
+        not_found -> Image;
+        _ ->
+            case binary:encode_hex(crypto:hash(sha256, Image), lowercase) of
+                Pinned -> Image;
+                Got ->
+                    throw({wasm_patch_init,
+                        <<"the image's sha256 is ", Got/binary, ", not the ", Pinned/binary,
+                            " the process names">>})
+            end
     end.
 
+image_bytes(not_found, _Pinned, _Opts) ->
+    throw({wasm_patch_init, <<"no image">>});
+image_bytes(<<0, "asm", _/binary>> = Bin, _Pinned, _Opts) -> Bin;
+image_bytes(ID, not_found, _Opts) when ?IS_ID(ID) ->
+    throw({wasm_patch_init, <<"an image named by ID needs image-sha256">>});
+image_bytes(ID, _Pinned, Opts) when ?IS_ID(ID) ->
+    case hb_cache:read(ID, Opts) of
+        {ok, Msg} when is_map(Msg) -> body(Msg, Opts);
+        {ok, Bin} when is_binary(Bin) -> Bin;
+        _ -> throw({wasm_patch_init, <<"image ", ID/binary, " not found">>})
+    end;
+image_bytes(Msg, _Pinned, Opts) when is_map(Msg) -> body(Msg, Opts);
+image_bytes(Link, Pinned, Opts) when ?IS_LINK(Link) ->
+    image_bytes(hb_cache:ensure_all_loaded(Link, Opts), Pinned, Opts);
+image_bytes(Other, _Pinned, _Opts) -> Other.
+
+%% The payload of an image message: `body' as a message carries it, `data' as
+%% an Arweave transaction decodes.
 body(Msg, Opts) when is_map(Msg) ->
-    hb_cache:ensure_all_loaded(hb_maps:get(<<"body">>, Msg, not_found, Opts), Opts);
+    case hb_maps:get(<<"body">>, Msg, not_found, Opts) of
+        not_found -> hb_cache:ensure_all_loaded(hb_maps:get(<<"data">>, Msg, not_found, Opts), Opts);
+        Body -> hb_cache:ensure_all_loaded(Body, Opts)
+    end;
 body(Bin, _Opts) -> Bin.
 
 %% @doc The process definition `wp_init' receives: the process message
-%% without its image, its private and per-slot keys; links loaded, and a
-%% `module' given by ID read from the cache.
+%% without its image, its private and per-slot keys, with its own `id' when
+%% it runs under `process@1.0'; links loaded, and a `module' given by ID read
+%% from the cache.
 definition(Base, Opts) ->
     Proc =
         case hb_maps:get(<<"process">>, Base, not_found, Opts) of
             P when is_map(P) -> P;
             _ -> Base
         end,
-    Def = maps:without(
+    Def0 = maps:without(
         [<<"priv">>, <<"image">>, <<"snapshot">>, <<"results">>, <<"at-slot">>],
         hb_private:reset(hb_cache:ensure_all_loaded(Proc, Opts))
     ),
+    % The process's own ID, as `process@1.0' names it (its signed ID), so the
+    % runtime can serve `ao.resolve' of its own definition (`/<id>/<key>').
+    Def =
+        case Proc =/= Base of
+            true -> Def0#{ <<"id">> => hb_message:id(Proc, signed, Opts) };
+            false -> Def0
+        end,
     lib_patch_exec:encode(module_by_id(Def, Opts), term, Opts).
 
 module_by_id(Def = #{ <<"module">> := ID }, Opts) when ?IS_ID(ID) ->
@@ -819,6 +860,39 @@ wire_encoding_matches_term_encoding_test() ->
         end,
         Samples
     ).
+
+%% An image named by ID is pinned by `image-sha256': unpinned or mismatched
+%% is refused, `data' (a gateway-fetched transaction) serves as the payload,
+%% and an approved copy from the prewarm boots without the ID resolving.
+image_pinning_test() ->
+    hb:init(),
+    Store = hb_test_utils:test_store(hb_store_lmdb),
+    Opts = test_opts(#{ <<"store">> => Store,
+        <<"wasm-patch-aot-dir">> => "_build/test-wasm-approved-" ++ integer_to_list(erlang:unique_integer([positive])) }),
+    Wasm = test_wasm(),
+    Sha = binary:encode_hex(crypto:hash(sha256, Wasm), lowercase),
+    {ok, ByBody} = hb_cache:write(#{ <<"body">> => Wasm }, Opts),
+    {ok, ByData} = hb_cache:write(#{ <<"data">> => Wasm }, Opts),
+    Base = fun(Image, Pin) ->
+        maps:merge((test_base())#{ <<"image">> => Image },
+            case Pin of none -> #{}; _ -> #{ <<"image-sha256">> => Pin } end)
+    end,
+    Init = fun(B) -> hb_ao:resolve(B, <<"init">>, Opts) end,
+    ?assertMatch({error, #{ <<"status">> := 422 }}, Init(Base(ByBody, none))),
+    ?assertMatch({error, #{ <<"status">> := 422 }}, Init(Base(ByBody, binary:copy(<<"0">>, 64)))),
+    ?assertMatch({ok, _}, Init(Base(ByBody, Sha))),
+    ?assertMatch({ok, _}, Init(Base(ByData, string:uppercase(Sha)))),
+    % Inline bytes need no pin, but a wrong pin is still refused.
+    ?assertMatch({ok, _}, Init(Base(Wasm, none))),
+    ?assertMatch({error, #{ <<"status">> := 422 }}, Init(Base(Wasm, binary:copy(<<"a">>, 64)))),
+    % An unknown ID boots from the approved copy of the pinned hash.
+    Missing = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ?assertMatch({error, _}, Init(Base(Missing, Sha))),
+    Dir = hb_util:list(maps:get(<<"wasm-patch-aot-dir">>, Opts)),
+    ok = filelib:ensure_dir(filename:join([Dir, "approved", "x"])),
+    ok = file:write_file(filename:join([Dir, "approved", hb_util:list(Sha) ++ ".wasm"]), Wasm),
+    {ok, S0} = Init(Base(Missing, Sha)),
+    ?assertEqual(<<"11">>, count(run(S0, [<<"Increment">>], Opts), Opts)).
 
 %% A module importing anything outside the allow-list never starts.
 refuses_imports_test() ->
