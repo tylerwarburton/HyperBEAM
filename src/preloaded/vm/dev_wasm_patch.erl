@@ -216,46 +216,87 @@ find(Path, Base, Opts) ->
         Value -> Value
     end.
 
-%% @doc The `.wasm' bytes: the `image' as bytes, as an ID in the cache, or as
-%% a message whose body they are. AOT bytes are refused: a node only runs AOT
-%% code it compiled itself.
+%% @doc The `.wasm' bytes. `image' is the bytes, a message whose `body' (or,
+%% fetched from a gateway, `data') they are, or that message's ID; AOT bytes
+%% are refused, as a node only runs AOT code it compiled itself.
+%%
+%% `image-sha256' pins the bytes: a process naming its image by ID must name
+%% it, and any image whose hash differs from the one named is refused. With a
+%% hash named, a copy the node holds as approved (`hb_wasm_aot:approved/2',
+%% written by the image build's prewarm) is used without fetching the ID.
 image(Base, Opts) ->
+    Pinned =
+        case find([<<"image-sha256">>], Base, Opts) of
+            not_found -> not_found;
+            Hex -> string:lowercase(hb_util:bin(Hex))
+        end,
     Image =
-        case find([<<"image">>], Base, Opts) of
-            not_found -> throw({wasm_patch_init, <<"no image">>});
-            <<0, "asm", _/binary>> = Bin -> Bin;
-            ID when ?IS_ID(ID) ->
-                case hb_cache:read(ID, Opts) of
-                    {ok, Msg} when is_map(Msg) -> body(Msg, Opts);
-                    {ok, Bin} when is_binary(Bin) -> Bin;
-                    _ -> throw({wasm_patch_init, <<"image ", ID/binary, " not found">>})
-                end;
-            Msg when is_map(Msg) -> body(Msg, Opts);
-            Link when ?IS_LINK(Link) -> body(hb_cache:ensure_all_loaded(Link, Opts), Opts);
-            Other -> Other
+        case Pinned =/= not_found andalso hb_wasm_aot:approved(Pinned, Opts) of
+            {ok, Approved} -> Approved;
+            _ -> image_bytes(find([<<"image">>], Base, Opts), Pinned, Opts)
         end,
     case Image of
-        <<0, "asm", _/binary>> -> Image;
+        <<0, "asm", _/binary>> -> ok;
         _ -> throw({wasm_patch_init, <<"the image is not a .wasm module">>})
+    end,
+    case Pinned of
+        not_found -> Image;
+        _ ->
+            case binary:encode_hex(crypto:hash(sha256, Image), lowercase) of
+                Pinned -> Image;
+                Got ->
+                    throw({wasm_patch_init,
+                        <<"the image's sha256 is ", Got/binary, ", not the ", Pinned/binary,
+                            " the process names">>})
+            end
     end.
 
+image_bytes(not_found, _Pinned, _Opts) ->
+    throw({wasm_patch_init, <<"no image">>});
+image_bytes(<<0, "asm", _/binary>> = Bin, _Pinned, _Opts) -> Bin;
+image_bytes(ID, not_found, _Opts) when ?IS_ID(ID) ->
+    throw({wasm_patch_init, <<"an image named by ID needs image-sha256">>});
+image_bytes(ID, _Pinned, Opts) when ?IS_ID(ID) ->
+    case hb_cache:read(ID, Opts) of
+        {ok, Msg} when is_map(Msg) -> body(Msg, Opts);
+        {ok, Bin} when is_binary(Bin) -> Bin;
+        _ -> throw({wasm_patch_init, <<"image ", ID/binary, " not found">>})
+    end;
+image_bytes(Msg, _Pinned, Opts) when is_map(Msg) -> body(Msg, Opts);
+image_bytes(Link, Pinned, Opts) when ?IS_LINK(Link) ->
+    image_bytes(hb_cache:ensure_all_loaded(Link, Opts), Pinned, Opts);
+image_bytes(Other, _Pinned, _Opts) -> Other.
+
+%% The payload of an image message: `body' as a message carries it, `data' as
+%% an Arweave transaction decodes.
 body(Msg, Opts) when is_map(Msg) ->
-    hb_cache:ensure_all_loaded(hb_maps:get(<<"body">>, Msg, not_found, Opts), Opts);
+    case hb_maps:get(<<"body">>, Msg, not_found, Opts) of
+        not_found -> hb_cache:ensure_all_loaded(hb_maps:get(<<"data">>, Msg, not_found, Opts), Opts);
+        Body -> hb_cache:ensure_all_loaded(Body, Opts)
+    end;
 body(Bin, _Opts) -> Bin.
 
 %% @doc The process definition `wp_init' receives: the process message
-%% without its image, its private and per-slot keys; links loaded, and a
-%% `module' given by ID read from the cache.
+%% without its image, its private and per-slot keys, with its own `id' when
+%% it runs under `process@1.0'; links loaded, and a `module' given by ID read
+%% from the cache.
 definition(Base, Opts) ->
     Proc =
         case hb_maps:get(<<"process">>, Base, not_found, Opts) of
             P when is_map(P) -> P;
             _ -> Base
         end,
-    Def = maps:without(
+    Def0 = maps:without(
         [<<"priv">>, <<"image">>, <<"snapshot">>, <<"results">>, <<"at-slot">>],
         hb_private:reset(hb_cache:ensure_all_loaded(Proc, Opts))
     ),
+    % The process's own ID, as `process@1.0' names it (its signed ID), so the
+    % runtime can serve `ao.resolve' of its own definition (`/<id>/<key>').
+    Def =
+        case Proc =/= Base of
+            true -> Def0#{ <<"id">> => hb_message:id(Proc, signed, Opts) };
+            false -> Def0
+        end,
     lib_patch_exec:encode(module_by_id(Def, Opts), term, Opts).
 
 module_by_id(Def = #{ <<"module">> := ID }, Opts) when ?IS_ID(ID) ->
@@ -271,10 +312,25 @@ module_by_id(Def, _Opts) -> Def.
 %% result handling. A failed slot puts the instance back first.
 compute(Key, RawBase, RawReq, Opts) ->
     T0 = erlang:monotonic_time(microsecond),
-    Req = hb_cache:read_all_commitments(RawReq, Opts),
+    Req = request_commitments(RawBase, RawReq, Opts),
     case init(RawBase, Req, Opts) of
         {ok, Base} -> compute(Key, Base, Req, T0, Opts);
         Error -> Error
+    end.
+
+%% The request with every commitment the store holds for it, as
+%% `lua-patch@1.0' reads it -- except in a process slot. There the request is
+%% the assignment the scheduler just read from the store, with its path set to
+%% `compute' (`dev_process:prepare_next_slot/4'), so it already carries every
+%% stored commitment of that assignment; and the lookup is by the uncommitted
+%% ID of the whole request, computed on every slot (0.5 ms of a 0.9 ms prep on
+%% a signed message). Over both devices' suites (5,448 requests) it never
+%% added one. The message's own commitments, the ones `signer()' reads, are
+%% the body's and are not touched by it.
+request_commitments(Base, Req, Opts) ->
+    case lib_patch_exec:in_slot(hb_private:from_message(Base)) of
+        true -> Req;
+        false -> hb_cache:read_all_commitments(Req, Opts)
     end.
 
 compute(_Key, Base, Req, T0, Opts) ->
@@ -285,11 +341,15 @@ compute(_Key, Base, Req, T0, Opts) ->
     {Literal, St0} = literal_links(InSlot, maps:get(<<"state">>, Priv), Base, Opts),
     Params = lib_patch_exec:params(Req, InSlot, Literal, Opts),
     ReqBin =
-        hb_wasm_patch_codec:encode(
-            case lib_patch_exec:encode(Params, term, Opts) of
-                [One] -> One;
-                Many -> Many
-            end
+        iolist_to_binary(
+            lib_patch_exec:encode(
+                case Params of
+                    [One] -> One;
+                    Many -> Many
+                end,
+                wire,
+                Opts
+            )
         ),
     T1 = erlang:monotonic_time(microsecond),
     hb_slot_log:note(wasm_patch_prep, T1 - T0),
@@ -781,6 +841,59 @@ types_script() ->
         "end\n"
     >>.
 
+%% The request written in one walk is the term encoding's bytes exactly.
+wire_encoding_matches_term_encoding_test() ->
+    hb:init(),
+    Opts = test_opts(),
+    rand:seed(exsss, {5, 6, 7}),
+    Signed = hb_message:commit(#{ <<"action">> => <<"Order.Place">>, <<"price">> => 12,
+        <<"assign-to">> => binary:copy(<<"T">>, 43), <<"tags">> => [<<"a">>, <<"b">>] },
+        #{ <<"priv-wallet">> => ar_wallet:new() }),
+    Samples = [#{ <<"slot">> => 3, <<"body">> => Signed, <<"path">> => <<"compute">> }, #{}, []]
+        ++ [ gen_value(4) || _ <- lists:seq(1, 300) ],
+    lists:foreach(
+        fun(Value) ->
+            ?assertEqual(
+                hb_wasm_patch_codec:encode(lib_patch_exec:encode(Value, term, Opts)),
+                iolist_to_binary(lib_patch_exec:encode(Value, wire, Opts))
+            )
+        end,
+        Samples
+    ).
+
+%% An image named by ID is pinned by `image-sha256': unpinned or mismatched
+%% is refused, `data' (a gateway-fetched transaction) serves as the payload,
+%% and an approved copy from the prewarm boots without the ID resolving.
+image_pinning_test() ->
+    hb:init(),
+    Store = hb_test_utils:test_store(hb_store_lmdb),
+    Opts = test_opts(#{ <<"store">> => Store,
+        <<"wasm-patch-aot-dir">> => "_build/test-wasm-approved-" ++ integer_to_list(erlang:unique_integer([positive])) }),
+    Wasm = test_wasm(),
+    Sha = binary:encode_hex(crypto:hash(sha256, Wasm), lowercase),
+    {ok, ByBody} = hb_cache:write(#{ <<"body">> => Wasm }, Opts),
+    {ok, ByData} = hb_cache:write(#{ <<"data">> => Wasm }, Opts),
+    Base = fun(Image, Pin) ->
+        maps:merge((test_base())#{ <<"image">> => Image },
+            case Pin of none -> #{}; _ -> #{ <<"image-sha256">> => Pin } end)
+    end,
+    Init = fun(B) -> hb_ao:resolve(B, <<"init">>, Opts) end,
+    ?assertMatch({error, #{ <<"status">> := 422 }}, Init(Base(ByBody, none))),
+    ?assertMatch({error, #{ <<"status">> := 422 }}, Init(Base(ByBody, binary:copy(<<"0">>, 64)))),
+    ?assertMatch({ok, _}, Init(Base(ByBody, Sha))),
+    ?assertMatch({ok, _}, Init(Base(ByData, string:uppercase(Sha)))),
+    % Inline bytes need no pin, but a wrong pin is still refused.
+    ?assertMatch({ok, _}, Init(Base(Wasm, none))),
+    ?assertMatch({error, #{ <<"status">> := 422 }}, Init(Base(Wasm, binary:copy(<<"a">>, 64)))),
+    % An unknown ID boots from the approved copy of the pinned hash.
+    Missing = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ?assertMatch({error, _}, Init(Base(Missing, Sha))),
+    Dir = hb_util:list(maps:get(<<"wasm-patch-aot-dir">>, Opts)),
+    ok = filelib:ensure_dir(filename:join([Dir, "approved", "x"])),
+    ok = file:write_file(filename:join([Dir, "approved", hb_util:list(Sha) ++ ".wasm"]), Wasm),
+    {ok, S0} = Init(Base(Missing, Sha)),
+    ?assertEqual(<<"11">>, count(run(S0, [<<"Increment">>], Opts), Opts)).
+
 %% A module importing anything outside the allow-list never starts.
 refuses_imports_test() ->
     hb:init(),
@@ -1077,6 +1190,330 @@ process_test_() ->
         {ok, Old} = Compute(0),
         ?assertEqual(<<"11">>, hb_ao:get(<<"count">>, Old, Opts))
     end}.
+
+%% `bridge-root@1.0' through `ao.resolve': the Lua runtime's own
+%% bridge_root.lua, over this NIF's verification natives (`wp_bls_fav',
+%% `wp_rsa_pss_sha256'), against the Erlang device under `lua-patch@1.0'.
+%% Every path PUSD uses (`possession', `verify'), valid and refused, gives
+%% the same status and the same value as Lua sees it, under the interpreter
+%% and AOT, instrumented. Runs when `HB_WASM_LUA' names the runtime's
+%% `.wasm'; `HB_BRIDGE_ROOT_VECTORS' also writes the vectors and lua-patch's
+%% answers as JSON, for the runtime's own host test (runtime.test.mjs).
+bridge_root_matches_lua_patch_test_() ->
+    {timeout, 900, fun() ->
+        case os:getenv("HB_WASM_LUA") of
+            false -> ok;
+            Path ->
+                hb:init(),
+                {ok, Runtime} = file:read_file(Path),
+                Vectors = br_vectors(),
+                Module = #{ <<"content-type">> => <<"application/lua">>,
+                    <<"body">> => br_script() },
+                Interp = test_opts(#{ <<"wasm-patch-allow-uninstrumented">> => false }),
+                Aot = Interp#{ <<"wasm-patch-aot">> => true,
+                    <<"wasm-patch-aot-dir">> => "_build/test-wasm-aot-bridge-root" },
+                Run =
+                    fun(Base, Opts) ->
+                        {ok, S0} = hb_ao:resolve(Base, <<"init">>, Opts),
+                        lists:map(
+                            fun({Name, _Expect, Call}) ->
+                                {ok, S} = hb_ao:resolve(S0,
+                                    #{ <<"path">> => <<"compute">>,
+                                        <<"body">> => #{ <<"call">> => Call } }, Opts),
+                                {Name, hb_ao:get(<<"r">>, S, Opts)}
+                            end,
+                            Vectors
+                        )
+                    end,
+                Lua = Run(#{ <<"device">> => <<"lua-patch@1.0">>, <<"module">> => Module }, Interp),
+                % Each vector says what the Erlang device answers, so a vector
+                % that stopped testing what it names fails here.
+                lists:foreach(
+                    fun({{Name, Expect, _}, {Name, Out}}) ->
+                        ?assertEqual({Name, Expect},
+                            {Name, binary_to_atom(hd(binary:split(Out, <<"|">>)))})
+                    end,
+                    lists:zip(Vectors, Lua)
+                ),
+                case os:getenv("HB_BRIDGE_ROOT_VECTORS") of
+                    false -> ok;
+                    Out ->
+                        ok = file:write_file(Out, hb_json:encode(#{
+                            <<"script">> => br_script(),
+                            <<"vectors">> => [
+                                #{ <<"name">> => Name, <<"call">> => br_json(Call),
+                                    <<"expect">> => Result }
+                            || {{Name, _, Call}, {Name, Result}} <- lists:zip(Vectors, Lua)]
+                        }))
+                end,
+                WasmBase = #{ <<"device">> => ?DEVICE, <<"image">> => Runtime, <<"module">> => Module },
+                lists:foreach(
+                    fun(Opts) ->
+                        lists:foreach(
+                            fun({Expected, Got}) -> ?assertEqual(Expected, Got) end,
+                            lists:zip(Lua, Run(WasmBase, Opts))
+                        )
+                    end,
+                    [Interp, Aot]
+                ),
+                % A native charges its fixed fuel (FUEL_BLS, 1e9) before it
+                % runs: a slot that cannot pay traps as out of fuel, the same
+                % under both.
+                {_, _, PopValid} = hd(Vectors),
+                lists:foreach(
+                    fun(Opts) ->
+                        {ok, Low} = hb_ao:resolve(WasmBase#{ <<"fuel-per-slot">> => 500000000 },
+                            <<"init">>, Opts),
+                        ?assertMatch(
+                            {error, #{ <<"body">> := <<"wasm-patch@1.0 trap: out of fuel">> }},
+                            hb_ao:resolve(Low, #{ <<"path">> => <<"compute">>,
+                                <<"body">> => #{ <<"call">> => PopValid } }, Opts))
+                    end,
+                    [Interp, Aot]
+                )
+        end
+    end}.
+
+%% A value for the JSON fixture: every binary as base64, so any bytes survive.
+br_json(Bin) when is_binary(Bin) -> #{ <<"b">> => base64:encode(Bin) };
+br_json(Int) when is_integer(Int) -> #{ <<"i">> => Int };
+br_json(List) when is_list(List) -> [br_json(V) || V <- List];
+br_json(Map) when is_map(Map) -> #{ <<"m">> => maps:map(fun(_, V) -> br_json(V) end, Map) }.
+
+%% Calls `ao.resolve' with the request in the slot's body and publishes the
+%% answer serialised canonically: sorted keys, every string as hex.
+br_script() ->
+    <<
+        "local HEX = '0123456789abcdef'\n"
+        "local function hex(s)\n"
+        "  local t = {}\n"
+        "  for i = 1, #s do\n"
+        "    local b = string.byte(s, i)\n"
+        "    local hi, lo = b // 16 + 1, b % 16 + 1\n"
+        "    t[i] = string.sub(HEX, hi, hi) .. string.sub(HEX, lo, lo)\n"
+        "  end\n"
+        "  return table.concat(t)\n"
+        "end\n"
+        "local function ser(v)\n"
+        "  local t = type(v)\n"
+        "  if t == 'string' then return 's' .. hex(v) end\n"
+        "  if t ~= 'table' then return t .. ':' .. tostring(v) end\n"
+        "  local keys = {}\n"
+        "  for k in pairs(v) do keys[#keys + 1] = { ser(k), k } end\n"
+        "  table.sort(keys, function(a, b) return a[1] < b[1] end)\n"
+        "  local out = {}\n"
+        "  for i, p in ipairs(keys) do out[i] = p[1] .. '=' .. ser(v[p[2]]) end\n"
+        "  return '{' .. table.concat(out, ',') .. '}'\n"
+        "end\n"
+        "function compute(req)\n"
+        "  local body = req.body or req\n"
+        "  local status, value = ao.resolve({ device = 'bridge-root@1.0' }, body.call)\n"
+        "  local out = tostring(status) .. '|' .. ser(value)\n"
+        "  return { patches = { { path = '/r', value = out } },\n"
+        "    results = { output = { data = out } } }\n"
+        "end\n"
+    >>.
+
+-define(BR_DST, <<"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_PUSD_ROOT_">>).
+-define(BR_POP_DST, <<"BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_PUSD_ROOT_">>).
+-define(BR_P, 16#1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab).
+
+br_member(I) ->
+    {Secret, Key} = blst_nif:keygen(<<I:256>>),
+    AO = hb_util:human_id(crypto:hash(sha256, <<"member", I:32>>)),
+    {Secret, Key, AO}.
+
+br_hex(Key) -> <<"0x", (binary:encode_hex(Key, lowercase))/binary>>.
+
+br_pop(Secret, AO, Key, Dst) ->
+    blst_nif:sign(Secret, <<"PUSD_BLS_POSSESSION_V1", (hb_util:decode(AO))/binary, Key/binary>>, Dst).
+
+%% Points on the curves outside the prime-order subgroups (as in
+%% dev_bridge_root's tests).
+br_fp(X) -> ((X rem ?BR_P) + ?BR_P) rem ?BR_P.
+br_fp_pow(B, E) -> binary:decode_unsigned(crypto:mod_pow(br_fp(B), E, ?BR_P)).
+br_fp_square(A) -> br_fp_pow(A, (?BR_P - 1) div 2) =:= 1.
+br_g1_off(X) ->
+    case br_fp_square(X * X * X + 4) of
+        true ->
+            Y = br_fp_pow(X * X * X + 4, (?BR_P + 1) div 4),
+            <<1:1, 0:1, (case Y > (?BR_P - 1) div 2 of true -> 1; false -> 0 end):1, X:381>>;
+        false -> br_g1_off(X + 1)
+    end.
+br_g2_off(C1) ->
+    {S0, S1} = {br_fp(1 - C1 * C1), br_fp(2 * C1)},
+    {A0, A1} = {br_fp(S0 - S1 * C1 + 4), br_fp(S0 * C1 + S1 + 4)},
+    case br_fp_square(A0 * A0 + A1 * A1) of
+        true -> <<1:1, 0:1, 0:1, C1:381, 1:384>>;
+        false -> br_g2_off(C1 + 1)
+    end.
+
+%% The author's signed item for an operation, as the device rebuilds it.
+br_item(Wallet, Root, Operation) ->
+    Author = hb_util:human_id(crypto:hash(sha256, ar_wallet:to_pubkey(Wallet))),
+    Payload = Operation#{ <<"target">> => Root, <<"author">> => Author,
+        <<"certificate-version">> => <<"pusd-root/v1">> },
+    Anchor = case maps:get(<<"anchor">>, Payload, not_found) of
+        not_found -> <<>>;
+        A -> hb_util:decode(A)
+    end,
+    ar_bundles:sign_item(#tx{ format = ans104, target = hb_util:decode(Root), anchor = Anchor,
+        tags = lists:sort(maps:to_list(maps:without([<<"target">>, <<"anchor">>], Payload))) },
+        Wallet).
+
+br_bitmap(N, Indices) ->
+    Bytes = (N + 7) div 8,
+    <<(lists:foldl(fun(I, Acc) -> Acc bor (1 bsl I) end, 0, Indices)):(Bytes * 8)/little>>.
+
+br_signing_bytes(Root, Epoch, IntentID) ->
+    <<"PUSD_ROOT_CERTIFICATE_V2", (hb_util:decode(Root))/binary, Epoch:64/big,
+        (hb_util:decode(IntentID))/binary>>.
+
+br_endorse(Members, Indices, Bytes) ->
+    <<(br_bitmap(length(Members), Indices))/binary,
+        (blst_nif:aggregate([blst_nif:sign(element(1, lists:nth(I + 1, Members)), Bytes, ?BR_DST)
+            || I <- Indices]))/binary>>.
+
+%% {Name, what the Erlang device answers, the request}.
+br_vectors() ->
+    Members = [br_member(I) || I <- lists:seq(1, 17)],
+    [{S1, K1, AO1}, {_S2, K2, AO2} | _] = Members,
+    Pop1 = br_pop(S1, AO1, K1, ?BR_POP_DST),
+    Pop1Text = hb_util:encode(Pop1),
+    Poss = fun(Fields) -> maps:merge(#{ <<"path">> => <<"possession">>, <<"ao">> => AO1,
+        <<"bls">> => br_hex(K1), <<"pop">> => Pop1Text }, Fields) end,
+    OffG1 = br_g1_off(1),
+    Aliased = << <<(case C of $- -> $+; $_ -> $/; _ -> C end)>> || <<C>> <= Pop1Text >>,
+    <<AOHead:42/binary, AOLast>> = AO1,
+    Possession = [
+        {<<"pop-valid">>, ok, Poss(#{})},
+        {<<"pop-key-upper-hex">>, ok, Poss(#{ <<"bls">> => <<"0x", (binary:encode_hex(K1))/binary>> })},
+        {<<"pop-key-raw">>, ok, Poss(#{ <<"bls">> => K1 })},
+        {<<"pop-hex">>, ok, Poss(#{ <<"pop">> => br_hex(Pop1) })},
+        {<<"pop-raw">>, ok, Poss(#{ <<"pop">> => Pop1 })},
+        {<<"pop-aliased">>, ok, Poss(#{ <<"pop">> => Aliased })},
+        {<<"pop-padded">>, ok, Poss(#{ <<"pop">> => <<Pop1Text/binary, "==">> })},
+        {<<"pop-missing">>, error, maps:remove(<<"pop">>, Poss(#{}))},
+        {<<"pop-empty">>, error, Poss(#{ <<"pop">> => <<>> })},
+        {<<"pop-long">>, error, Poss(#{ <<"pop">> => <<Pop1Text/binary, "AA">> })},
+        {<<"pop-bad-char">>, error, Poss(#{ <<"pop">> => <<(binary:part(Pop1Text, 0, 127))/binary, "!">> })},
+        {<<"pop-other-key">>, error, Poss(#{ <<"bls">> => br_hex(K2) })},
+        {<<"pop-other-ao">>, error, Poss(#{ <<"ao">> => AO2 })},
+        {<<"pop-wrong-tag">>, error, Poss(#{ <<"pop">> => hb_util:encode(br_pop(S1, AO1, K1, ?BR_DST)) })},
+        {<<"pop-garbage">>, error, Poss(#{ <<"pop">> => binary:copy(<<7>>, 96) })},
+        {<<"pop-infinity">>, error, Poss(#{ <<"bls">> => br_hex(<<16#c0, 0:376>>),
+            <<"pop">> => br_hex(<<16#c0, 0:760>>) })},
+        {<<"pop-off-subgroup-key">>, error, Poss(#{ <<"bls">> => br_hex(OffG1) })},
+        {<<"pop-off-subgroup-sig">>, error, Poss(#{ <<"pop">> => br_hex(br_g2_off(1)) })},
+        {<<"pop-key-bad-hex">>, error, Poss(#{ <<"bls">> => <<"0x", (binary:part(br_hex(K1), 2, 95))/binary, "g">> })},
+        {<<"pop-key-short">>, error, Poss(#{ <<"bls">> => binary:part(br_hex(K1), 0, 96) })},
+        {<<"pop-ao-noncanonical">>, error, Poss(#{ <<"ao">> => <<AOHead/binary,
+            (case AOLast of $A -> $B; _ -> $A end)>> })},
+        {<<"pop-ao-short">>, error, Poss(#{ <<"ao">> => AOHead })}
+    ],
+    Wallet = ar_wallet:new(),
+    Root = hb_util:human_id(crypto:hash(sha256, <<"root">>)),
+    Committee = fun(N) -> [#{ <<"ao">> => AO, <<"bls">> => br_hex(K) } || {_, K, AO} <- lists:sublist(Members, N)] end,
+    Base = #{ <<"action">> => <<"Transfer">>, <<"quantity">> => <<"50">>,
+        <<"recipient">> => AO2, <<"attestor-epoch">> => <<"7">>, <<"root-sequence">> => <<"1">> },
+    %% A certificate: the operation the author signs, the JSON the request
+    %% carries (default: its encoding), the committee size and signers.
+    Cert =
+        fun(Opts) ->
+            Op = maps:get(op, Opts, Base),
+            Epoch = maps:get(epoch, Opts, 7),
+            N = maps:get(n, Opts, 3),
+            Item = br_item(Wallet, Root, Op),
+            IntentID = hb_util:human_id(Item#tx.id),
+            Bytes = br_signing_bytes(Root, Epoch, IntentID),
+            #{ <<"path">> => <<"verify">>, <<"root">> => Root,
+                <<"epoch">> => maps:get(epoch_value, Opts, Epoch),
+                <<"intent-id">> => IntentID, <<"committee">> => Committee(N),
+                <<"operation">> => maps:get(json, Opts, hb_json:encode(Op)),
+                <<"authorization">> => <<(Item#tx.owner)/binary, (Item#tx.signature)/binary>>,
+                <<"endorsements">> => br_endorse(lists:sublist(Members, N),
+                    maps:get(signers, Opts, lists:seq(0, N div 2)), Bytes) }
+        end,
+    Valid = Cert(#{}),
+    WithOp = fun(Extra) -> Cert(#{ op => maps:merge(Base, Extra) }) end,
+    %% JSON the device reads as Base: the encoding with text spliced in after
+    %% the opening brace.
+    Spliced = fun(Prefix) ->
+        <<"{", Rest/binary>> = hb_json:encode(Base),
+        Cert(#{ json => <<"{", Prefix/binary, Rest/binary>> })
+    end,
+    BigEpoch = 18446744073709551615,
+    Verify = [
+        {<<"cert-valid">>, ok, Valid},
+        {<<"cert-one-member">>, ok, Cert(#{ n => 1 })},
+        {<<"cert-sixteen">>, ok, Cert(#{ n => 16 })},
+        {<<"cert-other-majority">>, ok, Cert(#{ n => 5, signers => [1, 3, 4] })},
+        {<<"cert-anchor">>, ok, WithOp(#{ <<"anchor">> => hb_util:human_id(crypto:hash(sha256, <<"a">>)) })},
+        {<<"cert-epoch-text">>, ok, Cert(#{ epoch_value => <<"7">> })},
+        {<<"cert-epoch-plus">>, ok, Cert(#{ epoch_value => <<"+07">> })},
+        {<<"cert-epoch-max">>, ok, Cert(#{ epoch => BigEpoch, epoch_value => integer_to_binary(BigEpoch),
+            op => Base#{ <<"attestor-epoch">> => integer_to_binary(BigEpoch) } })},
+        {<<"cert-epoch-negative">>, error, Cert(#{ epoch_value => -7 })},
+        {<<"cert-epoch-other">>, error, Cert(#{ epoch_value => 8 })},
+        {<<"cert-minority">>, error, Cert(#{ signers => [0] })},
+        {<<"cert-bit-past-committee">>, error, (fun() ->
+            #{ <<"endorsements">> := <<Map, Agg/binary>> } = Valid,
+            Valid#{ <<"endorsements">> => <<(Map bor 8), Agg/binary>> } end)()},
+        {<<"cert-long-bitmap">>, error, (fun() ->
+            #{ <<"endorsements">> := <<Map, Agg/binary>> } = Valid,
+            Valid#{ <<"endorsements">> => <<Map, 0, Agg/binary>> } end)()},
+        {<<"cert-identity">>, error, Valid#{ <<"endorsements">> => <<3, 16#c0, 0:760>> }},
+        {<<"cert-off-subgroup">>, error, Valid#{ <<"endorsements">> => <<3, (br_g2_off(1))/binary>> }},
+        {<<"cert-tampered">>, error, Valid#{ <<"operation">> =>
+            hb_json:encode(Base#{ <<"quantity">> => <<"5000">> }) }},
+        {<<"cert-authorization-zero">>, error, Valid#{ <<"authorization">> => <<0:8192>> }},
+        {<<"cert-intent-other">>, error, Valid#{ <<"intent-id">> => Root }},
+        {<<"cert-root-other">>, error, Valid#{ <<"root">> => AO1 }},
+        {<<"cert-committee-17">>, error, Valid#{ <<"committee">> => Committee(17) }},
+        {<<"cert-committee-empty">>, error, Valid#{ <<"committee">> => [] }},
+        {<<"cert-committee-repeat-key">>, error, Valid#{ <<"committee">> =>
+            (fun([M0, M1, M2]) -> [M0, M1#{ <<"bls">> => string:uppercase(maps:get(<<"bls">>, M0)) }, M2] end)(Committee(3)) }},
+        {<<"cert-committee-raw-key">>, ok, Valid#{ <<"committee">> =>
+            [M#{ <<"bls">> => K } || {M, {_, K, _}} <- lists:zip(Committee(3), lists:sublist(Members, 3))] }},
+        {<<"cert-committee-loose-ao">>, ok, Valid#{ <<"committee">> =>
+            [M#{ <<"ao">> => <<"member-", (integer_to_binary(I))/binary>> } || {I, M} <- lists:enumerate(Committee(3))] }},
+        {<<"cert-json-first-wins">>, ok, Spliced(<<"\"quantity\":\"50\",\"quantity\":\"5000\",">>)},
+        {<<"cert-json-later-number">>, ok, Spliced(<<"\"quantity\":\"50\",\"quantity\":-1.5e+3,">>)},
+        {<<"cert-json-later-nested">>, ok, Spliced(<<"\"quantity\":\"50\",\"quantity\":{\"a\":[1,true,null,\"x\",{}]},">>)},
+        {<<"cert-json-overflow">>, error, Spliced(<<"\"quantity\":\"50\",\"quantity\":1e400,">>)},
+        {<<"cert-json-bad-utf8">>, error, Spliced(<<"\"quantity\":\"50\",\"quantity\":\"", 16#c0, 16#af, "\",">>)},
+        {<<"cert-json-lone-surrogate">>, error, Spliced(<<"\"quantity\":\"50\",\"quantity\":\"\\ud800\",">>)},
+        {<<"cert-json-number-value">>, error, Spliced(<<"\"zz\":1,">>)},
+        {<<"cert-json-escaped-key">>, ok, (fun() ->
+            <<"{", Rest/binary>> = hb_json:encode(maps:remove(<<"action">>, Base)),
+            Valid#{ <<"operation">> => <<"{\"\\u0061ction\":\"Tr\\u0061nsfer\",", Rest/binary>> } end)()},
+        {<<"cert-json-trailing">>, error, Valid#{ <<"operation">> =>
+            <<(maps:get(<<"operation">>, Valid))/binary, "x">> }},
+        {<<"cert-key-newline">>, ok, WithOp(#{ <<"note\n">> => <<"x">> })},
+        {<<"cert-key-upper">>, error, WithOp(#{ <<"Note">> => <<"x">> })},
+        {<<"cert-key-private">>, error, WithOp(#{ <<"private">> => <<"x">> })},
+        {<<"cert-key-reserved">>, error, WithOp(#{ <<"body">> => <<"x">> })},
+        {<<"cert-too-long">>, error, WithOp(#{ <<"pad">> => binary:copy(<<"x">>, 2048) })},
+        {<<"cert-from-stamp">>, ok, WithOp(#{ <<"from-process">> => AO1 })},
+        {<<"cert-data-key">>, ok, WithOp(#{ <<"ao-data-key">> => <<"x">> })},
+        {<<"cert-data-key-existing">>, ok, WithOp(#{ <<"ao-data-key">> => <<"author">> })},
+        {<<"cert-data-key-own">>, ok, WithOp(#{ <<"ao-data-key">> => <<"action">> })},
+        {<<"cert-data-key-refused">>, error, WithOp(#{ <<"ao-data-key">> => <<"owner">> })},
+        {<<"cert-data-key-private">>, error, WithOp(#{ <<"ao-data-key">> => <<"PRIVx">> })},
+        {<<"cert-bundle-format">>, ok, WithOp(#{ <<"bundle-format">> => <<"binary">> })},
+        {<<"cert-bundle-binary">>, ok, WithOp(#{ <<"bundle-format">> => <<"binary">>,
+            <<"bundle-version">> => <<"2.0.0">> })},
+        {<<"cert-bundle-map">>, ok, WithOp(#{ <<"bundle-format">> => <<"binary">>,
+            <<"bundle-version">> => <<"2.0.0">>, <<"bundle-map">> => <<"x">> })},
+        {<<"cert-bundle-version">>, ok, WithOp(#{ <<"bundle-version">> => <<"2.0.0">> })},
+        {<<"cert-bundle-upper">>, ok, WithOp(#{ <<"bundle-format">> => <<"BINARY">>,
+            <<"bundle-version">> => <<"2.0.0">> })},
+        {<<"cert-bundle-map-empty">>, ok, WithOp(#{ <<"bundle-format">> => <<"binary">>,
+            <<"bundle-version">> => <<"2.0.0">>, <<"bundle-map">> => <<>> })},
+        {<<"cert-ao-type-binary">>, ok, WithOp(#{ <<"ao-type">> => <<"binary">> })},
+        {<<"cert-ao-type-other">>, ok, WithOp(#{ <<"ao-type">> => <<"list">> })}
+    ],
+    Possession ++ Verify.
 
 %% @doc Per-slot phase means, run only when asked:
 %% `HB_WASM_PATCH_BENCH=2000 rebar3 device test -d dev_wasm_patch'

@@ -176,10 +176,11 @@ wasm-patch-instrument:
 # Compile the approved wasm-patch@1.0 modules (sha256 + source, in
 # $(WASM_PATCH_PREWARM)) into the build's priv/wasm-aot, the node's default AOT
 # cache, so an image ships them compiled. Run it after `rebar3 release' in an
-# image build; it uses the release's code when there is one.
+# image build: with a release it runs the release's code only, so the cache
+# lands in the release's own priv (the one the node reads), not the build's.
 WASM_PATCH_PREWARM ?= config/wasm-patch-prewarm.json
 wasm-patch-prewarm: wamrc wasm-patch-instrument
-	erl -noshell -pa $(wildcard _build/default/rel/hb/lib/*/ebin) $(wildcard _build/default/lib/*/ebin) \
+	erl -noshell -pa $(or $(wildcard _build/default/rel/hb/lib/*/ebin),$(wildcard _build/default/lib/*/ebin)) \
 		-eval 'hb_wasm_aot:prewarm_cli("$(WASM_PATCH_PREWARM)").'
 
 # Unit tests, then interpreter-vs-AOT equivalence on the node's own runtime build.
