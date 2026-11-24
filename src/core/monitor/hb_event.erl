@@ -295,7 +295,42 @@ record(Topic, Message, Mod, Func, Line, Opts, Count) ->
         <<"debug", _/binary>> -> ignored;
         TopicBin ->
             record_event(Topic, Message, Mod, Func, Line, Opts),
-            find_event_server() ! {record, TopicBin, parse_name(Message), Count}
+            count(TopicBin, parse_name(Message), Count)
+    end.
+
+%% @doc Count an event in the calling process. `prometheus_counter' keeps its
+%% values in ETS, safe to update from any process. Every event used to be a
+%% message to one server process that did the same increment: under fifteen
+%% busy processes, ~170 events a message spun on that server's queue lock for
+%% 21% of the node's CPU (perf, bench/msgpath.mjs). The counter is declared
+%% once per node (`declared/0').
+count(Topic, Event, Count) ->
+    case declared() of
+        true ->
+            try prometheus_counter:inc(<<"event">>, [Topic, Event], Count)
+            catch _:_ -> ok
+            end;
+        false -> ok
+    end.
+
+declared() ->
+    case persistent_term:get({?MODULE, declared}, false) of
+        true -> true;
+        false ->
+            % First event of the node (or a race of a few): declare it in
+            % the one server, which never counts again.
+            _ = find_event_server(),
+            case wait_declared(100) of
+                true -> persistent_term:put({?MODULE, declared}, true), true;
+                false -> false
+            end
+    end.
+
+wait_declared(0) -> false;
+wait_declared(N) ->
+    try prometheus_counter:value(<<"event">>, [<<"x">>, <<"x">>]) of
+        _ -> true
+    catch _:_ -> timer:sleep(10), wait_declared(N - 1)
     end.
 
 record_event(Topic, Message, Mod, Func, Line, #{ <<"on">> := #{ <<"event">> := _ }} = Opts) ->
