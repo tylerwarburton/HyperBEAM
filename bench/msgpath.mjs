@@ -1,5 +1,6 @@
 // node bench/msgpath.mjs <node-url> [--procs 1] [--clients 32] [--seconds 30]
 //                         [--idle 30] [--msg trivial|pair] [--out file.json]
+//                         [--container name]
 //
 // The per-message path of one process (or --procs N at once), on a local node.
 // Each process is lua-patch@1.0 doing a trivial mutation (a counter); with
@@ -20,10 +21,15 @@
 //
 // The node's /~hyperbuddy@1.0/phases is read around each window; the report
 // gives each phase's delta: calls per confirmed message and mean us per call.
+// With --container (a local Docker container running the node), the
+// container's CPU time (cgroup cpu.stat) per confirmed message too: the
+// number that sets node-wide capacity, and steadier than msg/s when other
+// work shares the machine.
 import crypto from 'node:crypto';
 import os from 'node:os';
 import fs from 'node:fs';
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
+import { execFileSync } from 'node:child_process';
 import { signDataItem, generateWallet } from './ans104.mjs';
 
 const LUA = `
@@ -72,6 +78,16 @@ async function main() {
   const IDLE = Number(opt('idle', 30));
   const KIND = opt('msg', 'trivial');
   const OUT = opt('out', null);
+  const CONTAINER = opt('container', null);
+  const cpuUs = () => {
+    if (!CONTAINER) return null;
+    // cgroup v2 (cpu.stat, microseconds) or v1 (cpuacct.usage, nanoseconds).
+    const t = execFileSync('docker', ['exec', CONTAINER, 'sh', '-c',
+      'cat /sys/fs/cgroup/cpu.stat 2>/dev/null || echo ns $(cat /sys/fs/cgroup/cpuacct/cpuacct.usage)'],
+      { encoding: 'utf8' });
+    const v2 = /usage_usec (\d+)/.exec(t);
+    return v2 ? Number(v2[1]) : Number(/ns (\d+)/.exec(t)[1]) / 1000;
+  };
   const now = () => performance.now();
 
   const jwk = generateWallet();
@@ -167,11 +183,12 @@ async function main() {
   if (IDLE > 0) {
     const ms = []; const sc = [];
     const end = now() + IDLE * 1000;
-    const p0 = await phases();
+    const p0 = await phases(); const u0 = cpuUs();
     let n = 0;
     while (now() < end && n < 400) { const r = await one(pids[0], ws[0]); ms.push(r.rtt); sc.push(r.sched); n++; }
-    const p1 = await phases();
+    const p1 = await phases(); const u1 = cpuUs();
     report.idle = { n, rtt_p50_ms: pct(ms, 0.5), rtt_p95_ms: pct(ms, 0.95), sched_p50_ms: pct(sc, 0.5),
+      cpu_ms_per_msg: u0 === null ? null : +((u1 - u0) / 1000 / n).toFixed(2),
       phases: phaseDelta(p0, p1, n) };
     console.error('idle', JSON.stringify({ n, rtt_p50_ms: report.idle.rtt_p50_ms, rtt_p95_ms: report.idle.rtt_p95_ms }));
   }
@@ -189,11 +206,11 @@ async function main() {
       }
     })());
     await new Promise((r) => setTimeout(r, 5000)); // ramp
-    const c0 = ws.map((w) => w.count); const p0 = await phases(); const t0 = now();
+    const c0 = ws.map((w) => w.count); const p0 = await phases(); const u0 = cpuUs(); const t0 = now();
     measuring = true;
     await new Promise((r) => setTimeout(r, SECONDS * 1000));
     measuring = false;
-    const c1 = ws.map((w) => w.count); const p1 = await phases(); const t1 = now();
+    const c1 = ws.map((w) => w.count); const t1 = now(); const u1 = cpuUs(); const p1 = await phases();
     stop = true;
     await Promise.all(loops);
     const per = c1.map((c, i) => (c - c0[i]) / ((t1 - t0) / 1000));
@@ -204,6 +221,8 @@ async function main() {
       proc_msg_s: +(per.reduce((a, b) => a + b, 0) / P).toFixed(1),
       proc_msg_s_min: +Math.min(...per).toFixed(1),
       rtt_p50_ms: pct(rtts, 0.5), rtt_p95_ms: pct(rtts, 0.95), sched_p50_ms: pct(scs, 0.5), sched_p95_ms: pct(scs, 0.95),
+      cpu_ms_per_msg: u0 === null ? null : +((u1 - u0) / 1000 / confirmed).toFixed(2),
+      cpu_cores: u0 === null ? null : +((u1 - u0) / 1000 / (t1 - t0)).toFixed(2),
       errors, first_error: firstErr, run_queue: p1.run_queue,
       phases: phaseDelta(p0, p1, confirmed),
     };
