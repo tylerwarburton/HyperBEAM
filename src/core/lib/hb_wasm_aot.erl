@@ -13,7 +13,7 @@
 %%% module runs under the interpreter: bit-identical results, only slower.
 -module(hb_wasm_aot).
 -export([get/2, key/2, flags/1, wamrc/1, wamr_tag/0]).
--export([instrument/3, instrument_version/1, prewarm/2, prewarm_cli/1]).
+-export([instrument/3, instrument_version/1, prewarm/2, prewarm_cli/1, approved/2]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -83,6 +83,7 @@ prewarm_one(Sha, Source, Cap, Opts) ->
         {ok, Wasm} ->
             case hex(crypto:hash(sha256, Wasm)) of
                 Sha ->
+                    ok = keep_approved(Sha, Wasm, Opts),
                     case instrument(Wasm, Cap, Opts) of
                         {ok, Instrumented, _Version} ->
                             case get(Instrumented, Opts#{ <<"wasm-patch-aot">> => true }) of
@@ -105,6 +106,35 @@ prewarm_cli(File) ->
         true -> 0;
         false -> 1
     end).
+
+%% @doc An approved image this node holds (`prewarm/2' keeps one copy of each
+%% module it compiles, under `approved/<sha256>.wasm' in the AOT directory):
+%% `{ok, Bytes}' when present and still of that hash, else `not_found'. A
+%% process pinning its image by `image-sha256' boots from this copy without
+%% fetching the image.
+approved(Sha, Opts) when is_binary(Sha), byte_size(Sha) =:= 64 ->
+    case lists:all(fun(C) -> (C >= $0 andalso C =< $9) orelse (C >= $a andalso C =< $f) end,
+            binary_to_list(Sha)) of
+        false -> not_found;
+        true ->
+            case file:read_file(approved_path(Sha, Opts)) of
+                {ok, Bytes} ->
+                    case hex(crypto:hash(sha256, Bytes)) of
+                        Sha -> {ok, Bytes};
+                        _ -> not_found
+                    end;
+                _ -> not_found
+            end
+    end;
+approved(_Sha, _Opts) -> not_found.
+
+approved_path(Sha, Opts) ->
+    filename:join([dir(Opts), "approved", hb_util:list(Sha) ++ ".wasm"]).
+
+keep_approved(Sha, Wasm, Opts) ->
+    Path = approved_path(Sha, Opts),
+    ok = filelib:ensure_dir(Path),
+    file:write_file(Path, Wasm).
 
 fetch(<<"http://", _/binary>> = URL) -> http_get(URL);
 fetch(<<"https://", _/binary>> = URL) -> http_get(URL);
@@ -297,6 +327,10 @@ prewarm_test_() ->
         Opts = #{ <<"wasm-patch-aot-dir">> => Dir },
         [{Sha, First}, {_, Bad}] = prewarm(File, Opts),
         ?assertMatch({error, {sha256_mismatch, _}}, Bad),
+        % The approved copy is kept, and only under its own hash.
+        ?assertEqual({ok, Wasm}, approved(Sha, Opts)),
+        ?assertEqual(not_found, approved(binary:copy(<<"0">>, 64), Opts)),
+        ?assertEqual(not_found, approved(<<"../../etc/passwd">>, Opts)),
         case wamrc(Opts) of
             {ok, _} ->
                 {ok, Key} = First,
