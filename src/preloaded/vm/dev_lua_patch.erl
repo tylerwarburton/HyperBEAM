@@ -1483,6 +1483,36 @@ worker_slot_does_not_hash_state_test_() ->
         exit(Worker, kill)
     end}.
 
+%% @doc A process reached only through nested resolutions -- deliveries into
+%% it, which is how most processes are reached after a restart -- has its
+%% slots computed by a worker that its scheduler's follower starts, not by the
+%% follower itself from the newest snapshot. Nested, `await-inprogress' is
+%% false, and the follower inherited it: its computes never grouped, no worker
+%% ever started, and every slot replayed from the last snapshot (Paralith's
+%% lobby, 2026-11-25).
+nested_schedule_starts_a_worker_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Opts = #{
+            <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"process-worker-spawn">> => true,
+            <<"process-workers">> => true,
+            <<"await-inprogress">> => false,
+            <<"process-delta-cache">> => true,
+            <<"process-snapshot-target">> => false,
+            <<"process-delta-checkpoint-slots">> => 1000
+        },
+        Process = delta_process(Opts),
+        {ok, _} = hb_cache:write(Process, Opts),
+        Group = hb_util:human_id(hb_message:id(Process, all, Opts)),
+        [ {ok, _} = hb_ao:resolve(Process, schedule_request(Process, N, Opts), Opts)
+        || N <- lists:seq(1, 3) ],
+        Worker = wait_for_worker(Group, 50),
+        ?assert(is_pid(hb_name:lookup({process_worker, Group}))),
+        exit(Worker, kill)
+    end}.
+
 %% @doc Count `hb_message:id' and `hb_message:commit' calls, local or remote,
 %% whose message is a computed process state (it carries `last-action').
 count_state_hashes(Fun) ->

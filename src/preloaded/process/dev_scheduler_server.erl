@@ -515,8 +515,16 @@ follow(Proc, Opts) ->
 %% with `hashpath => update' its resolution hashed the whole returned state
 %% for a hashpath nobody reads, about once a second for every busy process
 %% (`worker_slot_does_not_hash_state_test_').
+%% Nor `await-inprogress': a scheduler started by a nested resolution (a
+%% delivery into the process, the commonest way a process is reached after
+%% a restart) has it false, and with it false `hb_persistent' never groups
+%% the follower's compute, so the worker is never started and every slot was
+%% computed in the follower from the newest stored snapshot, replaying every
+%% slot since: a lab process reached only by deliveries executed 35,436
+%% slots for 201 after a restart; a Paralith lobby, ~70 a second.
 follower_opts(Opts) ->
     Opts#{ <<"spawn-worker">> => true, <<"hashpath">> => ignore,
+        <<"await-inprogress">> => <<"named">>,
         % It discards the state: the worker answers it with the slot alone
         % (`dev_process_worker:answer/3').
         <<"process-compute-wants">> => <<"slot">> }.
