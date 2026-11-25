@@ -782,16 +782,34 @@ confirm(ReplyPID, Message, Assignment, State) ->
             maybe_inform_recipient(
                 remote_confirmation, ReplyPID, Message, Assignment, State);
         Uploader ->
+            Opts = maps:get(opts, State),
+            Slot = hb_util:int(hb_ao:get(<<"slot">>, Assignment, Opts)),
+            Waiter =
+                case maps:get(mode, State) of
+                    remote_confirmation -> {ReplyPID, Message, Assignment};
+                    _ -> none
+                end,
             Uploader !
-                {durable,
-                    hb_util:int(hb_ao:get(<<"slot">>, Assignment, maps:get(opts, State))),
-                    case maps:get(mode, State) of
-                        remote_confirmation -> {ReplyPID, Message, Assignment};
-                        _ -> none
-                    end
-                },
+                case kept_keys(Assignment, State) of
+                    undefined -> {durable, Slot, Waiter};
+                    Keys -> {durable, Slot, Waiter, Keys}
+                end,
             ok
     end.
+
+%% The keys the slot's body and assignment were kept under
+%% (`hb_item_bytes'), so the uploader takes them without reading the slot
+%% back; `undefined' if either has none.
+kept_keys(Assignment, State = #{ keep_item_bytes := true }) ->
+    Opts = maps:get(opts, State),
+    try
+        {ok, BodyKey} =
+            hb_item_bytes:key(hb_maps:get(<<"body">>, Assignment, #{}, Opts), Opts),
+        {ok, AssignmentKey} = hb_item_bytes:key(Assignment, Opts),
+        {BodyKey, AssignmentKey}
+    catch _:_ -> undefined
+    end;
+kept_keys(_Assignment, _State) -> undefined.
 
 %% @doc Assign a message to the next slot (`aggressive' mode).
 assign(State, Message, ReplyPID) ->

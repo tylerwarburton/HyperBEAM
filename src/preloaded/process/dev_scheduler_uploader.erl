@@ -113,6 +113,9 @@ start_uploader(ProcID, Mode, Opts) ->
                 target => read_cursor(ProcID, <<"uploaded">>, Opts),
                 check_at => 0,
                 waiting => [],
+                % Slot => the keys of its body and assignment in
+                % `hb_item_bytes', as the server sent them.
+                kept => #{},
                 backoff => ?MIN_BACKOFF,
                 pending_since => undefined,
                 window_slots =>
@@ -184,23 +187,32 @@ wake_after(State = #{ confirmed := Confirmed, cursor := Cursor }, Now) ->
 now_ms() -> erlang:monotonic_time(millisecond).
 
 %% @doc Take every slot the server has sent, waiting up to `Timeout' for the
-%% first.
-take(State = #{ target := Target, waiting := Waiting }, Timeout) ->
+%% first. A slot may come with the keys its two items were kept under
+%% (`hb_item_bytes'); at most two windows' worth are held, so a bundler that
+%% is down costs reads of the store later, not memory now.
+take(State, Timeout) ->
     receive
-        {durable, Slot, Waiter} ->
-            take(
-                State#{
-                    target => max(Target, Slot),
-                    waiting =>
-                        case Waiter of
-                            none -> Waiting;
-                            _ -> [{Slot, Waiter} | Waiting]
-                        end
-                },
-                0
-            )
+        {durable, Slot, Waiter} -> take(durable(State, Slot, Waiter, undefined), 0);
+        {durable, Slot, Waiter, Keys} -> take(durable(State, Slot, Waiter, Keys), 0)
     after Timeout -> State
     end.
+
+durable(State = #{ target := Target, waiting := Waiting }, Slot, Waiter, Keys) ->
+    Kept = maps:get(kept, State, #{}),
+    State#{
+        target => max(Target, Slot),
+        waiting =>
+            case Waiter of
+                none -> Waiting;
+                _ -> [{Slot, Waiter} | Waiting]
+            end,
+        kept =>
+            case Keys =/= undefined
+                    andalso map_size(Kept) < 2 * maps:get(window_slots, State, 1) of
+                true -> Kept#{ Slot => Keys };
+                false -> Kept
+            end
+    }.
 
 %% @doc Post the next window, and move the cursor past it. If the bundler does
 %% not take it, wait and try again.
@@ -216,7 +228,12 @@ upload_window(State = #{ id := ProcID, opts := Opts, cursor := Cursor,
             ),
             ok = hb_store:flush(store(Opts), Opts),
             funded(true),
-            State#{ cursor => PostedLast, backoff => ?MIN_BACKOFF };
+            State#{
+                cursor => PostedLast,
+                backoff => ?MIN_BACKOFF,
+                kept => maps:filter(fun(S, _) -> S > PostedLast end,
+                    maps:get(kept, State, #{}))
+            };
         Error ->
             Wait = refused_wait(ProcID, Error, Backoff, Opts),
             ?event(warning,
@@ -387,7 +404,8 @@ answer(State = #{ confirmed := Cursor, waiting := Waiting }) ->
 %% not taken. One request carries the whole window, which keeps a busy node
 %% under the bundler's request limit. A window already signed for `First'
 %% (in either format) is posted again byte for byte.
-post_window(ProcID, First, Max, #{ mode := Mode, window_bytes := Bytes, opts := Opts }) ->
+post_window(ProcID, First, Max,
+        State = #{ mode := Mode, window_bytes := Bytes, opts := Opts }) ->
     try
         Path = window_path(ProcID, First),
         {Last, Serialized} =
@@ -395,7 +413,8 @@ post_window(ProcID, First, Max, #{ mode := Mode, window_bytes := Bytes, opts := 
                     #{ <<"read">> => Path, <<"exact">> => true }, Opts) of
                 {ok, Saved} -> saved_window(binary_to_term(Saved, [safe]));
                 {error, not_found} ->
-                    Prepared = prepare_window(ProcID, First, Max, Mode, Bytes, Opts),
+                    Prepared = prepare_window(ProcID, First, Max, Mode, Bytes,
+                        maps:get(kept, State, #{}), Opts),
                     ok = hb_store:write(store(Opts),
                         #{ Path => term_to_binary(Prepared) }, Opts),
                     ok = hb_store:flush(store(Opts), Opts),
@@ -426,17 +445,19 @@ saved_window({Last, Bytes}) -> {Last, Bytes}.
 %% to that this node holds (a process's module, say) goes in with it, so the
 %% schedule can be rebuilt from Arweave alone. The item's ID is not
 %% reproducible (RSA-PSS signatures are salted); its data is, for the same
-%% window.
+%% window. `Kept' (slot => keys) names the slots whose items the node kept:
+%% those are not read from the store at all.
 prepare_window(ProcID, First, Max, Mode, MaxBytes, Opts) ->
-    {Read, Items, LastSlot} =
+    prepare_window(ProcID, First, Max, Mode, MaxBytes, #{}, Opts).
+prepare_window(ProcID, First, Max, Mode, MaxBytes, Kept, Opts) ->
+    {LastAssignmentID, Items, LastSlot} =
         case Mode of
-            full ->
-                {R, I} = read_window(ProcID, First, Max, MaxBytes, Opts),
-                {R, I, First + length(R) - 1};
-            fingerprint -> {[read_slot(ProcID, Max, Opts)], [], Max}
+            full -> read_window(ProcID, First, Max, MaxBytes, Kept, Opts);
+            fingerprint ->
+                {_, LastAssignment} = read_slot(ProcID, Max, Opts),
+                {hb_message:id(LastAssignment, signed, Opts), [], Max}
         end,
-    {_, LastAssignment} = lists:last(Read),
-    LastID = hb_util:human_id(hb_message:id(LastAssignment, signed, Opts)),
+    LastID = hb_util:human_id(LastAssignmentID),
     Tags = [
         {<<"Data-Protocol">>, <<"ao-schedule-archive">>},
         {<<"Archive-Format">>, integer_to_binary(?FORMAT)},
@@ -463,29 +484,47 @@ prepare_window(ProcID, First, Max, Mode, MaxBytes, Opts) ->
         end,
     {?FORMAT, LastSlot, ar_bundles:serialize(Item)}.
 
-%% The slots `First'..`Max' and their items, bodies first then assignments
-%% (format 1's order), cut before the slot that would take the window past
-%% `MaxBytes' uncompressed; the first slot always goes.
-read_window(ProcID, First, Max, MaxBytes, Opts) ->
-    read_window(ProcID, First, Max, MaxBytes, Opts, 0, []).
-read_window(_ProcID, Slot, Max, _MaxBytes, _Opts, _Size, Acc) when Slot > Max ->
-    window_items(lists:reverse(Acc));
-read_window(ProcID, Slot, Max, MaxBytes, Opts, Size, Acc) ->
-    {Body, Assignment} = read_slot(ProcID, Slot, Opts),
-    BodyItem = kept_item(Body, Opts),
-    AssignmentItem = kept_item(Assignment, Opts),
+%% The slots `First'..`Max' as `{LastAssignmentID, Items, LastSlot}': the
+%% items bodies first then assignments (format 1's order), cut before the
+%% slot that would take the window past `MaxBytes' uncompressed; the first
+%% slot always goes.
+read_window(ProcID, First, Max, MaxBytes, Kept, Opts) ->
+    read_window(ProcID, First, Max, MaxBytes, Kept, Opts, 0, []).
+read_window(_ProcID, Slot, Max, _MaxBytes, _Kept, _Opts, _Size, Acc) when Slot > Max ->
+    window_items(Slot - 1, Acc);
+read_window(ProcID, Slot, Max, MaxBytes, Kept, Opts, Size, Acc) ->
+    {AssignmentID, BodyItem, AssignmentItem} = slot_items(ProcID, Slot, Kept, Opts),
     Next = Size + byte_size(ar_bundles:serialize(BodyItem))
         + byte_size(ar_bundles:serialize(AssignmentItem)),
     case Acc =/= [] andalso Next > MaxBytes of
-        true -> window_items(lists:reverse(Acc));
+        true -> window_items(Slot - 1, Acc);
         false ->
-            read_window(ProcID, Slot + 1, Max, MaxBytes, Opts, Next,
-                [{{Body, Assignment}, BodyItem, AssignmentItem} | Acc])
+            read_window(ProcID, Slot + 1, Max, MaxBytes, Kept, Opts, Next,
+                [{AssignmentID, BodyItem, AssignmentItem} | Acc])
     end.
 
-window_items(Slots) ->
-    {[ R || {R, _, _} <- Slots ],
-        [ B || {_, B, _} <- Slots ] ++ [ A || {_, _, A} <- Slots ]}.
+window_items(LastSlot, Reversed = [{LastID, _, _} | _]) ->
+    Slots = lists:reverse(Reversed),
+    {LastID, [ B || {_, B, _} <- Slots ] ++ [ A || {_, _, A} <- Slots ], LastSlot}.
+
+%% A slot's assignment ID and its two items: the kept bytes of both, when the
+%% server named them and the node still has them (an ANS-104 assignment's ID
+%% is its item's), or else the slot as the store holds it.
+slot_items(ProcID, Slot, Kept, Opts) ->
+    case maps:get(Slot, Kept, undefined) of
+        {BodyKey, AssignmentKey} ->
+            case {hb_item_bytes:by_key(BodyKey), hb_item_bytes:by_key(AssignmentKey)} of
+                {{ok, Body}, {ok, Assignment}} ->
+                    {Assignment#tx.id, Body, Assignment};
+                _ -> stored_items(ProcID, Slot, Opts)
+            end;
+        undefined -> stored_items(ProcID, Slot, Opts)
+    end.
+
+stored_items(ProcID, Slot, Opts) ->
+    {Body, Assignment} = read_slot(ProcID, Slot, Opts),
+    {hb_message:id(Assignment, signed, Opts),
+        kept_item(Body, Opts), kept_item(Assignment, Opts)}.
 
 %% Deterministic for the same input and zlib build: level 9, zlib framing.
 compress(Data) ->
@@ -1170,12 +1209,13 @@ test_opts() ->
 %% the store, byte for byte, and the bytes go once it is built. The bodies
 %% arrive as a client sends them: items signed outside the node, decoded as
 %% the HTTP server decodes them, their bytes kept as it keeps them; the
-%% assignments are signed as the scheduler signs them.
+%% assignments are signed as the scheduler signs them, and named by the keys
+%% the server sends with each slot.
 kept_bytes_window_test() ->
     Opts = test_opts(),
     ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
     Client = ar_wallet:new(),
-    Messages =
+    Slots =
         lists:append([ begin
             Data = <<"slot ", (integer_to_binary(Slot))/binary>>,
             TX = ar_bundles:sign_item(
@@ -1198,19 +1238,29 @@ kept_bytes_window_test() ->
             ?assertEqual(Bytes, ar_bundles:serialize(item(Body, Opts))),
             ?assertEqual(ar_bundles:serialize(item(Assignment, Opts)),
                 ar_bundles:serialize(kept_item(Assignment, Opts))),
-            [Body, Assignment]
+            {ok, BodyKey} = hb_item_bytes:key(Body, Opts),
+            {ok, AssignmentKey} = hb_item_bytes:key(Assignment, Opts),
+            [{Slot, {BodyKey, AssignmentKey}, [Body, Assignment]}]
           end
         || Slot <- lists:seq(0, 4) ]),
     ok = dev_scheduler_cache:flush(Opts),
+    Keys = maps:from_list([ {Slot, K} || {Slot, K, _} <- Slots ]),
+    Messages = lists:append([ M || {_, _, M} <- Slots ]),
     Kept = fun() -> lists:usort([ hb_item_bytes:lookup(M, Opts) =/= not_found || M <- Messages ]) end,
     ?assertEqual([true], Kept()),
-    {2, 4, FromKept} = prepare_window(ProcID, 0, 4, full, ?DEFAULT_WINDOW_BYTES, Opts),
+    % The server's keys name every slot: none is read from the store, which
+    % holds no slot of `Elsewhere' at all.
+    Elsewhere = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    {2, 4, FromKept} =
+        prepare_window(Elsewhere, 0, 4, full, ?DEFAULT_WINDOW_BYTES, Keys, Opts),
     ?assertEqual([false], Kept()),
     {2, 4, FromStore} = prepare_window(ProcID, 0, 4, full, ?DEFAULT_WINDOW_BYTES, Opts),
     A = ar_bundles:deserialize_item_wrapper(FromKept),
     B = ar_bundles:deserialize_item_wrapper(FromStore),
     ?assertEqual(archive_bundle(B#tx.tags, B#tx.data), archive_bundle(A#tx.tags, A#tx.data)),
-    ?assertEqual(B#tx.data, A#tx.data).
+    ?assertEqual(B#tx.data, A#tx.data),
+    Tag = fun(Name, I) -> proplists:get_value(Name, I#tx.tags) end,
+    ?assertEqual(Tag(<<"Last-Assignment">>, B), Tag(<<"Last-Assignment">>, A)).
 
 %% @doc A full window's data is the same bytes every time it is prepared (the
 %% signature, and so the item's ID, is salted), and smaller than what it

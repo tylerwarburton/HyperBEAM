@@ -15,7 +15,8 @@
 %%% built, or after `?MAX_AGE_MS'. A miss (a restart, an `httpsig@1.0'
 %%% push, a full table) costs only the rebuild.
 -module(hb_item_bytes).
--export([archived/2, put_verified/3, put_signed/1, lookup/2, forget/1]).
+-export([archived/2, put_verified/3, put_signed/1]).
+-export([key/2, by_key/1, lookup/2, forget/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -79,18 +80,20 @@ put_signed(_) -> unsigned.
 %% @doc The item that carries `Msg''s ANS-104 signature, as its bytes give
 %% it, or `not_found'.
 lookup(Msg, Opts) ->
+    try key(Msg, Opts) of
+        {ok, Key} -> by_key(Key);
+        not_found -> not_found
+    catch _:_ -> not_found
+    end.
+
+%% @doc The item kept under `Key', or `not_found'.
+by_key(Key) ->
     case ets:whereis(?TABLE) of
         undefined -> not_found;
         _ ->
-            try key(Msg, Opts) of
-                {ok, Key} ->
-                    case ets:lookup(?TABLE, Key) of
-                        [{Key, Bytes, _}] ->
-                            {ok, ar_bundles:deserialize_item_wrapper(Bytes)};
-                        [] -> not_found
-                    end;
-                not_found -> not_found
-            catch _:_ -> not_found
+            case ets:lookup(?TABLE, Key) of
+                [{Key, Bytes, _}] -> {ok, ar_bundles:deserialize_item_wrapper(Bytes)};
+                [] -> not_found
             end
     end.
 
@@ -107,7 +110,8 @@ forget(Items) ->
             )
     end.
 
-%% The key of a message's one signed ANS-104 commitment.
+%% @doc The key of a message's one signed ANS-104 commitment, or
+%% `not_found'.
 key(Msg, Opts) ->
     Commitments = hb_maps:get(<<"commitments">>, Msg, #{}, Opts),
     Signed =
