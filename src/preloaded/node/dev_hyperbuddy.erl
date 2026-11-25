@@ -1,7 +1,7 @@
 %%% @doc A device that renders a REPL-like interface for AO-Core via HTML.
 -module(dev_hyperbuddy).
 -export([device_info/1, format/3, return_file/2]).
--export([metrics/3, events/3, slots/3, trace/3, phases/3]).
+-export([metrics/3, events/3, slots/3, trace/3, phases/3, pstate/3]).
 -export([throw/3]).
 -include_lib("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -196,10 +196,15 @@ slots_body(Window, Named) ->
 count_us({N, Us}) -> #{ <<"count">> => N, <<"us">> => Us }.
 
 slot_process(#{ <<"pid">> := Pid, <<"last_slot">> := Computed } = Proc, Labelled) ->
+    % The scheduler's own table, read directly: `dev_scheduler_cache' is a
+    % preloaded device library packaged under a name of its own, so calling
+    % it from here was undefined, caught, and every process read as not
+    % scheduled here (Paralith, 2026-11-25: all 44).
     Durable =
-        case catch dev_scheduler_cache:durable(Pid) of
-            D when is_integer(D) -> D;
+        try ets:lookup(dev_scheduler_durable, hb_util:human_id(Pid)) of
+            [{_, D}] when is_integer(D) -> D;
             _ -> null
+        catch _:_ -> null
         end,
     Mailbox =
         case catch hb_name:lookup({process_worker, Pid}) of
@@ -227,6 +232,51 @@ slot_process(#{ <<"pid">> := Pid, <<"last_slot">> := Computed } = Proc, Labelled
                    lists:member(Phase, [slot_next, worker_await, worker_execute,
                        ensure_loaded, compute_cache_read, delivery_flush]) ])
     }.
+
+%% @doc The newest stored rows of one process's state, as the store lists
+%% them (`pstate/<pid>/<kind>/<slot>'): for each of `f' (full states), `s'
+%% (VM snapshot markers) and `d' (deltas) the `limit' highest slots (default
+%% 20, at most 1,000), highest first, and the newest of each. Listings only:
+%% no row is read or decoded, and the chunks of a chunked row are skipped.
+-spec pstate(#{ _ => _ }, #{ _ => _ }, #{ _ => _ }) -> {ok, #{ _ => _ }} | {error, #{ _ => _ }}.
+pstate(_, Req, Opts) ->
+    Pid = maps:get(<<"pid">>, Req, <<>>),
+    Limit =
+        case catch hb_util:int(maps:get(<<"limit">>, Req, 20)) of
+            L when is_integer(L) -> max(1, min(1000, L));
+            _ -> 20
+        end,
+    case is_binary(Pid) andalso hb_util:is_human_id(Pid) of
+        false -> {error, #{ <<"status">> => 400, <<"body">> => <<"pid: a process id">> }};
+        true ->
+            Store = hb_opts:get(process_store, hb_opts:get(store, [], Opts), Opts),
+            Kinds =
+                maps:from_list(
+                    [ {K, pstate_rows(Store, <<"pstate/", Pid/binary, "/", K/binary>>, Limit)}
+                    || K <- [<<"f">>, <<"s">>, <<"d">>] ]),
+            {ok, #{
+                <<"content-type">> => <<"application/json">>,
+                <<"cache-control">> => <<"no-store">>,
+                <<"body">> => hb_json:encode(Kinds#{ <<"pid">> => Pid, <<"limit">> => Limit })
+            }}
+    end.
+
+%% The highest `N' slots under `Prefix', paging down past chunk names.
+pstate_rows(Store, Prefix, N) -> pstate_rows(Store, Prefix, N, none, [], 200).
+pstate_rows(_Store, _Prefix, N, _From, Acc, 0) -> lists:sublist(Acc, N);
+pstate_rows(Store, Prefix, N, From, Acc, Pages) ->
+    Req0 = #{ <<"list">> => Prefix, <<"limit">> => 256, <<"direction">> => desc },
+    Page =
+        case catch hb_store:list(Store,
+                case From of none -> Req0; _ -> Req0#{ <<"from">> => From } end, #{}) of
+            {ok, Names} -> [ Name || Name <- Names, Name =/= From ];
+            _ -> []
+        end,
+    Acc1 = Acc ++ [ I || Name <- Page, I <- [catch binary_to_integer(Name)], is_integer(I) ],
+    case length(Acc1) >= N orelse Page == [] of
+        true -> lists:sublist(Acc1, N);
+        false -> pstate_rows(Store, Prefix, N, lists:last(Page), Acc1, Pages - 1)
+    end.
 
 %% The node's delivery backlog (`lib_process_delivery:metrics/0'), read
 %% through `process@1.0' as the metrics collector reads it. A preloaded device
@@ -452,6 +502,29 @@ slots_endpoint_test() ->
     ?assertEqual(60, maps:get(<<"window_s">>, Read(#{ <<"window">> => <<"soon">> }))),
     ?assertEqual([], maps:get(<<"processes">>, Read(#{ <<"pid">> => <<"unknown">> }))),
     hb_phase_timer:reset().
+
+%% @doc `pstate' lists a process's newest state rows by kind, highest first,
+%% without the chunks of a chunked row; a pid that is not one is refused.
+pstate_endpoint_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb),
+    Opts = #{ <<"store">> => [Store] },
+    Pid = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Key = fun(K, S) -> <<"pstate/", Pid/binary, "/", K/binary, "/",
+        (iolist_to_binary(io_lib:format("~12..0B", [S])))/binary>> end,
+    ok = hb_store:write([Store],
+        maps:from_list(
+            [ {Key(<<"d">>, S), <<"d">>} || S <- lists:seq(1, 30) ] ++
+            [ {Key(<<"f">>, S), <<"f">>} || S <- [0, 10, 20] ] ++
+            [ {<<(Key(<<"f">>, 20))/binary, ".", (integer_to_binary(C))/binary>>, <<"c">>}
+            || C <- lists:seq(1, 300) ] ++
+            [ {Key(<<"s">>, 20), <<"s">>} ]),
+        Opts),
+    {ok, Res} = pstate(#{}, #{ <<"pid">> => Pid, <<"limit">> => <<"5">> }, Opts),
+    Body = hb_json:decode(maps:get(<<"body">>, Res)),
+    ?assertEqual([20, 10, 0], maps:get(<<"f">>, Body)),
+    ?assertEqual([20], maps:get(<<"s">>, Body)),
+    ?assertEqual([30, 29, 28, 27, 26], maps:get(<<"d">>, Body)),
+    ?assertMatch({error, #{ <<"status">> := 400 }}, pstate(#{}, #{ <<"pid">> => <<"x">> }, Opts)).
 
 trace_endpoint_test() ->
     hb_phase_timer:record(trace_endpoint_test, 0),
