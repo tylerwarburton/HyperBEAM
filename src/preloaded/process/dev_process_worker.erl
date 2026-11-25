@@ -1193,6 +1193,9 @@ worker_never_rewinds_test_() ->
         % `compute_to_slot' on the worker's live state at slot 2.
         Store = hb_opts:get(<<"store">>, undefined, Opts),
         #{ <<"db">> := DB } = hb_store:find(Store),
+        % Slot 2's checkpoint is written off the slot: landing after the
+        % delete, it would put the slot back.
+        ok = lib_process_cache:await_checkpoint(Group),
         {ok, _} =
             elmdb:delete_batch(
                 DB,
