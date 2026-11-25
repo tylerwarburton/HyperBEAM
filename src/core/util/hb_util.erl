@@ -14,6 +14,7 @@
 -export([number/1, list_to_numbered_message/1]).
 -export([find_target_path/2, template_matches/3]).
 -export([is_ordered_list/2, message_to_ordered_list/1, message_to_ordered_list/2]).
+-export([list_option/2]).
 -export([numbered_keys_to_list/2]).
 -export([is_string_list/1, list_replace/3, list_without/2, list_with/2]).
 -export([to_sorted_list/1, to_sorted_list/2, to_sorted_keys/1, to_sorted_keys/2]).
@@ -638,6 +639,21 @@ list_with(List1, List2) ->
 %% @doc Remove all occurrences of all items in the first list from the second list.
 list_without(List1, List2) ->
     lists:filter(fun(Item) -> not lists:member(Item, List1) end, List2).
+
+%% @doc A list-valued node option as a list of binaries, however it arrived:
+%% a list, a numbered message, a JSON array or a comma-separated binary.
+%% Absent or empty is `[]'.
+list_option(Value, Opts) when is_map(Value) ->
+    list_option(message_to_ordered_list(Value, Opts), Opts);
+list_option(Value, _Opts) when is_list(Value), Value =/= [], is_integer(erlang:hd(Value)) ->
+    list_option(list_to_binary(Value), _Opts);
+list_option(Value, _Opts) when is_list(Value) ->
+    [ B || V <- Value, B <- [string:trim(bin(V))], B =/= <<>> ];
+list_option(<<"[", _/binary>> = JSON, Opts) ->
+    list_option(hb_json:decode(JSON), Opts);
+list_option(Value, Opts) when is_binary(Value) ->
+    list_option(binary:split(Value, <<",">>, [global]), Opts);
+list_option(_, _Opts) -> [].
 
 %% @doc Take a message with numbered keys and convert it to a list of tuples
 %% with the associated key as an integer. Optionally, it takes a standard

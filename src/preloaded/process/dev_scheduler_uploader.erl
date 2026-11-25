@@ -97,20 +97,8 @@ mode(ProcID, Opts) ->
         _ -> none
     end.
 
-%% @doc A list-valued node option as a list of binaries, however it arrived:
-%% a list, a numbered message, a JSON array or a comma-separated binary.
-%% Absent or empty is `[]'.
-list_option(Value, Opts) when is_map(Value) ->
-    list_option(hb_util:message_to_ordered_list(Value, Opts), Opts);
-list_option(Value, _Opts) when is_list(Value), Value =/= [], is_integer(hd(Value)) ->
-    list_option(list_to_binary(Value), _Opts);
-list_option(Value, _Opts) when is_list(Value) ->
-    [ B || V <- Value, B <- [string:trim(hb_util:bin(V))], B =/= <<>> ];
-list_option(<<"[", _/binary>> = JSON, Opts) ->
-    list_option(hb_json:decode(JSON), Opts);
-list_option(Value, Opts) when is_binary(Value) ->
-    list_option(binary:split(Value, <<",">>, [global]), Opts);
-list_option(_, _Opts) -> [].
+%% @doc A list-valued node option as a list of binaries (`hb_util:list_option/2').
+list_option(Value, Opts) -> hb_util:list_option(Value, Opts).
 
 start_uploader(ProcID, Mode, Opts) ->
     Int = fun(Key, Default) -> hb_util:int(hb_opts:get(Key, Default, Opts)) end,
@@ -1196,7 +1184,9 @@ kept_bytes_window_test() ->
                         {<<"N">>, integer_to_binary(Slot)}] },
                 Client),
             Bytes = ar_bundles:serialize(TX),
-            ok = hb_item_bytes:put_verified(Bytes),
+            ok = hb_item_bytes:put_verified(Bytes,
+                <<"/", ProcID/binary, "~process@1.0/schedule">>,
+                Opts#{ <<"scheduler-upload-processes">> => [ProcID] }),
             Body = hb_message:with_only_committed_deep(
                 hb_http:decode(<<"ans104@1.0">>, Bytes, Opts), Opts),
             Assignment = hb_message:commit(

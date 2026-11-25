@@ -165,6 +165,7 @@ start(ProcID, Proc, Opts) ->
                     % node's upload list. Its windows are signed by the key
                     % that signs the assignments: a follower finds them on
                     % Arweave by that owner.
+                    keep_item_bytes => hb_item_bytes:archived(ProcID, Opts),
                     uploader =>
                         case hb_opts:get(scheduler_publish_remote, true, Opts) of
                             false -> undefined;
@@ -901,9 +902,10 @@ commit_assignment(BaseAssignment, State) ->
                 ),
             <<"cache-pack">> =>
                 hb_opts:get(<<"scheduler-pack-messages">>, true, RawOpts) =/= false,
-            % The uploader posts the assignment as the bytes signed here
-            % (`hb_item_bytes'), not rebuilt from the store.
-            keep_item_bytes => maps:get(uploader, State, undefined) =/= undefined
+            % The uploader of an archived process posts the assignment as
+            % the bytes signed here (`hb_item_bytes'), not rebuilt from the
+            % store.
+            keep_item_bytes => maps:get(keep_item_bytes, State, false)
         },
     CommittmentSpec = maps:get(committment_spec, State),
     lists:foldr(

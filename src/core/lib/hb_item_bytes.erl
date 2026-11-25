@@ -15,7 +15,7 @@
 %%% built, or after `?MAX_AGE_MS'. A miss (a restart, an `httpsig@1.0'
 %%% push, a full table) costs only the rebuild.
 -module(hb_item_bytes).
--export([enabled/1, put_verified/1, put_signed/1, lookup/2, forget/1]).
+-export([archived/2, put_verified/3, put_signed/1, lookup/2, forget/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -25,24 +25,51 @@
 -define(MAX_AGE_MS, 600000).
 -define(SWEEP_MS, 1000).
 
-%% @doc Whether this node keeps item bytes: it publishes schedules, and lists
-%% processes to archive whole.
-enabled(Opts) ->
-    hb_opts:get(scheduler_publish_remote, false, Opts) =:= true andalso
-        not lists:member(hb_opts:get(scheduler_upload_processes, [], Opts),
-            [[], <<>>, #{}]).
+%% @doc Whether this node archives `ProcID''s schedule whole: it publishes
+%% schedules (`scheduler-publish-remote', on unless set false) and lists the
+%% process on `scheduler-upload-processes'.
+archived(ProcID, Opts) ->
+    hb_opts:get(scheduler_publish_remote, true, Opts) =/= false andalso
+        lists:member(hb_util:human_id(ProcID),
+            hb_util:list_option(
+                hb_opts:get(scheduler_upload_processes, [], Opts), Opts)).
 
-%% @doc Keep the bytes of an item a client sent, if their signature verifies.
-put_verified(Bytes) when is_binary(Bytes) ->
+%% @doc Keep the bytes of an item a client sent to `Path', if this node
+%% archives the process it is for and the bytes' signature verifies. The
+%% process is the path's leading ID (`/<pid>~process@1.0/schedule'), or else
+%% the item's `target' (`/~scheduler@1.0/schedule').
+put_verified(Bytes, Path, Opts) when is_binary(Bytes) ->
+    case hb_opts:get(scheduler_upload_processes, [], Opts) of
+        Empty when Empty =:= []; Empty =:= <<>> -> not_archived;
+        _ ->
+            case path_process(Path) of
+                undefined -> keep(Bytes, unknown, Opts);
+                ProcID -> keep(Bytes, archived(ProcID, Opts), Opts)
+            end
+    end.
+
+keep(_Bytes, false, _Opts) -> not_archived;
+keep(Bytes, Archived, Opts) ->
     try ar_bundles:deserialize_item_wrapper(Bytes) of
         TX = #tx{ signature = Sig } when Sig =/= ?DEFAULT_SIG ->
-            case ar_bundles:verify_item(TX) of
-                true -> insert({TX#tx.id, TX#tx.owner}, Bytes);
-                false -> unverified
+            case Archived =:= true orelse target_archived(TX, Opts) of
+                false -> not_archived;
+                true ->
+                    case ar_bundles:verify_item(TX) of
+                        true -> insert({TX#tx.id, TX#tx.owner}, Bytes);
+                        false -> unverified
+                    end
             end;
         _ -> unsigned
     catch _:_ -> undecodable
     end.
+
+path_process(<<"/", ID:43/binary, _/binary>>) -> ID;
+path_process(_) -> undefined.
+
+target_archived(#tx{ target = Target }, Opts) when byte_size(Target) == 32 ->
+    archived(Target, Opts);
+target_archived(_, _Opts) -> false.
 
 %% @doc Keep the bytes of an item this node signed.
 put_signed(TX = #tx{ signature = Sig }) when Sig =/= ?DEFAULT_SIG ->
@@ -170,33 +197,58 @@ sweep() ->
 
 %%% Tests
 
-signed_item(Data) ->
+-define(PROC, <<"pRoCeSsPrOcEsSpRoCeSsPrOcEsSpRoCeSsPrOcEsS0">>).
+-define(PATH, <<"/", ?PROC/binary, "~process@1.0/schedule">>).
+
+opts() -> #{ <<"scheduler-upload-processes">> => [?PROC] }.
+
+signed_item(Data) -> signed_item(Data, <<>>).
+signed_item(Data, Target) ->
     ar_bundles:sign_item(
         #tx{ format = ans104, data = Data, data_size = byte_size(Data),
-            tags = [{<<"Action">>, <<"Probe">>}] },
+            target = Target, tags = [{<<"Action">>, <<"Probe">>}] },
         hb:wallet()
     ).
 
 %% An item is found by the message decoded from it, as the bytes it came in.
 round_trip_test() ->
-    Opts = #{},
+    Opts = opts(),
     TX = signed_item(crypto:strong_rand_bytes(16)),
     Bytes = ar_bundles:serialize(TX),
-    ok = put_verified(Bytes),
+    ok = put_verified(Bytes, ?PATH, Opts),
     Msg = hb_http:decode(<<"ans104@1.0">>, Bytes, Opts),
     {ok, Found} = lookup(Msg, Opts),
     ?assertEqual(Bytes, ar_bundles:serialize(Found)),
     ok = forget([Found]),
     ?assertEqual(not_found, lookup(Msg, Opts)).
 
+%% Only an item for an archived process is kept: the process in the path,
+%% or else the item's target.
+archived_only_test() ->
+    Opts = opts(),
+    Other = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Item = fun(Target) -> ar_bundles:serialize(signed_item(crypto:strong_rand_bytes(8), Target)) end,
+    ?assertEqual(not_archived,
+        put_verified(Item(<<>>), <<"/", Other/binary, "~process@1.0/schedule">>, Opts)),
+    ?assertEqual(not_archived, put_verified(Item(<<>>), ?PATH, #{})),
+    ?assertEqual(not_archived,
+        put_verified(Item(<<>>), <<"/~scheduler@1.0/schedule">>, Opts)),
+    ?assertEqual(not_archived,
+        put_verified(Item(hb_util:native_id(Other)), <<"/~scheduler@1.0/schedule">>, Opts)),
+    ?assertEqual(ok,
+        put_verified(Item(hb_util:native_id(?PROC)), <<"/~scheduler@1.0/schedule">>, Opts)),
+    ?assertEqual(not_archived,
+        put_verified(Item(<<>>), ?PATH,
+            Opts#{ <<"scheduler-publish-remote">> => false })).
+
 %% Bytes whose signature does not verify are not kept, nor unsigned ones.
 refuses_unverified_test() ->
     TX = signed_item(<<"real">>),
     Bytes = ar_bundles:serialize(TX),
     Tampered = <<(binary:part(Bytes, 0, byte_size(Bytes) - 4))/binary, "fake">>,
-    ?assertEqual(unverified, put_verified(Tampered)),
+    ?assertEqual(unverified, put_verified(Tampered, ?PATH, opts())),
     ?assertEqual(unsigned, put_signed(TX#tx{ signature = ?DEFAULT_SIG })),
-    ?assertEqual(undecodable, put_verified(<<"junk">>)).
+    ?assertEqual(undecodable, put_verified(<<"junk">>, ?PATH, opts())).
 
 %% A full table keeps nothing more, and gives the room it reserved back.
 bounded_test() ->
@@ -204,7 +256,8 @@ bounded_test() ->
     [{_, Bytes0}] = ets:lookup(?TABLE, '$bytes'),
     ets:update_counter(?TABLE, '$bytes', ?MAX_BYTES),
     try
-        ?assertEqual(full, put_verified(ar_bundles:serialize(signed_item(<<"x">>))))
+        ?assertEqual(full,
+            put_verified(ar_bundles:serialize(signed_item(<<"x">>)), ?PATH, opts()))
     after ets:update_counter(?TABLE, '$bytes', -?MAX_BYTES)
     end,
     ?assertEqual([{'$bytes', Bytes0}], ets:lookup(?TABLE, '$bytes')).

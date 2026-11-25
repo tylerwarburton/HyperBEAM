@@ -1994,11 +1994,10 @@ req_to_tabm_singleton(Req, Body, Opts) ->
                     );
             false -> do_nothing
         end,
-        % A signed item is kept as the bytes it came in, for the schedule
-        % uploader (`hb_item_bytes').
-        case Codec =:= <<"ans104@1.0">> andalso Signers =/= []
-                andalso hb_item_bytes:enabled(Opts) of
-            true -> hb_item_bytes:put_verified(Body);
+        % A signed item for a process this node archives is kept as the
+        % bytes it came in, for the schedule uploader (`hb_item_bytes').
+        case Codec =:= <<"ans104@1.0">> andalso Signers =/= [] of
+            true -> hb_item_bytes:put_verified(Body, cowboy_req:path(Req), Opts);
             false -> do_nothing
         end,
         Normalized
