@@ -254,10 +254,31 @@ pstate(_, Req, Opts) ->
                 maps:from_list(
                     [ {K, pstate_rows(Store, <<"pstate/", Pid/binary, "/", K/binary>>, Limit)}
                     || K <- [<<"f">>, <<"s">>, <<"d">>] ]),
+            % The head marker every compute below it trusts as stored
+            % (`computed/<pid>/latest', "slot:ms"), and the newest slot the
+            % node stored for the process since it started, where and by whom.
+            Marker =
+                case catch hb_store:read(Store, <<"computed/", Pid/binary, "/latest">>, Opts) of
+                    {ok, M} when is_binary(M) -> M;
+                    _ -> null
+                end,
+            LastWrite =
+                try ets:lookup(lib_process_cache_writes, Pid) of
+                    [{_, WSlot, WStore, Writer, WMs}] ->
+                        #{ <<"slot">> => WSlot, <<"store">> => WStore,
+                           <<"writer">> => hb_util:bin(pid_to_list(Writer)),
+                           <<"writer_alive">> => is_process_alive(Writer),
+                           <<"worker">> =>
+                               hb_name:lookup({process_worker, Pid}) =:= Writer,
+                           <<"ms">> => WMs };
+                    [] -> null
+                catch _:_ -> null
+                end,
             {ok, #{
                 <<"content-type">> => <<"application/json">>,
                 <<"cache-control">> => <<"no-store">>,
-                <<"body">> => hb_json:encode(Kinds#{ <<"pid">> => Pid, <<"limit">> => Limit })
+                <<"body">> => hb_json:encode(Kinds#{ <<"pid">> => Pid, <<"limit">> => Limit,
+                    <<"head_marker">> => Marker, <<"last_write">> => LastWrite })
             }}
     end.
 

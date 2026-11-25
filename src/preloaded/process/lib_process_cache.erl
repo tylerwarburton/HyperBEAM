@@ -18,6 +18,8 @@
 %% Children per listing of a kind, and slots per page of `latest_paged/6'.
 -define(LIST_PAGE, 128).
 -define(LATEST_PAGE, 100).
+%% The newest slot each process stored since the node started (`note_write/3').
+-define(WRITES, lib_process_cache_writes).
 
 %% @doc Read the result of a process at a given slot.
 read(ProcID, Opts) ->
@@ -83,7 +85,25 @@ write_stored(ProcID, Slot, Msg, RawOpts) ->
         Opts),
     % Between slots: copy out the held states other processes asked for.
     serve_asks(ProcID),
+    note_write(ProcID, Slot, Opts),
     Result.
+
+%% The newest slot each process stored since the node started, where, and by
+%% whom: `{ProcID, Slot, StoreName, Writer, Ms}' (`/~hyperbuddy@1.0/pstate'
+%% shows it). A process whose rows stop at one slot while it keeps computing
+%% is writing somewhere else, or not at all, and this says which.
+note_write(ProcID, Slot, Opts) when is_integer(Slot) ->
+    ensure_hot_table(),
+    Name =
+        case first_lmdb_store(Opts) of
+            #{ <<"name">> := N } -> N;
+            _ -> <<"none">>
+        end,
+    try ets:insert(?WRITES, {hb_util:human_id(ProcID), Slot, Name, self(), os:system_time(millisecond)})
+    catch error:badarg -> ok
+    end;
+note_write(_ProcID, _Slot, _Opts) ->
+    ok.
 
 %% @doc The public state of a slot (`hb_private:reset/1' of it), built from
 %% the slot before's when the slot is a delta of it: that one with the keys
@@ -637,6 +657,8 @@ ensure_hot_table() ->
                                 {read_concurrency, true}]) of
                             _ ->
                                 ets:new(?ASKS, [named_table, public, bag,
+                                    {write_concurrency, true}]),
+                                ets:new(?WRITES, [named_table, public, set,
                                     {write_concurrency, true}]),
                                 Parent ! {Ref, created},
                                 receive after infinity -> ok end
