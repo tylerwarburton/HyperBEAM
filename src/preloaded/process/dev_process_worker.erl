@@ -133,6 +133,11 @@ loop(GroupName, Base, Opts) ->
             drain_needs(GroupName),
             Base2 = serve_needs(GroupName, Base, Opts),
             loop(GroupName, Base2, Opts);
+        {lib_process_cache, ask, ProcID} ->
+            % A reader wants a state this worker holds (`lib_process_cache');
+            % a busy worker answers between its slots instead.
+            lib_process_cache:serve_asks(ProcID),
+            loop(GroupName, Base, Opts);
         stop ->
             ?event(worker, {stopping, {group, GroupName}, {base, Base}}),
             exit(normal)
