@@ -4,6 +4,12 @@
 +sbwt none
 +sbwtdcpu none
 +sbwtdio none
+## Wake a sleeping scheduler only when the run queues are long: with the
+## default every short burst of messages woke one, and waking schedulers
+## (futex, try_to_wake_up) was 16% of the node's samples. Lab, 44 processes
+## at ~440 writes/s, two runs each: CPU per write 15.9/15.0 -> 12.5/12.9 ms,
+## round trip p50 50/45 -> 45/46 ms, p95 273/76 -> 77/81 ms.
++swt very_high
 ## Dirty CPU schedulers run wasm-patch@1.0 slots (hb_wasm_nif): AOT code
 ## and its natives use the native stack, so give them 2048 kilowords (16 MB).
 +sssdcpu 2048
