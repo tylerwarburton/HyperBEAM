@@ -38,3 +38,6 @@ following:
    code must actually work in-production.
 5. Always attempt to leave the codebase in a better state than you found it. More
    precise, clear, and minimal -- while maintaining the existing featureset.
+6. A new stored or wire format gets its reader one release before its writer,
+   and a reader refuses an encoding it does not know instead of crashing: a
+   node must survive a rollback of one release (`docs/FORMAT_CHANGES.md`).

@@ -618,6 +618,9 @@ restore(Base, Body, Separate, Opts) ->
         Pass -> ok;
         _ -> throw({wasm_patch_init, <<"the snapshot was taken under another instrumentation pass">>})
     end,
+    % Every encoding any build writes is read here, and one this build does
+    % not know is refused (422) rather than crashing the compute
+    % (docs/FORMAT_CHANGES.md).
     Mem =
         case maps:get(<<"memory-encoding">>, Snapshot, <<"zlib">>) of
             <<"separate">> ->
@@ -627,7 +630,10 @@ restore(Base, Body, Separate, Opts) ->
                 end;
             % As df9322fde wrote them: the memory uncompressed in the body.
             <<"raw">> -> Memory;
-            <<"zlib">> -> zlib:uncompress(Memory)
+            <<"zlib">> -> zlib:uncompress(Memory);
+            Other ->
+                throw({wasm_patch_init,
+                    <<"the snapshot's memory encoding is unknown: ", (hb_util:bin(Other))/binary>>})
         end,
     Gl = [{N, Kind, V} || {N, Kind, V} <- Globals, is_binary(N), is_integer(V)],
     case hb_wasm_nif:restore(Inst, Gen, Mem, Gl) of
@@ -784,10 +790,16 @@ snapshot_restore_test() ->
             ?assertEqual(<<"16">>, count(run(R, [<<"Increment">>], Opts), Opts))
         end,
         [Deferred, Raw]),
-    % Without its memory, a separate snapshot is refused.
+    % Without its memory, a separate snapshot is refused; so is an encoding
+    % this build does not know.
     ?assertMatch({error, #{ <<"status">> := 422 }},
         hb_ao:resolve(hb_ao:set(hb_private:reset(S5), <<"snapshot">>,
             maps:remove(<<"memory">>, Deferred), Opts), <<"normalize">>, Opts)),
+    Unknown = #{ <<"body">> => term_to_binary(DeferredBody#{
+        <<"memory-encoding">> => <<"zstd">>, <<"memory">> => Mem }) },
+    ?assertMatch({error, #{ <<"status">> := 422 }},
+        hb_ao:resolve(hb_ao:set(hb_private:reset(S5), <<"snapshot">>, Unknown, Opts),
+            <<"normalize">>, Opts)),
     % A snapshot of another image is refused.
     Other = hb_ao:set(Cold, <<"image">>, <<0, "asm", 1:32/little>>, Opts),
     ?assertMatch({error, #{ <<"status">> := 422 }}, hb_ao:resolve(Other, <<"normalize">>, Opts)).
