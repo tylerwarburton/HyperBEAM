@@ -455,7 +455,7 @@ root_balance(Account, View = {State, ROpts}) ->
             % pusd.lua folds balances into `balances-<n>' (BALANCE_BUCKETS);
             % `balances' is only its checkpoint and reads empty.
             % An empty Lua table publishes as `[]', so either may be a list.
-            Bucket = as_map(key(<<"balances-", (integer_to_binary(fold_bucket(Account, 256)))/binary>>, View)),
+            Bucket = as_map(key(<<"balances-", (integer_to_binary(balance_bucket(Account, View)))/binary>>, View)),
             case maps:find(Account, Bucket) of
                 {ok, Atoms} -> hb_util:int(Atoms);
                 error -> hb_util:int(maps:get(Account, as_map(key(<<"balances">>, View)), 0))
@@ -463,9 +463,50 @@ root_balance(Account, View = {State, ROpts}) ->
         Current -> hb_util:int(Current)
     end.
 
-%% pusd.lua's fold rule: the sum of the address's first four bytes mod `N'.
+%% The bucket `Account''s balance is in. A root that publishes `buckets'
+%% (`{"hash":"p31","balances-":{n0,level,split}}') folds by linear hashing,
+%% pusd.lua's `foldBucket'; one without it by the older fixed 256.
+balance_bucket(Account, View) ->
+    case as_map(key(<<"buckets">>, View)) of
+        #{ <<"hash">> := <<"p31">>, <<"balances-">> := G } when is_map(G) ->
+            linear_bucket(Account, hb_util:int(maps:get(<<"n0">>, G, 1)),
+                hb_util:int(maps:get(<<"level">>, G, 0)), hb_util:int(maps:get(<<"split">>, G, 0)));
+        _ -> fold_bucket(Account, 256)
+    end.
+
+%% pusd.lua's linear hash: the address's bytes as a base-31 polynomial mod
+%% 1000000007; bucket h mod m (m = n0 * 2^level), or h mod 2m below `split'.
+linear_bucket(Account, N0, Level, Split) ->
+    H = lists:foldl(fun(B, Acc) -> (Acc * 31 + B) rem 1000000007 end, 0, binary_to_list(Account)),
+    M = N0 bsl Level,
+    case H rem M of
+        B when B < Split -> H rem (2 * M);
+        B -> B
+    end.
+
+%% pusd.lua's older fold rule: the sum of the address's first four bytes mod `N'.
 fold_bucket(<<A, B, C, D, _/binary>>, N) -> (A + B + C + D) rem N;
 fold_bucket(Address, N) -> lists:sum(binary_to_list(Address)) rem N.
+
+%% The values are packages/sdk folded-keys.mjs `foldedBucket' for the same
+%% addresses and geometries (2026-11-25: the wasm-fast root keeps DA9q's
+%% 500,000 PUSD in `balances-0' and every Ledger-Enter read it as 0).
+linear_fold_balance_test() ->
+    DA9q = <<"DA9qhP25ZPz6MHIhO-7aNHDN3LsTAL7yCKYIkqr13Z8">>,
+    Tkq = <<"tkqULqMDeHKXCN79Cm_bDIV560JxXl6pBSmdPgxqwSw">>,
+    ?assertEqual(0, linear_bucket(DA9q, 1, 0, 0)),
+    ?assertEqual(5, linear_bucket(DA9q, 1, 3, 2)),
+    ?assertEqual(5, linear_bucket(DA9q, 2, 2, 5)),
+    ?assertEqual(6, linear_bucket(Tkq, 1, 3, 2)),
+    Geometry = hb_json:encode(#{ <<"hash">> => <<"p31">>,
+        <<"balances-">> => #{ <<"n0">> => 1, <<"level">> => 0, <<"split">> => 0 } }),
+    Linear = #{ <<"buckets">> => Geometry,
+        <<"balances-0">> => hb_json:encode(#{ DA9q => <<"500000000000">> }) },
+    ?assertEqual(500000000000, root_balance(DA9q, {Linear, #{}})),
+    ?assertEqual(0, root_balance(Tkq, {Linear, #{}})),
+    Fixed = #{ <<"balances-", (integer_to_binary(fold_bucket(DA9q, 256)))/binary>> =>
+        hb_json:encode(#{ DA9q => <<"7">> }) },
+    ?assertEqual(7, root_balance(DA9q, {Fixed, #{}})).
 
 %% Every account's root-intent row: pusd.lua publishes them folded into
 %% `rootintents-<n>' (32 buckets); an older root published one `rootintents'.
