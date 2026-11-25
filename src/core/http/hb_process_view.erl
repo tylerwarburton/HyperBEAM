@@ -232,8 +232,15 @@ walk(_Parts, _Value) -> miss.
 
 unforced(Req) ->
     not (is_map(Req) andalso
-        (is_map_key(<<"only-if-cached">>, Req) orelse is_map_key(<<"cache-control">>, Req))).
+        (is_map_key(<<"only-if-cached">>, Req) orelse
+         only_if_cached(maps:get(<<"cache-control">>, Req, <<>>)))).
 
+%% A `cache-control' of `no-cache' or `no-store' (the SDK sends no-cache on
+%% every read) only switches the result cache off, which the view is not: the
+%% generic path answers it from the same newest stored state
+%% (`dev_process:now/3'), so it is served here. `only-if-cached' answers only
+%% from the result cache, and a `max-age' asks for a fresh enough state: both
+%% go the generic way.
 servable(Req, Opts) ->
     enabled(Opts) andalso
         hb_util:atom(hb_opts:get(process_now_from_cache, false, Opts)) == true andalso
@@ -241,7 +248,13 @@ servable(Req, Opts) ->
         not (is_map(Req) andalso
                 (is_map_key(<<"max-age">>, Req) orelse
                  is_map_key(<<"only-if-cached">>, Req) orelse
-                 is_map_key(<<"cache-control">>, Req))).
+                 only_if_cached(maps:get(<<"cache-control">>, Req, <<>>)))).
+
+only_if_cached(CC) when is_binary(CC) ->
+    binary:match(hb_util:to_lower(CC), [<<"only-if-cached">>, <<"max-age">>]) =/= nomatch;
+only_if_cached(CC) when is_list(CC) ->
+    lists:any(fun(D) -> only_if_cached(hb_util:bin(D)) end, CC);
+only_if_cached(_) -> true.
 
 %% @doc `/<43-character id>~process@1.0/now/<key>', the key a single path
 %% part in its normal (lowercase) form and the request without a query.
@@ -312,6 +325,12 @@ update_and_read_test() ->
         [#{ <<"path">> => <<"/count">>, <<"delete">> => true }], Opts),
     ?assertEqual(miss, read(P, <<"count">>, #{}, Opts)),
     ?assertEqual(miss, read(P, <<"keep">>, #{ <<"max-age">> => <<"5">> }, Opts)),
+    % no-cache and no-store only switch the result cache off: served. A
+    % freshness bound or only-if-cached goes the generic way.
+    ?assertMatch({ok, _}, read(P, <<"keep">>, #{ <<"cache-control">> => <<"no-cache">> }, Opts)),
+    ?assertMatch({ok, _}, read(P, <<"keep">>, #{ <<"cache-control">> => [<<"no-store">>, <<"no-cache">>] }, Opts)),
+    ?assertEqual(miss, read(P, <<"keep">>, #{ <<"cache-control">> => <<"only-if-cached">> }, Opts)),
+    ?assertEqual(miss, read(P, <<"keep">>, #{ <<"cache-control">> => <<"max-age=0">> }, Opts)),
     % A gap in the slots rewrites every key.
     ok = update(P, 7, #{ <<"other">> => <<"o">>, <<"at-slot">> => 7 },
         [#{ <<"path">> => <<"/other">>, <<"value">> => <<"o">> }], Opts),
