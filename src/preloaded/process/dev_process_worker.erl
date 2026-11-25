@@ -30,7 +30,8 @@
 %%% options map, and a full-mailbox selective receive after every slot left
 %%% the vault's worker with a 108M-word heap, collecting garbage instead of
 %%% computing.
--define(WAITERS, dev_process_worker_waiters).
+-define(WAITERS, dev_process_worker_waiters).
+-define(SLOT_ONLY, '$slot_only').
 
 %% @doc Return a group name for a request. A compute of a slot beyond the
 %% newest stored one (the head) groups by process ID; any other compute runs
@@ -241,7 +242,12 @@ held_slot(Base) ->
         _ -> -1
     end.
 
-%% @doc Send each row its answer and delete it.
+%% @doc Send each row its answer and delete it. A waiter that asked for the
+%% slot only (`{?SLOT_ONLY, _}' references: the scheduler's follower, which
+%% discards the state) gets the slot and not the state: sending a process's
+%% whole state to it on every slot was the largest cost of a slot left that
+%% grows with the size of the state (lab node, 100,000 published keys of 500
+%% bytes: a quarter of the node's CPU).
 answer(GroupName, Rows, Answer) ->
     Msg =
         case Answer of
@@ -250,7 +256,11 @@ answer(GroupName, Rows, Answer) ->
         end,
     lists:foreach(
         fun({S, Ref, Pid}) ->
-            Pid ! {ready, Ref, Msg},
+            Pid ! {ready, Ref,
+                case {Ref, Msg} of
+                    {{?SLOT_ONLY, _}, {ok, _}} -> {ok, #{ <<"at-slot">> => S }};
+                    _ -> Msg
+                end},
             ets:delete(?WAITERS, {GroupName, S, Ref})
         end,
         Rows
@@ -482,7 +492,11 @@ delegate(Worker, GroupName, Base, Req, Slot, Opts) ->
 
 await_compute(Worker, GroupName, Base, Req, TargetSlot, Opts) ->
     ensure_waiters(),
-    Ref = make_ref(),
+    Ref =
+        case hb_opts:get(<<"process-compute-wants">>, state, Opts) of
+            <<"slot">> -> {?SLOT_ONLY, make_ref()};
+            _ -> make_ref()
+        end,
     Key = {GroupName, TargetSlot, Ref},
     ets:insert(?WAITERS, {Key, self()}),
     try

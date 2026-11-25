@@ -70,10 +70,9 @@ write_stored(ProcID, Slot, Msg, RawOpts) ->
                 write_full_blob(ProcID, Slot, Msg, Store, Opts);
             {not_found, _} -> write_full(ProcID, Slot, Msg, Opts)
         end,
-    % A VM snapshot is only ever restored from its stored row: the hot cache
-    % does not keep one (left uncompressed for a checkpoint written off the
-    % slot, it is the whole instance's memory).
-    hot_put(ProcID, Slot, maps:remove(<<"snapshot">>, Public), Opts),
+    % The hot cache names the slot and the process holding its state, not a
+    % copy of it (`hot_hold/3').
+    hb_phase_timer:time(slot_hot_put, fun() -> hot_hold(ProcID, Slot, Opts) end),
     % The published-key view `now' reads are answered from.
     hb_process_view:update(ProcID, Slot, Public,
         case delta(Msg, Opts) of
@@ -397,6 +396,45 @@ patch_list(Patches, Opts) when is_map(Patches) ->
         false -> []
     end.
 
+%%% A stored slot's hot entry is `{?HELD, Pid}': the slot's public state is
+%%% the one `public_state/4' keeps in the writing process's dictionary (the
+%%% process worker's, as it computes in order), read from there by any other
+%%% process (`erlang:process_info/2', `{dictionary, Key}') while it is still
+%%% that slot. Copying the state into the table on every slot was the one
+%%% step of a slot that grew with the size of the state: 116 us a slot at
+%%% 1,000 published keys of 500 bytes, 17.4 ms at 100,000 (lab node, a
+%%% `lua-patch@1.0' process), so a large-state process paid for its whole
+%%% state on every message. A slot the holder has moved past is read from
+%%% the store (`read/3', its delta chain back to a checkpoint), on demand.
+%%% A state filled in by a read (`latest/4') is still kept whole: it was
+%%% materialised for the read anyway.
+-define(HELD, '$held').
+-define(CHECKPOINTER, lib_process_cache_checkpointer).
+
+hot_hold(ProcID, Slot, Opts) when is_integer(Slot) ->
+    hot_put(ProcID, Slot, {?HELD, self()}, Opts);
+hot_hold(_ProcID, _Slot, _Opts) ->
+    ok.
+
+%% The state a hot entry stands for, or `not_found'.
+hot_value(ProcID, Slot, {?HELD, Pid}) ->
+    Key = {?MODULE, public, ProcID},
+    Held =
+        case Pid == self() of
+            true -> get(Key);
+            false ->
+                case catch erlang:process_info(Pid, {dictionary, Key}) of
+                    {{dictionary, Key}, Value} -> Value;
+                    _ -> undefined
+                end
+        end,
+    case Held of
+        {Slot, Public} -> {ok, maps:remove(<<"snapshot">>, Public)};
+        _ -> not_found
+    end;
+hot_value(_ProcID, _Slot, Msg) ->
+    {ok, Msg}.
+
 hot_put(ProcID, Slot, Msg, Opts) when is_integer(Slot) ->
     case hot_slots(Opts) of
         0 -> ok;
@@ -437,7 +475,7 @@ hot_get(ProcID, Slot, Opts) ->
 
 hot_get(ProcID, Slot) ->
     try ets:lookup(?HOT, {ProcID, Slot}) of
-        [{_, Msg}] -> {ok, Msg};
+        [{_, Msg}] -> hot_value(ProcID, Slot, Msg);
         [] -> not_found
     catch error:badarg -> not_found
     end.
@@ -466,7 +504,11 @@ hot_latest(ProcID, Limit) ->
     try ets:prev(?HOT, {ProcID, Upper}) of
         {ProcID, Slot} = Key ->
             case ets:lookup(?HOT, Key) of
-                [{_, Msg}] -> {ok, Slot, Msg};
+                [{_, Msg}] ->
+                    case hot_value(ProcID, Slot, Msg) of
+                        {ok, State} -> {ok, Slot, State};
+                        not_found -> not_found
+                    end;
                 [] -> not_found
             end;
         _ -> not_found
@@ -760,6 +802,11 @@ legacy_slots(ProcID, Opts) ->
 -define(BLOB_NS, <<"pstate">>).
 -define(BLOB_VSN, 1).
 -define(BLOB_CHUNK, 4000).
+%% Chunks of a value written together (~256 KB), each write a separate hold
+%% of the store's write lock, with a pause after it (`blob_put/4'): an 81 MB
+%% row is ~320 writes and ~0.3 s of pauses.
+-define(CHUNKS_PER_WRITE, 64).
+-define(CHUNK_PAUSE_MS, 1).
 -define(CHUNKED, "pstate-chunks:").
 
 blob_store(Opts) ->
@@ -794,17 +841,25 @@ blob_put(Store, Key, Value, Opts) when byte_size(Value) =< ?BLOB_CHUNK ->
     blob_write(Store, #{ Key => Value }, Key, Opts);
 blob_put(Store, Key, Value, Opts) ->
     Chunks = chunks(Value),
-    % The chunks first, so a key that names chunks always has them.
-    ok =
-        blob_write(
-            Store,
-            maps:from_list(
-                [ {chunk_key(Key, N), C}
-                || {N, C} <- lists:zip(lists:seq(1, length(Chunks)), Chunks) ]
-            ),
-            Key,
-            Opts
-        ),
+    % The chunks first, so a key that names chunks always has them; a few
+    % hundred to a write, as one write holds the store's write lock for all
+    % of its rows: an 81 MB checkpoint (20,000 chunks) in one write held it
+    % for seconds (checkpoint_put p90 4.2 s on the game's 8 shards at
+    % 100,000 players), and every slot of every process waited behind it.
+    % A checkpoint writer (low priority) pauses after each write, leaving the
+    % lock to the slots waiting on it: nothing else stops it taking the lock
+    % straight back. A slot writing its own row does not.
+    Pause = erlang:process_info(self(), priority) == {priority, low},
+    lists:foreach(
+        fun(Group) ->
+            ok = blob_write(Store, maps:from_list(Group), Key, Opts),
+            Pause andalso timer:sleep(?CHUNK_PAUSE_MS)
+        end,
+        groups(
+            [ {chunk_key(Key, N), C}
+            || {N, C} <- lists:zip(lists:seq(1, length(Chunks)), Chunks) ],
+            ?CHUNKS_PER_WRITE)
+    ),
     blob_write(
         Store,
         #{ Key => <<?CHUNKED, (integer_to_binary(length(Chunks)))/binary>> },
@@ -820,6 +875,12 @@ blob_write(Store, Rows, Key, Opts) ->
 
 chunks(<<C:?BLOB_CHUNK/binary, Rest/binary>>) when Rest =/= <<>> -> [C | chunks(Rest)];
 chunks(Last) -> [Last].
+
+groups([], _N) -> [];
+groups(List, N) when length(List) =< N -> [List];
+groups(List, N) ->
+    {Group, Rest} = lists:split(N, List),
+    [Group | groups(Rest, N)].
 
 chunk_key(Key, N) -> <<Key/binary, ".", (integer_to_binary(N))/binary>>.
 
@@ -981,9 +1042,11 @@ write_delta_blob(ProcID, Slot, Patches, LoadedResults, Store, Opts) ->
 %%% queued behind it. Until the full row is on disk the slot reads as its
 %%% delta, back to the previous checkpoint; a crash before it is written
 %%% loses only the shortcut, as a restart then restores from the previous
-%%% snapshot and replays. A process has at most one such writer: a
-%%% checkpoint due while the last is still being written is left to the
-%%% next one. `process-async-checkpoints' false writes them in the slot.
+%%% snapshot and replays. Writers run at low priority, a bounded number at
+%%% once, stalest first (`checkpointer/0'): large-state processes made every
+%%% overlapping writer a multi-GB encode at once (8 game shards of 100,000
+%%% players: the round trip p50 of every shard rose 33 -> 418 ms).
+%%% `process-async-checkpoints' false writes them in the slot.
 
 %% @doc Whether checkpoints of a process run with `RawOpts' are written off
 %% the slot (`dev_process' then leaves a VM snapshot uncompressed).
@@ -994,57 +1057,145 @@ async_ok(Opts) ->
         hb_util:atom(hb_opts:get(<<"process-async-checkpoints">>, true, Opts)) =/= false.
 
 checkpoint_async(ProcID, Slot, Msg, Store, Opts) ->
-    Tab = checkpoint_table(),
-    case ets:lookup(Tab, ProcID) of
-        [{_, Pid, _}] when is_pid(Pid) ->
-            case is_process_alive(Pid) of
-                true ->
-                    ?event(warning, {checkpoint_skipped, {proc_id, ProcID}, {slot, Slot}}),
-                    ok;
-                false -> start_checkpoint(Tab, ProcID, Slot, Msg, Store, Opts)
-            end;
-        _ -> start_checkpoint(Tab, ProcID, Slot, Msg, Store, Opts)
-    end.
-
-start_checkpoint(Tab, ProcID, Slot, Msg, Store, Opts) ->
-    Pid = spawn(fun() ->
-        try full_blob(ProcID, Slot, Msg, Store, Opts)
-        catch Class:Reason ->
-            ?event(warning, {checkpoint_failed, {proc_id, ProcID}, {slot, Slot},
-                {class, Class}, {reason, Reason}})
+    Checkpointer = checkpointer(),
+    % The writer is spawned here, with the slot's state, and waits for its
+    % turn (`checkpointer/0'): told to go, it writes the row; superseded by a
+    % newer checkpoint of its process before its turn came, it exits.
+    Writer = spawn(fun() ->
+        Mon = erlang:monitor(process, Checkpointer),
+        receive
+            go ->
+                process_flag(priority, low),
+                Result =
+                    try full_blob(ProcID, Slot, Msg, Store, Opts), ok
+                    catch Class:Reason ->
+                        ?event(warning, {checkpoint_failed, {proc_id, ProcID}, {slot, Slot},
+                            {class, Class}, {reason, Reason}}),
+                        failed
+                    end,
+                exit({checkpoint, Result});
+            skip -> ok;
+            {'DOWN', Mon, process, _, _} -> ok
         end
     end),
-    ets:insert(Tab, {ProcID, Pid, Slot}),
+    Checkpointer ! {due, ProcID, Slot, Writer, checkpoint_slots(Opts), checkpoint_writers(Opts)},
     ok.
 
-%% @doc Wait for the checkpoint a process is writing, if any.
+%% Writers that may run at once: `process-checkpoint-writers', default 1. Two
+%% on the game's 8 shards at 100,000 players stored every checkpoint but
+%% contended for the store's write lock: round trip p95 37 -> 624 ms,
+%% lmdb_commit 3.9 -> 12.4 ms.
+checkpoint_writers(Opts) ->
+    case hb_util:int(hb_opts:get(<<"process-checkpoint-writers">>, 1, Opts)) of
+        N when N >= 1 -> N;
+        _ -> 1
+    end.
+
+%% @doc Wait until a process has no checkpoint waiting or being written.
 await_checkpoint(ProcID) ->
-    case ets:whereis(lib_process_cache_checkpoints) of
+    case whereis(?CHECKPOINTER) of
         undefined -> ok;
-        Tab ->
-            case ets:lookup(Tab, ProcID) of
-                [{_, Pid, _}] ->
-                    Ref = erlang:monitor(process, Pid),
-                    receive {'DOWN', Ref, process, _, _} -> ok end;
-                [] -> ok
+        Pid ->
+            Pid ! {await, ProcID, self()},
+            receive {checkpoint_idle, ProcID} -> ok
+            after 120000 -> {error, timeout}
             end
     end.
 
-checkpoint_table() ->
-    case ets:whereis(lib_process_cache_checkpoints) of
+%%% The checkpointer: one process on the node that decides which waiting
+%%% checkpoint is written next. Every process keeps at most its newest
+%%% checkpoint waiting (a newer one supersedes it: only the newest state is
+%%% worth writing). At most `process-checkpoint-writers' (1) are written at once,
+%%% one per process, the stalest first: the process with the most slots since
+%%% its last stored checkpoint -- what a restart would replay -- and before
+%%% all of those, any past three cadences without one. Its last stored slot
+%%% is what it wrote since the node started (unknown: none, so a process it
+%%% has not seen is taken as stale). On the game's 8 shards at 100,000
+%%% players one writer skipping what came due while it was busy stored 10 of
+%%% 23 snapshots in 150 s, and a skipped process could go without one for
+%%% any length of time.
+checkpointer() ->
+    case whereis(?CHECKPOINTER) of
         undefined ->
-            Self = self(),
-            Ref = make_ref(),
-            spawn(fun() ->
-                try ets:new(lib_process_cache_checkpoints, [named_table, public, set]) of
-                    _ -> Self ! Ref, receive never -> ok end
-                catch error:badarg -> Self ! Ref
+            Pid = spawn(fun() ->
+                try register(?CHECKPOINTER, self()) of
+                    true ->
+                        checkpointer_loop(#{ pending => #{}, running => #{},
+                            busy => #{}, last => #{}, writers => 1, waiters => [] })
+                catch error:badarg -> ok
                 end
             end),
-            receive Ref -> ok end,
-            ets:whereis(lib_process_cache_checkpoints);
-        Tab -> Tab
+            Ref = erlang:monitor(process, Pid),
+            receive {'DOWN', Ref, process, Pid, _} -> ok
+            after 50 -> erlang:demonitor(Ref, [flush])
+            end,
+            checkpointer();
+        Pid -> Pid
     end.
+
+checkpointer_loop(S = #{ pending := Pending, running := Running, busy := Busy,
+        last := Last, waiters := Waiters }) ->
+    receive
+        {due, ProcID, Slot, Writer, Cadence, Writers} ->
+            case maps:find(ProcID, Pending) of
+                {ok, {Older, _, _}} -> Older ! skip;
+                error -> ok
+            end,
+            checkpointer_loop(start_checkpoints(S#{
+                pending := Pending#{ ProcID => {Writer, Slot, Cadence} },
+                writers := Writers }));
+        {'DOWN', Ref, process, _, Reason} ->
+            case maps:take(Ref, Running) of
+                {{ProcID, Slot}, Running1} ->
+                    Last1 =
+                        case Reason of
+                            {checkpoint, ok} ->
+                                Last#{ ProcID => max(Slot, maps:get(ProcID, Last, -1)) };
+                            _ -> Last
+                        end,
+                    S1 = S#{ running := Running1, busy := maps:remove(ProcID, Busy), last := Last1 },
+                    checkpointer_loop(start_checkpoints(answer_waiters(S1)));
+                error -> checkpointer_loop(S)
+            end;
+        {await, ProcID, From} ->
+            checkpointer_loop(answer_waiters(S#{ waiters := [{ProcID, From} | Waiters] }));
+        {status, From} ->
+            From ! {checkpoint_status, maps:without([waiters], S)},
+            checkpointer_loop(S)
+    end.
+
+%% Start the stalest waiting checkpoints while there are free writers.
+start_checkpoints(S = #{ pending := Pending, running := Running, busy := Busy,
+        last := Last, writers := Writers }) ->
+    Free = Writers - map_size(Running),
+    Ready =
+        lists:reverse(lists:sort(
+            [ {{Stale > 3 * Cadence, Stale}, ProcID}
+            || {ProcID, {_Writer, Slot, Cadence}} <- maps:to_list(Pending),
+               not is_map_key(ProcID, Busy),
+               Stale <- [Slot - maps:get(ProcID, Last, -1)] ])),
+    lists:foldl(
+        fun({{_, Stale}, ProcID}, Acc = #{ pending := P, running := R, busy := B }) ->
+            {Writer, Slot, _} = maps:get(ProcID, P),
+            hb_phase_timer:record(checkpoint_staleness, Stale),
+            Ref = erlang:monitor(process, Writer),
+            Writer ! go,
+            Acc#{ pending := maps:remove(ProcID, P), running := R#{ Ref => {ProcID, Slot} },
+                busy := B#{ ProcID => true } }
+        end,
+        S,
+        lists:sublist(Ready, max(0, Free))
+    ).
+
+answer_waiters(S = #{ pending := Pending, busy := Busy, waiters := Waiters }) ->
+    {Done, Waiting} =
+        lists:partition(
+            fun({ProcID, _}) ->
+                not is_map_key(ProcID, Pending) andalso not is_map_key(ProcID, Busy)
+            end,
+            Waiters),
+    [ From ! {checkpoint_idle, ProcID} || {ProcID, From} <- Done ],
+    S#{ waiters := Waiting }.
 
 %% @doc Write a slot of a full-state process (one without patches: `lua@5.3a',
 %% WASM, native devices) as one full-state row. Each row stands alone, so
@@ -1371,6 +1522,60 @@ delta_slots_read_back_test() ->
     ?assert(lists:all(Same, lists:seq(0, 4))),
     {ok, 4, Latest} = latest(ProcID, Opts),
     ?assertEqual(<<"4">>, hb_maps:get(<<"count">>, hb_cache:ensure_all_loaded(Latest, Opts), Opts)).
+
+%% @doc A stored slot's hot entry names the process that wrote it, not a
+%% copy of its state: another process reads the state from the writer while
+%% it holds that slot; a slot the writer has moved past, or one whose writer
+%% is gone, is read from the store, the same.
+held_state_test() ->
+    Opts = #{
+        <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+        <<"process-delta-cache">> => true,
+        <<"process-state-blobs">> => true,
+        <<"process-delta-checkpoint-slots">> => 100
+    },
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Self = self(),
+    Writer = spawn(fun() ->
+        State0 = #{ <<"count">> => <<"0">>, <<"at-slot">> => 0 },
+        {ok, _} = write(ProcID, 0, State0, Opts),
+        Loop = fun Loop(N, Prev) ->
+            receive
+                {step, From} ->
+                    Patches = [#{ <<"path">> => <<"/count">>, <<"value">> => integer_to_binary(N) }],
+                    Results = #{ <<"output">> => #{ <<"data">> => integer_to_binary(N) } },
+                    {ok, Next} = hb_state_patch:apply(Prev, Patches, Results, N, Opts),
+                    {ok, _} = write(ProcID, N,
+                        Next#{ <<"priv">> => #{ <<"process-cache-delta">> =>
+                            #{ <<"patches">> => Patches, <<"results">> => Results } } }, Opts),
+                    From ! {stepped, N},
+                    Loop(N + 1, Next);
+                stop -> ok
+            end
+        end,
+        Self ! ready,
+        Loop(1, State0)
+    end),
+    receive ready -> ok end,
+    Step = fun() -> Writer ! {step, Self}, receive {stepped, N} -> N end end,
+    Count = fun(N) -> {ok, M} = read(ProcID, N, Opts), hb_maps:get(<<"count">>, M, Opts) end,
+    1 = Step(),
+    ?assertMatch([{_, {?HELD, Writer}}], ets:lookup(?HOT, {ProcID, 1})),
+    ?assertEqual(<<"1">>, Count(1)),
+    2 = Step(),
+    % Slot 1 is no longer held: read from the store; slot 2 from the writer.
+    ?assertEqual(not_found, hot_get(ProcID, 1)),
+    ?assertEqual(<<"1">>, Count(1)),
+    ?assertMatch({ok, _}, hot_get(ProcID, 2)),
+    ?assertEqual(<<"2">>, Count(2)),
+    ?assertMatch({ok, 2, _}, latest(ProcID, Opts)),
+    Writer ! stop,
+    timer:sleep(50),
+    % Its writer gone, the head is read from the store.
+    ?assertEqual(not_found, hot_get(ProcID, 2)),
+    ?assertEqual(<<"2">>, Count(2)),
+    {ok, 2, Latest} = latest(ProcID, Opts),
+    ?assertEqual(<<"2">>, hb_maps:get(<<"count">>, Latest, Opts)).
 
 %% @doc With the hot cache empty (a restart, then no slot computed), the newest
 %% stored state is materialized once and kept hot: the next `latest' -- every
@@ -1723,6 +1928,7 @@ state_blobs_layout_test() ->
                 {ok, Next} = hb_state_patch:apply(Prev, Patches, Results, N, Opts),
                 Msg = case N of 3 -> Next#{ <<"snapshot">> => <<"vm3">> }; _ -> Next end,
                 {ok, _} = write(ProcID, N, Delta(Msg, Patches, Results), Opts),
+                ok = await_checkpoint(ProcID),
                 [Next | Acc]
             end,
             [State0],
@@ -1778,6 +1984,7 @@ async_checkpoint_test() ->
                 {ok, Next} = hb_state_patch:apply(Prev, Patches, Results, N, Opts),
                 {ok, _} = write(ProcID, N, Delta(Next, Patches, Results), Opts),
                 {ok, Read} = read(ProcID, N, Opts),
+                ok = await_checkpoint(ProcID),
                 ?assertEqual(Bin, hb_maps:get(<<"count">>, Read)),
                 Next
             end,
@@ -1795,6 +2002,57 @@ async_checkpoint_test() ->
     {_, F2, D2} = Run(Base#{ <<"process-async-checkpoints">> => false }),
     ?assertEqual([0, 2, 4], F2),
     ?assertEqual([1, 3], D2).
+
+%% @doc The checkpointer starts the stalest waiting checkpoints first, those
+%% past three cadences before any other, never more than its writers at once
+%% and never two of one process; a newer checkpoint of a process supersedes
+%% its waiting one.
+checkpointer_order_test() ->
+    Writer = fun() -> spawn(fun() -> receive go -> receive stop -> ok end; skip -> ok end end) end,
+    [W1, W2, W3] = [Writer(), Writer(), Writer()],
+    S0 = #{ pending => #{
+                <<"a">> => {W1, 120, 100},   % 120 slots since its last: 1.2 cadences
+                <<"b">> => {W2, 350, 100},   % 350 since none stored: past 3 cadences
+                <<"c">> => {W3, 260, 100} },
+            running => #{}, busy => #{},
+            last => #{ <<"a">> => 0, <<"b">> => -1, <<"c">> => 0 },
+            writers => 1, waiters => [] },
+    S1 = start_checkpoints(S0),
+    ?assertEqual([<<"a">>, <<"c">>], lists:sort(maps:keys(maps:get(pending, S1)))),
+    ?assertEqual([<<"b">>], maps:keys(maps:get(busy, S1))),
+    S2 = start_checkpoints(S1#{ writers := 2 }),
+    ?assertEqual([<<"a">>], maps:keys(maps:get(pending, S2))),
+    ?assertEqual([<<"b">>, <<"c">>], lists:sort(maps:keys(maps:get(busy, S2)))),
+    % A busy process's next checkpoint waits for it.
+    S3 = start_checkpoints(S2#{ writers := 3,
+        pending := (maps:get(pending, S2))#{ <<"c">> => {Writer(), 400, 100} } }),
+    ?assertEqual([<<"c">>], maps:keys(maps:get(pending, S3))),
+    [ P ! stop || P <- [W1, W2, W3] ],
+    % Through the process: a newer checkpoint of a waiting process supersedes it.
+    Checkpointer = checkpointer(),
+    Self = self(),
+    Blocker = spawn(fun() -> receive go -> Self ! started, receive stop -> exit({checkpoint, ok}) end end end),
+    Old = spawn(fun() -> receive go -> Self ! {old, go}; skip -> Self ! {old, skip} end end),
+    New = spawn(fun() -> receive go -> Self ! {new, go}, exit({checkpoint, ok}); skip -> Self ! {new, skip} end end),
+    P1 = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    P2 = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Checkpointer ! {due, P1, 10, Blocker, 100, 1},
+    receive started -> ok after 5000 -> ?assert(false) end,
+    Checkpointer ! {due, P2, 5, Old, 100, 1},
+    Checkpointer ! {due, P2, 6, New, 100, 1},
+    receive {old, R} -> ?assertEqual(skip, R) after 5000 -> ?assert(false) end,
+    Blocker ! stop,
+    receive {new, R2} -> ?assertEqual(go, R2) after 5000 -> ?assert(false) end,
+    ok = await_checkpoint(P2),
+    Checkpointer ! {status, self()},
+    receive {checkpoint_status, #{ last := LastSlots }} ->
+        ?assertEqual(6, maps:get(P2, LastSlots)),
+        ?assertEqual(10, maps:get(P1, LastSlots))
+    after 5000 -> ?assert(false)
+    end,
+    % The node-wide writer count returns to its default.
+    Checkpointer ! {due, P1, 11, spawn(fun() -> receive _ -> ok end end), 100, 1},
+    ok = await_checkpoint(P1).
 
 %% @doc With `process-state-blobs', a full-state process (no patches) writes
 %% each slot as one `f' row too, never RC7's content-addressed layout.
