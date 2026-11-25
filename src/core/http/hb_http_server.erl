@@ -663,6 +663,8 @@ challenge_node(ACME, ServerID, NodeMsg) ->
     ).
 
 listener_protocol_options(ServerID, NodeMsg) ->
+    % A listener starting anew is read from its environment first.
+    forget_node_msg(ServerID),
     MaxBody = hb_util:int(
         hb_opts:get(http_max_body, ?DEFAULT_MAX_BODY, NodeMsg)
     ),
@@ -786,6 +788,7 @@ start_http2(ServerID, ProtoOpts, NodeMsg, TLSOpts) ->
                 }
             ),
             cowboy:set_env(ServerID, node_msg, #{}),
+            forget_node_msg(ServerID),
             cowboy:stop_listener(ServerID),
             start_http2(ServerID, ProtoOpts, NodeMsg, TLSOpts);
         {error, Reason} ->
@@ -1294,7 +1297,9 @@ set_opts(Opts) ->
             ok;
         ServerRef ->
             % `Opts' from a request contain no key material: keep the node's.
-            ok = cowboy:set_env(ServerRef, node_msg, with_node_committer(Opts)),
+            NodeMsg = with_node_committer(Opts),
+            ok = cowboy:set_env(ServerRef, node_msg, NodeMsg),
+            persistent_term:put({?MODULE, node_msg, ServerRef}, NodeMsg),
             hb_tls:notify(ServerRef)
     end.
 set_opts(Request, Opts) ->
@@ -1317,14 +1322,32 @@ set_opts(Request, Opts) ->
             {set_opts(FinalOpts), FinalOpts}
     end.
 
-%% @doc Get the node message for the current process.
+%% @doc Get the node message for the current process. It is kept as a
+%% persistent term beside the listener's environment (`set_opts/1' writes
+%% both): read from the environment, every request copied the whole node
+%% message out of ranch's table, twice (lab, 44 processes at 450 writes/s:
+%% 2.5% of the node's CPU in `ranch_server:get_protocol_options/1').
 get_opts() ->
     get_opts(#{ <<"http-server">> => get(server_id) }).
 get_opts(NodeMsg) ->
     case hb_opts:get(http_server, no_server_ref, NodeMsg) of
         no_server_ref -> NodeMsg;
-        ServerRef -> cowboy:get_env(ServerRef, node_msg, no_node_msg)
+        ServerRef ->
+            case persistent_term:get({?MODULE, node_msg, ServerRef}, undefined) of
+                undefined ->
+                    case cowboy:get_env(ServerRef, node_msg, no_node_msg) of
+                        Map when is_map(Map), map_size(Map) > 0 ->
+                            persistent_term:put({?MODULE, node_msg, ServerRef}, Map),
+                            Map;
+                        Other -> Other
+                    end;
+                Cached -> Cached
+            end
     end.
+
+forget_node_msg(ServerRef) ->
+    _ = persistent_term:erase({?MODULE, node_msg, ServerRef}),
+    ok.
 
 %% @doc Call `Fun' with the node message of the server that `Opts' give, and
 %% return its result. Calls for one server run one at a time, so a `Fun' that
