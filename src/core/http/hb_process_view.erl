@@ -257,11 +257,14 @@ only_if_cached(CC) when is_list(CC) ->
 only_if_cached(_) -> true.
 
 %% @doc `/<43-character id>~process@1.0/now/<key>', the key a single path
-%% part in its normal (lowercase) form and the request without a query.
+%% part and the request without a query. The key is looked up lowercased, as
+%% the generic path finds it (`dev_message:get/4', and a device's functions
+%% through `hb_util:key_to_atom/1'): the SDK reads `player-<address>' and
+%% `stake-<address>' with the address's own capitals, and each of those reads
+%% used to miss the view and copy the process's whole state.
 parse(<<"/", ID:43/binary, "~process@1.0/now/", Key/binary>>) when byte_size(Key) > 0 ->
-    case hb_util:is_human_id(ID) andalso binary:match(Key, [<<"/">>, <<"?">>, <<"&">>, <<"~">>, <<"+">>]) == nomatch
-            andalso hb_util:to_lower(Key) == Key of
-        true -> {ok, ID, Key};
+    case hb_util:is_human_id(ID) andalso binary:match(Key, [<<"/">>, <<"?">>, <<"&">>, <<"~">>, <<"+">>]) == nomatch of
+        true -> {ok, ID, hb_util:lowercase_key(Key)};
         false -> miss
     end;
 parse(<<"/", ID:43/binary, "~process@1.0/compute&slot=", Rest/binary>>) ->
@@ -400,6 +403,6 @@ parse_test() ->
     ID = hb_util:human_id(crypto:strong_rand_bytes(32)),
     ?assertEqual({ok, ID, <<"count">>}, parse(<<"/", ID/binary, "~process@1.0/now/count">>)),
     ?assertEqual(miss, parse(<<"/", ID/binary, "~process@1.0/now/a/b">>)),
-    ?assertEqual(miss, parse(<<"/", ID/binary, "~process@1.0/now/Count">>)),
+    ?assertEqual({ok, ID, <<"player-abc">>}, parse(<<"/", ID/binary, "~process@1.0/now/Player-AbC">>)),
     ?assertEqual(miss, parse(<<"/", ID/binary, "~process@1.0/now">>)),
     ?assertEqual(miss, parse(<<"/", ID/binary, "~process@1.0/compute/count">>)).
