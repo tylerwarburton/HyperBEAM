@@ -90,8 +90,10 @@
 %% the attestor whose loop made the call passed nothing for an hour
 %% (2026-11-16: every node, after the efbce1663 restart).
 view(Pusd, Url, Args = #{ opts := NodeOpts, dir := Dir }) ->
-    R = catch_up(load(Pusd, Url, NodeOpts, Dir),
-        maps:get(slice, Args, ?SLICE_SLOTS), maps:get(deadline, Args, infinity)),
+    R = at_low_priority(fun() ->
+        catch_up(load(Pusd, Url, NodeOpts, Dir),
+            maps:get(slice, Args, ?SLICE_SLOTS), maps:get(deadline, Args, infinity))
+    end),
     case R of
         #{ computed := -1 } -> {not_yet, maps:get(stopped, R)};
         #{ computed := C, snapshot := Snap } when C < Snap -> {not_yet, catching_up(R)};
@@ -382,6 +384,19 @@ drop(Cursor, Stores) ->
     ok = hb_store:reset(Stores),
     ok = file:delete(Cursor),
     -1.
+
+%% @doc Run `Fun' at low priority, and put the caller's priority back. A
+%% replica's catch-up recomputes a ledger's history on its own (a new build
+%% drops the computed store, `same_build/5'): on Paralith a lane replica
+%% recomputing PUSD L1 from slot ~10,000 toward ~45,500 after a roll was a
+%% fifth of the node's execution CPU and competed slot for slot with the
+%% live ones (round trip p95 1.93 -> 2.56 s, push 0.47 -> 2.76 s). At low
+%% priority it takes what the live slots leave.
+at_low_priority(Fun) ->
+    Prev = process_flag(priority, low),
+    try Fun()
+    after process_flag(priority, Prev)
+    end.
 
 %% @doc Replayed code gets the same key isolation as public HTTP execution.
 %% The attestor retains its signing keys outside the foreign Lua environment.
@@ -968,6 +983,15 @@ replica_failure_is_scrubbed_test() ->
 %% The computed store keeps only what the replica acts on and resumes from:
 %% the newest two snapshots and the newest two states. Every other state goes,
 %% and nothing of the verified store is touched.
+%% @doc Catch-up runs at low priority and gives the caller its own back, also
+%% when it fails.
+low_priority_catch_up_test() ->
+    normal = element(2, process_info(self(), priority)),
+    ?assertEqual(low, at_low_priority(fun() -> element(2, process_info(self(), priority)) end)),
+    ?assertEqual(normal, element(2, process_info(self(), priority))),
+    ?assertError(boom, at_low_priority(fun() -> erlang:error(boom) end)),
+    ?assertEqual(normal, element(2, process_info(self(), priority))).
+
 prune_keeps_the_head_test() ->
     Verified = hb_test_utils:test_store(hb_store_lmdb, <<"replica-prune">>),
     Computed = hb_test_utils:test_store(hb_store_lmdb, <<"replica-prune.computed">>),

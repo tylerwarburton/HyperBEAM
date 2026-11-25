@@ -388,8 +388,13 @@ replica_assignment(P, N, ROpts) ->
 index_batch([], _R, F) -> F;
 index_batch(Ready, #{ proc := Proc, opts := ROpts }, F = #{ p := P, opts := Opts }) ->
     {Last, _} = lists:last(Ready),
+    % Behind the live slots: a follower's replica computes another node's
+    % process for its own index, at low priority (`lib_bridge_replica').
+    Prev = process_flag(priority, low),
     {ok, _} =
-        hb_ao:resolve(Proc, #{ <<"path">> => <<"compute">>, <<"slot">> => Last }, ROpts),
+        try hb_ao:resolve(Proc, #{ <<"path">> => <<"compute">>, <<"slot">> => Last }, ROpts)
+        after process_flag(priority, Prev)
+        end,
     ok = write_entries(P, Ready, Proc, ROpts, Opts),
     progress(F#{ indexed := Last }).
 
