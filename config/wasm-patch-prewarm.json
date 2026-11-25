@@ -3,6 +3,10 @@
     {
       "sha256": "b9853d790b71865fbce4536f2d572a2bd4c5c078a950e3e2db05b3bfac70c98a",
       "source": "config/wasm-patch-runtimes/wasm-lua-b9853d790b71.wasm"
+    },
+    {
+      "sha256": "5c6497d71b829e414efbc7aceb0dd3e60bebefb2e4ae19de69b9c61a4e9ce1e9",
+      "source": "config/wasm-patch-runtimes/wasm-lua-5c6497d71b82.wasm"
     }
   ]
 }

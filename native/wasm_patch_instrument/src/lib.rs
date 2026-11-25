@@ -8,7 +8,8 @@
 //! Validation refuses: SIMD, threads/atomics/shared memory, reference types,
 //! tail calls, exceptions, multi-memory, GC, any non-function import, any
 //! function import outside the allowlist (`env.invoke_vii`,
-//! `env.throw_longjmp`, `env.wp_bls_fav`, `env.wp_rsa_pss_sha256`, exact
+//! `env.throw_longjmp`, `env.wp_bls_fav`, `env.wp_rsa_pss_sha256`, the
+//! `env.wp_rng_*` natives, exact
 //! signatures), a start function that can reach an
 //! import, a memory without a maximum or with one above the cap, an export
 //! already named `wp_fuel`/`wp_depth`/`wp_g*`, and an already instrumented
@@ -79,6 +80,10 @@ const ALLOWED_IMPORTS: &[(&str, &str, &[ValType], &[ValType])] = &[
     // native itself. wasm32 pointers and lengths.
     ("env", "wp_bls_fav", &[ValType::I32; 7], &[ValType::I32]),
     ("env", "wp_rsa_pss_sha256", &[ValType::I32; 5], &[ValType::I32]),
+    // rng@1.0 natives (hb_wasm_nif.c): the RNG beacons' checks.
+    ("env", "wp_rng_bls", &[ValType::I32; 6], &[ValType::I32]),
+    ("env", "wp_rng_reveal", &[ValType::I32; 7], &[ValType::I32]),
+    ("env", "wp_rng_crack", &[ValType::I32; 9], &[ValType::I32]),
 ];
 
 pub struct Config {
