@@ -84,6 +84,13 @@ sign_tx(Msg, TX, Req, Opts) ->
             Req,
             Opts
         ),
+    % A scheduler signing an assignment keeps the item's bytes for its
+    % uploader (`hb_item_bytes'). An atom key: no request or configuration
+    % file can set it.
+    case maps:get(keep_item_bytes, Opts, false) of
+        true -> hb_item_bytes:put_signed(Signed);
+        false -> ok
+    end,
     SignedStructured =
         hb_message:convert(
             Signed,

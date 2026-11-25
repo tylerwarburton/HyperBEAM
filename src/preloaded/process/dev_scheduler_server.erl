@@ -900,7 +900,10 @@ commit_assignment(BaseAssignment, State) ->
                     RawOpts
                 ),
             <<"cache-pack">> =>
-                hb_opts:get(<<"scheduler-pack-messages">>, true, RawOpts) =/= false
+                hb_opts:get(<<"scheduler-pack-messages">>, true, RawOpts) =/= false,
+            % The uploader posts the assignment as the bytes signed here
+            % (`hb_item_bytes'), not rebuilt from the store.
+            keep_item_bytes => maps:get(uploader, State, undefined) =/= undefined
         },
     CommittmentSpec = maps:get(committment_spec, State),
     lists:foldr(

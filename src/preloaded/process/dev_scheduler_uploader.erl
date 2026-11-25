@@ -457,6 +457,8 @@ prepare_window(ProcID, First, Max, Mode, MaxBytes, Opts) ->
         {<<"To-Slot">>, hb_util:bin(LastSlot)},
         {<<"Last-Assignment">>, LastID}
     ],
+    % The window is built: the bytes the node kept of its items are done with.
+    ok = hb_item_bytes:forget(Items),
     Item =
         case Mode of
             full ->
@@ -482,8 +484,8 @@ read_window(_ProcID, Slot, Max, _MaxBytes, _Opts, _Size, Acc) when Slot > Max ->
     window_items(lists:reverse(Acc));
 read_window(ProcID, Slot, Max, MaxBytes, Opts, Size, Acc) ->
     {Body, Assignment} = read_slot(ProcID, Slot, Opts),
-    BodyItem = item(Body, Opts),
-    AssignmentItem = item(Assignment, Opts),
+    BodyItem = kept_item(Body, Opts),
+    AssignmentItem = kept_item(Assignment, Opts),
     Next = Size + byte_size(ar_bundles:serialize(BodyItem))
         + byte_size(ar_bundles:serialize(AssignmentItem)),
     case Acc =/= [] andalso Next > MaxBytes of
@@ -566,6 +568,14 @@ sign(Data, Tags, Opts) ->
         #tx{ format = ans104, data = Data, data_size = byte_size(Data), tags = Tags },
         hb_opts:get(priv_wallet, hb:wallet(), Opts)
     ).
+
+%% @doc A message as the item the node kept the signed bytes of
+%% (`hb_item_bytes'), or else as `item/2' builds it from the store.
+kept_item(Msg, Opts) ->
+    case hb_item_bytes:lookup(Msg, Opts) of
+        {ok, Item} -> Item;
+        not_found -> item(Msg, Opts)
+    end.
 
 %% @doc A message as an Arweave item. A message signed as an ANS-104 item is
 %% that item, its own ID and signature: only that commitment is taken, since a
@@ -1167,6 +1177,50 @@ write_slots(ProcID, Slots, Opts) ->
 
 test_opts() ->
     #{ <<"store">> => [hb_test_utils:test_store()], <<"priv-wallet">> => hb:wallet() }.
+
+%% @doc A window built from the bytes the node kept is the window built from
+%% the store, byte for byte, and the bytes go once it is built. The bodies
+%% arrive as a client sends them: items signed outside the node, decoded as
+%% the HTTP server decodes them, their bytes kept as it keeps them; the
+%% assignments are signed as the scheduler signs them.
+kept_bytes_window_test() ->
+    Opts = test_opts(),
+    ProcID = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    Client = ar_wallet:new(),
+    Messages =
+        lists:append([ begin
+            Data = <<"slot ", (integer_to_binary(Slot))/binary>>,
+            TX = ar_bundles:sign_item(
+                #tx{ format = ans104, data = Data, data_size = byte_size(Data),
+                    tags = [{<<"Action">>, <<"Probe">>},
+                        {<<"N">>, integer_to_binary(Slot)}] },
+                Client),
+            Bytes = ar_bundles:serialize(TX),
+            ok = hb_item_bytes:put_verified(Bytes),
+            Body = hb_message:with_only_committed_deep(
+                hb_http:decode(<<"ans104@1.0">>, Bytes, Opts), Opts),
+            Assignment = hb_message:commit(
+                #{ <<"process">> => ProcID, <<"slot">> => Slot, <<"body">> => Body,
+                   <<"type">> => <<"Assignment">>, <<"variant">> => <<"ao.N.1">> },
+                Opts#{ keep_item_bytes => true }, <<"ans104@1.0">>),
+            ok = dev_scheduler_cache:write(ProcID, Assignment, Opts),
+            ?assertEqual(Bytes, ar_bundles:serialize(kept_item(Body, Opts))),
+            ?assertEqual(Bytes, ar_bundles:serialize(item(Body, Opts))),
+            ?assertEqual(ar_bundles:serialize(item(Assignment, Opts)),
+                ar_bundles:serialize(kept_item(Assignment, Opts))),
+            [Body, Assignment]
+          end
+        || Slot <- lists:seq(0, 4) ]),
+    ok = dev_scheduler_cache:flush(Opts),
+    Kept = fun() -> lists:usort([ hb_item_bytes:lookup(M, Opts) =/= not_found || M <- Messages ]) end,
+    ?assertEqual([true], Kept()),
+    {2, 4, FromKept} = prepare_window(ProcID, 0, 4, full, ?DEFAULT_WINDOW_BYTES, Opts),
+    ?assertEqual([false], Kept()),
+    {2, 4, FromStore} = prepare_window(ProcID, 0, 4, full, ?DEFAULT_WINDOW_BYTES, Opts),
+    A = ar_bundles:deserialize_item_wrapper(FromKept),
+    B = ar_bundles:deserialize_item_wrapper(FromStore),
+    ?assertEqual(archive_bundle(B#tx.tags, B#tx.data), archive_bundle(A#tx.tags, A#tx.data)),
+    ?assertEqual(B#tx.data, A#tx.data).
 
 %% @doc A full window's data is the same bytes every time it is prepared (the
 %% signature, and so the item's ID, is salted), and smaller than what it
