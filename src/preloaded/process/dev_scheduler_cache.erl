@@ -156,11 +156,13 @@ read(ProcID, Slot, RawOpts) ->
     ),
     % A slot this node no longer holds is read from the cold tier: its own
     % folder on the share, the other nodes' (verified), then Arweave
-    % (`hb_store_cold').
+    % (`hb_store_cold'). It is verified against the process's definition,
+    % which is in the node's stores: a foreign process's never is in the
+    % scheduler's, and every slot of it was refused (`[scheduler]').
     Found =
         case hb_cache:read(P1, Opts) of
             {error, not_found} ->
-                case hb_store_cold:read_assignment(ProcID, hb_util:int(Slot), Opts) of
+                case hb_store_cold:read_assignment(ProcID, hb_util:int(Slot), RawOpts) of
                     {ok, Cold} -> {ok, Cold};
                     not_found -> {error, not_found}
                 end;
@@ -783,3 +785,26 @@ spawn_carries_referenced_image_test() ->
     {ok, Read} = hb_cache:read(ImageID, #{ <<"store">> => [Irr] }),
     ?assertEqual(hb_maps:get(<<"data">>, Image, Opts),
                  hb_maps:get(<<"data">>, hb_cache:ensure_all_loaded(Read, #{ <<"store">> => [Irr] }), Opts)).
+
+%% @doc A foreign process's slot that this node no longer holds is read from a
+%% peer's cold folder and verified against the process's definition, which is
+%% in the node's stores and never in the scheduler's: every such slot was
+%% refused (`[scheduler]'), RSA or Ed25519 scheduled alike.
+cold_foreign_slot_verified_test_() ->
+    {timeout, 120, fun() ->
+        lists:foreach(fun(KeyType) ->
+            Peer = #{ opts := POpts, p := P } = hb_store_cold:test_env("cache-peer", KeyType),
+            hb_store_cold:assign(Peer, lists:seq(0, 19), 3600000),
+            ok = hb_store_cold:tick(POpts),
+            Me = #{ opts := MOpts0 } = hb_store_cold:test_env("cache-reader", ?RSA_KEY_TYPE),
+            {ok, Proc} = hb_cache:read(P, POpts),
+            {ok, _} = hb_cache:write(hb_cache:ensure_all_loaded(Proc, POpts),
+                MOpts0#{ <<"store">> => [maps:get(main, Me)] }),
+            Cold = maps:get(<<"cold-tier">>, MOpts0),
+            MOpts = MOpts0#{ <<"cold-tier">> => Cold#{ <<"peers">> =>
+                [#{ <<"node">> => <<"peer">>,
+                    <<"path">> => list_to_binary(hb_store_cold:share(POpts)) }] } },
+            {ok, A} = read(P, 2, MOpts),
+            ?assertEqual(2, hb_util:int(hb_ao:get(<<"slot">>, A, MOpts)))
+        end, [?RSA_KEY_TYPE, ?EDDSA_KEY_TYPE])
+    end}.

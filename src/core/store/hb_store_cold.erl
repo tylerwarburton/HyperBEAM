@@ -58,6 +58,9 @@
 -module(hb_store_cold).
 -export([maybe_start/1, status/0, tick/1, config/1]).
 -export([read_assignment/3, restore_checkpoint/3, ship_replica/3, restore_replica/4]).
+-ifdef(TEST).
+-export([test_env/2, assign/3, share/1]).
+-endif.
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -441,15 +444,33 @@ verified(A, P, Slot, Opts) ->
         {message, fun() -> (not is_map(Body)) orelse hb_message:verify(Body, all, Opts) =:= true end},
         {scheduler, fun() ->
             Schedulers = schedulers(P, Opts),
-            lists:any(fun(S) -> lists:member(S, Schedulers) end,
-                [ Addr || S <- hb_message:signers(A, Opts),
-                          {ok, Addr} <- [hb_committer:address(S)] ])
+            lists:any(fun(S) -> lists:member(S, Schedulers) end, signer_addresses(A, Opts))
         end}
     ],
     case [ Name || {Name, Check} <- Checks, (catch Check()) =/= true ] of
         [] -> true;
-        Failed -> ?event(warning, {cold_slot_not_verified, P, Slot, Failed}), false
+        Failed ->
+            ?event(warning, {cold_slot_not_verified, P, Slot, Failed,
+                {schedulers, (catch schedulers(P, Opts))},
+                {signers, (catch signer_addresses(A, Opts))}}),
+            false
     end.
+
+%% @doc The addresses that signed a slot: each committer's, and, for an
+%% ANS-104 signature (RSA or Ed25519, a node's `scheduler-key-type'), the
+%% address of the key itself, which the `signature' check has verified. An
+%% item decoded without its committer (one the committer device could not be
+%% resolved for) still names the key that signed it. Nothing else names
+%% anybody: an hmac or unsigned commitment has no key.
+signer_addresses(A, Opts) ->
+    Committers =
+        [ Addr || S <- hb_message:signers(A, Opts), {ok, Addr} <- [hb_committer:address(S)] ],
+    Keys =
+        [ hb_util:human_id(ar_wallet:to_address(hb_util:decode(Owner), ar_tx:deserialize_sig_type(Type)))
+        || #{ <<"type">> := Type, <<"owner">> := Owner } <-
+               hb_maps:values(hb_maps:get(<<"commitments">>, A, #{}, Opts), Opts),
+           lists:member(Type, [?RSA_SIGN_TYPE, ?EDDSA_SIGN_TYPE]) ],
+    lists:usort(Committers ++ Keys).
 
 schedulers(P, Opts) ->
     case hb_cache:read(P, Opts) of
@@ -748,13 +769,14 @@ build() ->
 
 -define(TEST_DIR, "/tmp/hb-cold-test").
 
-test_env(Name) ->
+test_env(Name) -> test_env(Name, ?RSA_KEY_TYPE).
+test_env(Name, KeyType) ->
     Dir = ?TEST_DIR ++ "/" ++ Name ++ "-" ++ integer_to_list(erlang:unique_integer([positive])),
     os:cmd("rm -rf " ++ Dir),
     Main = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => list_to_binary(Dir ++ "/main") },
     Irr = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => list_to_binary(Dir ++ "/irr") },
     ok = hb_store:start([Main, Irr]),
-    Sched = ar_wallet:new(),
+    Sched = ar_wallet:new(KeyType),
     Opts = #{ <<"store">> => [Main, Irr#{ <<"access">> => [<<"read">>] }],
               <<"scheduler-store">> => [Irr], <<"priv-wallet">> => Sched,
               <<"match-index">> => false,
@@ -777,6 +799,7 @@ assign(#{ irr := Irr, opts := Opts, p := P }, Slots, AgeMs) ->
             Body = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"target">> => P,
                 <<"n">> => integer_to_binary(N) }, Client, <<"ans104@1.0">>),
             A = hb_message:commit(#{ <<"type">> => <<"Assignment">>, <<"process">> => P,
+                <<"variant">> => <<"ao.N.1">>,
                 <<"slot">> => N, <<"timestamp">> => erlang:system_time(millisecond) - AgeMs,
                 <<"body">> => Body }, Opts#{ <<"cache-pack">> => true }, <<"ans104@1.0">>),
             WOpts = Opts#{ <<"store">> => [Irr], <<"cache-pack">> => true },
@@ -870,8 +893,16 @@ does_not_use_the_file_server_test_() ->
 %% @doc A slot read from another node's folder is used only if it verifies
 %% and the process's scheduler signed it.
 peer_slots_verified_test_() ->
-    {timeout, 120, fun() ->
-        Peer = #{ opts := POpts, p := P } = test_env("peer"),
+    {timeout, 120, fun() -> peer_slots_verified(?RSA_KEY_TYPE) end}.
+
+%% @doc The same with an Ed25519 scheduling key (`scheduler-key-type'): the
+%% key the process names is the key that signed, and a slot another Ed25519
+%% key signed is refused.
+peer_slots_verified_ed25519_test_() ->
+    {timeout, 120, fun() -> peer_slots_verified(?EDDSA_KEY_TYPE) end}.
+
+peer_slots_verified(KeyType) ->
+        Peer = #{ opts := POpts, p := P } = test_env("peer", KeyType),
         assign(Peer, lists:seq(0, 19), 3600000),
         ok = tick(POpts),
         PeerShare = list_to_binary(share(POpts)),
@@ -887,14 +918,14 @@ peer_slots_verified_test_() ->
         {ok, A} = read_assignment(P, 2, MOpts),
         ?assertEqual(2, hb_util:int(hb_ao:get(<<"slot">>, A, MOpts))),
         % Signed by a key that is not the process's scheduler: refused.
-        Forged = (test_env("forger"))#{ p => P },
+        Forged = (test_env("forger", KeyType))#{ p => P },
         assign(Forged, lists:seq(0, 19), 3600000),
         #{ opts := FOpts } = Forged,
         ok = tick(FOpts),
         MOpts2 = MOpts0#{ <<"cold-tier">> => Cold#{ <<"peers">> =>
             [#{ <<"node">> => <<"forger">>, <<"path">> => list_to_binary(share(FOpts)) }] } },
-        ?assertEqual(not_found, read_assignment(P, 2, MOpts2))
-    end}.
+        ?assertEqual(not_found, read_assignment(P, 2, MOpts2)).
+
 
 %% @doc Daily checkpoints are shipped; one is put back where none is held,
 %% from this node's folder or a trusted peer's only.
@@ -1001,8 +1032,14 @@ replica_snapshot_test_() ->
 
 %% @doc The last fallback: a slot in an archive window on Arweave, verified.
 arweave_fallback_test_() ->
-    {timeout, 60, fun() ->
-        #{ opts := Opts0, p := P, sched := Sched } = test_env("arweave"),
+    {timeout, 60, fun() -> arweave_fallback(?RSA_KEY_TYPE) end}.
+
+%% @doc The same window, signed by an Ed25519 scheduling key.
+arweave_fallback_ed25519_test_() ->
+    {timeout, 60, fun() -> arweave_fallback(?EDDSA_KEY_TYPE) end}.
+
+arweave_fallback(KeyType) ->
+        #{ opts := Opts0, p := P, sched := Sched } = test_env("arweave", KeyType),
         Client = #{ <<"priv-wallet">> => ar_wallet:new() },
         Body = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"target">> => P,
             <<"n">> => <<"7">> }, Client, <<"ans104@1.0">>),
@@ -1028,8 +1065,8 @@ arweave_fallback_test_() ->
         {ok, Got} = read_assignment(P, 7, Opts),
         ?assertEqual(7, hb_util:int(hb_ao:get(<<"slot">>, Got, Opts))),
         ?assertEqual(<<"7">>, hb_ao:get(<<"body/n">>, Got, Opts)),
-        ?assertEqual(not_found, read_assignment(P, 8, Opts))
-    end}.
+        ?assertEqual(not_found, read_assignment(P, 8, Opts)).
+
 
 stub_gateway(Route) ->
     {ok, _} = application:ensure_all_started(inets),
@@ -1060,3 +1097,23 @@ stub_headers(Socket, Len) ->
         {ok, http_eoh} -> Len;
         {ok, _} -> stub_headers(Socket, Len)
     end.
+
+%% @doc An Ed25519 assignment whose commitment lost its committer is still the
+%% scheduler's: its verified key names it. One signed by another Ed25519 key,
+%% or carrying only an hmac, names nobody the process lists.
+signer_addresses_test() ->
+    Sched = ar_wallet:new(?EDDSA_KEY_TYPE),
+    Addr = hb_util:human_id(ar_wallet:to_address(Sched)),
+    A = hb_message:commit(#{ <<"type">> => <<"Assignment">>, <<"slot">> => 1 },
+        #{ <<"priv-wallet">> => Sched }, <<"ans104@1.0">>),
+    ?assertEqual([Addr], signer_addresses(A, #{})),
+    Bare = A#{ <<"commitments">> => maps:map(fun(_, C) -> maps:remove(<<"committer">>, C) end,
+        maps:get(<<"commitments">>, A)) },
+    ?assertEqual([], hb_message:signers(Bare, #{})),
+    ?assertEqual([Addr], signer_addresses(Bare, #{})),
+    Other = hb_message:commit(#{ <<"type">> => <<"Assignment">>, <<"slot">> => 1 },
+        #{ <<"priv-wallet">> => ar_wallet:new(?EDDSA_KEY_TYPE) }, <<"ans104@1.0">>),
+    ?assertNot(lists:member(Addr, signer_addresses(Other, #{}))),
+    Hmac = #{ <<"commitments">> => #{ <<"h">> => #{ <<"type">> => <<"hmac-sha256">>,
+        <<"owner">> => hb_util:encode(maps:get(<<"owner">>, Sched)) } } },
+    ?assertEqual([], signer_addresses(Hmac, #{})).
