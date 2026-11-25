@@ -760,7 +760,8 @@ read_below_retention_floor_test_() ->
         ?assertEqual(8, hb_ao:get(<<"count">>, Head, Opts)),
         % No age floor: only the newest checkpoints are kept, as the test needs.
         #{ deleted := Deleted } =
-            hb_store_retention:retain(Opts#{ <<"store-retention-keep-seconds">> => 0 }),
+            hb_store_retention:retain(Opts#{ <<"store-retention-keep-seconds">> => 0,
+                <<"store-retention-keep-slots">> => 0 }),
         ?assert(Deleted > 0),
         ProcID = hb_message:id(Base, all, Opts),
         Kept = pstate_slots(ProcID, <<"f">>, Opts),

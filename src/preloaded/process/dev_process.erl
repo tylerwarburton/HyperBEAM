@@ -1690,11 +1690,69 @@ pruned_setup(Slots) ->
     {ok, HeadState} =
         hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => Head }, Opts),
     ?assertEqual(integer_to_binary(Slots), hb_ao:get(<<"count">>, HeadState, Opts)),
-    % No age floor: only the newest checkpoints are kept, as the test needs.
+    % No age floor and no slot window: only the newest checkpoints, and the
+    % hourly ones below them, are kept, as the tests of reads below the
+    % floor need.
     #{ deleted := Deleted } =
-        hb_store_retention:retain(Opts#{ <<"store-retention-keep-seconds">> => 0 }),
+        hb_store_retention:retain(Opts#{ <<"store-retention-keep-seconds">> => 0,
+            <<"store-retention-keep-slots">> => 0,
+            <<"store-retention-checkpoint-tiers">> => [[3600, 24]] }),
     ?assert(Deleted > 0),
     {Process, ProcID, Head, Opts}.
+
+%% @doc Retention's default policy (the newest two snapshots, and every slot
+%% of the window below the head) over a delta process: every slot of the
+%% window reads back as computed, without replay; nothing below the floor
+%% is left; and a worker started afresh resumes from the kept head and
+%% computes on.
+window_prune_keeps_reads_test_() ->
+    {timeout, 180, fun() ->
+        application:ensure_all_started(hb),
+        Opts =
+            #{
+                <<"store">> => hb_test_utils:test_store(hb_store_lmdb),
+                <<"priv-wallet">> => ar_wallet:new(),
+                <<"process-state-blobs">> => true,
+                <<"process-delta-cache">> => true,
+                <<"process-hot-cache-slots">> => 0,
+                <<"process-snapshot-slots">> => 3,
+                <<"process-snapshot-time">> => false,
+                <<"process-snapshot-target">> => false,
+                <<"process-compute-on-schedule">> => false,
+                <<"spawn-worker">> => true,
+                <<"process-workers">> => true,
+                <<"process-worker-spawn">> => true,
+                <<"await-inprogress">> => named,
+                <<"store-retention-keep-slots">> => 6
+            },
+        Process = hb_process_test_vectors:lua_patch_process(pruned_counter_script(), Opts),
+        {ok, _} = hb_cache:write(Process, Opts),
+        ProcID = hb_message:id(Process, all, Opts),
+        Schedule = fun(N) ->
+            hb_process_test_vectors:schedule_test_message(
+                Process, <<"inc">>, #{ <<"n">> => N }, Opts)
+        end,
+        [ Schedule(N) || N <- lists:seq(1, 20) ],
+        Count = fun(S) ->
+            {ok, St} = hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => S }, Opts),
+            hb_ao:get(<<"count">>, St, Opts)
+        end,
+        ?assertEqual(<<"20">>, Count(19)),
+        #{ deleted := Deleted } = hb_store_retention:retain(Opts),
+        ?assert(Deleted > 0),
+        % The floor is the newest snapshot at least 6 below the head (19): 12.
+        ?assertEqual([15, 18], hb_process_test_vectors:pstate_slots(ProcID, <<"s">>, Opts) -- [12]),
+        ?assertEqual(12, hd(stored_slots(ProcID, Opts))),
+        Execs = slot_executions(),
+        [ ?assertEqual(integer_to_binary(S + 1), Count(S)) || S <- lists:seq(13, 19) ],
+        ?assertEqual(Execs, slot_executions()),
+        % Without a worker, the state is loaded from what is kept, and the
+        % process computes on from it.
+        Schedule(21),
+        NoWorker = Opts#{ <<"process-workers">> => false, <<"spawn-worker">> => false },
+        {ok, St20} = hb_ao:resolve(Process, #{ <<"path">> => <<"compute">>, <<"slot">> => 20 }, NoWorker),
+        ?assertEqual(<<"21">>, hb_ao:get(<<"count">>, St20, NoWorker))
+    end}.
 
 slot_executions() ->
     lists:sum([ N || {slot_execution, _, N, _} <- hb_phase_timer:read() ]).

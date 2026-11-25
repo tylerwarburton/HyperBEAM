@@ -13,10 +13,16 @@
 %%% Every process keeps one unbroken run of stored state from its floor up to
 %%% its head, and every slot in it reads without recompute. The floor is the
 %%% newest checkpoint carrying a VM snapshot (an `s' marker: the only states
-%%% a worker can resume from) whose assignment is at least
-%%% `store-retention-keep-seconds' old (default 259,200: three days), and
-%%% never above the `store-retention-checkpoints'-th newest one (default 2),
-%%% which stays the minimum kept. A slot's time is the assignment timestamp
+%%% a worker can resume from) that is at least `store-retention-keep-slots'
+%%% (default 2,000: the lost-push repair window) below the process's head,
+%%% whose assignment is at least `store-retention-keep-seconds' old (default
+%%% 0: no age floor), and never above the `store-retention-checkpoints'-th
+%%% newest one (default 2), which stays the minimum kept. Everything below
+%%% the floor goes, older snapshots included: a process's history is its
+%%% messages, which the scheduler keeps and the uploader archives, not its
+%%% snapshots. Kept a day by age, every snapshot of a busy wasm-patch process
+%%% (23.5 MB each, every few hundred slots) filled Paralith's 300 GiB store
+%%% in hours (2026-11-25). A slot's time is the assignment timestamp
 %%% its `s' marker carries (`lib_process_cache'); a marker written before
 %%% markers carried one is empty, and its assignment is read instead. A time
 %%% that cannot be read counts as young, so the floor is never above it: what
@@ -33,13 +39,13 @@
 %%% (3,600: one hour, or `keep-seconds' when that is less) instead: each of
 %%% its slots is a whole state.
 %%%
-%%% Snapshot checkpoints below the floor are thinned, not kept forever:
-%%% besides the `store-retention-checkpoints' newest, a process keeps the
+%%% Snapshot checkpoints below the floor can be thinned instead of deleted:
+%%% besides the `store-retention-checkpoints' newest, a process then keeps the
 %%% oldest snapshot of each of the newest N buckets of every tier in
-%%% `store-retention-checkpoint-tiers' (a list of `[BucketSeconds, N]';
-%%% default `[[3600, 24], [86400, 7], [604800, 52]]': hourly for a day,
-%%% daily for a week, weekly for a year), and every snapshot whose time
-%%% cannot be read. The oldest of a bucket stays the oldest as time passes,
+%%% `store-retention-checkpoint-tiers' (a list of `[BucketSeconds, N]'; e.g.
+%%% `[[3600, 24], [86400, 7]]': hourly for a day, daily for a week; default
+%%% `[]': none), and every snapshot whose time cannot be read. With a cold
+%%% tier (`hb_store_cold'), a snapshot it has not shipped yet is kept. The oldest of a bucket stays the oldest as time passes,
 %%% so what a run keeps is never deleted by the next until its bucket ages
 %%% out. A slot whose state is gone is rebuilt on request by replay from the
 %%% nearest kept snapshot below it, or from the process's definition
@@ -82,7 +88,16 @@
 %%% whole batch or none of it. After each batch the run sleeps long enough to
 %%% keep its share of one scheduler at `store-retention-max-cpu-pct' (default
 %%% 25). A run stops after `store-retention-max-candidates' keys (default
-%%% 1,000,000); the next run continues.
+%%% 1,000,000); the next run starts a second later, so a backlog is cleared
+%%% in one sitting, at the CPU cap.
+%%%
+%%% A process that is no longer live (an earlier deploy, a throwaway spawn)
+%%% loses all of its rows, but only by name: `store-retention-live-processes'
+%%% is the node operator's list of the processes this node runs, and with it
+%%% set, `unlisted/1' reports every other process with rows here (rows,
+%%% chunks, bytes), and a run with `store-retention-delete-unlisted' true
+%%% deletes them, in the same throttled batches. Without the list nothing is
+%%% ever deleted this way: no process is judged dead by its looks.
 %%%
 %%% Configuration: `store-retention' (true to run), `store-retention-
 %%% interval-ms' (600,000), `store-retention-first-ms' (60,000), and the keys
@@ -92,19 +107,31 @@
 -export([maybe_start/1, start/1, stop/0, run_now/1, status/0, running/0]).
 -export([retain/1, retain/2, plan/3, plan/4, store/1, pruned_key/1]).
 -export([marker_time/1, assignment_time/3, assignment_ms/2, policy/1]).
+-export([unlisted/1]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -define(NS, <<"pstate">>).
 %% States a full-state process keeps besides its snapshot checkpoints.
 -define(RECENT, 32).
-%% How long every slot is kept by default: a day, and an hour for a
-%% full-state process, whose every slot is a whole state.
--define(KEEP_SECONDS, 86400).
+%% How long every slot is kept by default: by age, nothing beyond the slots
+%% below. A day of every slot was the default: at 100 messages a second, a
+%% busy process's snapshots alone (23.5 MB each, written every few hundred
+%% slots) filled a 300 GiB store in hours (Paralith, 2026-11-25).
+-define(KEEP_SECONDS, 0).
 -define(FULL_KEEP_SECONDS, 3600).
-%% Snapshot checkpoints kept below the floor: the oldest of each hour for a
-%% day, of each day for a week, of each week for a year.
--define(TIERS, [[3600, 24], [86400, 7], [604800, 52]]).
+%% Slots below the head a process keeps whole, whatever its snapshots: the
+%% lost-push repair window. A dropped push is repaired by re-pushing its
+%% sending slot, so that slot must still read without replay.
+-define(KEEP_SLOTS, 2000).
+%% Snapshot checkpoints kept below the floor besides the newest: none. The
+%% cold tier keeps a process's history (`hb_store_cold'); the local store
+%% keeps what the node computes on.
+-define(TIERS, []).
+%% A run that stopped at `store-retention-max-candidates' runs again after
+%% this, not after the interval: a backlog is cleared in one sitting, at the
+%% run's CPU cap.
+-define(BACKLOG_PAUSE_MS, 1000).
 %% A timestamp below this is in seconds (an Arweave block's, which the
 %% `arweave-scheduler@1.0' stamps its assignments with), not milliseconds:
 %% 10^11 is 1973 in milliseconds and the year 5138 in seconds.
@@ -118,6 +145,8 @@
 -define(PAGE, 1000).
 -define(ROWS_PAGE, 128).
 -define(ZONE_KINDS, [<<"s">>, <<"d">>, <<"f">>, <<"o">>, <<"q">>, <<"x">>]).
+%% The size of a chunk of a long row (`lib_process_cache', `?BLOB_CHUNK').
+-define(CHUNK_BYTES, 4000).
 -define(SERVER, hb_store_retention_server).
 -define(STATUS, {?MODULE, status}).
 -define(RUNNING, {?MODULE, running}).
@@ -162,7 +191,12 @@ server(Opts, Swept) ->
     receive
         run ->
             Report = safe_retain(Opts, Swept),
-            erlang:send_after(int(<<"store-retention-interval-ms">>, 600000, Opts), self(), run),
+            Next =
+                case maps:get(backlog, Report, false) of
+                    true -> ?BACKLOG_PAUSE_MS;
+                    false -> int(<<"store-retention-interval-ms">>, 600000, Opts)
+                end,
+            erlang:send_after(Next, self(), run),
             server(Opts, maps:get(swept, Report, Swept));
         {run_now, From, Ref} ->
             Report = safe_retain(Opts, Swept),
@@ -230,7 +264,18 @@ retain(Opts, Swept0) ->
             Max = int(<<"store-retention-max-candidates">>, 1000000, Opts),
             Batch = max(1, int(<<"store-retention-batch-keys">>, 1000, Opts)),
             Pct = min(100, max(1, int(<<"store-retention-max-cpu-pct">>, 25, Opts))),
-            Procs = list(Store, ?NS),
+            {Procs, Unlisted} =
+                case live(Opts) of
+                    all -> {[ P || P <- list(Store, ?NS), ?IS_ID(P) ], []};
+                    {ok, Live} ->
+                        lists:partition(fun(P) -> lists:member(P, Live) end,
+                            [ P || P <- list(Store, ?NS), ?IS_ID(P) ])
+                end,
+            {Deleted0, Slept0} =
+                case hb_util:atom(hb_opts:get(<<"store-retention-delete-unlisted">>, false, Opts)) of
+                    true -> delete_unlisted(Store, DB, Unlisted, Max, Batch, Pct, Opts);
+                    _ -> {0, 0}
+                end,
             {Deleted, Slept, Planned, Unreadable, Swept} =
                 lists:foldl(
                     fun(_P, Acc = {D, _, _, _, _}) when D >= Max -> Acc;
@@ -251,14 +296,16 @@ retain(Opts, Swept0) ->
                             Sw1 = case Done of {ok, F} -> Sw#{ P => F }; halted -> Sw end,
                             {D + D1, Sl + Sl1, Pl + Pl1, U + U1, Sw1}
                     end,
-                    {0, 0, 0, 0, Swept0},
+                    {Deleted0, Slept0, 0, 0, Swept0},
                     Procs
                 ),
             #{
                 status => ok,
                 processes => length(Procs),
+                unlisted => length(Unlisted),
                 planned => Planned,
                 deleted => Deleted,
+                backlog => Deleted >= Max,
                 unreadable_markers => Unreadable,
                 undelivered_outboxes => undelivered(Store, Procs),
                 duration_ms => erlang:monotonic_time(millisecond) - Start,
@@ -268,6 +315,62 @@ retain(Opts, Swept0) ->
             }
     end.
 
+%% @doc The node operator's list of live processes
+%% (`store-retention-live-processes'): `{ok, PIDs}', or `all' when it is not
+%% set, and nothing is judged dead.
+live(Opts) ->
+    case hb_util:list_option(hb_opts:get(<<"store-retention-live-processes">>, [], Opts), Opts) of
+        [] -> all;
+        L -> {ok, [ hb_util:human_id(P) || P <- L, ?IS_ID(P) ]}
+    end.
+
+%% @doc The processes with rows in the process-cache store that are not on
+%% the node's live list, each with its rows, chunks and bytes (chunks at
+%% their size, other rows sampled): what `store-retention-delete-unlisted'
+%% would delete. `{error, no_live_list}' without the list.
+unlisted(Opts) ->
+    case live(Opts) of
+        all -> {error, no_live_list};
+        {ok, Live} ->
+            Store = store(Opts),
+            ok = hb_store:start([Store], #{}, Opts),
+            {ok, maps:from_list(
+                [ {P, size_of(Store, P)}
+                || P <- list(Store, ?NS), ?IS_ID(P), not lists:member(P, Live) ])}
+    end.
+
+size_of(Store, P) ->
+    Kinds = [ {K, split_names(names(Store, P, K))} || K <- ?ZONE_KINDS ],
+    Rows = lists:sum([ length(R) || {_, {R, _}} <- Kinds ]),
+    Chunks = lists:sum([ length(C) || {_, {_, C}} <- Kinds ]),
+    Sample = lists:sublist([ key(P, K, S) || {K, {R, _}} <- Kinds, S <- R ], 64),
+    Sizes = [ byte_size(V) || Key <- Sample, {ok, V} <- [read(Store, Key)] ],
+    Avg = case Sizes of [] -> 0; _ -> lists:sum(Sizes) div length(Sizes) end,
+    #{ rows => Rows, chunks => Chunks, bytes => Chunks * ?CHUNK_BYTES + Rows * Avg }.
+
+%% Every row of each unlisted process, at most `Max' keys a run: the
+%% markers first, then the states, the outboxes and the receipts, each kind
+%% highest slot first. Delivered or not: the process is gone.
+delete_unlisted(Store, DB, Unlisted, Max, Batch, Pct, Opts) ->
+    lists:foldl(
+        fun(_P, Acc = {D, _}) when D >= Max -> Acc;
+           (P, {D, S}) ->
+                Keys = lists:sublist(all_rows(Store, P), Max - D),
+                ok = mark_pruned(Store, P, Keys, Opts),
+                {N, S1} = delete(DB, Keys, Batch, Pct),
+                ?event(store_retention, {deleted_unlisted_process, P, N}),
+                {D + N, S + S1}
+        end,
+        {0, 0},
+        Unlisted).
+
+all_rows(Store, P) ->
+    lists:append(
+        [ [ Key || Name <- lists:reverse(lists:sort(names(Store, P, K))),
+                   Key <- [<<(prefix(P, K))/binary, "/", Name/binary>>],
+                   is_retention_key(Key) ]
+        || K <- ?ZONE_KINDS ]).
+
 %% The run's settings.
 config(Opts) ->
     {ok, Policy} = policy(Opts),
@@ -275,6 +378,8 @@ config(Opts) ->
     KeepSecs = max(0, int(<<"store-retention-keep-seconds">>, ?KEEP_SECONDS, Opts)),
     #{
         keep => max(1, int(<<"store-retention-checkpoints">>, 2, Opts)),
+        keep_slots => max(0, int(<<"store-retention-keep-slots">>, ?KEEP_SLOTS, Opts)),
+        shipped => cold_shipped(Opts),
         recent => max(1, int(<<"store-retention-recent-slots">>, ?RECENT, Opts)),
         keep_seconds => KeepSecs,
         % Never longer than the node's `keep-seconds' unless set.
@@ -356,7 +461,8 @@ plan(Store, P, Keep) -> plan(Store, P, Keep, ?RECENT).
 plan(Store, P, Keep, Recent) ->
     plan(Store, P, #{ <<"store-retention-checkpoints">> => Keep,
                       <<"store-retention-recent-slots">> => Recent,
-                      <<"store-retention-keep-seconds">> => 0 }).
+                      <<"store-retention-keep-seconds">> => 0,
+                      <<"store-retention-keep-slots">> => 0 }).
 
 %% Hand the keys of one process to `Fun(Keys, Acc)' in the order to delete
 %% them, a page at a time, until it answers `{halt, Acc}'. First the `o' and
@@ -372,8 +478,9 @@ walk(Store, P, Cfg0, Fun, Acc0) ->
     Delta = list_page(Store, prefix(P, <<"d">>), none, asc, 1) =/= [],
     Cfg = Cfg0#{ keep_seconds := keep_seconds(P, Delta, Cfg0) },
     Snaps = lists:reverse(slots(Store, P, <<"s">>)),
-    {Floor, Unreadable} = floor(Store, P, Snaps, Cfg),
-    Kept = thin(Store, P, Snaps, Cfg),
+    {AgeFloor, Unreadable} = floor(Store, P, Snaps, Cfg),
+    Floor = below_window(AgeFloor, Snaps, head(Store, P), Cfg),
+    Kept = maps:merge(thin(Store, P, Snaps, Cfg), unshipped(P, Snaps, Cfg)),
     Bottom = maps:get(P, maps:get(swept, Cfg, #{}), 0),
     Rule =
         keep_snapshots(
@@ -396,6 +503,43 @@ walk(Store, P, Cfg0, Fun, Acc0) ->
             end
     end.
 
+%% The floor, no higher than the newest snapshot at least `keep-slots' below
+%% the process's head: every slot of the repair window reads from the rows
+%% above the floor, without replay.
+below_window(none, _Snaps, _Head, _Cfg) -> none;
+below_window({ok, F}, Snaps, Head, #{ keep_slots := KeepSlots }) ->
+    Limit = min(F, Head - KeepSlots),
+    case [ S || S <- Snaps, S =< Limit ] of
+        [S | _] -> {ok, S};
+        [] -> none
+    end.
+
+%% The process's newest computed slot: of its deltas or its full states.
+head(Store, P) ->
+    lists:max([-1 | rows_desc(Store, P, <<"d">>, 1) ++ rows_desc(Store, P, <<"f">>, 1)]).
+
+%% With a cold tier, the snapshots it has not shipped yet stay
+%% (`hb_store_cold' ships each in turn and marks the newest it shipped).
+unshipped(_P, _Snaps, #{ shipped := off }) -> #{};
+unshipped(P, Snaps, #{ shipped := Shipped }) ->
+    Mark = Shipped(P),
+    maps:from_list([ {S, true} || S <- Snaps, S > Mark ]).
+
+%% How far the cold tier has shipped each process, or `off'.
+cold_shipped(Opts) ->
+    case hb_store_cold:config(Opts) of
+        undefined -> off;
+        _ ->
+            Store = store(Opts),
+            fun(P) ->
+                Key = <<"~cold@1.0/checkpoint/", P/binary>>,
+                case hb_store:read([Store], #{ <<"read">> => Key, <<"exact">> => true }, Opts) of
+                    {ok, V} -> try binary_to_integer(V) catch _:_ -> -1 end;
+                    _ -> -1
+                end
+            end
+    end.
+
 %% The snapshot checkpoints `thin/4' keeps stay, at any age: their markers
 %% and their states. Below `Bottom' (the floor of the last finished walk)
 %% nothing else is left, so the walk ends there.
@@ -411,6 +555,9 @@ keep_snapshots(Rule = #{ keep := Keep }, Snap, Bottom) ->
 %% The snapshot checkpoints to keep below the floor, as a map of slots: the
 %% `Keep' newest, the oldest of each of the newest buckets of every tier,
 %% and any whose time cannot be read (fail closed). The rest go.
+thin(_Store, _P, Snaps, #{ keep := Keep, tiers := [] }) ->
+    % No tiers: the newest alone, and no time to read.
+    maps:from_list([ {S, true} || S <- lists:sublist(Snaps, Keep) ]);
 thin(Store, P, Snaps, #{ keep := Keep, tiers := Tiers, now := Now, opts := Opts }) ->
     {Newest, Older} = lists:split(min(Keep, length(Snaps)), Snaps),
     Timed = [ {S, snapshot_time(Store, P, S, Opts)} || S <- Older ],
@@ -856,6 +1003,140 @@ int(Key, Default, Opts) -> hb_util:int(hb_opts:get(Key, Default, Opts)).
 
 %%% Tests
 
+%% @doc By default a process keeps its newest snapshots and every slot from
+%% the newest snapshot at least `keep-slots' below its head; every older
+%% snapshot, delta and receipt goes, whatever its age, and nothing has to
+%% be dated to go.
+keep_slots_window_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb, <<"ret-window">>),
+    ok = hb_store:start([Store], #{}, #{}),
+    P = new_pid(),
+    Snaps = lists:seq(0, 5000, 100),
+    ok = hb_store:write([Store], maps:from_list(
+        [ {key(P, <<"f">>, S), <<"full">>} || S <- Snaps ] ++
+        [ {key(P, <<"s">>, S), <<>>} || S <- Snaps ] ++
+        [ {key(P, <<"d">>, S), <<"delta">>} || S <- lists:seq(1, 5050), S rem 100 =/= 0 ] ++
+        [ {key(P, <<"x">>, S), <<"r">>} || S <- [5, 2995, 3005] ]), #{}),
+    Opts = #{ <<"store">> => [Store] },
+    #{ deleted := Deleted, backlog := false } = retain(Opts),
+    ?assertEqual([ S || S <- Snaps, S >= 3000 ], slots(Store, P, <<"s">>)),
+    ?assertEqual([ S || S <- Snaps, S >= 3000 ], slots(Store, P, <<"f">>)),
+    ?assertEqual([ S || S <- lists:seq(3001, 5050), S rem 100 =/= 0 ], slots(Store, P, <<"d">>)),
+    ?assertEqual([3005], slots(Store, P, <<"x">>)),
+    ?assertEqual((30 * 2) + (2999 - 29) + 2, Deleted),
+    % A second run finds nothing; a window of 0 keeps the newest two.
+    ?assertMatch(#{ deleted := 0 }, retain(Opts)),
+    retain(Opts#{ <<"store-retention-keep-slots">> => 0 }),
+    ?assertEqual([4900, 5000], slots(Store, P, <<"s">>)),
+    ?assertEqual(4901, hd(slots(Store, P, <<"d">>))).
+
+%% @doc A process off the live list is reported, and deleted whole only
+%% when the node says so; without a live list nothing is judged dead.
+unlisted_process_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb, <<"ret-unlisted">>),
+    ok = hb_store:start([Store], #{}, #{}),
+    Live = new_pid(),
+    Dead = new_pid(),
+    Big = binary:copy(<<"z">>, 9000),
+    Rows = fun(P) ->
+        [ {key(P, <<"f">>, 0), <<"pstate-chunks:2">>},
+          {<<(key(P, <<"f">>, 0))/binary, ".1">>, binary:part(Big, 0, 4000)},
+          {<<(key(P, <<"f">>, 0))/binary, ".2">>, binary:part(Big, 4000, 4000)},
+          {key(P, <<"s">>, 0), <<>>},
+          {key(P, <<"o">>, 3), <<"undelivered">>} ] ++
+        [ {key(P, <<"d">>, S), <<"delta">>} || S <- lists:seq(1, 5) ]
+    end,
+    ok = hb_store:write([Store], maps:from_list(Rows(Live) ++ Rows(Dead)), #{}),
+    Base = #{ <<"store">> => [Store] },
+    ?assertEqual({error, no_live_list}, unlisted(Base)),
+    #{ unlisted := 0 } = retain(Base#{ <<"store-retention-delete-unlisted">> => true }),
+    Listed = Base#{ <<"store-retention-live-processes">> => [Live] },
+    {ok, #{ Dead := #{ rows := 8, chunks := 2, bytes := Bytes } } = Report} = unlisted(Listed),
+    ?assertEqual([Dead], maps:keys(Report)),
+    ?assert(Bytes >= 8000),
+    % Reported, not deleted, until the node says so.
+    #{ unlisted := 1 } = retain(Listed),
+    ?assertEqual([0], slots(Store, Dead, <<"s">>)),
+    #{ deleted := 10 } = retain(Listed#{ <<"store-retention-delete-unlisted">> => true }),
+    [ ?assertEqual([], names(Store, Dead, K)) || K <- ?ZONE_KINDS ],
+    [ ?assertEqual({ok, V}, read(Store, K)) || {K, V} <- Rows(Live) ].
+
+%% @doc A run that stops at its candidate limit says so, and the next one
+%% carries on from where it stopped.
+backlog_runs_again_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb, <<"ret-backlog">>),
+    ok = hb_store:start([Store], #{}, #{}),
+    P = new_pid(),
+    Head = age_layout(Store, P, lists:duplicate(6, 0)),
+    Opts = #{ <<"store">> => [Store], <<"store-retention-keep-slots">> => 0,
+              <<"store-retention-max-candidates">> => 10 },
+    ?assertMatch(#{ deleted := 10, backlog := true }, retain(Opts)),
+    ?assertMatch(#{ backlog := true }, retain(Opts)),
+    ?assertMatch(#{ backlog := false }, retain(Opts#{ <<"store-retention-max-candidates">> => 1000 })),
+    ?assertEqual(40, floor_of(Store, P, Head)).
+
+%% @doc With a cold tier, a snapshot it has not shipped stays, below the
+%% floor or not; once shipped, the next run takes it.
+unshipped_snapshot_stays_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb, <<"ret-cold">>),
+    ok = hb_store:start([Store], #{}, #{}),
+    P = new_pid(),
+    Head = age_layout(Store, P, lists:duplicate(6, 0)),
+    Mark = <<"~cold@1.0/checkpoint/", P/binary>>,
+    ok = hb_store:write([Store], #{ Mark => <<"10">> }, #{}),
+    Opts = #{ <<"store">> => [Store], <<"store-retention-keep-slots">> => 0,
+              <<"cold-tier">> => #{ <<"path">> => <<"/nonexistent-cold-share">> } },
+    retain(Opts),
+    ?assertEqual([20, 30, 40, 50], slots(Store, P, <<"s">>)),
+    ?assertEqual(40, floor_of(Store, P, Head)),
+    ok = hb_store:write([Store], #{ Mark => <<"50">> }, #{}),
+    retain(Opts),
+    ?assertEqual([40, 50], slots(Store, P, <<"s">>)).
+
+%% @doc Under the default policy too, whatever prefix of a run's deletions
+%% lands, every remaining delta chains down to a full state and every `s'
+%% marker names a state that exists.
+window_crash_prefix_leaves_a_chain_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb, <<"ret-wprefix">>),
+    ok = hb_store:start([Store], #{}, #{}),
+    P = new_pid(),
+    Head = age_layout(Store, P, lists:duplicate(6, 0)),
+    Rows = [ {K, S} || K <- [<<"s">>, <<"d">>, <<"f">>], S <- slots(Store, P, K) ],
+    Keys = plan(Store, P, #{ <<"store-retention-keep-slots">> => 20 }),
+    Doomed = [ {K, binary_to_integer(S)} || Key <- Keys,
+               [_, _, K, S] <- [binary:split(Key, <<"/">>, [global])] ],
+    Chains =
+        fun(Left) ->
+            Has = fun(K, S) -> lists:member({K, S}, Left) end,
+            Reaches = fun Reaches(S) -> Has(<<"f">>, S) orelse (Has(<<"d">>, S) andalso Reaches(S - 1)) end,
+            lists:all(fun({<<"d">>, S}) -> Reaches(S - 1);
+                         ({<<"s">>, S}) -> Has(<<"f">>, S);
+                         (_) -> true
+                      end, Left)
+        end,
+    lists:foreach(
+        fun(N) -> ?assert(Chains(Rows -- lists:sublist(Doomed, N))) end,
+        lists:seq(0, length(Doomed))),
+    % The floor is the newest snapshot 20 slots below the head (55): 30.
+    ?assertEqual(31, lists:min([ S || {<<"d">>, S} <- Rows -- Doomed ])),
+    ?assertEqual(55, Head).
+%% The age-and-tier policy these tests were written for (the defaults
+%% before `store-retention-keep-slots'): a day of every slot, snapshots
+%% thinned hourly, daily and weekly, no slot window. A test's own options
+%% win.
+legacy(Opts) ->
+    maps:merge(#{ <<"store-retention-keep-seconds">> => 86400,
+                  <<"store-retention-checkpoint-tiers">> => [[3600, 24], [86400, 7], [604800, 52]],
+                  <<"store-retention-keep-slots">> => 0 }, Opts).
+retain_legacy(Opts) -> retain(legacy(Opts)).
+retain_legacy(Opts, Swept) -> retain(legacy(Opts), Swept).
+plan_legacy(Store, P, Keep) -> plan_legacy(Store, P, Keep, ?RECENT).
+plan_legacy(Store, P, Keep, Recent) ->
+    plan(Store, P, legacy(#{ <<"store-retention-checkpoints">> => Keep,
+                             <<"store-retention-recent-slots">> => Recent,
+                             <<"store-retention-keep-seconds">> => 0 })).
+
+
 delete_primitive_present_test() ->
     ?assert(delete_supported()).
 
@@ -889,7 +1170,7 @@ retain_deletes_only_below_floor_test() ->
     Opts = #{ <<"store">> => [Main], <<"irreplaceable-store">> => Irr,
               <<"store-retention-batch-keys">> => 3,
               <<"store-retention-keep-seconds">> => 0 },
-    #{ deleted := Deleted } = retain(Opts),
+    #{ deleted := Deleted } = retain_legacy(Opts),
     Gone = [ K || K <- maps:keys(Rows), hb_store:read([Main], K, #{}) =/= {ok, maps:get(K, Rows)} ],
     % The snapshot checkpoints below the floor (0, 10) stay.
     Expected = lists:sort([ key(P, <<"d">>, S) || S <- lists:seq(1, 19), S rem 10 =/= 0 ]),
@@ -902,7 +1183,7 @@ retain_deletes_only_below_floor_test() ->
     ?assertMatch({ok, _}, hb_store:read([Main], pruned_key(P), #{})),
     ?assertMatch({error, _}, hb_store:read([Main], pruned_key(Q), #{})),
     % A second run finds nothing more.
-    ?assertMatch(#{ deleted := 0 }, retain(Opts)).
+    ?assertMatch(#{ deleted := 0 }, retain_legacy(Opts)).
 
 %% @doc Deletion runs top-down: the highest doomed slot first. The snapshot
 %% checkpoints below the floor stay.
@@ -915,7 +1196,7 @@ plan_order_test() ->
         [ {key(P, <<"d">>, S), <<"x">>} || S <- [1, 2, 3, 5] ]), #{}),
     ?assertEqual(
         [ key(P, <<"d">>, 5), key(P, <<"d">>, 3), key(P, <<"d">>, 2), key(P, <<"d">>, 1) ],
-        plan(Main, P, 1)).
+        plan_legacy(Main, P, 1)).
 
 never_a_foreign_key_test() ->
     P = hb_util:human_id(crypto:strong_rand_bytes(32)),
@@ -936,12 +1217,12 @@ plan_full_state_test() ->
     ?assertEqual(
         [ key(P, <<"f">>, 9), key(P, <<"f">>, 8), key(P, <<"f">>, 7), key(P, <<"f">>, 6),
           key(P, <<"f">>, 4), key(P, <<"f">>, 3), key(P, <<"f">>, 2), key(P, <<"f">>, 1) ],
-        plan(Main, P, 2, 3)),
+        plan_legacy(Main, P, 2, 3)),
     % Without any snapshot checkpoint, only the newest states stay.
     Q = hb_util:human_id(crypto:strong_rand_bytes(32)),
     ok = hb_store:write([Main], maps:from_list(
         [ {key(Q, <<"f">>, S), <<"x">>} || S <- lists:seq(0, 4) ]), #{}),
-    ?assertEqual([ key(Q, <<"f">>, 1), key(Q, <<"f">>, 0) ], plan(Main, Q, 2, 3)).
+    ?assertEqual([ key(Q, <<"f">>, 1), key(Q, <<"f">>, 0) ], plan_legacy(Main, Q, 2, 3)).
 
 %% @doc A chunked row's chunks go right after it; chunks left without their
 %% row go too, unless they belong to the newest slot (a row being written).
@@ -956,8 +1237,8 @@ plan_chunks_test() ->
     ?assertEqual(
         [ key(P, <<"f">>, 2), C(2, 1), C(2, 2), key(P, <<"f">>, 1), C(1, 1), C(1, 2),
           C(0, 1), C(0, 2) ],
-        plan(Main, P, 2, 1)),
-    ?assert(lists:all(fun is_retention_key/1, plan(Main, P, 2, 1))),
+        plan_legacy(Main, P, 2, 1)),
+    ?assert(lists:all(fun is_retention_key/1, plan_legacy(Main, P, 2, 1))),
     ?assertNot(is_retention_key(<<(key(P, <<"f">>, 1))/binary, ".x">>)).
 
 %% @doc A slot's delivery rows: `o' (its outbox) and `q' (its signed
@@ -975,7 +1256,7 @@ outbox_rows_wait_for_delivery_test() ->
         [ {key(P, <<"o">>, S), <<"x">>} || S <- [3, 5, 12, 22] ] ++
         [ {key(P, <<"q">>, S), <<"x">>} || S <- [3, 22] ] ++
         [ {key(P, <<"x">>, S), <<"r">>} || S <- [5, 7, 22] ]), #{}),
-    Planned = plan(Main, P, 2),
+    Planned = plan_legacy(Main, P, 2),
     Has = fun(K, S) -> lists:member(key(P, K, S), Planned) end,
     % Delivered: `o' and `q' go, at any slot.
     ?assert(Has(<<"o">>, 5)),
@@ -996,7 +1277,7 @@ outbox_rows_wait_for_delivery_test() ->
         [ K || K <- Planned, lists:member(K,
             [key(P, <<"d">>, 5), key(P, <<"o">>, 5), key(P, <<"x">>, 5)]) ]),
     #{ undelivered_outboxes := Undelivered } =
-        retain(#{ <<"store">> => [Main], <<"store-retention-keep-seconds">> => 0 }),
+        retain_legacy(#{ <<"store">> => [Main], <<"store-retention-keep-seconds">> => 0 }),
     ?assertEqual(#{ P => 2 }, maps:with([P], Undelivered)),
     ?assertEqual({ok, <<"x">>}, hb_store:read([Main], key(P, <<"o">>, 3), #{})),
     ?assertEqual({ok, <<"x">>}, hb_store:read([Main], key(P, <<"q">>, 3), #{})),
@@ -1005,7 +1286,7 @@ outbox_rows_wait_for_delivery_test() ->
     ?assertNotEqual({ok, <<"x">>}, hb_store:read([Main], key(P, <<"o">>, 22), #{})),
     % Once delivered, the outbox goes at the next run.
     ok = hb_store:write([Main], #{ key(P, <<"x">>, 3) => <<"r">> }, #{}),
-    retain(#{ <<"store">> => [Main], <<"store-retention-keep-seconds">> => 0 }),
+    retain_legacy(#{ <<"store">> => [Main], <<"store-retention-keep-seconds">> => 0 }),
     ?assertNotEqual({ok, <<"x">>}, hb_store:read([Main], key(P, <<"o">>, 3), #{})),
     ?assertNotEqual({ok, <<"x">>}, hb_store:read([Main], key(P, <<"q">>, 3), #{})),
     ?assertEqual({ok, <<"x">>}, hb_store:read([Main], key(P, <<"o">>, 12), #{})),
@@ -1015,7 +1296,7 @@ outbox_rows_wait_for_delivery_test() ->
         [ {key(Q, <<"f">>, S), <<"x">>} || S <- lists:seq(0, 6) ] ++
         [ {key(Q, <<"o">>, S), <<"x">>} || S <- [1, 2, 6] ] ++
         [ {key(Q, <<"x">>, S), <<"r">>} || S <- [1, 6] ]), #{}),
-    QPlanned = plan(Main, Q, 2, 2),
+    QPlanned = plan_legacy(Main, Q, 2, 2),
     ?assert(lists:member(key(Q, <<"o">>, 1), QPlanned)),
     ?assert(lists:member(key(Q, <<"o">>, 6), QPlanned)),
     ?assert(lists:member(key(Q, <<"x">>, 1), QPlanned)),
@@ -1073,7 +1354,7 @@ floor_after(Ages, Opts) ->
     ok = hb_store:start([Store], #{}, #{}),
     P = new_pid(),
     Head = age_layout(Store, P, Ages),
-    retain(Opts#{ <<"store">> => [Store] }),
+    retain_legacy(Opts#{ <<"store">> => [Store] }),
     floor_of(Store, P, Head).
 
 %% @doc The floor is the newest checkpoint at least `keep-seconds' old: every
@@ -1114,8 +1395,8 @@ thin_test() ->
     Kept = thin(Store, P, Snaps, #{ keep => 2, tiers => [[3600, 24], [86400, 7]],
                                     now => Now, opts => #{ <<"store">> => [Store] } }),
     ?assertEqual([10, 25, 30, 50, 60, 70], lists:sort(maps:keys(Kept))),
-    % No tiers: the newest two, and what cannot be dated.
-    ?assertEqual([25, 60, 70], lists:sort(maps:keys(thin(Store, P, Snaps,
+    % No tiers: the newest two, and nothing needs a date.
+    ?assertEqual([60, 70], lists:sort(maps:keys(thin(Store, P, Snaps,
         #{ keep => 2, tiers => [], now => Now, opts => #{ <<"store">> => [Store] } })))).
 
 %% @doc A run deletes the snapshots the tiers no longer keep, also below the
@@ -1132,16 +1413,16 @@ thinned_below_swept_floor_test() ->
     Opts = #{ <<"store">> => [Store], <<"store-retention-keep-seconds">> => 0,
               <<"store-retention-checkpoint-tiers">> => [[3600, 24]] },
     ?assertMatch(#{ status := invalid_checkpoint_tiers, deleted := 0 },
-        retain(Opts#{ <<"store-retention-checkpoint-tiers">> => [[0, 1]] })),
+        retain_legacy(Opts#{ <<"store-retention-checkpoint-tiers">> => [[0, 1]] })),
     ?assertEqual(lists:seq(0, 50, 10), slots(Store, P, <<"s">>)),
     % The walk stops at 40, yet the snapshots below it that one hourly
     % bucket does not keep go: all made in the same instant, the oldest of
     % them (0) stays, with the newest two.
-    #{ swept := Swept } = retain(Opts, #{ P => 40 }),
+    #{ swept := Swept } = retain_legacy(Opts, #{ P => 40 }),
     ?assertEqual([0, 40, 50], slots(Store, P, <<"s">>)),
     ?assertEqual([0, 40, 50], slots(Store, P, <<"f">>)),
     ?assertEqual(40, floor_of(Store, P, Head)),
-    ?assertMatch(#{ deleted := 0 }, retain(Opts, Swept)).
+    ?assertMatch(#{ deleted := 0 }, retain_legacy(Opts, Swept)).
 
 %% @doc The newest `store-retention-checkpoints' checkpoints stay whatever
 %% their age: the floor is never above the `Keep'-th newest.
@@ -1162,8 +1443,8 @@ zero_keep_seconds_is_the_checkpoint_floor_test() ->
     ok = hb_store:start([Store], #{}, #{}),
     P = new_pid(),
     _ = age_layout(Store, P, lists:duplicate(6, legacy)),
-    ?assertEqual(plan(Store, P, 2), plan(Store, P, Zero)),
-    ?assertMatch(#{ unreadable_markers := 0 }, retain(Zero#{ <<"store">> => [Store] })).
+    ?assertEqual(plan_legacy(Store, P, 2), plan(Store, P, legacy(Zero))),
+    ?assertMatch(#{ unreadable_markers := 0 }, retain_legacy(Zero#{ <<"store">> => [Store] })).
 
 %% @doc `store-retention-policy' sets `keep-seconds' per process, from the
 %% node's options; every other process keeps the node's.
@@ -1173,7 +1454,7 @@ per_process_policy_test() ->
     Ages = [ H * ?HOUR || H <- [6, 5, 4, 3, 2, 1] ],
     [P, Short, Long] = Procs = [ new_pid() || _ <- [1, 2, 3] ],
     Head = lists:last([ age_layout(Store, Q, Ages) || Q <- Procs ]),
-    retain(#{
+    retain_legacy(#{
         <<"store">> => [Store],
         <<"store-retention-keep-seconds">> => 3 * ?HOUR + 1800,
         <<"store-retention-policy">> => [
@@ -1214,12 +1495,12 @@ policy_from_json_config_test() ->
     AsMap = Load("map.json", #{ Long => #{ <<"keep-seconds">> => 86400 } }),
     ?assertMatch({error, _}, policy(AsMap)),
     ?assertMatch(#{ status := invalid_policy, deleted := 0 },
-                 retain(AsMap#{ <<"store">> => [Store] })),
+                 retain_legacy(AsMap#{ <<"store">> => [Store] })),
     ?assertEqual(0, floor_of(Store, Long, Head)),
     ?assertEqual(0, floor_of(Store, Other, Head)),
     AsList = Load("list.json", [ #{ <<"process">> => Long, <<"keep-seconds">> => 86400 } ]),
     ?assertEqual({ok, #{ Long => 86400 }}, policy(AsList)),
-    retain(AsList#{ <<"store">> => [Store] }),
+    retain_legacy(AsList#{ <<"store">> => [Store] }),
     ?assertEqual(0, floor_of(Store, Long, Head)),
     ?assertEqual(20, floor_of(Store, Other, Head)),
     % Entries that cannot be read are refused, not skipped.
@@ -1243,7 +1524,7 @@ fail_closed_on_unreadable_time_test() ->
     % Empty markers, and no assignment to read instead.
     Head = age_layout(Store, P, lists:duplicate(6, legacy)),
     #{ deleted := 0, unreadable_markers := Unreadable } =
-        retain(#{ <<"store">> => [Store], <<"store-retention-keep-seconds">> => 60 }),
+        retain_legacy(#{ <<"store">> => [Store], <<"store-retention-keep-seconds">> => 60 }),
     ?assert(Unreadable > 0),
     ?assertEqual(0, floor_of(Store, P, Head)),
     % Slot 30's time is unknown; without it the floor would be 30.
@@ -1276,7 +1557,7 @@ legacy_marker_reads_assignment_test() ->
                 Opts)
         end,
         lists:zip([0, 10, 20], lists:sublist(Ages, 3))),
-    retain(Opts#{ <<"store-retention-keep-seconds">> => 3 * ?HOUR + 1800 }),
+    retain_legacy(Opts#{ <<"store-retention-keep-seconds">> => 3 * ?HOUR + 1800 }),
     ?assertEqual(20, floor_of(Store, P, Head)).
 
 %% @doc An Arweave-scheduled process's assignments carry their block's
@@ -1324,9 +1605,9 @@ timestamp_in_seconds_test() ->
                 SOpts)
         end,
         lists:zip(lists:seq(0, 50, 10), [ H * ?HOUR || H <- [6, 5, 4, 3, 2, 1] ])),
-    ?assertMatch(#{ deleted := 0, unreadable_markers := 0 }, retain(SOpts)),
+    ?assertMatch(#{ deleted := 0, unreadable_markers := 0 }, retain_legacy(SOpts)),
     ?assertEqual(0, floor_of(Store, P, Head)),
-    retain(SOpts#{ <<"store-retention-keep-seconds">> => 3 * ?HOUR + 1800 }),
+    retain_legacy(SOpts#{ <<"store-retention-keep-seconds">> => 3 * ?HOUR + 1800 }),
     ?assertEqual(20, floor_of(Store, P, Head)).
 
 %% @doc Whatever prefix of a run's deletions lands (a `kill -9' at any
@@ -1338,7 +1619,7 @@ every_crash_prefix_leaves_a_chain_test() ->
     P = new_pid(),
     Head = age_layout(Store, P, [ H * ?HOUR || H <- [6, 5, 4, 3, 2, 1] ]),
     Rows = [ {K, S} || K <- [<<"s">>, <<"d">>, <<"f">>], S <- slots(Store, P, K) ],
-    Keys = plan(Store, P, #{ <<"store-retention-keep-seconds">> => 3 * ?HOUR + 1800 }),
+    Keys = plan(Store, P, legacy(#{ <<"store-retention-keep-seconds">> => 3 * ?HOUR + 1800 })),
     ?assertEqual(length(Keys), length(lists:usort(Keys))),
     Doomed = [ {K, binary_to_integer(S)} || Key <- Keys,
                [_, _, K, S] <- [binary:split(Key, <<"/">>, [global])] ],
@@ -1369,20 +1650,20 @@ swept_floor_bounds_the_walk_test() ->
     Head = age_layout(Store, P, lists:duplicate(6, 0)),
     ok = hb_store:write([Store], #{ key(P, <<"o">>, 3) => <<"x">> }, #{}),
     Opts = #{ <<"store">> => [Store], <<"store-retention-keep-seconds">> => 0 },
-    #{ swept := Swept } = retain(Opts),
+    #{ swept := Swept } = retain_legacy(Opts),
     ?assertEqual(#{ P => 40 }, Swept),
     ?assertEqual(40, floor_of(Store, P, Head)),
     % Below the swept floor the walk lists nothing, so a row planted there
     % (which no real slot below a floor ever gets) is left alone...
     ok = hb_store:write([Store], #{ key(P, <<"d">>, 25) => <<"delta">> }, #{}),
-    ?assertMatch(#{ deleted := 0 }, retain(Opts, Swept)),
+    ?assertMatch(#{ deleted := 0 }, retain_legacy(Opts, Swept)),
     ?assertEqual({ok, <<"delta">>}, hb_store:read([Store], key(P, <<"d">>, 25), #{})),
     % ...but a late delivery below it is not.
     ok = hb_store:write([Store], #{ key(P, <<"x">>, 3) => <<"r">> }, #{}),
-    ?assertMatch(#{ deleted := 1 }, retain(Opts, Swept)),
+    ?assertMatch(#{ deleted := 1 }, retain_legacy(Opts, Swept)),
     ?assertMatch({error, not_found}, hb_store:read([Store], key(P, <<"o">>, 3), #{})),
     % A server that remembers nothing walks the whole process again: the
     % planted delta goes, and so does the late receipt below the floor.
-    ?assertMatch(#{ deleted := 2 }, retain(Opts)),
+    ?assertMatch(#{ deleted := 2 }, retain_legacy(Opts)),
     ?assertEqual(40, floor_of(Store, P, Head)).
 
