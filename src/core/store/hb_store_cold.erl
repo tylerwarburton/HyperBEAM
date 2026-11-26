@@ -89,6 +89,7 @@ config(Opts) ->
                 keep_local_ms => Int(<<"keep-local-seconds">>, 604800) * 1000,
                 bounded_copy => hb_util:atom(maps:get(<<"bounded-copy">>, C, false)) =:= true,
                 checkpoint_priority => checkpoint_priority(maps:get(<<"checkpoint-priority">>, C, [])),
+                recovery_anchor => recovery_anchor(maps:get(<<"recovery-anchor">>, C, undefined)),
                 prune_local_slots =>
                     hb_util:atom(maps:get(<<"prune-local-slots">>, C, true)) =:= true,
                 thinning => thinning(maps:get(<<"checkpoint-thinning">>, C, [[30, 5], [365, 25]])),
@@ -125,6 +126,15 @@ checkpoint_priority(Pids) when is_list(Pids), length(Pids) =< 5 ->
         false -> invalid
     end;
 checkpoint_priority(_) -> invalid.
+
+%% A nominated checkpoint is supplemental recovery material. It never moves
+%% the sequential checkpoint watermark or says that signed history is covered.
+recovery_anchor(undefined) -> none;
+recovery_anchor(#{ <<"process">> := Pid, <<"slot">> := Slot } = Spec)
+        when is_binary(Pid), byte_size(Pid) =:= 43, ?IS_ID(Pid),
+             is_integer(Slot), Slot >= 0, Slot < 1000000000000, map_size(Spec) =:= 2 ->
+    {Pid, Slot};
+recovery_anchor(_) -> invalid.
 
 peers(L) when is_list(L) -> [ P || P <- L, is_map(P), is_map_key(<<"path">>, P) ];
 peers(M) when is_map(M) -> peers(hb_util:message_to_ordered_list(M));
@@ -201,12 +211,17 @@ tick(Opts) ->
 %% Reserve checkpoint attempts before a potentially slow successful slot
 %% traversal. The copy-only cursor and counts are scheduling state, not a
 %% claim that the whole archive backlog was examined or published.
+archive_phases(#{ recovery_anchor := invalid }, _Opts) ->
+    {{error, invalid_recovery_anchor}, ok};
+archive_phases(#{ recovery_anchor := {_, _}, bounded_copy := false }, _Opts) ->
+    {{error, recovery_anchor_requires_bounded_copy}, ok};
 archive_phases(#{ bounded_copy := true, checkpoint_priority := invalid }, _Opts) ->
     {{error, invalid_checkpoint_priority}, ok};
 archive_phases(#{ bounded_copy := true, prune_local_slots := false } = Cfg, Opts) ->
     Priority = maps:get(checkpoint_priority, Cfg),
     Reclaim = hb_util:atom(hb_opts:get(<<"store-retention">>, false, Opts)) =:= true,
-    case Priority =/= [] andalso Reclaim of
+    Focused = Priority =/= [] orelse maps:get(recovery_anchor, Cfg, none) =/= none,
+    case Focused andalso Reclaim of
         true -> {{error, focused_copy_requires_hot_hold}, ok};
         false -> bounded_archive_phases(Cfg, Opts)
     end;
@@ -219,9 +234,15 @@ archive_phases(Cfg, Opts) ->
 bounded_archive_phases(Cfg, Opts) ->
     Main = hb_store_retention:store(Opts),
     Store = irr(Opts),
+    {Budget, AnchoredPid} = case ship_recovery_anchor(Cfg, Main) of
+        none -> {2, none};
+        {attempted, Pid} -> {1, Pid}
+    end,
     Checkpoints = run_phase(checkpoints, fun() ->
-        copy_round(checkpoints, list_names(Main, <<"pstate">>), maps:get(checkpoint_priority, Cfg), {2, 1},
-            fun(P, Limit) ->
+        copy_round(checkpoints, list_names(Main, <<"pstate">>), maps:get(checkpoint_priority, Cfg), {Budget, 1},
+            fun
+              (P, _Limit) when P =:= AnchoredPid -> [];
+              (P, Limit) ->
                 Mark = read_int(Main, mark_key(<<"checkpoint">>, P), -1),
                 lists:sublist([ S || S <- pstate_slots(Main, P, <<"s">>), S > Mark ], Limit)
             end,
@@ -730,6 +751,28 @@ gateway(Method, Gateway, Path, Body) ->
 
 %%% Checkpoints
 
+%% At most one nominated attempt can consume the ordinary checkpoint
+%% budget. Keep its result and on-disk records independent of coverage.
+ship_recovery_anchor(#{ recovery_anchor := none }, _Main) -> none;
+ship_recovery_anchor(#{ recovery_anchor := {P, S}, path := Root } = Cfg, Main) ->
+    Key = <<(mark_key(<<"recovery-anchor">>, P))/binary, "/", (list_to_binary(pad(S)))/binary>>,
+    Published = crypto:hash(sha256, hb_util:bin(Root)),
+    case hb_store:read([Main], #{ <<"read">> => Key, <<"exact">> => true }, #{}) of
+        {ok, Published} -> none;
+        _ ->
+            _ = run_phase(recovery_anchor, fun() ->
+                Rows = snapshot_rows(Main, P, S),
+                Bytes = put_file(Cfg, recovery_file(Root, P, S), #{ process => P, slot => S, rows => Rows }),
+                ok = hb_store:write([Main], #{ Key => Published }, #{}),
+                ok = hb_store:flush([Main], #{}),
+                status_update(fun(St) -> St#{ recovery_anchor => #{slot => S, bytes => Bytes} } end)
+            end),
+            {attempted, P}
+    end.
+
+recovery_file(Root, P, S) ->
+    filename:join([Root, "recovery-anchors", hb_util:list(P), pad(S) ++ ".hbc"]).
+
 %% Ship, per process, the oldest snapshot checkpoint of each UTC day that is
 %% not shipped yet: the daily and weekly ones retention keeps.
 ship_checkpoints(Cfg, Opts) ->
@@ -916,13 +959,21 @@ restore_checkpoint(P0, Target, Opts) ->
                 Floor = lists:max([-1 | Local]),
                 Dirs = [ maps:get(path, Cfg) | [ maps:get(path, Peer) || Peer <- maps:get(peers, Cfg),
                                                                          maps:get(trusted, Peer) ] ],
-                Candidates =
-                    lists:reverse(lists:sort(
-                        [ {S, filename:join([Dir, "checkpoints", hb_util:list(P), F])}
-                        || Dir <- Dirs,
-                           F <- list_dir(Cfg, filename:join([Dir, "checkpoints", hb_util:list(P)])),
-                           {S, _, _} <- [checkpoint_name(F)],
-                           S > Floor, S =< Target ])),
+                Anchors = case Cfg of
+                    #{ recovery_anchor := {P, A}, bounded_copy := true, prune_local_slots := false,
+                       path := Root } when A > Floor, A =< Target ->
+                        case hb_util:atom(hb_opts:get(<<"store-retention">>, false, Opts)) of
+                            true -> [];
+                            _ -> [{A, recovery_file(Root, P, A)}]
+                        end;
+                    _ -> []
+                end,
+                Normal = [ {S, filename:join([Dir, "checkpoints", hb_util:list(P), F])}
+                    || Dir <- Dirs,
+                       F <- list_dir(Cfg, filename:join([Dir, "checkpoints", hb_util:list(P)])),
+                       {S, _, _} <- [checkpoint_name(F)],
+                       S > Floor, S =< Target ],
+                Candidates = lists:reverse(lists:sort(Anchors ++ Normal)),
                 restore_first(Cfg, Main, P, Candidates)
             catch _:_ -> not_found
             end
