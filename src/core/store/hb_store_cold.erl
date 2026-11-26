@@ -236,21 +236,62 @@ bounded_archive_phases(Cfg, Opts) ->
 
 copy_round(Name, Pids, Priority, {Total, PerPid}, Prepare, Publish) ->
     Progress = maps:get(copy_progress, status(), #{}),
-    Last = maps:get(last, maps:get(Name, Progress, #{}), none),
+    Previous = maps:get(Name, Progress, #{}),
+    Last = maps:get(last, Previous, none),
     Sorted = lists:usort([P || P <- Pids, ?IS_ID(P)]),
     First = [ P || P <- Priority, lists:member(P, Sorted) ],
-    Ordered = First ++ (Sorted -- First),
-    Next = case lists:splitwith(fun(P) -> P =/= Last end, Ordered) of
-        {Before, [Last | After]} -> After ++ Before ++ [Last];
-        _ -> Ordered
+    Ordinary = Sorted -- First,
+    Result = case {First, maps:find(lanes, Previous)} of
+        {[_ | _], {ok, Lanes}} ->
+            reserve_checkpoint(First, Ordinary, Lanes, {Total, PerPid}, Prepare, Publish);
+        _ ->
+            Initial = copy_group(First ++ Ordinary, Last, 16, Total, PerPid, Prepare, Publish),
+            begin_reservation(First, Initial)
     end,
-    Result = copy_visit(lists:sublist(Next, 16), Total, PerPid, Prepare, Publish,
-        #{ attempts => 0, completed => 0, examined => 0, failures => [], last => Last }),
     status_update(fun(S) -> S#{ copy_progress => Progress#{ Name => Result } } end),
     case maps:get(failures, Result) of
         [] -> ok;
         [{_, Reason} | _] -> throw({cold_io, Reason})
     end.
+
+%% Keep the first focused pass unchanged. Once it has visited the last
+%% priority process, reserve one recurring attempt and share the rest with
+%% the ordinary rotation. Separate cursors prevent a recovering priority
+%% process from sending the ordinary queue back to its beginning.
+begin_reservation([], Result) -> Result;
+begin_reservation(Priority, #{ last := Last } = Result) ->
+    End = lists:last(Priority),
+    case Last =:= End orelse (Last =/= none andalso not lists:member(Last, Priority)) of
+        true ->
+            Ordinary = case Last =:= End of true -> none; false -> Last end,
+            Result#{ lanes => #{ priority => End, ordinary => Ordinary } };
+        false -> Result
+    end.
+
+reserve_checkpoint(Priority, Ordinary, Prior, {Total, PerPid}, Prepare, Publish) ->
+    Focused = copy_group(Priority, maps:get(priority, Prior), 16, 1, PerPid, Prepare, Publish),
+    Attempted = maps:get(attempts, Focused),
+    Examined = maps:get(examined, Focused),
+    Rest = copy_group(Ordinary, maps:get(ordinary, Prior), 16 - Examined,
+        Total - Attempted, PerPid, Prepare, Publish),
+    Last = case maps:get(examined, Rest) of
+        0 -> maps:get(last, Focused);
+        _ -> maps:get(last, Rest)
+    end,
+    #{ attempts => Attempted + maps:get(attempts, Rest),
+       completed => maps:get(completed, Focused) + maps:get(completed, Rest),
+       examined => Examined + maps:get(examined, Rest),
+       failures => maps:get(failures, Rest) ++ maps:get(failures, Focused),
+       last => Last,
+       lanes => #{ priority => maps:get(last, Focused), ordinary => maps:get(last, Rest) } }.
+
+copy_group(Ordered, Last, Visits, Total, PerPid, Prepare, Publish) ->
+    Next = case lists:splitwith(fun(P) -> P =/= Last end, Ordered) of
+        {Before, [Last | After]} -> After ++ Before ++ [Last];
+        _ -> Ordered
+    end,
+    copy_visit(lists:sublist(Next, Visits), Total, PerPid, Prepare, Publish,
+        #{ attempts => 0, completed => 0, examined => 0, failures => [], last => Last }).
 
 copy_visit([], _Total, _PerPid, _Prepare, _Publish, Stats) -> Stats;
 copy_visit(_, 0, _PerPid, _Prepare, _Publish, Stats) -> Stats;
@@ -721,7 +762,10 @@ ship_checkpoint(Cfg, Main, P, S) ->
     ok = hb_store:write([Main], #{ mark_key(<<"checkpoint">>, P) => integer_to_binary(S),
                                   mark_key(<<"checkpoint-seq">>, P) => integer_to_binary(Seq) }, #{}),
     ok = hb_store:flush([Main], #{}),
-    status_update(fun(St) -> St#{ shipped_bytes => maps:get(shipped_bytes, St, 0) + Bytes } end).
+    status_update(fun(St) -> St#{
+        shipped_bytes => maps:get(shipped_bytes, St, 0) + Bytes,
+        checkpoint_bytes => maps:get(checkpoint_bytes, St, 0) + Bytes,
+        verified_checkpoints => maps:get(verified_checkpoints, St, 0) + 1 } end).
 
 %% On the share, checkpoints are thinned with age, never to none
 %% (`thin_plan/3').
