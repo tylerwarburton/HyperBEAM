@@ -639,15 +639,19 @@ snap_ms(Store, P, S) ->
 %% A snapshot checkpoint's rows: its `s' marker, its `f' state and chunks.
 snapshot_rows(Store, P, S) ->
     Keys = [ blob_key(P, K, S) || K <- [<<"s">>, <<"f">>] ],
-    Rows = [ {K, V} || K <- Keys,
-                       {ok, V} <- [hb_store:read([Store], #{ <<"read">> => K, <<"exact">> => true }, #{})] ],
+    Rows = [ snapshot_row(Store, K) || K <- Keys ],
     Chunks =
-        [ {CK, CV}
+        [ snapshot_row(Store, <<K/binary, ".", (integer_to_binary(I))/binary>>)
         || {K, <<"pstate-chunks:", N/binary>>} <- Rows,
-           I <- lists:seq(1, binary_to_integer(N)),
-           CK <- [<<K/binary, ".", (integer_to_binary(I))/binary>>],
-           {ok, CV} <- [hb_store:read([Store], #{ <<"read">> => CK, <<"exact">> => true }, #{})] ],
+           I <- lists:seq(1, binary_to_integer(N)) ],
     Chunks ++ Rows.
+
+%% Each checkpoint row must be present before the file can be shipped.
+snapshot_row(Store, Key) ->
+    case hb_store:read([Store], #{ <<"read">> => Key, <<"exact">> => true }, #{}) of
+        {ok, Value} -> {Key, Value};
+        Error -> erlang:error({incomplete_checkpoint, Key, Error})
+    end.
 
 blob_key(P, Kind, S) ->
     <<"pstate/", P/binary, "/", Kind/binary, "/", (list_to_binary(pad(S)))/binary>>.
@@ -968,6 +972,64 @@ checkpoints_test_() ->
         ?assertEqual(not_found, restore_checkpoint(Q, 100, Peer(false))),
         ?assertEqual({ok, 30}, restore_checkpoint(Q, 100, Peer(true)))
     end}.
+
+%% @doc A missing checkpoint row blocks shipment of this and later snapshots
+%% until the row is available. After it is repaired, restore reproduces the
+%% complete rows of either form of checkpoint.
+incomplete_checkpoints_stop_shipping_test_() ->
+    [ {atom_to_list(Missing), {timeout, 120, fun() -> incomplete_checkpoint(Missing) end}}
+    || Missing <- [full_state, chunk] ].
+
+incomplete_checkpoint(Missing) ->
+    #{ main := Main, opts := Opts, p := P } = test_env("incomplete-" ++ atom_to_list(Missing)),
+    Cfg = config(Opts),
+    Now = erlang:system_time(millisecond),
+    S = fun(N) -> blob_key(P, <<"s">>, N) end,
+    F = fun(N) -> blob_key(P, <<"f">>, N) end,
+    Small = term_to_binary({1, #{ <<"snapshot">> => <<"small state">> }}, [compressed]),
+    Large = term_to_binary({1, #{ <<"snapshot">> => crypto:strong_rand_bytes(6000) }}, [compressed]),
+    <<Part1:4000/binary, Part2/binary>> = Large,
+    Marker = fun(State) ->
+        term_to_binary({1, #{
+            <<"timestamp">> => Now, <<"build">> => <<"test">>,
+            <<"state-digest">> => crypto:hash(sha256, State) }}, [compressed])
+    end,
+    ok = hb_store:write([Main], #{ (S(10)) => Marker(Small), (F(10)) => Small }, #{}),
+    ok = hb_store:flush([Main], #{}),
+    ok = tick(Opts),
+    Mark = mark_key(<<"checkpoint">>, P),
+    Seq = mark_key(<<"checkpoint-seq">>, P),
+    F20 = F(20),
+    Chunk1 = <<F20/binary, ".1">>,
+    Chunk2 = <<F20/binary, ".2">>,
+    {Rows, MissingRow} =
+        case Missing of
+            full_state -> {#{ (S(20)) => Marker(Small) }, #{ F20 => Small }};
+            chunk ->
+                {#{ (S(20)) => Marker(Large), F20 => <<"pstate-chunks:2">>,
+                    Chunk1 => Part1 }, #{ Chunk2 => Part2 }}
+        end,
+    ok = hb_store:write([Main], Rows#{
+        (S(30)) => Marker(Small), (F(30)) => Small }, #{}),
+    ok = hb_store:flush([Main], #{}),
+    Dir = filename:join([share(Opts), "checkpoints", hb_util:list(P)]),
+    Result = tick(Opts),
+    ?assertMatch({{error, _}, 10, 0, 1},
+        {Result, read_int(Main, Mark, -1), read_int(Main, Seq, -1),
+            length(list_dir(Cfg, Dir))}),
+    ok = hb_store:write([Main], MissingRow, #{}),
+    ok = hb_store:flush([Main], #{}),
+    ok = tick(Opts),
+    ?assertEqual({30, 2, 3},
+        {read_int(Main, Mark, -1), read_int(Main, Seq, -1), length(list_dir(Cfg, Dir))}),
+    Expected = maps:merge(Rows, MissingRow),
+    Keys = maps:keys(Expected),
+    #{ <<"db">> := DB } = hb_store:find(Main),
+    {ok, _} = elmdb:delete_batch(DB, Keys),
+    ?assertEqual({ok, 20}, restore_checkpoint(P, 20, Opts)),
+    ?assertEqual(Expected, maps:from_list(
+        [ {K, V} || K <- Keys,
+            {ok, V} <- [hb_store:read([Main], #{ <<"read">> => K, <<"exact">> => true }, #{})] ])).
 
 %% @doc Thinning never leaves an age band without a checkpoint, keeps every
 %% `N'th in each band, and is stable: thinning what it kept deletes nothing.
