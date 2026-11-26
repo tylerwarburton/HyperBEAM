@@ -584,6 +584,7 @@ ship_checkpoint(Cfg, Main, P, S) ->
     Bytes = put_file(Cfg, File, #{ process => P, slot => S, rows => Rows }),
     ok = hb_store:write([Main], #{ mark_key(<<"checkpoint">>, P) => integer_to_binary(S),
                                   mark_key(<<"checkpoint-seq">>, P) => integer_to_binary(Seq) }, #{}),
+    ok = hb_store:flush([Main], #{}),
     status_update(fun(St) -> St#{ shipped_bytes => maps:get(shipped_bytes, St, 0) + Bytes } end).
 
 %% On the share, checkpoints are thinned with age, never to none
@@ -639,18 +640,77 @@ snap_ms(Store, P, S) ->
 %% A snapshot checkpoint's rows: its `s' marker, its `f' state and chunks.
 snapshot_rows(Store, P, S) ->
     Keys = [ blob_key(P, K, S) || K <- [<<"s">>, <<"f">>] ],
-    Rows = [ snapshot_row(Store, K) || K <- Keys ],
-    Chunks =
-        [ snapshot_row(Store, <<K/binary, ".", (integer_to_binary(I))/binary>>)
-        || {K, <<"pstate-chunks:", N/binary>>} <- Rows,
-           I <- lists:seq(1, binary_to_integer(N)) ],
-    Chunks ++ Rows.
+    Read = fun(K) -> snapshot_row(Store, K) end,
+    Rows = [ {K, Read(K)} || K <- Keys ],
+    Chunks = lists:append([ snapshot_chunks(K, V, Read) || {K, V} <- Rows ]),
+    case checkpoint_rows(P, S, Chunks ++ Rows) of
+        {ok, _} -> Chunks ++ Rows;
+        error -> erlang:error({invalid_checkpoint, P, S})
+    end.
 
 %% Each checkpoint row must be present before the file can be shipped.
 snapshot_row(Store, Key) ->
     case hb_store:read([Store], #{ <<"read">> => Key, <<"exact">> => true }, #{}) of
-        {ok, Value} -> {Key, Value};
-        Error -> erlang:error({incomplete_checkpoint, Key, Error})
+        {ok, Value} when is_binary(Value) -> Value;
+        _ -> erlang:error({incomplete_checkpoint, Key})
+    end.
+
+%% A chunked row names every part in order.
+snapshot_chunks(Key, <<"pstate-chunks:", Digits/binary>>, Read) ->
+    Count = binary_to_integer(Digits),
+    true = Count > 0,
+    snapshot_chunks(Key, Count, Read, []);
+snapshot_chunks(_Key, _Value, _Read) -> [].
+
+snapshot_chunks(_Key, 0, _Read, Rows) -> Rows;
+snapshot_chunks(Key, N, Read, Rows) ->
+    Part = <<Key/binary, ".", (integer_to_binary(N))/binary>>,
+    snapshot_chunks(Key, N - 1, Read, [{Part, Read(Part)} | Rows]).
+
+%% Accept just this checkpoint's marker, state and declared chunks. The
+%% marker ties the full encoded state to the keys for this process and slot.
+checkpoint_rows(P, S, Rows) ->
+    try
+        Map = maps:from_list(Rows),
+        true = map_size(Map) =:= length(Rows),
+        Read = fun(K) ->
+            case maps:find(K, Map) of
+                {ok, B} when is_binary(B) -> B;
+                _ -> throw(invalid_checkpoint_row)
+            end
+        end,
+        MarkerKey = blob_key(P, <<"s">>, S),
+        StateKey = blob_key(P, <<"f">>, S),
+        MarkerRow = Read(MarkerKey),
+        StateRow = Read(StateKey),
+        MarkerParts = snapshot_chunks(MarkerKey, MarkerRow, Read),
+        StateParts = snapshot_chunks(StateKey, StateRow, Read),
+        true = map_size(Map) =:= 2 + length(MarkerParts) + length(StateParts),
+        Marker = iolist_to_binary(snapshot_payload(MarkerRow, MarkerParts)),
+        State = snapshot_payload(StateRow, StateParts),
+        true = snapshot_matches(Marker, State, S),
+        {ok, Map}
+    catch _:_ -> error
+    end.
+
+snapshot_payload(Row, []) -> Row;
+snapshot_payload(_Row, Parts) -> [ B || {_, B} <- Parts ].
+
+%% An empty or undigested legacy marker still requires a usable snapshot at
+%% the requested slot. A digest-bearing marker covers the reassembled data.
+snapshot_matches(<<>>, State, Slot) -> legacy_snapshot(State, Slot);
+snapshot_matches(Marker, State, Slot) ->
+    case binary_to_term(Marker, [safe]) of
+        {1, #{ <<"state-digest">> := Digest }} ->
+            crypto:hash(sha256, State) =:= Digest;
+        {1, Fields} when is_map(Fields) -> legacy_snapshot(State, Slot);
+        _ -> false
+    end.
+
+legacy_snapshot(State, Slot) ->
+    case binary_to_term(iolist_to_binary(State), [safe]) of
+        {1, #{ <<"at-slot">> := Slot, <<"snapshot">> := _ }} -> true;
+        _ -> false
     end.
 
 blob_key(P, Kind, S) ->
@@ -682,19 +742,28 @@ restore_checkpoint(P0, Target, Opts) ->
                            F <- list_dir(Cfg, filename:join([Dir, "checkpoints", hb_util:list(P)])),
                            {S, _, _} <- [checkpoint_name(F)],
                            S > Floor, S =< Target ])),
-                restore_first(Cfg, Main, Candidates)
+                restore_first(Cfg, Main, P, Candidates)
             catch _:_ -> not_found
             end
     end.
 
-restore_first(_Cfg, _Main, []) -> not_found;
-restore_first(Cfg, Main, [{S, File} | Rest]) ->
-    case get_file(Cfg, File) of
-        {ok, #{ slot := S, rows := Rows }} ->
-            ok = hb_store:write([Main], maps:from_list(Rows), #{}),
+restore_first(_Cfg, _Main, _P, []) -> not_found;
+restore_first(Cfg, Main, P, [{S, File} | Rest]) ->
+    case read_checkpoint(Cfg, P, S, File) of
+        {ok, Rows} ->
+            ok = hb_store:write([Main], Rows, #{}),
             ok = hb_store:flush([Main], #{}),
             {ok, S};
-        _ -> restore_first(Cfg, Main, Rest)
+        error -> restore_first(Cfg, Main, P, Rest)
+    end.
+
+%% A corrupted file or one with rows from another checkpoint is a miss.
+read_checkpoint(Cfg, P, S, File) ->
+    try get_file(Cfg, File) of
+        {ok, #{ process := P, slot := S, rows := Rows }} ->
+            checkpoint_rows(P, S, Rows);
+        _ -> error
+    catch error:badarg -> error
     end.
 
 %%% Replica snapshots
@@ -747,19 +816,26 @@ restore_replica(Pusd, Computed, Opts, _VerifiedSlot) ->
                            F <- list_dir(Cfg, filename:join([Dir, "replica", hb_util:list(Pusd)])),
                            S <- [catch list_to_integer(filename:rootname(F))], is_integer(S) ])),
                 Build = build(),
-                first_replica(Cfg, Computed, Build, Candidates)
+                first_replica(Cfg, Computed, Pusd, Build, Candidates)
             catch _:_ -> not_found
             end
     end.
 
-first_replica(_Cfg, _Computed, _Build, []) -> not_found;
-first_replica(Cfg, Computed, Build, [{S, File} | Rest]) ->
-    case get_file(Cfg, File) of
-        {ok, #{ slot := S, build := Build, rows := Rows }} ->
-            ok = hb_store:write([Computed], maps:from_list(Rows), #{}),
+first_replica(_Cfg, _Computed, _P, _Build, []) -> not_found;
+first_replica(Cfg, Computed, P, Build, [{S, File} | Rest]) ->
+    Result =
+        try get_file(Cfg, File) of
+            {ok, #{ process := P, slot := S, build := Build, rows := Rows }} ->
+                checkpoint_rows(P, S, Rows);
+            _ -> error
+        catch error:badarg -> error
+        end,
+    case Result of
+        {ok, Verified} ->
+            ok = hb_store:write([Computed], Verified, #{}),
             ok = hb_store:flush([Computed], #{}),
             {ok, S};
-        _ -> first_replica(Cfg, Computed, Build, Rest)
+        error -> first_replica(Cfg, Computed, P, Build, Rest)
     end.
 
 build() ->
@@ -939,15 +1015,18 @@ checkpoints_test_() ->
         Q = hb_util:human_id(crypto:strong_rand_bytes(32)),
         Day = ?DAY_MS, Now = erlang:system_time(millisecond),
         Marker = fun(Ms) -> term_to_binary({1, #{ <<"timestamp">> => Ms }}) end,
+        State20 = test_snapshot(20, <<"state-20">>),
+        State30 = test_snapshot(30, crypto:strong_rand_bytes(6010)),
+        <<Part1:4000/binary, Part2/binary>> = State30,
         ok = hb_store:write([Main], #{
             blob_key(Q, <<"s">>, 10) => Marker(Now - 2 * Day),
-            blob_key(Q, <<"f">>, 10) => <<"state-10">>,
+            blob_key(Q, <<"f">>, 10) => test_snapshot(10, <<"state-10">>),
             blob_key(Q, <<"s">>, 20) => Marker(Now - 2 * Day + 1000),
-            blob_key(Q, <<"f">>, 20) => <<"state-20">>,
+            blob_key(Q, <<"f">>, 20) => State20,
             blob_key(Q, <<"s">>, 30) => Marker(Now),
             blob_key(Q, <<"f">>, 30) => <<"pstate-chunks:2">>,
-            <<(blob_key(Q, <<"f">>, 30))/binary, ".1">> => <<"a">>,
-            <<(blob_key(Q, <<"f">>, 30))/binary, ".2">> => <<"b">> }, #{}),
+            <<(blob_key(Q, <<"f">>, 30))/binary, ".1">> => Part1,
+            <<(blob_key(Q, <<"f">>, 30))/binary, ".2">> => Part2 }, #{}),
         ok = hb_store:flush([Main], #{}),
         ok = tick(Opts),
         Share = share(Opts),
@@ -957,7 +1036,7 @@ checkpoints_test_() ->
         #{ <<"db">> := DB } = hb_store:find(Main),
         {ok, _} = elmdb:delete_batch(DB, [ blob_key(Q, K, S) || K <- [<<"s">>, <<"f">>], S <- [10, 20, 30] ]),
         ?assertEqual({ok, 20}, restore_checkpoint(Q, 25, Opts)),
-        ?assertEqual({ok, <<"state-20">>}, hb_store:read([Main], blob_key(Q, <<"f">>, 20), #{})),
+        ?assertEqual({ok, State20}, hb_store:read([Main], blob_key(Q, <<"f">>, 20), #{})),
         % Past one day, 1 in 2: of 10 (seq 0) and 20 (seq 1), 10 stays; 30
         % is younger and stays.
         Cold0 = maps:get(<<"cold-tier">>, Opts),
@@ -978,7 +1057,7 @@ checkpoints_test_() ->
 %% complete rows of either form of checkpoint.
 incomplete_checkpoints_stop_shipping_test_() ->
     [ {atom_to_list(Missing), {timeout, 120, fun() -> incomplete_checkpoint(Missing) end}}
-    || Missing <- [full_state, chunk] ].
+    || Missing <- [full_state, chunk, digest_mismatch] ].
 
 incomplete_checkpoint(Missing) ->
     #{ main := Main, opts := Opts, p := P } = test_env("incomplete-" ++ atom_to_list(Missing)),
@@ -986,15 +1065,17 @@ incomplete_checkpoint(Missing) ->
     Now = erlang:system_time(millisecond),
     S = fun(N) -> blob_key(P, <<"s">>, N) end,
     F = fun(N) -> blob_key(P, <<"f">>, N) end,
-    Small = term_to_binary({1, #{ <<"snapshot">> => <<"small state">> }}, [compressed]),
-    Large = term_to_binary({1, #{ <<"snapshot">> => crypto:strong_rand_bytes(6000) }}, [compressed]),
+    State10 = test_snapshot(10, <<"small state">>),
+    State20 = test_snapshot(20, <<"small state">>),
+    State30 = test_snapshot(30, <<"small state">>),
+    Large = test_snapshot(20, crypto:strong_rand_bytes(6000)),
     <<Part1:4000/binary, Part2/binary>> = Large,
     Marker = fun(State) ->
         term_to_binary({1, #{
             <<"timestamp">> => Now, <<"build">> => <<"test">>,
             <<"state-digest">> => crypto:hash(sha256, State) }}, [compressed])
     end,
-    ok = hb_store:write([Main], #{ (S(10)) => Marker(Small), (F(10)) => Small }, #{}),
+    ok = hb_store:write([Main], #{ (S(10)) => Marker(State10), (F(10)) => State10 }, #{}),
     ok = hb_store:flush([Main], #{}),
     ok = tick(Opts),
     Mark = mark_key(<<"checkpoint">>, P),
@@ -1002,27 +1083,30 @@ incomplete_checkpoint(Missing) ->
     F20 = F(20),
     Chunk1 = <<F20/binary, ".1">>,
     Chunk2 = <<F20/binary, ".2">>,
-    {Rows, MissingRow} =
+    {Rows, Repaired} =
         case Missing of
-            full_state -> {#{ (S(20)) => Marker(Small) }, #{ F20 => Small }};
+            full_state -> {#{ (S(20)) => Marker(State20) }, #{ F20 => State20 }};
             chunk ->
                 {#{ (S(20)) => Marker(Large), F20 => <<"pstate-chunks:2">>,
-                    Chunk1 => Part1 }, #{ Chunk2 => Part2 }}
+                    Chunk1 => Part1 }, #{ Chunk2 => Part2 }};
+            digest_mismatch ->
+                {#{ (S(20)) => Marker(Large), F20 => <<"pstate-chunks:2">>,
+                    Chunk1 => Part1, Chunk2 => <<"damaged">> }, #{ Chunk2 => Part2 }}
         end,
     ok = hb_store:write([Main], Rows#{
-        (S(30)) => Marker(Small), (F(30)) => Small }, #{}),
+        (S(30)) => Marker(State30), (F(30)) => State30 }, #{}),
     ok = hb_store:flush([Main], #{}),
     Dir = filename:join([share(Opts), "checkpoints", hb_util:list(P)]),
     Result = tick(Opts),
     ?assertMatch({{error, _}, 10, 0, 1},
         {Result, read_int(Main, Mark, -1), read_int(Main, Seq, -1),
             length(list_dir(Cfg, Dir))}),
-    ok = hb_store:write([Main], MissingRow, #{}),
+    ok = hb_store:write([Main], Repaired, #{}),
     ok = hb_store:flush([Main], #{}),
     ok = tick(Opts),
     ?assertEqual({30, 2, 3},
         {read_int(Main, Mark, -1), read_int(Main, Seq, -1), length(list_dir(Cfg, Dir))}),
-    Expected = maps:merge(Rows, MissingRow),
+    Expected = maps:merge(Rows, Repaired),
     Keys = maps:keys(Expected),
     #{ <<"db">> := DB } = hb_store:find(Main),
     {ok, _} = elmdb:delete_batch(DB, Keys),
@@ -1030,6 +1114,60 @@ incomplete_checkpoint(Missing) ->
     ?assertEqual(Expected, maps:from_list(
         [ {K, V} || K <- Keys,
             {ok, V} <- [hb_store:read([Main], #{ <<"read">> => K, <<"exact">> => true }, #{})] ])).
+
+%% @doc Restore skips invalid archives without writing any of their rows.
+checkpoint_restore_validates_payload_test_() ->
+    {timeout, 60, fun() ->
+        #{ main := Main, opts := Opts, p := P } = test_env("restore-verified"),
+        Cfg = config(Opts),
+        Root = filename:join([share(Opts), "checkpoints", hb_util:list(P)]),
+        Marker = fun(B) -> term_to_binary({1, #{
+            <<"state-digest">> => crypto:hash(sha256, B) }}) end,
+        RowsAt = fun(Slot, State, Mark) ->
+            [{blob_key(P, <<"s">>, Slot), Mark}, {blob_key(P, <<"f">>, Slot), State}]
+        end,
+        S5 = test_snapshot(5, <<"legacy">>),
+        L5 = filename:join(Root, pad(5) ++ "-0-0.hbc"),
+        S10 = test_snapshot(10, crypto:strong_rand_bytes(6000)),
+        <<Part1:4000/binary, Part2/binary>> = S10,
+        F10 = blob_key(P, <<"f">>, 10),
+        K1 = <<F10/binary, ".1">>,
+        K2 = <<F10/binary, ".2">>,
+        Good = [{K1, Part1}, {K2, Part2} | RowsAt(10, <<"pstate-chunks:2">>, Marker(S10))],
+        Archive = #{ process => P, slot => 10, rows => Good },
+        Other = hb_util:human_id(crypto:strong_rand_bytes(32)),
+        ExtraKey = blob_key(Other, <<"f">>, 10),
+        L10 = filename:join(Root, pad(10) ++ "-0-1.hbc"),
+        Invalid = [
+            Archive#{ process => Other },
+            Archive#{ slot => 5 },
+            Archive#{ rows => lists:keydelete(K2, 1, Good) },
+            Archive#{ rows => lists:keyreplace(K2, 1, Good, {K2, <<0>>}) },
+            Archive#{ rows => [{ExtraKey, S10} | Good] },
+            Archive#{ rows => [hd(Good) | Good] },
+            Archive#{ rows => RowsAt(10, S5, <<>>) }
+        ],
+        lists:foreach(
+            fun(Unusable) ->
+                _ = put_file(Cfg, L10, Unusable),
+                ?assertEqual(not_found, restore_checkpoint(P, 10, Opts)),
+                ?assertEqual({error, not_found}, hb_store:read([Main], F10, #{})),
+                ?assertEqual({error, not_found}, hb_store:read([Main], ExtraKey, #{}))
+            end,
+            Invalid),
+        % Even an intact HBC hash cannot make an unusable checkpoint a base.
+        _ = put_file(Cfg, L5, #{ process => P, slot => 5, rows => RowsAt(5, S5, <<>>) }),
+        ?assertEqual({ok, 5}, restore_checkpoint(P, 10, Opts)),
+        ?assertEqual({ok, S5}, hb_store:read([Main], blob_key(P, <<"f">>, 5), #{})),
+        _ = put_file(Cfg, L10, Archive),
+        ?assertEqual({ok, 10}, restore_checkpoint(P, 10, Opts)),
+        ?assertEqual(maps:from_list(Good), maps:from_list(
+            [ {K, V} || {K, _} <- Good, {ok, V} <- [hb_store:read([Main], K, #{})] ]))
+    end}.
+
+test_snapshot(Slot, Snapshot) ->
+    term_to_binary({1, #{ <<"at-slot">> => Slot, <<"snapshot">> => Snapshot }},
+        [{compressed, 1}]).
 
 %% @doc Thinning never leaves an age band without a checkpoint, keeps every
 %% `N'th in each band, and is stable: thinning what it kept deletes nothing.
@@ -1073,16 +1211,17 @@ replica_snapshot_test_() ->
     {timeout, 60, fun() ->
         #{ main := Computed, opts := Opts, dir := Dir } = test_env("replica"),
         Pusd = hb_util:human_id(crypto:strong_rand_bytes(32)),
+        Head = test_snapshot(500, <<"head">>),
         ok = hb_store:write([Computed], #{
             blob_key(Pusd, <<"s">>, 500) => term_to_binary({1, #{}}),
-            blob_key(Pusd, <<"f">>, 500) => <<"head">> }, #{}),
+            blob_key(Pusd, <<"f">>, 500) => Head }, #{}),
         ok = ship_replica(Pusd, Computed, Opts),
         File = share(Opts) ++ "/replica/" ++ binary_to_list(Pusd) ++ "/" ++ pad(500) ++ ".hbc",
         ?assert(lists:any(fun(_) -> timer:sleep(100), filelib:is_file(File) end, lists:seq(1, 50))),
         Fresh = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => list_to_binary(Dir ++ "/fresh") },
         ok = hb_store:start(Fresh),
         ?assertEqual({ok, 500}, restore_replica(Pusd, Fresh, Opts, -1)),
-        ?assertEqual({ok, <<"head">>}, hb_store:read([Fresh], blob_key(Pusd, <<"f">>, 500), #{})),
+        ?assertEqual({ok, Head}, hb_store:read([Fresh], blob_key(Pusd, <<"f">>, 500), #{})),
         % Another build's snapshot is not used.
         Cfg = config(Opts),
         {ok, T} = get_file(Cfg, File),
