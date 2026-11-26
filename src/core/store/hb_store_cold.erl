@@ -88,6 +88,7 @@ config(Opts) ->
                     || P <- peers(maps:get(<<"peers">>, C, [])) ],
                 keep_local_ms => Int(<<"keep-local-seconds">>, 604800) * 1000,
                 bounded_copy => hb_util:atom(maps:get(<<"bounded-copy">>, C, false)) =:= true,
+                checkpoint_priority => checkpoint_priority(maps:get(<<"checkpoint-priority">>, C, [])),
                 prune_local_slots =>
                     hb_util:atom(maps:get(<<"prune-local-slots">>, C, true)) =:= true,
                 thinning => thinning(maps:get(<<"checkpoint-thinning">>, C, [[30, 5], [365, 25]])),
@@ -114,6 +115,16 @@ thinning(L) when is_list(L) ->
            is_integer(D), D >= 0, is_integer(N), N >= 1 ]);
 thinning(M) when is_map(M) -> thinning(hb_util:message_to_ordered_list(M));
 thinning(_) -> [].
+
+%% A protected observation can bring at most five known processes to the
+%% front of the checkpoint rotation. The rest resume in the same cycle.
+checkpoint_priority(Pids) when is_list(Pids), length(Pids) =< 5 ->
+    case length(lists:usort(Pids)) =:= length(Pids) andalso
+        lists:all(fun(P) -> is_binary(P) andalso byte_size(P) =:= 43 andalso ?IS_ID(P) end, Pids) of
+        true -> Pids;
+        false -> invalid
+    end;
+checkpoint_priority(_) -> invalid.
 
 peers(L) when is_list(L) -> [ P || P <- L, is_map(P), is_map_key(<<"path">>, P) ];
 peers(M) when is_map(M) -> peers(hb_util:message_to_ordered_list(M));
@@ -190,11 +201,26 @@ tick(Opts) ->
 %% Reserve checkpoint attempts before a potentially slow successful slot
 %% traversal. The copy-only cursor and counts are scheduling state, not a
 %% claim that the whole archive backlog was examined or published.
+archive_phases(#{ bounded_copy := true, checkpoint_priority := invalid }, _Opts) ->
+    {{error, invalid_checkpoint_priority}, ok};
 archive_phases(#{ bounded_copy := true, prune_local_slots := false } = Cfg, Opts) ->
+    Priority = maps:get(checkpoint_priority, Cfg),
+    Reclaim = hb_util:atom(hb_opts:get(<<"store-retention">>, false, Opts)) =:= true,
+    case Priority =/= [] andalso Reclaim of
+        true -> {{error, focused_copy_requires_hot_hold}, ok};
+        false -> bounded_archive_phases(Cfg, Opts)
+    end;
+archive_phases(#{ bounded_copy := true }, _Opts) ->
+    {{error, bounded_copy_requires_source_hold}, ok};
+archive_phases(Cfg, Opts) ->
+    Slots = run_phase(slots, fun() -> ship_slots(Cfg, Opts) end),
+    {Slots, run_phase(checkpoints, fun() -> ship_checkpoints(Cfg, Opts) end)}.
+
+bounded_archive_phases(Cfg, Opts) ->
     Main = hb_store_retention:store(Opts),
     Store = irr(Opts),
     Checkpoints = run_phase(checkpoints, fun() ->
-        copy_round(checkpoints, list_names(Main, <<"pstate">>), {2, 1},
+        copy_round(checkpoints, list_names(Main, <<"pstate">>), maps:get(checkpoint_priority, Cfg), {2, 1},
             fun(P, Limit) ->
                 Mark = read_int(Main, mark_key(<<"checkpoint">>, P), -1),
                 lists:sublist([ S || S <- pstate_slots(Main, P, <<"s">>), S > Mark ], Limit)
@@ -202,23 +228,23 @@ archive_phases(#{ bounded_copy := true, prune_local_slots := false } = Cfg, Opts
             fun(P, S) -> ship_checkpoint(Cfg, Main, P, S) end)
     end),
     Slots = run_phase(slots, fun() ->
-        copy_round(slots, list_names(Store, ?ASSIGNMENTS), {4, 2},
+        copy_round(slots, list_names(Store, ?ASSIGNMENTS), [], {4, 2},
             fun(P, Limit) -> copy_ranges(Cfg, Store, P, Limit) end,
             fun(P, Ready) -> ship_range(Cfg, Store, P, Ready, Opts) end)
     end),
-    {Slots, Checkpoints};
-archive_phases(#{ bounded_copy := true }, _Opts) ->
-    {{error, bounded_copy_requires_source_hold}, ok};
-archive_phases(Cfg, Opts) ->
-    Slots = run_phase(slots, fun() -> ship_slots(Cfg, Opts) end),
-    {Slots, run_phase(checkpoints, fun() -> ship_checkpoints(Cfg, Opts) end)}.
+    {Slots, Checkpoints}.
 
-copy_round(Name, Pids, {Total, PerPid}, Prepare, Publish) ->
+copy_round(Name, Pids, Priority, {Total, PerPid}, Prepare, Publish) ->
     Progress = maps:get(copy_progress, status(), #{}),
     Last = maps:get(last, maps:get(Name, Progress, #{}), none),
     Sorted = lists:usort([P || P <- Pids, ?IS_ID(P)]),
-    {Ahead, Wrap} = lists:partition(fun(P) -> Last =:= none orelse P > Last end, Sorted),
-    Result = copy_visit(lists:sublist(Ahead ++ Wrap, 16), Total, PerPid, Prepare, Publish,
+    First = [ P || P <- Priority, lists:member(P, Sorted) ],
+    Ordered = First ++ (Sorted -- First),
+    Next = case lists:splitwith(fun(P) -> P =/= Last end, Ordered) of
+        {Before, [Last | After]} -> After ++ Before ++ [Last];
+        _ -> Ordered
+    end,
+    Result = copy_visit(lists:sublist(Next, 16), Total, PerPid, Prepare, Publish,
         #{ attempts => 0, completed => 0, examined => 0, failures => [], last => Last }),
     status_update(fun(S) -> S#{ copy_progress => Progress#{ Name => Result } } end),
     case maps:get(failures, Result) of
