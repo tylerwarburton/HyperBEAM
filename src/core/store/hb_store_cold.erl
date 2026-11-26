@@ -87,6 +87,7 @@ config(Opts) ->
                          trusted => hb_util:atom(maps:get(<<"trusted">>, P, false)) =:= true }
                     || P <- peers(maps:get(<<"peers">>, C, [])) ],
                 keep_local_ms => Int(<<"keep-local-seconds">>, 604800) * 1000,
+                bounded_copy => hb_util:atom(maps:get(<<"bounded-copy">>, C, false)) =:= true,
                 prune_local_slots =>
                     hb_util:atom(maps:get(<<"prune-local-slots">>, C, true)) =:= true,
                 thinning => thinning(maps:get(<<"checkpoint-thinning">>, C, [[30, 5], [365, 25]])),
@@ -153,8 +154,7 @@ status_update(Fun) -> persistent_term:put(?STATUS, Fun(status())).
 %% A complete tick keeps the old availability and return-value contract.
 tick(Opts) ->
     Cfg = config(Opts),
-    Slots = run_phase(slots, fun() -> ship_slots(Cfg, Opts) end),
-    Checkpoints = run_phase(checkpoints, fun() -> ship_checkpoints(Cfg, Opts) end),
+    {Slots, Checkpoints} = archive_phases(Cfg, Opts),
     Result =
         case {Slots, Checkpoints, maps:get(prune_local_slots, Cfg)} of
             {{error, _} = Failed, _, _} -> Failed;
@@ -186,6 +186,88 @@ tick(Opts) ->
             end)
     end,
     Result.
+
+%% Reserve checkpoint attempts before a potentially slow successful slot
+%% traversal. The copy-only cursor and counts are scheduling state, not a
+%% claim that the whole archive backlog was examined or published.
+archive_phases(#{ bounded_copy := true, prune_local_slots := false } = Cfg, Opts) ->
+    Main = hb_store_retention:store(Opts),
+    Store = irr(Opts),
+    Checkpoints = run_phase(checkpoints, fun() ->
+        copy_round(checkpoints, list_names(Main, <<"pstate">>), {2, 1},
+            fun(P, Limit) ->
+                Mark = read_int(Main, mark_key(<<"checkpoint">>, P), -1),
+                lists:sublist([ S || S <- pstate_slots(Main, P, <<"s">>), S > Mark ], Limit)
+            end,
+            fun(P, S) -> ship_checkpoint(Cfg, Main, P, S) end)
+    end),
+    Slots = run_phase(slots, fun() ->
+        copy_round(slots, list_names(Store, ?ASSIGNMENTS), {4, 2},
+            fun(P, Limit) -> copy_ranges(Cfg, Store, P, Limit) end,
+            fun(P, Ready) -> ship_range(Cfg, Store, P, Ready, Opts) end)
+    end),
+    {Slots, Checkpoints};
+archive_phases(#{ bounded_copy := true }, _Opts) ->
+    {{error, bounded_copy_requires_source_hold}, ok};
+archive_phases(Cfg, Opts) ->
+    Slots = run_phase(slots, fun() -> ship_slots(Cfg, Opts) end),
+    {Slots, run_phase(checkpoints, fun() -> ship_checkpoints(Cfg, Opts) end)}.
+
+copy_round(Name, Pids, {Total, PerPid}, Prepare, Publish) ->
+    Progress = maps:get(copy_progress, status(), #{}),
+    Last = maps:get(last, maps:get(Name, Progress, #{}), none),
+    Sorted = lists:usort([P || P <- Pids, ?IS_ID(P)]),
+    {Ahead, Wrap} = lists:partition(fun(P) -> Last =:= none orelse P > Last end, Sorted),
+    Result = copy_visit(lists:sublist(Ahead ++ Wrap, 16), Total, PerPid, Prepare, Publish,
+        #{ attempts => 0, completed => 0, examined => 0, failures => [], last => Last }),
+    status_update(fun(S) -> S#{ copy_progress => Progress#{ Name => Result } } end),
+    case maps:get(failures, Result) of
+        [] -> ok;
+        [{_, Reason} | _] -> throw({cold_io, Reason})
+    end.
+
+copy_visit([], _Total, _PerPid, _Prepare, _Publish, Stats) -> Stats;
+copy_visit(_, 0, _PerPid, _Prepare, _Publish, Stats) -> Stats;
+copy_visit([P | Rest], Total, PerPid, Prepare, Publish, Stats0) ->
+    Stats = Stats0#{ last := P, examined := maps:get(examined, Stats0) + 1 },
+    try Prepare(P, min(Total, PerPid)) of
+        Work ->
+            {Used, Next} = copy_publish(P, Work, Publish, 0, Stats),
+            copy_visit(Rest, Total - Used, PerPid, Prepare, Publish, Next)
+    catch
+        throw:{cold_io, Why} ->
+            copy_visit(Rest, Total, PerPid, Prepare, Publish, copy_failure(P, Why, Stats));
+        C:E ->
+            copy_visit(Rest, Total, PerPid, Prepare, Publish, copy_failure(P, {C, E}, Stats))
+    end.
+
+copy_publish(_P, [], _Publish, Used, Stats) -> {Used, Stats};
+copy_publish(P, [Work | Rest], Publish, Used, Stats0) ->
+    Stats = Stats0#{ attempts := maps:get(attempts, Stats0) + 1 },
+    try ok = Publish(P, Work) of
+        ok ->
+            copy_publish(P, Rest, Publish, Used + 1,
+                Stats#{ completed := maps:get(completed, Stats) + 1 })
+    catch
+        throw:{cold_io, Why} -> {Used + 1, copy_failure(P, Why, Stats)};
+        C:E -> {Used + 1, copy_failure(P, {C, E}, Stats)}
+    end.
+
+copy_failure(P, Reason, Stats) ->
+    Stats#{ failures := [{P, Reason} | maps:get(failures, Stats)] }.
+
+copy_ranges(Cfg, Store, P, Limit) ->
+    Mark = read_int(Store, mark_key(<<"shipped">>, P), -1),
+    Unshipped = [ S || S <- slots_of(Store, P), S > Mark ],
+    Range = maps:get(range, Cfg),
+    Ready = lists:sublist(Unshipped, min(Limit * Range, max(0, length(Unshipped) - ?LAG))),
+    copy_ranges(Ready, Range).
+
+copy_ranges([], _Range) -> [];
+copy_ranges(Slots, Range) when length(Slots) =< Range -> [Slots];
+copy_ranges(Slots, Range) ->
+    {Group, Rest} = lists:split(Range, Slots),
+    [Group | copy_ranges(Rest, Range)].
 
 %% Keep the last result and time per phase. A slot timeout must not hide a
 %% successfully read-back checkpoint, or vice versa.
@@ -333,21 +415,26 @@ ship_process(Cfg, Store, P, Opts) ->
         false -> length(Slots);
         true ->
             Ready = lists:sublist(Slots, min(maps:get(range, Cfg), length(Slots) - ?LAG)),
-            From = hd(Ready), To = lists:last(Ready),
-            Rows = lists:append([ closure(Store, slot_path(P, S)) || S <- Ready ]),
-            Ms = assignment_ms(P, To, Opts),
-            File = filename:join([maps:get(path, Cfg), "slots", hb_util:list(P),
-                pad(From) ++ "-" ++ pad(To) ++ ".hbc"]),
-            Bytes = put_file(Cfg, File,
-                #{ process => P, from => From, to => To, newest_ms => Ms, rows => Rows }),
-            ok = hb_store:write([Store], #{
-                mark_key(<<"shipped">>, P) => integer_to_binary(To),
-                <<(mark_key(<<"range">>, P))/binary, "/", (list_to_binary(pad(To)))/binary>> =>
-                    term_to_binary({From, To, Ms}) }, #{}),
-            ok = hb_store:flush([Store], #{}),
-            status_update(fun(S) -> S#{ shipped_bytes => maps:get(shipped_bytes, S, 0) + Bytes } end),
+            ok = ship_range(Cfg, Store, P, Ready, Opts),
             length(Slots) - length(Ready)
     end.
+
+%% Same archive file and durable cursor used by the C8 tick.
+ship_range(Cfg, Store, P, Ready, Opts) ->
+    From = hd(Ready), To = lists:last(Ready),
+    Rows = lists:append([ closure(Store, slot_path(P, S)) || S <- Ready ]),
+    Ms = assignment_ms(P, To, Opts),
+    File = filename:join([maps:get(path, Cfg), "slots", hb_util:list(P),
+        pad(From) ++ "-" ++ pad(To) ++ ".hbc"]),
+    Bytes = put_file(Cfg, File,
+        #{ process => P, from => From, to => To, newest_ms => Ms, rows => Rows }),
+    ok = hb_store:write([Store], #{
+        mark_key(<<"shipped">>, P) => integer_to_binary(To),
+        <<(mark_key(<<"range">>, P))/binary, "/", (list_to_binary(pad(To)))/binary>> =>
+            term_to_binary({From, To, Ms}) }, #{}),
+    ok = hb_store:flush([Store], #{}),
+    status_update(fun(S) -> S#{ shipped_bytes => maps:get(shipped_bytes, S, 0) + Bytes } end),
+    ok.
 
 assignment_ms(P, S, Opts) ->
     case hb_store_retention:assignment_time(P, S, Opts#{ <<"scheduler-store">> => [irr(Opts)] }) of
