@@ -87,6 +87,8 @@ config(Opts) ->
                          trusted => hb_util:atom(maps:get(<<"trusted">>, P, false)) =:= true }
                     || P <- peers(maps:get(<<"peers">>, C, [])) ],
                 keep_local_ms => Int(<<"keep-local-seconds">>, 604800) * 1000,
+                prune_local_slots =>
+                    hb_util:atom(maps:get(<<"prune-local-slots">>, C, true)) =:= true,
                 thinning => thinning(maps:get(<<"checkpoint-thinning">>, C, [[30, 5], [365, 25]])),
                 interval => Int(<<"interval-ms">>, 60000),
                 io_timeout => Int(<<"io-timeout-ms">>, 10000),
@@ -146,19 +148,19 @@ status() -> persistent_term:get(?STATUS, #{ available => true }).
 
 status_update(Fun) -> persistent_term:put(?STATUS, Fun(status())).
 
-%% @doc One tick: ship new slots, delete local slots that are shipped and
-%% old, ship daily checkpoints. `ok', or the first failure (the share is then
-%% marked unavailable; nothing local was touched past what was confirmed).
+%% @doc Archive both kinds of data even when one stage fails. Reclaim local
+%% assignments only when both archive stages succeeded and pruning is enabled.
+%% A complete tick keeps the old availability and return-value contract.
 tick(Opts) ->
     Cfg = config(Opts),
+    Slots = run_phase(slots, fun() -> ship_slots(Cfg, Opts) end),
+    Checkpoints = run_phase(checkpoints, fun() -> ship_checkpoints(Cfg, Opts) end),
     Result =
-        try
-            ok = ship_slots(Cfg, Opts),
-            ok = prune_slots(Cfg, Opts),
-            ok = ship_checkpoints(Cfg, Opts)
-        catch
-            throw:{cold_io, IOWhy} -> {error, IOWhy};
-            C:E -> {error, {C, E}}
+        case {Slots, Checkpoints, maps:get(prune_local_slots, Cfg)} of
+            {{error, _} = Failed, _, _} -> Failed;
+            {ok, {error, _} = Failed, _} -> Failed;
+            {ok, ok, true} -> run_phase(prune, fun() -> prune_slots(Cfg, Opts) end);
+            {ok, ok, false} -> ok
         end,
     case Result of
         ok ->
@@ -184,6 +186,27 @@ tick(Opts) ->
             end)
     end,
     Result.
+
+%% Keep the last result and time per phase. A slot timeout must not hide a
+%% successfully read-back checkpoint, or vice versa.
+run_phase(Name, Fun) ->
+    Started = erlang:system_time(millisecond),
+    update_phase(Name, #{ started_at => Started, result => running }),
+    Result =
+        try ok = Fun()
+        catch
+            throw:{cold_io, IOWhy} -> {error, IOWhy};
+            C:E -> {error, {C, E}}
+        end,
+    update_phase(Name, #{ started_at => Started,
+        finished_at => erlang:system_time(millisecond), result => Result }),
+    Result.
+
+update_phase(Name, Phase) ->
+    status_update(fun(S) ->
+        Phases = maps:get(phases, S, #{}),
+        S#{ phases => Phases#{ Name => Phase } }
+    end).
 
 set_gauge(Name, Value) ->
     try
@@ -589,6 +612,7 @@ ship_checkpoint(Cfg, Main, P, S) ->
 
 %% On the share, checkpoints are thinned with age, never to none
 %% (`thin_plan/3').
+thin_checkpoints(#{ thinning := [] }, _P) -> ok;
 thin_checkpoints(Cfg, P) ->
     Dir = filename:join([maps:get(path, Cfg), "checkpoints", hb_util:list(P)]),
     Files = [ {Seq, S, Ms, F} || F <- list_dir(Cfg, Dir), {S, Ms, Seq} <- [checkpoint_name(F)] ],
