@@ -69,9 +69,23 @@
 %%% (`hb_store_budget') decide what may go, and an unshipped signed row never
 %%% does.
 %%%
+%%% The node's local stores have a byte budget too, `hot-bytes' (none when
+%%% unset): kept below RAM, it keeps LMDB resident in the page cache, without
+%%% which a round trip was 3-4x slower (AX102 lab). While the node's LMDB
+%%% stores hold more than it live (`hb_store_lmdb' `live_bytes', all stores),
+%%% the processes least recently read (`note_read/1'), and the largest among
+%%% them, give up their oldest slots first, never below `hot-slots-floor',
+%%% until the excess is covered. A cut is computed once per measurement of the
+%%% stores (every 30 s), so slots deleted since are never counted twice.
+%%%
 %%% Under disk pressure (`hb_store_budget' at `soft' or above) the hot window
 %%% shrinks to `hot-slots-floor' and no checkpoint is shipped, so the link
 %%% carries only what local disk is waiting on.
+%%%
+%%% Shipping is paced: a round that shipped B bytes is followed by a pause of
+%%% at least B / `ship-bytes-per-second', so a backlog (a node that takes up
+%%% the cold tier with a full window, or catches up after an outage) uses
+%%% the link at that rate and no faster.
 %%%
 %%% A message read by ID after its slot left local disk is served from the
 %%% share. Each range file has a sidecar, `<from>-<to>.ids', that lists every
@@ -108,7 +122,10 @@
 %%%   peers                    [#{ node, path, trusted }]: other nodes'
 %%%                            folders, read only
 %%%   hot-slots                newest slots of each process kept locally
-%%%                            (10,000)
+%%%                            (100,000)
+%%%   hot-bytes                the node's local LMDB bytes, live, at most
+%%%                            (none); windows shrink to stay under it
+%%%   ship-bytes-per-second    the shipper's pace (8 MiB)
 %%%   hot-slots-floor          the same under disk pressure (2,000: the
 %%%                            lost-push repair window)
 %%%   prune-local-slots        false holds every local slot (true)
@@ -137,7 +154,7 @@
 -module(hb_store_cold).
 -export([maybe_start/1, status/0, tick/1, config/1]).
 -export([read_assignment/3, restore_checkpoint/3, ship_replica/3, restore_replica/4]).
--export([seen/4, register_source/1]).
+-export([seen/4, register_source/1, note_read/1]).
 %% A read-only store (`store-module' `hb_store_cold'): reads by ID from the share.
 -export([scope/1, read/3]).
 -ifdef(TEST).
@@ -173,7 +190,13 @@ config(Opts) ->
                          path => hb_util:list(maps:get(<<"path">>, P)),
                          trusted => hb_util:atom(maps:get(<<"trusted">>, P, false)) =:= true }
                     || P <- peers(maps:get(<<"peers">>, C, [])) ],
-                hot_slots => max(Floor, Int(<<"hot-slots">>, 10000)),
+                hot_slots => max(Floor, Int(<<"hot-slots">>, 100000)),
+                hot_bytes =>
+                    case maps:get(<<"hot-bytes">>, C, undefined) of
+                        undefined -> undefined;
+                        HB -> hb_util:int(HB)
+                    end,
+                ship_rate => max(1, Int(<<"ship-bytes-per-second">>, 8388608)),
                 hot_floor => Floor,
                 prune_local_slots =>
                     hb_util:atom(maps:get(<<"prune-local-slots">>, C, true)) =:= true,
@@ -238,11 +261,12 @@ maybe_start(Opts) ->
 %% up to `?MAX_BACKOFF_MS'.
 server(Opts, Backoff) ->
     process_flag(priority, low),
+    _ = reads_table(),
     Cfg = config(Opts),
     Interval = maps:get(interval, Cfg),
     {Wait, Next} =
         case catch round(Cfg, Opts) of
-            {ok, true} -> {?BUSY_PAUSE_MS, 0};
+            {ok, true} -> {paced(Cfg), 0};
             {ok, false} -> {Interval, 0};
             _ ->
                 B = min(?MAX_BACKOFF_MS, max(Interval, Backoff * 2)),
@@ -251,6 +275,37 @@ server(Opts, Backoff) ->
     receive
         {tick_now, From, Ref} -> From ! {Ref, ok}, server(Opts, Next)
     after Wait -> server(Opts, Next)
+    end.
+
+%% The pause after a round with a backlog left: long enough that the round's
+%% bytes went at `ship-bytes-per-second' at most.
+paced(Cfg) ->
+    S = status(),
+    Bytes = maps:get(last_round_bytes, S, 0),
+    Ms = maps:get(last_round_ms, S, 0),
+    max(?BUSY_PAUSE_MS, Bytes * 1000 div maps:get(ship_rate, Cfg) - Ms).
+
+%% The table of when each process was last read, owned by the shipper.
+-define(READS, hb_store_cold_reads).
+reads_table() ->
+    case ets:whereis(?READS) of
+        undefined -> catch ets:new(?READS, [named_table, public, set, {write_concurrency, true}]);
+        _ -> ok
+    end.
+
+%% @doc Note that `P' was read now: the processes read least recently give up
+%% local slots first when the node is over `hot-bytes'. Free when no shipper
+%% runs.
+note_read(P) ->
+    try ets:insert(?READS, {P, erlang:monotonic_time(second)}), ok
+    catch error:badarg -> ok
+    end.
+
+last_read(P) ->
+    try ets:lookup(?READS, P) of
+        [{P, T}] -> T;
+        [] -> undefined
+    catch error:badarg -> undefined
     end.
 
 %% @doc The share's state: whether the last round reached it, since when not,
@@ -273,6 +328,7 @@ tick(Opts) ->
 %% the share is marked unavailable. Local deletes are decided from verified
 %% range rows only, so they run whatever the share's state.
 round(Cfg, Opts) ->
+    Started = erlang:monotonic_time(millisecond),
     Level = hb_store_budget:level(),
     Slots = run_phase(slots, fun() -> ship_slots(Cfg, Opts) end),
     Prune =
@@ -295,6 +351,8 @@ round(Cfg, Opts) ->
     status_update(fun(S) ->
         S#{ level => Level,
             last_round => erlang:system_time(millisecond),
+            last_round_ms => erlang:monotonic_time(millisecond) - Started,
+            last_round_bytes => maps:get(bytes, Slots, 0) + maps:get(bytes, Checkpoints, 0),
             last_failures => lists:sublist(Failures, 8),
             shipped_bytes => maps:get(shipped_bytes, S, 0)
                 + maps:get(bytes, Slots, 0) + maps:get(bytes, Checkpoints, 0),
@@ -521,9 +579,36 @@ list_names(Store, Path) ->
         _ -> []
     end.
 
-slots_of(Store, P) ->
-    lists:sort([ I || N <- list_names(Store, <<?ASSIGNMENTS/binary, "/", P/binary>>),
-                      I <- [catch binary_to_integer(N)], is_integer(I) ]).
+%% A process's newest slot, found by probing up from `Hint' (a slot known
+%% shipped, or -1): its slots above every deleted one are contiguous, so a
+%% few reads find it, where listing them cost every slot in the window, every
+%% round (100,000 a process). -1 for none.
+head(Store, P, Hint) ->
+    case has_slot(Store, P, Hint + 1) of
+        false -> Hint;
+        true -> gallop(Store, P, Hint + 1, 1)
+    end.
+
+gallop(Store, P, Known, Step) ->
+    case has_slot(Store, P, Known + Step) of
+        true -> gallop(Store, P, Known + Step, Step * 2);
+        false -> bisect(Store, P, Known, Known + Step)
+    end.
+
+bisect(_Store, _P, Lo, Hi) when Hi - Lo =< 1 -> Lo;
+bisect(Store, P, Lo, Hi) ->
+    Mid = (Lo + Hi) div 2,
+    case has_slot(Store, P, Mid) of
+        true -> bisect(Store, P, Mid, Hi);
+        false -> bisect(Store, P, Lo, Mid)
+    end.
+
+has_slot(_Store, _P, S) when S < 0 -> false;
+has_slot(Store, P, S) ->
+    case hb_store:read([Store], #{ <<"read">> => slot_path(P, S), <<"exact">> => true }, #{}) of
+        {ok, _} -> true;
+        _ -> false
+    end.
 
 slot_path(P, S) -> <<?ASSIGNMENTS/binary, "/", P/binary, "/", (integer_to_binary(S))/binary>>.
 
@@ -569,13 +654,15 @@ ship_slots(Cfg, Opts) ->
 %% more, and confirm again (`readback' confirms at once). A failure ends this
 %% process's turn, never another's.
 ship_process(Cfg, Store, P, Opts) ->
-    Slots = slots_of(Store, P),
     {Verified0, Failed0} = confirm(Cfg, Store, P),
     Written =
         max(read_int(Store, mark_key(<<"shipped">>, P), -1),
             read_int(Store, mark_key(<<"written">>, P), -1)),
-    Unwritten = [ S || S <- Slots, S > Written ],
-    Ready = lists:sublist(Unwritten, max(0, length(Unwritten) - ?LAG)),
+    Head = head(Store, P, Written),
+    % A slot written per round at most `ranges-per-round' x `range-slots':
+    % never a list of the whole backlog.
+    Last = min(Head - ?LAG, Written + maps:get(ranges_per_round, Cfg) * maps:get(range, Cfg)),
+    Ready = case Last > Written of true -> lists:seq(Written + 1, Last); false -> [] end,
     {Done, Bytes, Used, Failed1} =
         case Failed0 of
             [] -> write_ranges(Cfg, Store, P, Ready, maps:get(ranges_per_round, Cfg), Opts, {0, 0, 0});
@@ -588,8 +675,8 @@ ship_process(Cfg, Store, P, Opts) ->
         end,
     Shipped = read_int(Store, mark_key(<<"shipped">>, P), -1),
     #{ done => Done + Verified0 + Verified1, verified => Verified0 + Verified1,
-       bytes => Bytes, more => Used < length(Ready),
-       lag => length([ S || S <- Slots, S > Shipped ]),
+       bytes => Bytes, more => Written + Used < Head - ?LAG,
+       lag => max(0, Head - Shipped),
        failures => Failed0 ++ Failed1 ++ Failed2 }.
 
 %% Write ranges of `Slots', each at most `range-slots' slots and about
@@ -720,25 +807,95 @@ assignment_ms(Store, P, S, Opts) ->
 %% transaction. Slot 0 stays, and so does every `message-slots' row (the
 %% scheduler's dedupe index). `#{ done, pruned }'.
 prune_slots(Cfg, Level, Opts) ->
-    Hot =
-        case hb_store_budget:rank(Level) >= hb_store_budget:rank(soft) of
-            true -> maps:get(hot_floor, Cfg);
-            false -> maps:get(hot_slots, Cfg)
-        end,
-    Counts =
-        [ prune_process(Store, DB, P, Hot)
+    Procs =
+        [ {{Store, P}, DB, Head, Local, Ranges}
         || {Store, _} <- sources(Opts),
            #{ <<"db">> := DB } <- [hb_store:find(inner(Store))],
-           P <- list_names(Store, ?ASSIGNMENTS), ?IS_ID(P) ],
+           P <- list_names(Store, ?ASSIGNMENTS), ?IS_ID(P),
+           Ranges <- [lists:sort(list_names(Store, range_prefix(P)))],
+           Shipped <- [read_int(Store, mark_key(<<"shipped">>, P), -1)],
+           Head <- [head(Store, P, Shipped)],
+           Local <- [local_slots(Store, P, Ranges, Shipped, Head)] ],
+    Windows = windows(Cfg, Level, [ {K, Local} || {K, _, _, Local, _} <- Procs ], Opts),
+    Counts =
+        [ prune_ranges(Store, DB, P, Head - maps:get(K, Windows), Ranges, 0)
+        || {K = {Store, P}, DB, Head, _, Ranges} <- Procs, Ranges =/= [] ],
+    status_update(fun(S) -> S#{ windows_cut => maps:size(maps:filter(
+        fun(_, W) -> W < maps:get(hot_slots, Cfg) end, Windows)) } end),
     #{ done => length([ C || C <- Counts, C > 0 ]), pruned => lists:sum(Counts) }.
 
-prune_process(Store, DB, P, Hot) ->
-    case lists:sort(list_names(Store, range_prefix(P))) of
-        [] -> 0;
-        Ranges ->
-            Below = lists:max([-1 | slots_of(Store, P)]) - Hot,
-            prune_ranges(Store, DB, P, Below, Ranges, 0)
+%% The slots of a process held locally: from the first range not yet deleted
+%% (or past the last shipped, when every shipped range is gone) to its head.
+local_slots(Store, P, Ranges, Shipped, Head) ->
+    Low =
+        case Ranges of
+            [First | _] ->
+                case hb_store:read([Store], #{ <<"read">> => <<(range_prefix(P))/binary, "/",
+                        First/binary>>, <<"exact">> => true }, #{}) of
+                    {ok, V} -> element(1, binary_to_term(V, [safe]));
+                    _ -> Shipped + 1
+                end;
+            [] -> Shipped + 1
+        end,
+    max(0, Head - max(1, Low) + 1).
+
+%% Each process's hot window. `hot-slots', or `hot-slots-floor' under disk
+%% pressure; and while the node's LMDB stores hold more than `hot-bytes'
+%% live, the processes read least recently, the largest among them first,
+%% give up their oldest local slots, never below the floor, until the excess
+%% is covered at the stores' bytes per local slot. A cut holds until the
+%% stores are measured again: a new measurement already counts what it freed.
+-define(BUDGET, {?MODULE, budget}).
+windows(Cfg, Level, Procs, _Opts) ->
+    Floor = maps:get(hot_floor, Cfg),
+    Base =
+        case hb_store_budget:rank(Level) >= hb_store_budget:rank(soft) of
+            true -> Floor;
+            false -> maps:get(hot_slots, Cfg)
+        end,
+    Plain = maps:from_list([ {K, Base} || {K, _} <- Procs ]),
+    case maps:get(hot_bytes, Cfg) of
+        undefined -> Plain;
+        Budget ->
+            Live = live_bytes(),
+            case persistent_term:get(?BUDGET, undefined) of
+                {Live, Cut} -> maps:merge(Plain, maps:with(maps:keys(Plain), Cut));
+                _ ->
+                    Cut = cut(Live - Budget, Base, Floor, Procs, Live),
+                    persistent_term:put(?BUDGET, {Live, Cut}),
+                    maps:merge(Plain, Cut)
+            end
     end.
+
+cut(Excess, _Base, _Floor, _Procs, _Live) when Excess =< 0 -> #{};
+cut(Excess, Base, Floor, Procs, Live) ->
+    Slots = lists:sum([ L || {_, L} <- Procs ]),
+    PerSlot = max(1, Live div max(1, Slots)),
+    Order = lists:sort(
+        fun({{_, PA}, LA}, {{_, PB}, LB}) ->
+            {recency(PA), -LA} =< {recency(PB), -LB}
+        end, Procs),
+    cut_each(Order, Excess, PerSlot, Base, Floor, #{}).
+
+cut_each(_, Excess, _PerSlot, _Base, _Floor, Acc) when Excess =< 0 -> Acc;
+cut_each([], _Excess, _PerSlot, _Base, _Floor, Acc) -> Acc;
+cut_each([{K, Local} | Rest], Excess, PerSlot, Base, Floor, Acc) ->
+    Spare = max(0, min(Local, Base) - Floor),
+    Take = min(Spare, (Excess + PerSlot - 1) div PerSlot),
+    cut_each(Rest, Excess - Take * PerSlot, PerSlot, Base, Floor,
+        Acc#{ K => min(Local, Base) - Take }).
+
+%% Never read sorts first; then the oldest read.
+recency(P) ->
+    case last_read(P) of
+        undefined -> {0, 0};
+        T -> {1, T}
+    end.
+
+%% The node's LMDB stores, live: their pages less their free lists.
+live_bytes() ->
+    lists:sum([ maps:get(live_bytes, H, maps:get(file_bytes, H, 0))
+              || H <- maps:values(hb_store_lmdb:health()) ]).
 
 prune_ranges(_Store, _DB, _P, _Below, [], N) -> N;
 prune_ranges(Store, DB, P, Below, [Name | Rest], N) ->
@@ -2275,3 +2432,71 @@ replica_store_ships_and_prunes_test_() ->
             persistent_term:erase(?SOURCES)
         end
     end}.
+
+%% @doc A process's newest slot is found by probing, also above deleted ones.
+head_probe_test_() ->
+    {timeout, 60, fun() ->
+        Env = #{ irr := Irr, opts := Opts, p := P } = test_env("head"),
+        ?assertEqual(-1, head(Irr, P, -1)),
+        assign(Env, lists:seq(0, 39), 3600000),
+        ?assertEqual(39, head(Irr, P, -1)),
+        ?assertEqual(39, head(Irr, P, 17)),
+        ?assertEqual(39, head(Irr, P, 39)),
+        ok = tick(Opts),
+        ?assertNot(local(Env, 5)),
+        ?assertEqual(39, head(Irr, P, read_int(Irr, mark_key(<<"shipped">>, P), -1)))
+    end}.
+
+%% @doc Over the node's byte budget, the process read least recently gives
+%% up its oldest local slots first, never below the floor; one read just now
+%% keeps its whole window. A cut is made once per measurement.
+node_budget_cuts_the_least_read_first_test_() ->
+    {timeout, 120, fun() ->
+        EnvA = #{ opts := Opts0, p := PA } = test_env("budget"),
+        EnvB = #{ p := PB } = another_process(EnvA),
+        Cold = maps:get(<<"cold-tier">>, Opts0),
+        Opts = Opts0#{ <<"cold-tier">> => Cold#{ <<"hot-slots">> => 1000, <<"range-slots">> => 5,
+            <<"ranges-per-round">> => 100, <<"hot-bytes">> => 88000 } },
+        assign(EnvA, lists:seq(0, 59), 3600000),
+        assign(EnvB, lists:seq(0, 59), 3600000),
+        _ = reads_table(),
+        ok = note_read(PA),
+        Health = persistent_term:get({hb_store_lmdb, health}, #{}),
+        % 118 local slots a process pair (1..59 each) at 1,000 B: 30 over.
+        persistent_term:put({hb_store_lmdb, health}, #{ fake => #{ live_bytes => 118000 } }),
+        try
+            ok = tick(Opts),
+            % B, never read, keeps its newest 29: slots up to 30 go.
+            ?assertNot(local(EnvB, 10)),
+            ?assertNot(local(EnvB, 29)),
+            ?assert(local(EnvB, 35)),
+            % A keeps everything.
+            ?assert(local(EnvA, 10)),
+            ?assert(local(EnvA, 1)),
+            % The same measurement again cuts nothing more.
+            ok = tick(Opts),
+            ?assert(local(EnvB, 35)),
+            ?assert(local(EnvA, 10)),
+            % A far larger excess stops at the floor (16) for both.
+            persistent_term:put({hb_store_lmdb, health}, #{ fake => #{ live_bytes => 10000000 } }),
+            ok = tick(Opts),
+            ?assert(local(EnvB, 44)),
+            ?assert(local(EnvA, 44)),
+            ?assertNot(local(EnvA, 10))
+        after
+            persistent_term:put({hb_store_lmdb, health}, Health),
+            persistent_term:erase(?BUDGET)
+        end
+    end}.
+
+%% @doc A round's bytes set the pause after it: the shipper runs at its pace.
+paced_test() ->
+    Before = status(),
+    try
+        status_update(fun(S) -> S#{ last_round_bytes => 8388608, last_round_ms => 100 } end),
+        ?assertEqual(900, paced(#{ ship_rate => 8388608 })),
+        status_update(fun(S) -> S#{ last_round_bytes => 1000, last_round_ms => 100 } end),
+        ?assertEqual(?BUSY_PAUSE_MS, paced(#{ ship_rate => 8388608 }))
+    after
+        persistent_term:put(?STATUS, Before)
+    end.
