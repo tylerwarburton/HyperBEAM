@@ -319,7 +319,7 @@ load(Pusd, Url, NodeOpts, Dir, OnOtherBuild) ->
     ok = filelib:ensure_dir(binary_to_list(<<Base/binary, "/">>)),
     ok = filelib:ensure_dir(binary_to_list(<<Base/binary, ".computed/">>)),
     ComputedTo = same_build(Cursor, Build, Verified, Computed, OnOtherBuild),
-    ok = hb_store:start([Verified, Computed]),
+    ok = start_replica_stores(Verified, Computed),
     % Nothing computed here: start from this build's newest replica snapshot
     % on the cold tier, if there is one (`hb_store_cold').
     case ComputedTo =:= -1 andalso newest_snapshot(Computed, Pusd) =:= -1 of
@@ -336,6 +336,90 @@ load(Pusd, Url, NodeOpts, Dir, OnOtherBuild) ->
     R1#{ computed := min(Slot, ComputedTo) }.
 
 lmdb(Name) -> #{ <<"store-module">> => hb_store_lmdb, <<"name">> => Name }.
+
+start_replica_stores(Verified, Computed) ->
+    case start_replica_store(verified, Verified) of
+        ok -> start_replica_store(computed, Computed);
+        Failure -> Failure
+    end.
+
+start_replica_store(Role, Store) ->
+    Key = {?MODULE, replica_start_summary, Role},
+    %% The singleton list retains hb_store:start's treatment of not_found.
+    case hb_store:start([Store]) of
+        ok ->
+            erase(Key),
+            ok;
+        Failure ->
+            _ = catch note_replica_start_failure(Key, Role, Failure),
+            Failure
+    end.
+
+note_replica_start_failure(Key, Role, Failure) ->
+    Summary = replica_start_summary(Role, Failure),
+    case get(Key) of
+        Summary -> ok;
+        _ ->
+            ?event(warning, {replica_store_start_redacted, Summary}),
+            put(Key, Summary),
+            ok
+    end.
+
+replica_start_summary(Role, {failure, {error, {badmatch, Native}, Stack}}) ->
+    {Kind, Errno} = replica_native_error(Native),
+    {Role, replica_start_stage(Stack), Kind, Errno};
+replica_start_summary(Role, {failure, {_Class, _, Stack}}) ->
+    {Role, replica_start_stage(Stack), other, unreported};
+replica_start_summary(Role, Native) ->
+    {Kind, Errno} = replica_native_error(Native),
+    {Role, startup, Kind, Errno}.
+
+%% These line numbers are pinned to 703de2ef7's unchanged hb_store_lmdb.
+%% The file field and any argument list remain outside the report.
+replica_start_stage([{hb_store_lmdb, start, _, Info} | _]) when is_list(Info) ->
+    case proplists:get_value(line, Info) of
+        56 -> metrics_init;
+        59 -> ensure_dir;
+        99 -> env_open;
+        100 -> db_open;
+        102 -> flusher;
+        _ -> startup
+    end;
+replica_start_stage([_ | Rest]) -> replica_start_stage(Rest);
+replica_start_stage(_) -> startup.
+
+replica_native_error({error, Reason}) -> replica_native_error({error, Reason, undefined});
+replica_native_error({error, no_space, _}) -> {no_space, enospc};
+replica_native_error({error, E, _})
+    when E =:= eacces; E =:= eperm; E =:= enoent; E =:= enotdir; E =:= enospc;
+         E =:= edquot; E =:= enomem; E =:= emfile; E =:= enfile; E =:= erofs; E =:= eio ->
+    {os_error, E};
+replica_native_error({error, environment_error, <<"Failed to open environment: Other(", N/binary>>}) ->
+    {environment_error, replica_errno(N)};
+replica_native_error({error, database_error, <<"Failed to open database: Other(", N/binary>>}) ->
+    {database_error, replica_errno(N)};
+replica_native_error({error, E, _})
+    when E =:= environment_error; E =:= database_error; E =:= io_error;
+         E =:= permission_denied; E =:= invalid_path; E =:= directory_not_found;
+         E =:= corrupted; E =:= map_full; E =:= map_resized;
+         E =:= dbs_full; E =:= readers_full; E =:= incompatible ->
+    {E, unreported};
+replica_native_error(_) -> {other, unreported}.
+
+%% The pinned native wrappers use the exact debug spelling Other(N).
+%% Match complete known suffixes and keep generic native errors generic.
+replica_errno(<<"1)">>) -> eperm;
+replica_errno(<<"2)">>) -> enoent;
+replica_errno(<<"5)">>) -> eio;
+replica_errno(<<"12)">>) -> enomem;
+replica_errno(<<"13)">>) -> eacces;
+replica_errno(<<"20)">>) -> enotdir;
+replica_errno(<<"23)">>) -> enfile;
+replica_errno(<<"24)">>) -> emfile;
+replica_errno(<<"28)">>) -> enospc;
+replica_errno(<<"30)">>) -> erofs;
+replica_errno(<<"122)">>) -> edquot;
+replica_errno(_) -> unreported.
 
 %% The newest snapshot slot in a computed store, or -1.
 newest_snapshot(Computed, Pusd) ->
@@ -955,6 +1039,29 @@ other_build_kept_only_when_asked() ->
     _ = load(Pusd, Unreachable, #{}, Dir),
     ?assertNotEqual({ok, <<"computed">>}, Read(Computed)),
     ?assertEqual({ok, <<"verified">>}, Read(Store)).
+
+replica_start_redaction_test() ->
+    Secret = <<"fixture secret/path/argument">>,
+    Frame = fun(L) -> {hb_store_lmdb, start, [Secret], [{file, Secret}, {line, L}]} end,
+    Failure = fun(E, L) -> {failure, {error, {badmatch, E}, [Frame(L)]}} end,
+    ?assertEqual({verified, ensure_dir, os_error, eacces},
+        replica_start_summary(verified, Failure({error, eacces}, 59))),
+    ?assertEqual({verified, env_open, no_space, enospc},
+        replica_start_summary(verified, Failure({error, no_space}, 99))),
+    ?assertEqual({computed, db_open, database_error, edquot},
+        replica_start_summary(computed,
+            Failure({error, database_error, <<"Failed to open database: Other(122)">>}, 100))),
+    ?assertEqual({computed, env_open, environment_error, enomem},
+        replica_start_summary(computed,
+            Failure({error, environment_error, <<"Failed to open environment: Other(12)">>}, 99))),
+    ?assertEqual({computed, env_open, environment_error, unreported},
+        replica_start_summary(computed,
+            Failure({error, environment_error,
+                <<"Failed to open environment: Other(13)", Secret/binary>>}, 99))),
+    ?assertEqual({computed, db_open, io_error, unreported},
+        replica_start_summary(computed, Failure({error, io_error, Secret}, 100))),
+    ?assertEqual({computed, flusher, other, unreported},
+        replica_start_summary(computed, {failure, {exit, Secret, [Frame(102)]}})).
 
 %% A slot that crashes a check is refused with the same scrubbed text as a
 %% failed pass: the public status never shows a call's arguments.
