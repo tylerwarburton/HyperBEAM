@@ -73,6 +73,18 @@
 %%% shrinks to `hot-slots-floor' and no checkpoint is shipped, so the link
 %%% carries only what local disk is waiting on.
 %%%
+%%% A message read by ID after its slot left local disk is served from the
+%%% share. Each range file has a sidecar, `<from>-<to>.ids', that lists every
+%%% ID its rows answer for. The share's host indexes those sidecars
+%%% (`coldcheck' `/locate'), so the index of every ID ever pruned grows on the
+%%% share and never locally. In the node's `store' list, after its local
+%%% stores, `#{ <<"store-module">> => hb_store_cold }' makes the cold tier a
+%%% read-only store of `remote' scope. A read of an ID asks the host where the
+%%% ID is, reads that range file (its digest checked), and answers with the
+%%% ID's row, the packed message `hb_cache' unpacks. The newest few files read
+%%% are kept in memory, so a page of history costs one file read. An index can
+%%% only cause a miss: every answer is read back from the file.
+%%%
 %%% Reads fall back: a slot not held locally is read from this node's folder,
 %%% then from the other nodes' folders (`peers'), then from Arweave (the
 %%% schedule's archive windows, `dev_scheduler_uploader'). Anything read from
@@ -117,6 +129,8 @@
 -export([maybe_start/1, status/0, tick/1, config/1]).
 -export([read_assignment/3, restore_checkpoint/3, ship_replica/3, restore_replica/4]).
 -export([seen/4]).
+%% A read-only store (`store-module' `hb_store_cold'): reads by ID from the share.
+-export([scope/1, read/3]).
 -ifdef(TEST).
 -export([test_env/2, assign/3, share/1]).
 -endif.
@@ -600,9 +614,17 @@ take_range(_Store, _P, _Slots, _MaxSlots, _MaxBytes, Range, Rows, _Bytes) ->
 write_range(Cfg, Store, P, Range, Rows, Opts) ->
     From = hd(Range), To = lists:last(Range),
     Ms = assignment_ms(P, To, Opts),
+    File = range_file(Cfg, P, From, To),
     {Bytes, Digest} =
-        put_file(Cfg, range_file(Cfg, P, From, To),
+        put_file(Cfg, File,
             #{ process => P, from => From, to => To, newest_ms => Ms, rows => Rows }),
+    % The IDs the range answers for, for the share host's index (`locate/2').
+    IDs = iolist_to_binary([ [K, $\n] || {K, _} <- Rows, ?IS_ID(K), byte_size(K) =:= 43 ]),
+    io(Cfg, fun() ->
+        Ids = filename:rootname(File) ++ ".ids",
+        ok = hb_file:write_file(Ids ++ ".tmp", IDs, [binary]),
+        ok = hb_file:rename(Ids ++ ".tmp", Ids)
+    end),
     ok = hb_store:write([Store], #{
         pending_key(P, To) => term_to_binary({From, To, Ms, Digest, Bytes}),
         mark_key(<<"written">>, P) => integer_to_binary(To) }, #{}),
@@ -970,6 +992,101 @@ gateway(Method, Gateway, Path, Body) ->
         hb_http_gate:httpc_request(Method, Request, [{timeout, 30000}],
             [{body_format, binary}], #{}),
     Res.
+
+%%% Reads by ID (a store)
+
+%% @doc The cold tier is slow and may be away: never a local read.
+scope(_StoreOpts) -> remote.
+
+%% @doc Read an ID's row from the share: where the share's host says it is,
+%% from that range file. `{ok, Value}' (a packed message, whose children read
+%% by their IDs too), or `{error, not_found}'. Never throws.
+read(_StoreOpts, #{ <<"read">> := Key }, NodeOpts) when is_binary(Key), byte_size(Key) =:= 43 ->
+    case config(NodeOpts) of
+        #{ verify := coldcheck, verify_url := Url } = Cfg when Url =/= undefined ->
+            try by_id(Cfg, Key)
+            catch _:Why ->
+                ?event(cold_tier, {cold_read_by_id_failed, Key, Why}),
+                {error, not_found}
+            end;
+        _ -> {error, not_found}
+    end;
+read(_StoreOpts, _Req, _NodeOpts) -> {error, not_found}.
+
+by_id(Cfg, ID) ->
+    case locate(Cfg, ID) of
+        {ok, Rel} ->
+            Rows = range_rows(Cfg, Rel),
+            case lists:keyfind(ID, 1, Rows) of
+                {ID, <<"ao:", Target/binary>>} ->
+                    case lists:keyfind(Target, 1, Rows) of
+                        {Target, V} -> {ok, V};
+                        false -> {error, not_found}
+                    end;
+                {ID, V} -> {ok, V};
+                false -> {error, not_found}
+            end;
+        not_found -> {error, not_found}
+    end.
+
+%% Where the share's host has `ID': the range file's path below this node's
+%% folder, or `not_found'.
+locate(#{ verify_url := Url, verify_prefix := Prefix } = Cfg, ID) ->
+    Answer =
+        io(Cfg, fun() ->
+            hb_http_gate:httpc_request(get, {Url ++ "/locate?id=" ++ binary_to_list(ID), []},
+                [{timeout, maps:get(io_timeout, Cfg)}], [{body_format, binary}], #{})
+        end),
+    case Answer of
+        {ok, {{_, 200, _}, _, Json}} ->
+            case maps:get(ID, hb_json:decode(Json), #{}) of
+                #{ <<"path">> := Path } -> {ok, below_prefix(hb_util:list(Path), Prefix)};
+                _ -> not_found
+            end;
+        _ -> not_found
+    end.
+
+below_prefix(Path, "") -> Path;
+below_prefix(Path, Prefix) ->
+    case lists:prefix(Prefix ++ "/", Path) of
+        true -> lists:nthtail(length(Prefix) + 1, Path);
+        false -> Path
+    end.
+
+%% A range file's rows: from the newest few read (an ETS table, its owner a
+%% process of its own), or from the share.
+-define(READ_CACHE, hb_store_cold_read_cache).
+-define(READ_CACHE_FILES, 8).
+range_rows(Cfg, Rel) ->
+    Table = read_cache(),
+    case ets:lookup(Table, Rel) of
+        [{Rel, _, Rows}] -> Rows;
+        [] ->
+            {ok, #{ rows := Rows }} = get_file(sized(Cfg, 64 * 1024 * 1024),
+                filename:join(maps:get(path, Cfg), Rel)),
+            ets:insert(Table, {Rel, erlang:unique_integer([monotonic]), Rows}),
+            case ets:info(Table, size) > ?READ_CACHE_FILES of
+                true ->
+                    [{_, Oldest} | _] = lists:keysort(2, [ {R, N} || {R, N, _} <- ets:tab2list(Table) ]),
+                    ets:delete(Table, Oldest);
+                false -> ok
+            end,
+            Rows
+    end.
+
+read_cache() ->
+    case ets:whereis(?READ_CACHE) of
+        undefined ->
+            Self = self(),
+            hb_name:singleton(?READ_CACHE, fun() ->
+                catch ets:new(?READ_CACHE, [named_table, public, set, {read_concurrency, true}]),
+                Self ! {?READ_CACHE, ready},
+                receive stop -> ok end
+            end),
+            receive {?READ_CACHE, ready} -> ok after 1000 -> ok end,
+            ?READ_CACHE;
+        _ -> ?READ_CACHE
+    end.
 
 %%% Checkpoints
 
@@ -2041,4 +2158,57 @@ dedupe_moves_to_filters_test_() ->
         ?assertEqual(not_found, seen(Irr, P, [New], Opts)),
         os:cmd("mv " ++ Share ++ ".away " ++ Share),
         ?assertEqual({ok, 5, ID5}, seen(Irr, P, [ID5], Opts))
+    end}.
+
+%% A stub of the share host's `/locate' over the share folder `Share': it
+%% scans the `.ids' sidecars for the ID asked.
+stub_locate(Share, Prefix) ->
+    stub_gateway(fun(_Method, Path) ->
+        [_, Query] = binary:split(Path, <<"?">>),
+        [{<<"id">>, ID}] = uri_string:dissect_query(Query),
+        Found =
+            [ F || F <- filelib:wildcard(Share ++ "/slots/*/*.ids"),
+                   {ok, B} <- [file:read_file(F)],
+                   lists:member(ID, binary:split(B, <<"\n">>, [global])) ],
+        Answer =
+            case Found of
+                [F | _] ->
+                    Rel = filename:join([Prefix, "slots", filename:basename(filename:dirname(F)),
+                        filename:rootname(filename:basename(F)) ++ ".hbc"]),
+                    #{ ID => #{ <<"path">> => list_to_binary(Rel) } };
+                [] -> #{ ID => #{ <<"error">> => <<"not_found">> } }
+            end,
+        {200, hb_json:encode(Answer)}
+    end).
+
+%% @doc After its slot left local disk, a message reads by its signed ID, and
+%% its assignment by its own, through the cold tier as a store, as Lunar and
+%% the sites read history; an ID the share does not have is a miss.
+read_by_id_after_prune_test_() ->
+    {timeout, 120, fun() ->
+        Env = #{ irr := Irr, opts := Opts0, p := P } = test_env("by-id"),
+        Cold = maps:get(<<"cold-tier">>, Opts0),
+        Share = share(Opts0),
+        Opts = Opts0#{ <<"cold-tier">> => Cold#{ <<"verify">> => <<"coldcheck">>,
+            <<"verify-url">> => stub_coldcheck(filename:dirname(Share), ets:new(no_lies, [public])),
+            <<"verify-prefix">> => list_to_binary(filename:basename(Share)) } },
+        assign(Env, lists:seq(0, 39), 3600000),
+        {ok, A5} = hb_cache:read(slot_path(P, 5), Opts#{ <<"store">> => [Irr] }),
+        Body = hb_ao:get(<<"body">>, A5, Opts),
+        BodyID = hb_message:id(Body, signed, Opts),
+        AID = hb_message:id(A5, signed, Opts),
+        ok = tick(Opts),
+        ?assertNot(local(Env, 5)),
+        ?assertMatch({error, not_found}, hb_store:read([Irr], #{ <<"read">> => BodyID, <<"exact">> => true }, #{})),
+        Reader = Opts#{
+            <<"cold-tier">> => (maps:get(<<"cold-tier">>, Opts))#{
+                <<"verify-url">> => stub_locate(Share, filename:basename(Share)) },
+            <<"store">> => [Irr, #{ <<"store-module">> => hb_store_cold }] },
+        {ok, Read} = hb_cache:read(BodyID, Reader),
+        ?assertEqual(<<"5">>, hb_ao:get(<<"n">>, Read, Reader)),
+        ?assert(hb_message:verify(Read, all, Reader)),
+        {ok, ReadA} = hb_cache:read(AID, Reader),
+        ?assertEqual(5, hb_util:int(hb_ao:get(<<"slot">>, ReadA, Reader))),
+        ?assertEqual({error, not_found},
+            read(#{}, #{ <<"read">> => hb_util:human_id(crypto:strong_rand_bytes(32)) }, Reader))
     end}.
