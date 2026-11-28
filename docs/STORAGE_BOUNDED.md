@@ -29,11 +29,20 @@ shipper was one all-or-nothing pass, so a timeout lost the whole pass.
 | Computed states, deltas | from the newest snapshot that is at least `store-retention-keep-slots` (2,000) below the head | none |
 | Snapshots | the newest 2 per process | the newest one, at most once per `checkpoint-every-seconds` (3,600), thinned with age |
 | Irreplaceable journal | until shipped | `irreplaceable/` |
-| `message-slots` (dedupe index) | every row, about 100 B per message | none |
+| `message-slots` (dedupe index) | rows in the hot window; below it, filters (`hb_store_dedupe`, ~9 B per ID) | each slot's `slot-ids` row, in its range file |
 
-The dedupe index is the one local thing that still grows with history. At
-150 writes/s that is about 1.3 GB a day. It is kept for now (Tyler's
-decision 3, 2026-11-28).
+The dedupe filters are the one local thing that still grows with history:
+about 120 MB a day at 150 writes/s, down from about 1.6 GB a day of rows.
+A Bloom filter has no false negatives, so a message assigned before is
+always a candidate, and the share settles it. The steps:
+
+- When a range is deleted, its slots' `message-slots` rows are replaced, in
+  the same transaction, by a filter for the range plus per-process segment
+  filters.
+- A new message whose IDs the filters rule out is scheduled at once.
+- A candidate is checked against the range's file on the share. If the share
+  cannot be read, the message gets a 503 and waits. It is never assigned
+  twice.
 
 ## How a range ships
 
