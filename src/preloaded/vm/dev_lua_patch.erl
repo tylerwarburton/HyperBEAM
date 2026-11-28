@@ -1009,6 +1009,46 @@ process_delta_restore_test_() ->
         )
     end}.
 
+%% @doc Computed as a bridge replica computes (one call for a slice of slots,
+%% no worker, no hot cache, a snapshot at the target), the slots between the
+%% slice's ends are stored as deltas, not as full states, and read back.
+replica_slice_stores_deltas_test_() ->
+    {timeout, 60, fun() ->
+        hb:init(),
+        Store = hb_test_utils:test_store(hb_store_lmdb),
+        Opts = #{
+            <<"store">> => Store,
+            <<"priv-wallet">> => ar_wallet:new(),
+            <<"hashpath">> => ignore,
+            <<"spawn-worker">> => false,
+            <<"process-workers">> => false,
+            <<"process-worker-spawn">> => false,
+            <<"process-state-blobs">> => true,
+            <<"process-delta-cache">> => true,
+            <<"process-hot-cache-slots">> => 0,
+            <<"process-now-view">> => false,
+            <<"process-async-checkpoints">> => false,
+            <<"process-snapshot-target">> => true
+        },
+        Process = delta_process(Opts),
+        ProcID = hb_message:id(Process, all, Opts),
+        {ok, _} = hb_cache:write(Process, Opts),
+        [ {ok, _} = hb_ao:resolve(Process, schedule_request(Process, N, Opts), Opts)
+          || N <- lists:seq(1, 6) ],
+        {ok, State5} = hb_ao:resolve(Process,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 5 }, Opts),
+        ?assertEqual(<<"6">>, hb_ao:get(<<"count">>, State5, Opts)),
+        [Blobs | _] = hb_store:normalize_stores([Store]),
+        Full = lib_process_cache:blob_slots(ProcID, <<"f">>, Blobs),
+        Deltas = lib_process_cache:blob_slots(ProcID, <<"d">>, Blobs),
+        ?assertEqual([0, 5], Full),
+        ?assertEqual([1, 2, 3, 4], Deltas -- Full),
+        % A middle slot reads back through its deltas.
+        {ok, State3} = hb_ao:resolve(Process,
+            #{ <<"path">> => <<"compute">>, <<"slot">> => 3 }, Opts),
+        ?assertEqual(<<"4">>, hb_ao:get(<<"count">>, State3, Opts))
+    end}.
+
 %% @doc A key written with capitals is one key through every slot: written in
 %% one slot and again in later ones, through delta and checkpoint slots, a
 %% cold read of an old slot, a VM restore, and an HTTP read in both forms.

@@ -425,7 +425,20 @@ execution_opts(NodeOpts, Verified, Computed) ->
         <<"process-workers">> => false,
         <<"spawn-worker">> => false,
         <<"process-worker-spawn">> => false,
-        <<"process-delta-cache">> => false,
+        % A slot of a patch device is stored as its delta, and a full state
+        % only at a checkpoint (the slice's end, with its snapshot). Without
+        % it every replayed slot was a full row: PUSD's L1 ledger, ~700 KB of
+        % state, wrote 36,818 of them in 45 h on Paralith (25.7 GB, 39 ms a
+        % slot to encode and store; 2026-11-28). The hot cache and the
+        % published view are node-wide and keyed by process ID alone, so the
+        % replica keeps out of both: it never reads the node's own state of a
+        % process as its computation, nor lends the node its own. Its
+        % checkpoints are written in the slot, so the next call finds the
+        % snapshot it resumes from.
+        <<"process-delta-cache">> => true,
+        <<"process-hot-cache-slots">> => 0,
+        <<"process-now-view">> => false,
+        <<"process-async-checkpoints">> => false,
         <<"process-now-from-cache">> => false,
         <<"scheduler-lookahead">> => false,
         <<"scheduler-follow-redirects">> => false,
