@@ -104,33 +104,19 @@ tier at load, and it follows the same rules:
 A replica that recomputes old slots after a new build reads them back from
 the share.
 
-## The node's byte budget (`hot-bytes`)
+## The per-process cap
 
-Windows are per process. The page cache is per node, and the lab showed a
-round trip 3-4x slower once the store outgrew RAM. So `hot-bytes` bounds the
-node's local LMDB stores, live (all of them: main, scheduler, replicas),
-below RAM. While they hold more:
+A process keeps its newest slots up to `hot-slots` (500,000) or up to
+`hot-bytes-per-process` (5 GiB) of their rows, whichever comes first, and
+never below `hot-slots-floor` (2,000). Its bytes per slot are those of the
+ranges it shipped: a running average in which each new range counts a
+quarter. There is no node-wide cap: the number of processes grows with every
+spawn, and the disk-pressure stages below are the node's only backstop.
 
-- the processes read least recently (`note_read/1`, from every assignment
-  read) give up their oldest local slots first, the largest of them first;
-- a window never goes below `hot-slots-floor`;
-- the cut is sized at the stores' bytes per local slot, and is made once
-  per measurement of the stores (every 30 s), so slots freed since are not
-  counted twice.
-
-Only the schedule windows are cut. Computed state stays under retention, and
-if that alone is over budget, the disk-pressure stages below are the
-backstop.
-
-At 100,000 slots and ~5-9 KB a slot, a busy process holds 0.5-0.9 GB.
-Across 100-300 processes that is more than 100 GB, so on the AX102 the
-budget, not the window, is what binds: idle processes shrink first.
-
-Window size does not change the ship rate. Everything older than the newest
-16 slots ships at once; the window only decides when it may be deleted
-locally. At 150 writes/s that is ~0.9 MB/s, against the 8 MiB/s pace and the
-link's ~16 MB/s. A backlog, such as a store taking up the cold tier with full
-windows, ships at the pace: 30 GB in about an hour.
+The window does not change the ship rate. Everything older than the newest
+16 slots ships at once; the window only decides when a slot may be deleted
+locally. Shipping is paced at `ship-bytes-per-second` (8 MiB), so a backlog
+never takes the whole link: 30 GB takes about an hour.
 
 Every round finds each process's newest slot by probing up from its last
 mark, a few reads; it never lists the slots of its window.
@@ -160,8 +146,8 @@ the level by hand.
 
 | Key | Default | |
 |---|---|---|
-| `hot-slots` / `hot-slots-floor` | 100,000 / 2,000 | slots per process kept locally; the least a cut leaves |
-| `hot-bytes` | none | the node's local LMDB bytes, live, at most: keep below RAM (AX102: 100 GB of 128) |
+| `hot-slots` / `hot-slots-floor` | 500,000 / 2,000 | slots per process kept locally; the least a cap leaves |
+| `hot-bytes-per-process` | 5 GiB | the rows of a process's window, at most: whichever of it and `hot-slots` comes first |
 | `ship-bytes-per-second` | 8 MiB | the shipper's pace; a backlog never takes the whole link |
 | `prune-local-slots` | true | false holds every local slot |
 | `verify` / `verify-url` | `readback` / none | `coldcheck` needs the URL |

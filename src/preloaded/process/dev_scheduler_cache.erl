@@ -141,9 +141,6 @@ read(ProcID, Slot, Opts) when is_integer(Slot) ->
 read(ProcID, Slot, RawOpts) ->
     Opts = opts(RawOpts),
     Store = hb_opts:get(store, no_viable_store, Opts),
-    % Which processes are read is what decides whose local slots go first
-    % when the node is over its byte budget (`hb_store_cold', `hot-bytes').
-    ok = hb_store_cold:note_read(hb_util:human_id(ProcID)),
     P1 = hb_path:to_binary([
         ?SCHEDULER_CACHE_PREFIX,
         <<"assignments">>,
