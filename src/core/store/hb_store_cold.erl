@@ -97,6 +97,15 @@
 %%% are kept in memory, so a page of history costs one file read. An index can
 %%% only cause a miss: every answer is read back from the file.
 %%%
+%%% The scheduler's store is journaled to the share too (`hb_store_offsite_
+%%% journal'), so every message reached it twice: in a journal segment and in
+%%% a range file. Once every slot a shipped segment covers has a verified
+%%% range file, and the segment holds nothing else (`retire-journal', on by
+%%% default), the journal retires it: the share keeps each message once. The
+%%% local journal, which crash recovery replays, is never touched. A node that
+%%% lost its scheduler's store restores it from the range files and what is
+%%% left of the journal (`restore/2').
+%%%
 %%% A bridge or admission replica keeps the schedule it verified in a store of
 %%% its own (`lib_bridge_replica'), in the scheduler's layout, and that store
 %%% follows the same rules: a replica registers it (`register_source/1'), and
@@ -153,7 +162,7 @@
 -module(hb_store_cold).
 -export([maybe_start/1, status/0, tick/1, config/1]).
 -export([read_assignment/3, restore_checkpoint/3, ship_replica/3, restore_replica/4]).
--export([seen/4, register_source/1]).
+-export([seen/4, register_source/1, restore/2]).
 %% A read-only store (`store-module' `hb_store_cold'): reads by ID from the share.
 -export([scope/1, read/3]).
 -ifdef(TEST).
@@ -192,6 +201,8 @@ config(Opts) ->
                 hot_slots => max(Floor, Int(<<"hot-slots">>, 500000)),
                 hot_bytes => max(1, Int(<<"hot-bytes-per-process">>, 5368709120)),
                 ship_rate => max(1, Int(<<"ship-bytes-per-second">>, 8388608)),
+                retire_journal =>
+                    hb_util:atom(maps:get(<<"retire-journal">>, C, true)) =:= true,
                 hot_floor => Floor,
                 prune_local_slots =>
                     hb_util:atom(maps:get(<<"prune-local-slots">>, C, true)) =:= true,
@@ -307,13 +318,14 @@ round(Cfg, Opts) ->
             true -> run_phase(prune, fun() -> prune_slots(Cfg, Level, Opts) end);
             false -> #{}
         end,
+    Retire = run_phase(journal, fun() -> retire_journal(Cfg, Opts) end),
     Checkpoints =
         case hb_store_budget:rank(Level) >= hb_store_budget:rank(soft) of
             true -> #{ skipped => Level };
             false -> run_phase(checkpoints, fun() -> ship_checkpoints(Cfg, Opts) end)
         end,
     Reached = maps:get(done, Slots, 0) + maps:get(done, Checkpoints, 0),
-    Failures = lists:append([ maps:get(failures, R, []) || R <- [Slots, Prune, Checkpoints] ]),
+    Failures = lists:append([ maps:get(failures, R, []) || R <- [Slots, Prune, Retire, Checkpoints] ]),
     Result =
         case {Failures, Reached} of
             {[{_, Why} | _], 0} -> {error, Why};
@@ -331,7 +343,8 @@ round(Cfg, Opts) ->
             checkpoint_bytes => maps:get(checkpoint_bytes, S, 0) + maps:get(bytes, Checkpoints, 0),
             verified_ranges => maps:get(verified_ranges, S, 0) + maps:get(verified, Slots, 0),
             verified_checkpoints => maps:get(verified_checkpoints, S, 0) + maps:get(done, Checkpoints, 0),
-            pruned_slots => maps:get(pruned_slots, S, 0) + maps:get(pruned, Prune, 0) }
+            pruned_slots => maps:get(pruned_slots, S, 0) + maps:get(pruned, Prune, 0),
+            retired_segments => maps:get(retired_segments, S, 0) + maps:get(retired, Retire, 0) }
     end),
     available(Result),
     Result.
@@ -913,6 +926,88 @@ seen_in(Cfg, P, [{ID, From, To} | Rest]) ->
         _ -> {unavailable, {range_unreadable, P, From, To}}
     catch
         throw:{cold_io, Why} -> {unavailable, Why}
+    end.
+
+%% Retire the journal's shipped segments whose every slot has a verified
+%% range file (the journal lists only segments that hold nothing else).
+retire_journal(#{ retire_journal := false }, _Opts) -> #{};
+retire_journal(_Cfg, Opts) ->
+    case irr(Opts) of
+        Irr = #{ <<"store-module">> := hb_store_offsite_journal } ->
+            Covers = hb_store_offsite_journal:covers(Irr),
+            Shipped = fun(P) -> read_int(Irr, mark_key(<<"shipped">>, P), -1) end,
+            Names =
+                [ N || {N, #{ slots := Slots, other := false }} <- Covers,
+                       lists:all(fun({P, S}) -> Shipped(P) >= S end, maps:to_list(Slots)) ],
+            case Names of
+                [] -> #{};
+                _ ->
+                    case hb_store_offsite_journal:retire(Irr, Names) of
+                        {ok, New, _Gone} -> #{ retired => New };
+                        Other -> #{ failures => [{journal, Other}] }
+                    end
+            end;
+        _ -> #{}
+    end.
+
+%% @doc Rebuild a scheduler's store that was lost, into `Target', from this
+%% node's folder on the share: every slot of every range file (the rows as
+%% they were, their `message-slots' rows derived from their `slot-ids'),
+%% then what is left of the journal (`hb_store_offsite_journal:restore/3',
+%% which skips retired segments and refuses a result that skips a slot), then
+%% the cold tier's marks, from the files on the share. The prune then moves
+%% the history back off local disk, and the dedupe rows into filters, as it
+%% always does. `{ok, Report}' or `{error, Why}'.
+restore(Opts, Target) ->
+    Cfg = config(Opts),
+    Dir = filename:join(maps:get(path, Cfg), "slots"),
+    Procs = [ P || P <- names_in(Cfg, Dir), ?IS_ID(list_to_binary(P)) ],
+    Ranges =
+        lists:append(
+            [ restore_process(Cfg, Target, list_to_binary(P), filename:join(Dir, P)) || P <- Procs ]),
+    Journal =
+        case irr(Opts) of
+            Irr = #{ <<"store-module">> := hb_store_offsite_journal } ->
+                hb_store_offsite_journal:restore([hb_store_offsite_journal:target(Irr)], Target);
+            _ -> {ok, #{}}
+        end,
+    case Journal of
+        {ok, Report} ->
+            Marks =
+                maps:from_list(lists:append(
+                    [ [ {range_key(P, To), term_to_binary({From, To, Ms})},
+                        {mark_key(<<"shipped">>, P), integer_to_binary(Top)},
+                        {mark_key(<<"written">>, P), integer_to_binary(Top)} ]
+                    || {P, From, To, Ms} <- Ranges,
+                       Top <- [lists:max([ T || {Q, _, T, _} <- Ranges, Q =:= P ])] ])),
+            ok = hb_store:write([Target], Marks, #{}),
+            ok = hb_store:flush([Target], #{}),
+            {ok, Report#{ range_files => length(Ranges) }};
+        Error -> Error
+    end.
+
+restore_process(Cfg, Target, P, Dir) ->
+    [ begin
+          {ok, #{ process := P, from := From, to := To, newest_ms := Ms, rows := Rows }} =
+              get_file(sized(Cfg, 64 * 1024 * 1024), filename:join(Dir, F)),
+          Dedupe =
+              [ {message_slot_path(P, ID), integer_to_binary(S)}
+              || {K, V} <- Rows,
+                 <<"~scheduler@1.0/slot-ids/", Tail/binary>> <- [K],
+                 [P, SBin] <- [binary:split(Tail, <<"/">>)],
+                 S <- [binary_to_integer(SBin)],
+                 ID <- binary_to_term(V, [safe]) ],
+          ok = hb_store:write([Target], maps:from_list(Rows ++ Dedupe), #{}),
+          {P, From, To, Ms}
+      end
+    || F <- list_dir(Cfg, Dir),
+       % The scheduler's own files; a replica's (tagged) are not its slots.
+       length(string:split(filename:rootname(F), "-", all)) =:= 2 ].
+
+names_in(Cfg, Dir) ->
+    case io(Cfg, fun() -> hb_file:list_dir(Dir) end) of
+        {ok, Names} -> Names;
+        _ -> []
     end.
 
 %% @doc An assignment of `P' that this node does not hold: from its own
@@ -1518,8 +1613,12 @@ test_env(Name) -> test_env(Name, ?RSA_KEY_TYPE).
 test_env(Name, KeyType) ->
     Dir = ?TEST_DIR ++ "/" ++ Name ++ "-" ++ integer_to_list(erlang:unique_integer([positive])),
     os:cmd("rm -rf " ++ Dir),
-    Main = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => list_to_binary(Dir ++ "/main") },
-    Irr = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => list_to_binary(Dir ++ "/irr") },
+    % 1 GiB maps, not the default 2 TiB: a VM's address space holds about 60
+    % of those, and this module opens more.
+    Main = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => list_to_binary(Dir ++ "/main"),
+              <<"capacity">> => 1 bsl 30 },
+    Irr = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => list_to_binary(Dir ++ "/irr"),
+             <<"capacity">> => 1 bsl 30 },
     ok = hb_store:start([Main, Irr]),
     Sched = ar_wallet:new(KeyType),
     Opts = #{ <<"store">> => [Main, Irr#{ <<"access">> => [<<"read">>] }],
@@ -2331,7 +2430,8 @@ read_by_id_after_prune_test_() ->
 replica_store_ships_and_prunes_test_() ->
     {timeout, 120, fun() ->
         Env = #{ dir := Dir, opts := Opts, p := P } = test_env("replica"),
-        Rep = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => list_to_binary(Dir ++ "/replica/" ++ binary_to_list(P)) },
+        Rep = #{ <<"store-module">> => hb_store_lmdb, <<"capacity">> => 1 bsl 30,
+                 <<"name">> => list_to_binary(Dir ++ "/replica/" ++ binary_to_list(P)) },
         ok = hb_store:start([Rep]),
         RepEnv = Env#{ irr => Rep },
         assign(Env, lists:seq(0, 39), 3600000),
@@ -2414,3 +2514,66 @@ paced_test() ->
     after
         persistent_term:put(?STATUS, Before)
     end.
+
+%% A test environment whose scheduler's store is journaled to the share, as
+%% on a node with `irreplaceable-export'.
+journaled_env(Name) ->
+    Env = #{ dir := Dir, opts := Opts0, irr := Plain } = test_env(Name),
+    Share = share(Opts0),
+    Irr = hb_store_offsite_journal:wrap(Plain#{ <<"name">> => list_to_binary(Dir ++ "/irrj") },
+        #{ <<"path">> => list_to_binary(Share ++ "/irreplaceable"),
+           <<"journal">> => list_to_binary(Dir ++ "/irrj-journal"),
+           <<"compress">> => false }),
+    ok = hb_store:start([Irr]),
+    Main = maps:get(main, Env),
+    Opts = Opts0#{ <<"store">> => [Main, Irr#{ <<"access">> => [<<"read">>] }],
+                   <<"scheduler-store">> => [Irr] },
+    Env#{ irr => Irr, opts => Opts }.
+
+manifest(Opts) ->
+    {ok, B} = file:read_file(share(Opts) ++ "/irreplaceable/manifest.log"),
+    [ L || L <- binary:split(B, <<"\n">>, [global]), L =/= <<>> ].
+
+%% @doc Once every slot a shipped journal segment covers has a verified range
+%% file, the segment is retired: a manifest line, then the file goes, and the
+%% share keeps each message once. A crash between the line and the delete
+%% loses nothing and the next round finishes it; and a node that lost its
+%% scheduler's store restores every slot, with its dedupe rows, from the
+%% range files and what is left of the journal.
+journal_duplicates_retire_test_() ->
+    {timeout, 180, fun() ->
+        Env = #{ irr := Irr, opts := Opts, p := P } = journaled_env("retire"),
+        assign(Env, lists:seq(0, 39), 3600000),
+        idle = hb_store_offsite_journal:ship_now(Irr),
+        [{Seg1, #{ slots := #{ P := 39 }, other := false }}] = hb_store_offsite_journal:covers(Irr),
+        % Slots up to 23 have range files: the segment (up to 39) waits.
+        ok = tick(Opts),
+        ?assertEqual([], [ L || L = <<"retired ", _/binary>> <- manifest(Opts) ]),
+        assign(Env, lists:seq(40, 79), 3600000),
+        idle = hb_store_offsite_journal:ship_now(Irr),
+        % A crash after the retirement line, before the delete.
+        persistent_term:put({hb_store_offsite_journal, checkpoint_crash}, retire_after_line),
+        try ok = tick(Opts)
+        after persistent_term:erase({hb_store_offsite_journal, checkpoint_crash})
+        end,
+        Seg1File = share(Opts) ++ "/irreplaceable/" ++ binary_to_list(Seg1),
+        ?assert(lists:member(<<"retired ", Seg1/binary>>, manifest(Opts))),
+        ?assert(filelib:is_file(Seg1File)),
+        % The next round deletes it.
+        ok = tick(Opts),
+        ?assertNot(filelib:is_file(Seg1File)),
+        ?assertNot(local(Env, 30)),
+        % The scheduler's store is lost: everything comes back from the share.
+        Fresh = (hb_test_utils:test_store(hb_store_lmdb, <<"retire-restore">>))#{ <<"capacity">> => 1 bsl 30 },
+        ok = hb_store:start([Fresh]),
+        {ok, Report} = restore(Opts, Fresh),
+        ?assertMatch(#{ retired := 1 }, Report),
+        [ ?assertMatch({ok, _}, hb_store:read([Fresh], #{ <<"read">> => slot_path(P, S),
+            <<"exact">> => true }, #{})) || S <- lists:seq(0, 79) ],
+        [ID5] = persistent_term:get({?MODULE, test_ids, P, 5}),
+        ?assertEqual({ok, <<"5">>}, raw(Fresh, message_slot_path(P, ID5))),
+        ?assertEqual(read_int(Irr, mark_key(<<"shipped">>, P), -1),
+                     read_int(Fresh, mark_key(<<"shipped">>, P), -1)),
+        {ok, A30} = read_rows(closure(Fresh, slot_path(P, 30)), slot_path(P, 30), Opts),
+        ?assertEqual(30, hb_util:int(hb_ao:get(<<"slot">>, A30, Opts)))
+    end}.

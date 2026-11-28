@@ -104,6 +104,51 @@ tier at load, and it follows the same rules:
 A replica that recomputes old slots after a new build reads them back from
 the share.
 
+## One copy of each message on the share
+
+The scheduler's store is journaled to the share as well (the offsite
+journal), so every message reached the share twice: once in a journal
+segment and once in a range file. Tyler approved dropping the duplicate on
+2026-11-28. The steps:
+
+- As a segment ships, the journal computes its cover: the newest slot of
+  each process its rows belong to. A slot's rows are its assignment path,
+  the rows reached from it (its packed message and the IDs linked to it), its
+  `slot-ids` row and its `message-slots` rows. `~cold@1.0` rows count as
+  covered, since they are rebuilt from the share.
+- A segment that holds nothing else goes on a local `retirable` list.
+- Once every slot it covers has a verified range file, `retire/2` appends
+  `retired <name>` to the manifest (synced), deletes the segment, and only
+  then takes it off the list.
+- A crash on the way leaves it on the list, and the next round finishes it.
+- A segment holding anything else stays: a spawn's definition, a module.
+  The local journal, which crash recovery replays, is never touched.
+
+A node that lost its scheduler's store restores it with
+`hb_store_cold:restore/2`:
+
+1. every range file's rows, with their `message-slots` rows derived from
+   their `slot-ids`;
+2. then the remaining journal, which skips retired segments but keeps the
+   manifest's hash chain, and still refuses a result that skips a slot;
+3. then the cold tier's marks, from the files on the share.
+
+On the AX102 run's real journal, 3 of 5 sampled segments were fully covered.
+The fourth held the definitions and modules of shards spawned during the
+kill rounds.
+
+Share growth at 150 writes/s, measured on the AX102 run:
+
+| | Before | After |
+|---|---:|---:|
+| Slot range files | 2.9 KB/write | 2.9 KB/write |
+| Journal on the share | ~3.0 KB/write | segments with a spawn or module only |
+| ID index on pxe | | ~0.07 KB/write |
+| **Total, without checkpoints** | **~76 GB/day** | **~38 GB/day** |
+
+Checkpoints come on top: the newest snapshot per process, hourly, thinned
+after 30 days.
+
 ## The per-process cap
 
 A process keeps its newest slots up to `hot-slots` (500,000) or up to

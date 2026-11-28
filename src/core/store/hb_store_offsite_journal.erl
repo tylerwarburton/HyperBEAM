@@ -103,6 +103,24 @@
 %%% filesystem above `max-fill-pct': at the ceiling, shipping pauses
 %%% (`offsite_journal_ceiling' events) and resumes by itself.
 %%%
+%%% Retirement. A segment's cover is the newest slot of each process its
+%%% rows belong to, and whether it holds a row that is not one of them
+%%% (`cover/1'). A slot's rows are its
+%%% assignment path, the rows reached from it in the segment (its packed
+%%% message and the IDs linked to it), its `slot-ids' row and its
+%%% `message-slots' rows; `~cold@1.0' rows are the cold tier's own, rebuilt
+%%% from the share. A segment that holds nothing else is noted, with its
+%%% cover, as it ships,
+%%% in the local `retirable' list. Once the cold tier has a verified copy of
+%%% every slot such a segment covers (`hb_store_cold'), `retire/2' appends
+%%% `retired <name>' to the manifest (synced), deletes the segment, and only
+%%% then drops it from the list: the share keeps each
+%%% message once, not twice. A crash on the way leaves it on the list, and the
+%%% next `retire/2' finishes it (a repeated line is harmless). A restore skips
+%%% a retired segment, its manifest line still carrying the hash chain, and
+%%% takes its slots from the range files (`hb_store_cold:restore/2'). Only a
+%%% restore reads the manifest.
+%%%
 %%% Export options (`irreplaceable-export'):
 %%% <ul>
 %%%   <li>`path': the target directory. Required.</li>
@@ -121,6 +139,7 @@
 -module(hb_store_offsite_journal).
 -export([wrap/2, status/1, restore/2, restore/3, ship_now/1, checkpoint_now/1, clear_poison/1,
          clear_ship_poison/1]).
+-export([retire/2, covers/1, target/1, cover/1, uncovered/1]).
 -export([start/3, stop/3, reset/3, flush/3, scope/0, scope/1]).
 -export([read/3, write/3, list/3, match/3, batch/3, hold/3]).
 -include("include/hb.hrl").
@@ -2019,6 +2038,9 @@ shipper_loop(Store, St) ->
             St1 = checkpoint(Store, St),
             From ! {Ref, maps:get(durable, St1)},
             shipper_loop(Store, St1);
+        {{retire, Names}, From, Ref} ->
+            From ! {Ref, catch retire_in(Store, Names)},
+            shipper_loop(Store, St);
         checkpoint_tick ->
             % The first tick of a run is at once, so a replay is checkpointed
             % at once; then every `checkpoint-ms'.
@@ -2170,9 +2192,9 @@ manifest_tip(Target) ->
                     end,
                     ok = file:close(F)
             end,
-            case Lines of
+            case [ L || L <- Lines, not is_retired_line(L) ] of
                 [] -> <<>>;
-                _ -> element(4, parse_line(lists:last(Lines)))
+                Shipped -> element(4, parse_line(lists:last(Shipped)))
             end;
         {error, enoent} -> <<>>;
         {error, Reason} -> erlang:error({manifest_unreadable, Reason})
@@ -2182,6 +2204,9 @@ manifest_tip(Target) ->
 manifest_lines(Bin) ->
     Parts = binary:split(Bin, <<"\n">>, [global]),
     {lists:droplast(Parts) -- [<<>>], lists:last(Parts)}.
+
+is_retired_line(<<"retired ", _/binary>>) -> true;
+is_retired_line(_) -> false.
 
 parse_line(Line) ->
     case binary:split(Line, <<" ">>, [global]) of
@@ -2220,6 +2245,10 @@ ship_one(N, File, Store, Prev) ->
                              [Name, byte_size(Body), erlang:crc32(Body), Chain]),
         ok ?= append_synced(filename:join(Target, "manifest.log"), Line),
         ok ?= synced(sync_dir(Target)),
+        ok ?= case cover(Raw) of
+                  #{ other := false } = Cover -> note_retirable(Store, list_to_binary(Name), Cover);
+                  _ -> ok
+              end,
         ok ?= hb_file:delete(File),
         % Or a host crash brings it back, to be shipped again.
         ok ?= case sync_dir(journal_dir(Store)) of
@@ -2296,6 +2325,122 @@ file_sync(File, F) ->
 %% one (`ship_failed/3').
 synced(ok) -> ok;
 synced({error, Reason}) -> {error, {sync_failed, Reason}}.
+
+%%% Retirement.
+
+%% @doc A segment's cover: `#{ slots => #{ P => NewestSlot }, other => Bool }',
+%% `other' when it holds a row that is neither a slot's (see Retirement above)
+%% nor the cold tier's.
+cover(Raw) ->
+    Rows = maps:from_list(lists:append([ Pairs || {w, Pairs} <- records(Raw) ])),
+    Slot = fun(K) ->
+        case binary:split(K, <<"/">>, [global]) of
+            [<<"~scheduler@1.0">>, <<"assignments">>, P, S] -> slot(P, S);
+            [<<"~scheduler@1.0">>, <<"slot-ids">>, P, S] -> slot(P, S);
+            [<<"~scheduler@1.0">>, <<"message-slots">>, P, _ID] -> slot(P, maps:get(K, Rows));
+            _ -> none
+        end
+    end,
+    Slots = [ {K, PS} || K <- maps:keys(Rows), PS = {_, _} <- [Slot(K)] ],
+    Reached =
+        lists:foldl(
+            fun({K, _}, Acc) -> reach(Rows, K, Acc) end,
+            #{},
+            [ X || X = {<<"~scheduler@1.0/assignments/", _/binary>>, _} <- Slots ]),
+    Other = uncovered(Rows, Reached, Slots),
+    #{ slots => lists:foldl(fun({_, {P, S}}, M) -> M#{ P => max(S, maps:get(P, M, -1)) } end,
+                            #{}, Slots),
+       other => Other =/= [] }.
+
+%% @doc The rows of a segment that are neither a slot's nor the cold tier's:
+%% what keeps it from retiring.
+uncovered(Raw) when is_binary(Raw) ->
+    Rows = maps:from_list(lists:append([ Pairs || {w, Pairs} <- records(Raw) ])),
+    #{ other := _ } = cover(Raw),
+    Slots = [ K || K <- maps:keys(Rows), is_slot_key(K) ],
+    Reached = lists:foldl(fun(K, Acc) -> reach(Rows, K, Acc) end, #{},
+        [ K || K = <<"~scheduler@1.0/assignments/", _/binary>> <- Slots ]),
+    uncovered(Rows, Reached, [ {K, x} || K <- Slots ]).
+uncovered(Rows, Reached, Slots) ->
+    [ K || K <- maps:keys(Rows),
+           not is_map_key(K, Reached),
+           not lists:keymember(K, 1, Slots),
+           binary:longest_common_prefix([K, <<"~cold@1.0/">>]) < 10 ].
+
+is_slot_key(<<"~scheduler@1.0/assignments/", _/binary>>) -> true;
+is_slot_key(<<"~scheduler@1.0/slot-ids/", _/binary>>) -> true;
+is_slot_key(<<"~scheduler@1.0/message-slots/", _/binary>>) -> true;
+is_slot_key(_) -> false.
+
+slot(P, S) ->
+    case catch binary_to_integer(S) of
+        N when is_integer(N), N >= 0 -> {P, N};
+        _ -> none
+    end.
+
+%% The rows reached from `K' within a segment: through `ao:' links and the
+%% children a packed row names.
+reach(_Rows, K, Acc) when is_map_key(K, Acc) -> Acc;
+reach(Rows, K, Acc0) ->
+    Acc = Acc0#{ K => true },
+    case maps:find(K, Rows) of
+        {ok, <<"ao:", ID/binary>>} when ?IS_ID(ID) -> reach(Rows, ID, Acc);
+        {ok, V} -> lists:foldl(fun(ID, A) -> reach(Rows, ID, A) end, Acc, hb_cache:packed_links(V));
+        error -> Acc
+    end.
+
+%% @doc The export directory of a journaled store.
+target(Store) -> target_dir(Store).
+
+%% The local list of shipped segments that hold only slots' and the cold
+%% tier's rows, with their covers, oldest first. Advisory: a segment missing
+%% from it is kept on the share, never lost.
+retirable_file(Store) -> filename:join(journal_dir(Store), "retirable").
+
+note_retirable(Store, Name, Cover) ->
+    T = term_to_binary({Name, Cover}),
+    file:write_file(retirable_file(Store), <<(byte_size(T)):32, T/binary>>, [append, raw]).
+
+read_retirable(Store) ->
+    case file:read_file(retirable_file(Store)) of
+        {ok, Bin} -> retirable_terms(Bin);
+        _ -> []
+    end.
+
+retirable_terms(<<Len:32, T:Len/binary, Rest/binary>>) ->
+    [binary_to_term(T, [safe]) | retirable_terms(Rest)];
+retirable_terms(_) -> [].
+
+%% @doc The shipped segments a cold tier may retire, oldest first, with their
+%% covers: `[{Name, #{ slots, other := false }}]'.
+covers(Store) -> read_retirable(Store).
+
+%% @doc Retire shipped segments whose slots the cold tier holds verified
+%% copies of: in the shipper, so the manifest has one writer.
+retire(Store, Names) -> shipper_call(Store, {retire, Names}).
+
+retire_in(Store, Names0) ->
+    Target = target_dir(Store),
+    Names = lists:usort([ hb_util:bin(N) || N <- Names0 ]),
+    Pending = read_retirable(Store),
+    Retire = [ N || N <- Names, lists:keymember(N, 1, Pending) ],
+    case Retire of
+        [] -> {ok, 0, 0};
+        _ ->
+            Manifest = filename:join(Target, "manifest.log"),
+            ok = append_synced(Manifest, [ ["retired ", N, $\n] || N <- Retire ]),
+            ok = synced(sync_dir(Target)),
+            test_crash(retire_after_line),
+            [ hb_file:delete(filename:join(Target, hb_util:list(N))) || N <- Retire ],
+            ok = synced(sync_dir(Target)),
+            % Off the list only once the files are gone.
+            Left = [ E || E = {N, _} <- Pending, not lists:member(N, Retire) ],
+            Tmp = retirable_file(Store) ++ ".tmp",
+            ok = file:write_file(Tmp, [ <<(byte_size(T)):32, T/binary>> || E <- Left,
+                                        T <- [term_to_binary(E)] ]),
+            ok = file:rename(Tmp, retirable_file(Store)),
+            {ok, length(Retire), length(Retire)}
+    end.
 
 %%% Restore.
 
@@ -2383,7 +2528,9 @@ gaps(Store, Procs) ->
 source_files(Dir) ->
     case hb_file:read_file(filename:join(Dir, "manifest.log")) of
         {ok, Manifest} ->
-            {Lines, _Torn} = manifest_lines(Manifest),
+            {Lines0, _Torn} = manifest_lines(Manifest),
+            Retired = maps:from_list([ {N, true} || <<"retired ", N/binary>> <- Lines0 ]),
+            Lines = [ L || L <- Lines0, not is_retired_line(L) ],
             {Files, _} =
                 lists:mapfoldl(
                     fun(Line, Prev) ->
@@ -2391,8 +2538,12 @@ source_files(Dir) ->
                             try parse_line(Line)
                             catch _:_ -> throw({restore_error, {manifest_line, Line}})
                             end,
-                        {{shipped_key(Name), filename:join(Dir, Name), {Size, Crc, Prev, Chain}},
-                         Chain}
+                        Check =
+                            case is_map_key(Name, Retired) of
+                                true -> retired;
+                                false -> {Size, Crc, Prev, Chain}
+                            end,
+                        {{shipped_key(Name), filename:join(Dir, Name), Check}, Chain}
                     end,
                     <<>>,
                     Lines),
@@ -2407,6 +2558,9 @@ shipped_key(Name) ->
         binary:split(hb_util:bin(Name), [<<"-">>, <<".">>], [global]),
     {Token, binary_to_integer(Num)}.
 
+%% A retired segment's slots are in the range files (`hb_store_cold:restore/2').
+restore_file(_N, _File, retired, R, C) ->
+    {R, C#{ retired => maps:get(retired, C, 0) + 1 }, false};
 restore_file(N, File, Check, R, C) ->
     Body =
         case hb_file:read_file(File) of
@@ -2616,7 +2770,7 @@ bad_crc_test() ->
     write_rows(Store, rows(<<"d/">>, 1, 10)),
     ok = flush(Store, #{}, #{}),
     idle = ship_now(Store),
-    [Seg] = [ F || F <- filelib:wildcard(hb_util:list(Target) ++ "/seg-*") ],
+    [Seg] = [ F || F <- filelib:wildcard(hb_util:list(Target) ++ "/seg-*"), not lists:suffix(".cover", F) ],
     {ok, Bin} = file:read_file(Seg),
     Last = binary:last(Bin),
     ok = file:write_file(Seg, <<(binary:part(Bin, 0, byte_size(Bin) - 1))/binary,
