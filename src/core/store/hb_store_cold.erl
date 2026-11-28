@@ -41,6 +41,13 @@
 %%% `verify-url', to read the file from its disk and check it: one round trip
 %%% for up to 64 files, and no byte of them comes back over the link; the
 %%% host's `coldcheck' service answers each node for its own folder only).
+%%%
+%%% The scheduler's dedupe rows go with their slots: a slot's `slot-ids' row
+%%% (the IDs it was assigned under) ships in its range file, and at the delete
+%%% its `message-slots' rows are replaced by filters (`hb_store_dedupe'),
+%%% written in the same transaction. A message whose IDs the filters cannot
+%%% rule out is checked against the range file on the share (`seen/4'); if
+%%% the share cannot be read it waits, never is assigned twice.
 %%% Either way the digest proven is the one the node wrote into the file's
 %%% header. A file's name is fixed by its process and
 %%% range, so a crash between the file and its mark writes the same file
@@ -89,6 +96,9 @@
 %%%                            `http://10.77.0.1:8099' (`coldcheck' only:
 %%%                            without it nothing is ever verified, so
 %%%                            nothing is deleted)
+%%%   verify-prefix            where `path' is inside the folder `coldcheck'
+%%%                            answers this node for (empty: it is that
+%%%                            folder; a lab node in a subfolder names it)
 %%%   checkpoint-every-seconds the newest snapshot is shipped at most this
 %%%                            often per process (3,600)
 %%%   checkpoint-thinning      [[Days, N], ...]: past Days, keep the
@@ -106,6 +116,7 @@
 -module(hb_store_cold).
 -export([maybe_start/1, status/0, tick/1, config/1]).
 -export([read_assignment/3, restore_checkpoint/3, ship_replica/3, restore_replica/4]).
+-export([seen/4]).
 -ifdef(TEST).
 -export([test_env/2, assign/3, share/1]).
 -endif.
@@ -153,6 +164,7 @@ config(Opts) ->
                         undefined -> undefined;
                         U -> hb_util:list(U)
                     end,
+                verify_prefix => hb_util:list(maps:get(<<"verify-prefix">>, C, <<>>)),
                 checkpoint_every_ms => max(0, Int(<<"checkpoint-every-seconds">>, 3600)) * 1000,
                 thinning => thinning(maps:get(<<"checkpoint-thinning">>, C, [[30, 5], [365, 25]])),
                 concurrency => max(1, Int(<<"concurrency">>, 4)),
@@ -407,7 +419,13 @@ verified_files(#{ verify := coldcheck } = Cfg, Files) when length(Files) > 64 ->
     {First, Rest} = lists:split(64, Files),
     verified_files(Cfg, First) ++ verified_files(Cfg, Rest);
 verified_files(#{ verify := coldcheck, verify_url := Url } = Cfg, Files) ->
-    Query = lists:join("&", [ "path=" ++ uri_string:quote(Rel) || {Rel, _, _} <- Files ]),
+    Asked = fun(Rel) ->
+        case maps:get(verify_prefix, Cfg, "") of
+            "" -> Rel;
+            Prefix -> filename:join(Prefix, Rel)
+        end
+    end,
+    Query = lists:join("&", [ "path=" ++ uri_string:quote(Asked(Rel)) || {Rel, _, _} <- Files ]),
     Answer =
         io(Cfg, fun() ->
             hb_http_gate:httpc_request(get, {Url ++ "/verify?" ++ lists:flatten(Query), []},
@@ -416,7 +434,7 @@ verified_files(#{ verify := coldcheck, verify_url := Url } = Cfg, Files) ->
     case Answer of
         {ok, {{_, 200, _}, _, Json}} ->
             Verdicts = hb_json:decode(Json),
-            [ coldcheck_verdict(maps:get(list_to_binary(Rel), Verdicts, #{}), Digest)
+            [ coldcheck_verdict(maps:get(list_to_binary(Asked(Rel)), Verdicts, #{}), Digest)
             || {Rel, Digest, _} <- Files ];
         Other -> throw({cold_io, {coldcheck, Other}})
     end.
@@ -571,7 +589,7 @@ take_range(Store, P, Slots, MaxSlots, MaxBytes) ->
     take_range(Store, P, Slots, MaxSlots, MaxBytes, [], [], 0).
 take_range(Store, P, [S | Rest], MaxSlots, MaxBytes, Range, Rows, Bytes)
         when MaxSlots > 0, (Range =:= [] orelse Bytes < MaxBytes) ->
-    R = closure(Store, slot_path(P, S)),
+    R = closure(Store, slot_path(P, S)) ++ slot_ids_row(Store, P, S),
     Size = lists:sum([ byte_size(K) + byte_size(V) || {K, V} <- R ]),
     take_range(Store, P, Rest, MaxSlots - 1, MaxBytes, [S | Range], [R | Rows], Bytes + Size);
 take_range(_Store, _P, _Slots, _MaxSlots, _MaxBytes, Range, Rows, _Bytes) ->
@@ -680,25 +698,90 @@ prune_ranges(Store, DB, P, Below, [Name | Rest], N) ->
                 false -> N;
                 true ->
                     Slots = lists:seq(max(1, From), To),
-                    Keys = lists:usort(lists:append([ owned(Store, P, S) || S <- Slots ])),
+                    Owned = [ owned(Store, P, S) || S <- Slots ],
+                    Keys = lists:usort(lists:append([ K || {K, _} <- Owned ])),
+                    IDs = lists:append([ I || {_, I} <- Owned ]),
+                    % The filters that replace the dedupe rows, then the
+                    % delete: `delete_batch/2' commits both in one transaction.
+                    ok = hb_store:write([Store],
+                        hb_store_dedupe:add(Store, P, From, To, IDs), #{}),
                     {ok, _} = elmdb:delete_batch(DB, Keys ++ [Key]),
                     prune_ranges(Store, DB, P, Below, Rest, N + length(Slots))
             end;
         _ -> prune_ranges(Store, DB, P, Below, Rest, N)
     end.
 
-%% The rows slot `S' of `P' owns: its slot path, its packed row (`hb_cache',
-%% `cache-pack'), and every row that links to that packed row (its other
-%% IDs, its message's IDs). A row its closure reaches that links anywhere
-%% else is another's and stays: a process's own ID, which links to the
-%% packed row of its slot 0, or a message stored exploded. An assignment
-%% stored exploded owns only its slot path here.
+%% The rows slot `S' of `P' owns, and its dedupe IDs: `{Keys, IDs}'. The
+%% rows are its slot path, its packed row (`hb_cache', `cache-pack'), every
+%% row that links to that packed row (its other IDs, its message's IDs), its
+%% `slot-ids' row and the `message-slots' rows of those IDs that name it. A
+%% row its closure reaches that links anywhere else is another's and stays: a
+%% process's own ID, which links to the packed row of its slot 0, or a
+%% message stored exploded. An assignment stored exploded owns only its slot
+%% path here.
 owned(Store, P, S) ->
     Rows = closure(Store, slot_path(P, S)),
     Packed = [ K || {K, <<?PACKED, _/binary>>} <- Rows ],
     Links = [ <<"ao:", K/binary>> || K <- Packed ],
-    [ slot_path(P, S) |
-        [ K || {K, V} <- Rows, lists:member(K, Packed) orelse lists:member(V, Links) ] ].
+    IDs = slot_ids(Store, P, S),
+    Dedupe =
+        [ message_slot_path(P, ID) || ID <- IDs,
+          read_int(Store, message_slot_path(P, ID), -1) =:= S ],
+    {[ slot_path(P, S) | [ slot_ids_path(P, S) || IDs =/= [] ] ] ++ Dedupe ++
+        [ K || {K, V} <- Rows, lists:member(K, Packed) orelse lists:member(V, Links) ],
+     IDs}.
+
+%% The dedupe IDs the scheduler wrote for a slot (`dev_scheduler_cache:
+%% write_message_slot/4'), and the row that holds them.
+slot_ids_path(P, S) ->
+    <<"~scheduler@1.0/slot-ids/", P/binary, "/", (integer_to_binary(S))/binary>>.
+message_slot_path(P, ID) -> <<"~scheduler@1.0/message-slots/", P/binary, "/", ID/binary>>.
+
+slot_ids_row(Store, P, S) ->
+    case hb_store:read([Store], #{ <<"read">> => slot_ids_path(P, S), <<"exact">> => true }, #{}) of
+        {ok, V} -> [{slot_ids_path(P, S), V}];
+        _ -> []
+    end.
+
+slot_ids(Store, P, S) ->
+    case slot_ids_row(Store, P, S) of
+        [{_, V}] -> binary_to_term(V, [safe]);
+        [] -> []
+    end.
+
+%% @doc Whether a message with dedupe IDs `IDs' was assigned to `P' in a slot
+%% that left local disk: `{ok, Slot, ID}', `not_found', or `{unavailable,
+%% Why}' when the filters cannot rule it out and the range's file on the
+%% share cannot be read. Only this node's own folder is asked: a dedupe
+%% answer is never taken from another node.
+seen(Store, P, IDs, Opts) ->
+    case hb_store_dedupe:candidates(Store, P, IDs) of
+        [] -> not_found;
+        Candidates ->
+            case config(Opts) of
+                undefined -> {unavailable, no_cold_tier};
+                Cfg -> seen_in(Cfg, P, Candidates)
+            end
+    end.
+
+seen_in(_Cfg, _P, []) -> not_found;
+seen_in(Cfg, P, [{ID, From, To} | Rest]) ->
+    try get_file(Cfg, range_file(Cfg, P, From, To)) of
+        {ok, #{ process := P, from := From, to := To, rows := Rows }} ->
+            Found =
+                [ S || {K, V} <- Rows,
+                       <<"~scheduler@1.0/slot-ids/", Tail/binary>> <- [K],
+                       [P, SBin] <- [binary:split(Tail, <<"/">>)],
+                       S <- [binary_to_integer(SBin)],
+                       lists:member(ID, binary_to_term(V, [safe])) ],
+            case Found of
+                [S | _] -> {ok, S, ID};
+                [] -> seen_in(Cfg, P, Rest)
+            end;
+        _ -> {unavailable, {range_unreadable, P, From, To}}
+    catch
+        throw:{cold_io, Why} -> {unavailable, Why}
+    end.
 
 %% @doc An assignment of `P' that this node does not hold: from its own
 %% folder, then the peers' (verified), then Arweave (verified). `{ok, Msg}'
@@ -1241,7 +1324,14 @@ assign(#{ irr := Irr, opts := Opts, p := P }, Slots, AgeMs) ->
                 <<"body">> => Body }, Opts#{ <<"cache-pack">> => true }, <<"ans104@1.0">>),
             WOpts = Opts#{ <<"store">> => [Irr], <<"cache-pack">> => true },
             {ok, _} = hb_cache:write(A, WOpts),
-            ok = hb_cache:link(hb_message:id(A, signed, Opts), slot_path(P, N), WOpts)
+            ok = hb_cache:link(hb_message:id(A, signed, Opts), slot_path(P, N), WOpts),
+            % The dedupe rows, as `dev_scheduler_cache:write_message_slot/4'.
+            IDs = lists:sort([ hb_util:human_id(ID) || {ID, C} <- maps:to_list(
+                maps:get(<<"commitments">>, Body)), is_map_key(<<"committer">>, C) ]),
+            ok = hb_store:write([Irr], maps:from_list(
+                [ {slot_ids_path(P, N), term_to_binary(IDs)} |
+                  [ {message_slot_path(P, ID), integer_to_binary(N)} || ID <- IDs ] ]), #{}),
+            persistent_term:put({?MODULE, test_ids, P, N}, IDs)
         end,
         Slots),
     ok = hb_store:flush([Irr], #{}).
@@ -1774,9 +1864,14 @@ ranges_hold(#{ irr := Irr, p := P }, Opts) ->
 
 %% Every slot of the process up to `Newest' is held locally or read back,
 %% verified, from the share.
-nothing_lost(Env = #{ p := P }, Opts, Newest) ->
+nothing_lost(Env = #{ irr := Irr, p := P }, Opts, Newest) ->
     [ ?assert(local(Env, S) orelse element(1, read_assignment(P, S, Opts)) =:= ok)
     || S <- lists:seq(0, Newest) ],
+    % And no slot's message could be assigned again: its dedupe row is here,
+    % or the filters and the share find it.
+    [ ?assert(read_int(Irr, message_slot_path(P, ID), -1) =:= S orelse
+              seen(Irr, P, [ID], Opts) =:= {ok, S, ID})
+    || S <- lists:seq(0, Newest), ID <- persistent_term:get({?MODULE, test_ids, P, S}, []) ],
     ranges_hold(Env, Opts).
 
 %% @doc A prune deletes only the rows its slots own: never slot 0, never the
@@ -1848,8 +1943,10 @@ coldcheck_verify_test_() ->
         ok = tick(With(#{})),
         ?assert(local(Env, 5)),
         ?assertMatch(#{ last_failures := [{_, no_verify_url} | _] }, status()),
-        Opts = With(#{ <<"verify-url">> => stub_coldcheck(Share, Lies) }),
-        Rel2 = list_to_binary(range_rel(P, 10, 19)),
+        % The host answers for the folder above this node's (`verify-prefix').
+        Opts = With(#{ <<"verify-url">> => stub_coldcheck(filename:dirname(Share), Lies),
+                       <<"verify-prefix">> => list_to_binary(filename:basename(Share)) }),
+        Rel2 = list_to_binary(filename:join(filename:basename(Share), range_rel(P, 10, 19))),
         ets:insert(Lies, {Rel2}),
         ok = tick(Opts),
         ?assertNot(local(Env, 5)),
@@ -1917,4 +2014,31 @@ killed_rounds_lose_nothing_test_() ->
         Pruned = maps:get(pruned_slots, status()),
         ok = tick(Opts),
         ?assertEqual(Pruned, maps:get(pruned_slots, status()))
+    end}.
+
+%% @doc The dedupe rows of a pruned slot move into filters in the same
+%% transaction: the rows are gone, every one of the slot's IDs is still found
+%% (its file read back from the share), a new ID is not, and with the share
+%% gone an ID the filters cannot rule out is `unavailable', never `not_found'.
+dedupe_moves_to_filters_test_() ->
+    {timeout, 120, fun() ->
+        Env = #{ irr := Irr, opts := Opts, p := P } = test_env("dedupe"),
+        assign(Env, lists:seq(0, 39), 3600000),
+        ok = tick(Opts),
+        ?assertNot(local(Env, 5)),
+        [ID5] = persistent_term:get({?MODULE, test_ids, P, 5}),
+        ?assertEqual(not_found, raw(Irr, message_slot_path(P, ID5))),
+        ?assertEqual(not_found, raw(Irr, slot_ids_path(P, 5))),
+        ?assertEqual({ok, 5, ID5}, seen(Irr, P, [ID5], Opts)),
+        New = hb_util:human_id(crypto:strong_rand_bytes(32)),
+        ?assertEqual(not_found, seen(Irr, P, [New], Opts)),
+        % A slot still in the hot window keeps its row.
+        [ID30] = persistent_term:get({?MODULE, test_ids, P, 30}),
+        ?assertEqual({ok, <<"30">>}, raw(Irr, message_slot_path(P, ID30))),
+        Share = share(Opts),
+        os:cmd("mv " ++ Share ++ " " ++ Share ++ ".away"),
+        ?assertMatch({unavailable, _}, seen(Irr, P, [ID5], Opts)),
+        ?assertEqual(not_found, seen(Irr, P, [New], Opts)),
+        os:cmd("mv " ++ Share ++ ".away " ++ Share),
+        ?assertEqual({ok, 5, ID5}, seen(Irr, P, [ID5], Opts))
     end}.

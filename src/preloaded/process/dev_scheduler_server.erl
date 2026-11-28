@@ -707,6 +707,7 @@ new_assignment(State, Message, First, Pending) ->
     IDs = hb_phase_timer:time(sched_ids, fun() -> message_ids(Message, OnlyAttested, Opts) end),
     case hb_phase_timer:time(sched_dedupe, fun() -> assigned(ProcID, IDs, First, Pending, Opts) end) of
         {ok, Slot, ID} -> {refused, refusal(State, Slot, ID)};
+        {unavailable, Why} -> {refused, unavailable(State, Why)};
         not_found ->
             {Assignment, Next} = build_assignment(State, Message, OnlyAttested),
             NextSlot = maps:get(current, Next),
@@ -772,6 +773,17 @@ refusal(State, Slot, ID) ->
         <<"slot">> => Slot
     }.
 
+%% A message that may have been assigned in a slot the cold tier holds, while
+%% the share cannot be read: it waits (503), it is never assigned twice.
+unavailable(State, Why) ->
+    ?event(warning, {schedule_dedupe_unavailable,
+        {proc_id, maps:get(id, State)}, {reason, Why}}),
+    #{
+        <<"status">> => 503,
+        <<"retry-after">> => 30,
+        <<"body">> => <<"Cannot check this message against the process's history now. Retry later.">>
+    }.
+
 %% @doc Answer a client whose assignment is flushed, and hand the slot to the
 %% uploader if the node publishes remotely: a `remote_confirmation' client is
 %% then answered by the uploader, once the slot is on its way to Arweave.
@@ -831,6 +843,9 @@ do_assign(State, Message, ReplyPID) ->
             ProcID, IDs, maps:get(current, State), Opts) of
         {ok, Slot, ID} ->
             ReplyPID ! {refused, Message, refusal(State, Slot, ID)},
+            State;
+        {unavailable, Why} ->
+            ReplyPID ! {refused, Message, unavailable(State, Why)},
             State;
         not_found -> do_assign(State, Message, OnlyAttested, IDs, ReplyPID)
     end.
@@ -1226,6 +1241,55 @@ ed25519_scheduler_key_test_() ->
         ?assertThrow({scheduler_key_cannot_sign, {codec, <<"httpsig@1.0">>}, _},
             start(ProcID2, Proc2, HttpsigOpts)),
         ?assertEqual(not_found, dev_scheduler_cache:latest(ProcID2, Opts))
+    end}.
+
+%% @doc A message whose slot the cold tier moved off local disk is still
+%% assigned only once: re-posted, it is refused with its first slot, its
+%% dedupe row now a filter and its range read back from the share; with the
+%% share gone it waits (503) instead; a new message is scheduled either way.
+reposted_after_cold_prune_test_() ->
+    {timeout, 120, fun() ->
+        Wallet = hb:wallet(),
+        Store = small_store(hb_test_utils:test_store(hb_store_lmdb, <<"dedupe-cold">>)),
+        Share = <<(maps:get(<<"name">>, Store))/binary, "-share">>,
+        Opts = #{ <<"priv-wallet">> => Wallet, <<"store">> => [Store],
+                  <<"scheduling-mode">> => local_confirmation,
+                  <<"process-compute-on-schedule">> => false,
+                  <<"cold-tier">> => #{ <<"path">> => Share, <<"hot-slots">> => 16,
+                      <<"hot-slots-floor">> => 16, <<"io-timeout-ms">> => 2000,
+                      <<"arweave-gateway">> => false } },
+        ok = hb_store:start([Store], #{}, Opts),
+        Proc = dedupe_proc(Opts),
+        ProcID = hb_util:human_id(hb_message:id(Proc, all, Opts)),
+        Server = start(ProcID, Proc, Opts),
+        Msg = fun(N) -> hb_message:commit(#{ <<"type">> => <<"Message">>,
+            <<"n">> => integer_to_binary(N) }, Opts, <<"ans104@1.0">>) end,
+        Msgs = [ Msg(N) || N <- lists:seq(1, 60) ],
+        Slots = [ slot_of(schedule(Server, M)) || M <- Msgs ],
+        ok = dev_scheduler_cache:flush(Opts),
+        ok = hb_store_cold:tick(Opts),
+        Old = lists:nth(5, Msgs),
+        OldSlot = lists:nth(5, Slots),
+        [ID] = ids(Old, Opts),
+        % Its row is gone from the local store...
+        ?assertMatch({error, _}, hb_store:read([Store], #{ <<"read">> =>
+            <<"~scheduler@1.0/message-slots/", ProcID/binary, "/", ID/binary>>,
+            <<"exact">> => true }, #{})),
+        % ...and it is refused all the same, with its first slot.
+        ?assertMatch({error, #{ <<"status">> := 409, <<"slot">> := OldSlot }},
+            schedule(Server, Old)),
+        Fresh = slot_of(schedule(Server, Msg(1000))),
+        ?assertEqual(lists:last(Slots) + 1, Fresh),
+        % The share gone: the old message waits, a new one is scheduled.
+        os:cmd("mv " ++ binary_to_list(Share) ++ " " ++ binary_to_list(Share) ++ ".away"),
+        try
+            ?assertMatch({error, #{ <<"status">> := 503 }}, schedule(Server, Old)),
+            ?assertEqual(Fresh + 1, slot_of(schedule(Server, Msg(1001))))
+        after
+            os:cmd("mv " ++ binary_to_list(Share) ++ ".away " ++ binary_to_list(Share))
+        end,
+        ?assertMatch({error, #{ <<"status">> := 409, <<"slot">> := OldSlot }},
+            schedule(Server, Old))
     end}.
 
 %% @doc Posting a signed message again is refused with the slot it already

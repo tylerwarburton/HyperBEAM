@@ -219,21 +219,35 @@ signature_ids(Msg, Opts) ->
            is_map(Comm), is_map_key(<<"committer">>, Comm) ]).
 
 %% @doc Index the slot under each of the message's signature IDs, in the
-%% scheduler's store. The scheduler writes the rows right after the
-%% assignment, and the store's commits keep write order, so what is on disk
-%% after a crash is a prefix: an assignment without its rows can only be one
-%% of the last written.
+%% scheduler's store, and the IDs under the slot (`slot-ids', what the cold
+%% tier moves into `hb_store_dedupe' when it deletes the slot locally: the
+%% IDs exactly as written, never derived again). The scheduler writes the
+%% rows right after the assignment, and the store's commits keep write order,
+%% so what is on disk after a crash is a prefix: an assignment without its
+%% rows can only be one of the last written.
 write_message_slot(_ProcID, [], _Slot, _RawOpts) -> ok;
 write_message_slot(ProcID, IDs, Slot, RawOpts) ->
     Opts = opts(RawOpts),
     ok = hb_store:write(
         hb_opts:get(store, no_viable_store, Opts),
         maps:from_list(
-            [ {message_slot_path(ProcID, ID), hb_util:bin(Slot)} || ID <- IDs ]),
+            [ {slot_ids_path(ProcID, Slot), term_to_binary(lists:usort(IDs))} |
+              [ {message_slot_path(ProcID, ID), hb_util:bin(Slot)} || ID <- IDs ] ]),
         Opts#{ <<"store-failure">> => throw }).
 
+slot_ids_path(ProcID, Slot) ->
+    hb_path:to_binary([
+        ?SCHEDULER_CACHE_PREFIX,
+        <<"slot-ids">>,
+        hb_util:human_id(ProcID),
+        hb_util:bin(Slot)
+    ]).
+
 %% @doc The slot at or below `Current' that already carries one of the
-%% signature IDs: `{ok, Slot, ID}', or `not_found'. A row is read by its exact
+%% signature IDs: `{ok, Slot, ID}', or `not_found'; or `{unavailable, Why}'
+%% when the IDs may belong to a slot the cold tier moved off local disk and
+%% its copy cannot be read (`hb_store_cold:seen/4'): the message must wait,
+%% never be assigned twice. A row is read by its exact
 %% key (one `get', which sees the writes not yet flushed too; never a prefix
 %% scan, which commits pending writes first). A row is trusted only if that
 %% slot's assignment carries the ID, so a row whose assignment never landed
@@ -242,8 +256,14 @@ find_assigned(ProcID, IDs, Current, RawOpts) ->
     Opts = opts(RawOpts),
     Store = hb_opts:get(store, no_viable_store, Opts),
     find_assigned(ProcID, IDs, Current, Store, Opts#{ <<"store-failure">> => throw }).
-find_assigned(_ProcID, [], _Current, _Store, _Opts) -> not_found;
-find_assigned(ProcID, [ID | IDs], Current, Store, Opts) ->
+find_assigned(ProcID, IDs, Current, Store, Opts) ->
+    case find_local(ProcID, IDs, Current, Store, Opts) of
+        not_found -> hb_store_cold:seen(Store, hb_util:human_id(ProcID), IDs, Opts);
+        Found -> Found
+    end.
+
+find_local(_ProcID, [], _Current, _Store, _Opts) -> not_found;
+find_local(ProcID, [ID | IDs], Current, Store, Opts) ->
     Req = #{ <<"read">> => message_slot_path(ProcID, ID), <<"exact">> => true },
     case hb_store:read(Store, Req, Opts) of
         {ok, SlotBin} ->
@@ -261,9 +281,9 @@ find_assigned(ProcID, [ID | IDs], Current, Store, Opts) ->
                     end,
             case Carries of
                 true -> {ok, Slot, ID};
-                false -> find_assigned(ProcID, IDs, Current, Store, Opts)
+                false -> find_local(ProcID, IDs, Current, Store, Opts)
             end;
-        _ -> find_assigned(ProcID, IDs, Current, Store, Opts)
+        _ -> find_local(ProcID, IDs, Current, Store, Opts)
     end.
 
 message_slot_path(ProcID, ID) ->
