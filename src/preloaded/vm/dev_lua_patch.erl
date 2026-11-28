@@ -1038,9 +1038,16 @@ replica_slice_stores_deltas_test_() ->
         {ok, State5} = hb_ao:resolve(Process,
             #{ <<"path">> => <<"compute">>, <<"slot">> => 5 }, Opts),
         ?assertEqual(<<"6">>, hb_ao:get(<<"count">>, State5, Opts)),
-        [Blobs | _] = hb_store:normalize_stores([Store]),
-        Full = lib_process_cache:blob_slots(ProcID, <<"f">>, Blobs),
-        Deltas = lib_process_cache:blob_slots(ProcID, <<"d">>, Blobs),
+        Rows = fun(Kind) ->
+            case hb_store:list([Store], <<"pstate/", ProcID/binary, "/", Kind/binary>>, #{}) of
+                {ok, Names} ->
+                    lists:sort([ binary_to_integer(N) || N <- Names,
+                                 is_integer(catch binary_to_integer(N)) ]);
+                _ -> []
+            end
+        end,
+        Full = Rows(<<"f">>),
+        Deltas = Rows(<<"d">>),
         ?assertEqual([0, 5], Full),
         ?assertEqual([1, 2, 3, 4], Deltas -- Full),
         % A middle slot reads back through its deltas.
