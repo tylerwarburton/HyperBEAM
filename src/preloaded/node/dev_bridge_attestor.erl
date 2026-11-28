@@ -1358,9 +1358,10 @@ nudge_accept(Now, St = #{ nudge := ready, fast_until := FastUntil }) when Now >=
     {ok, St#{ nudge := pending }};
 nudge_accept(_Now, _St) -> ignore.
 
-%% After a pass: only new work keeps (or makes) the node fast.
+%% After a pass: only new work, or a replica the budget cut short, keeps (or
+%% makes) the node fast.
 pass_done(Now, St = #{ cfg := Cfg, nudge := Nudge }) ->
-    Work = maps:get(found_work, St, false),
+    Work = maps:get(found_work, St, false) orelse maps:get(replicas_behind, St, false),
     FastUntil = case Work of
         true -> Now + cfg_ms(Cfg, <<"fast-window">>, 120000);
         false -> maps:get(fast_until, St)
@@ -1371,16 +1372,35 @@ pass_done(Now, St = #{ cfg := Cfg, nudge := Nudge }) ->
     end }.
 
 %% Everything a pass does, it does on `View': PUSD as this node computed it.
-%% A pass spends at most `replica-budget-ms' (plus one slice per replica)
-%% bringing replicas forward: one far behind catches up over several passes,
-%% and the loop keeps passing meanwhile, on the verified state it has.
+%% Replica catch-up gets `replica-budget-ms' (plus one slice per replica)
+%% twice a pass: once for the root, and again for the lanes, counted from when
+%% the lanes start. The chain scans in between never spend it: on 2026-11-18
+%% they did, so the lanes got 25 slots a pass, and the budget was raised to
+%% ten minutes, which made every pass ten minutes long; a member mid-pass
+%% answers no `root-endorse', and its chain scan and signatures were ten
+%% minutes old. A replica the budget cut short keeps the loop fast
+%% (`replica_cut/2'), so a far-behind one catches up over many short passes.
 pass(St0 = #{ cfg := Cfg }) ->
-    St = St0#{ replica_deadline => erlang:monotonic_time(millisecond)
-        + cfg_ms(Cfg, <<"replica-budget-ms">>, 20000) },
+    St = replica_budget(St0#{ replicas_behind => false }),
     case view(maps:get(<<"pusd">>, Cfg), St) of
-        {ok, View, Replica} -> act(View, St#{ replica => Replica, root_view => View });
-        {not_yet, Why} -> St#{ last_error => Why, last_pass => os:system_time(millisecond) }
+        {ok, View, Replica} ->
+            act(View, (replica_behind(maps:get(stopped, Replica, null), St))#{
+                replica => Replica, root_view => View });
+        {not_yet, Why} -> (replica_behind(Why, St))#{ last_error => Why,
+            last_pass => os:system_time(millisecond) }
     end.
+
+%% A fresh replica budget from now.
+replica_budget(St = #{ cfg := Cfg }) ->
+    St#{ replica_deadline => erlang:monotonic_time(millisecond)
+        + cfg_ms(Cfg, <<"replica-budget-ms">>, 20000) }.
+
+%% Was a replica cut short by this pass's budget, rather than stopped on a
+%% slot it cannot verify or compute? Only the first should bring the next
+%% pass forward: a replica that cannot advance would otherwise pass hot.
+replica_cut(null, _St) -> false;
+replica_cut(_Stopped, St) ->
+    erlang:monotonic_time(millisecond) >= maps:get(replica_deadline, St, infinity).
 
 act(View, St) ->
     Info = key(<<"bridgeinfo">>, View),
@@ -1413,8 +1433,8 @@ attest(Info, View, St = #{ cfg := Cfg, me := Me }) ->
             St3 = apply_proposals(Info, St2),
             St4 = acknowledge(Withdrawals, chain_signatures(Info, Withdrawals, Epoch, St3)),
             St5 = relay_fast_ledgers(Info, LedgerDeposits, LedgerReceipts,
-                MoveReceipts, Epoch, St4#{root_intents => root_intents(View),
-                    root_certificate_info => Info}),
+                MoveReceipts, Epoch, replica_budget(St4#{root_intents => root_intents(View),
+                    root_certificate_info => Info})),
             St6 = committee_certificate(Epoch, St5),
             save_state(Cfg, St6),
             St7 = sweep_root_journals(found_work(Found, St, St6)),
@@ -1508,15 +1528,33 @@ scan_chain(<<"sui">>, C, Cursor, Opts) ->
         Error -> Error
     end.
 
+%% Base is read up to `Head' in `log-range' windows, at most `log-windows' of
+%% them a pass. One window a pass read 2,000 blocks per pass while Base made
+%% ~3,000 in a ten-minute pass (200 ms blocks), so two members' cursors fell
+%% hours behind and stayed there, and no deposit past them could be endorsed
+%% (2026-11-28). A window that fails after the first ends the pass's scan at
+%% the last window read; the first failing is the scan failing.
 scan_base(C, Cursor, Head, Opts) ->
+    scan_base_with(C, Cursor, Head,
+        fun(From, To) -> dev_bridge_attestor_chains:base_scan(C, From, To, Opts) end).
+
+scan_base_with(C, Cursor, Head, Scan) ->
+    Range = hb_util:int(maps:get(<<"log-range">>, C, 2000)),
+    Windows = hb_util:int(maps:get(<<"log-windows">>, C, 50)),
+    scan_base_windows(C, Cursor, Head, Scan, Range, Windows, Windows, []).
+
+scan_base_windows(_C, Cursor, _Head, _Scan, _Range, 0, _Max, Acc) ->
+    {ok, Acc, Cursor};
+scan_base_windows(C, Cursor, Head, Scan, Range, Left, Max, Acc) ->
     From = case Cursor of undefined -> hb_util:int(maps:get(<<"from-block">>, C, Head)); N -> N + 1 end,
-    To = min(Head, From + hb_util:int(maps:get(<<"log-range">>, C, 2000)) - 1),
+    To = min(Head, From + Range - 1),
     case To < From of
-        true -> {ok, [], Cursor};
+        true -> {ok, Acc, Cursor};
         false ->
-            case dev_bridge_attestor_chains:base_scan(C, From, To, Opts) of
-                {ok, Events} -> {ok, Events, To};
-                Error -> Error
+            case Scan(From, To) of
+                {ok, Events} -> scan_base_windows(C, To, Head, Scan, Range, Left - 1, Max, Acc ++ Events);
+                Error when Left =:= Max -> Error;
+                _ -> {ok, Acc, Cursor}
             end
     end.
 
@@ -2155,7 +2193,7 @@ relay_fast_ledgers(Info, Deposits, Receipts, MoveReceipts, Epoch,
                             lane_hint(Ledger, Node, maps:get(opts, S))),
                         case Needed andalso lane_view(Ledger, Node, S) of
                             false -> S;
-                            {ok, LaneView, _Replica} ->
+                            {ok, LaneView, Replica} ->
                                 LaneInfo = key(<<"laneinfo">>, LaneView),
                                 LaneExits = case key(<<"laneexits">>, LaneView) of
                                     L when is_list(L) -> L;
@@ -2181,7 +2219,7 @@ relay_fast_ledgers(Info, Deposits, Receipts, MoveReceipts, Epoch,
                                             end)
                                         end)
                                     end,
-                                    S,
+                                    replica_behind(maps:get(stopped, Replica, null), S),
                                     Plans
                                 ),
                                 dispatch_move_plans(
@@ -2194,7 +2232,7 @@ relay_fast_ledgers(Info, Deposits, Receipts, MoveReceipts, Epoch,
                                         maps:get(root_intents, St, #{}), maps:get(me, St)), S2
                                 );
                             {not_yet, Why} ->
-                                S#{ skipped := (maps:get(skipped, S))#{
+                                (replica_behind(Why, S))#{ skipped := (maps:get(skipped, S))#{
                                     <<"ledger:", Ledger/binary>> => Why
                                 } }
                         end
@@ -2203,6 +2241,10 @@ relay_fast_ledgers(Info, Deposits, Receipts, MoveReceipts, Epoch,
         St1,
         Allowed
     ).
+
+%% Note a replica the budget cut short (`replica_cut/2').
+replica_behind(Stopped, St) ->
+    St#{ replicas_behind => maps:get(replicas_behind, St, false) orelse replica_cut(Stopped, St) }.
 
 %% @doc Is lane `Ledger' to be replicated this pass? Only while the root needs
 %% its evidence (HYPERTOKEN_V2.md): a deposit the verified root holds ready
@@ -2919,6 +2961,60 @@ nudge_test() ->
     % A timed pass with work also arms it; the nudge stays ready.
     ?assertMatch(#{ nudge := ready, fast_until := 300000 },
         pass_done(200000, St3#{ found_work => true })).
+
+%% A replica the budget cut short keeps the loop fast; one stopped on a slot
+%% it cannot verify does not, or it would pass hot forever.
+replica_behind_test() ->
+    Now = erlang:monotonic_time(millisecond),
+    Past = #{ replica_deadline => Now - 1 },
+    Future = #{ replica_deadline => Now + 60000 },
+    ?assertNot(replica_cut(null, Past)),
+    ?assert(replica_cut(<<"catching up">>, Past)),
+    ?assertNot(replica_cut(<<"did not verify at slot 9">>, Future)),
+    ?assertNot(replica_cut(<<"catching up">>, #{})),
+    % Once behind, a later replica at its head does not clear it.
+    St = replica_behind(null, replica_behind(<<"catching up">>, Past)),
+    ?assertMatch(#{ replicas_behind := true }, St),
+    Cfg = #{ <<"fast-window">> => 100000 },
+    Base = #{ cfg => Cfg, nudge => ready, fast_until => 0, found_work => false },
+    ?assertMatch(#{ fast_until := 101000 }, pass_done(1000, Base#{ replicas_behind => true })),
+    ?assertMatch(#{ fast_until := 0 }, pass_done(1000, Base#{ replicas_behind => false })).
+
+%% The replica budget is fresh for the lanes, whatever the pass spent before.
+replica_budget_test() ->
+    St = replica_budget(#{ cfg => #{ <<"replica-budget-ms">> => 20000 },
+        replica_deadline => 0 }),
+    Left = maps:get(replica_deadline, St) - erlang:monotonic_time(millisecond),
+    ?assert(Left > 19000 andalso Left =< 20000).
+
+%% Base is read in windows up to the head, at most `log-windows' a pass.
+scan_base_windows_test() ->
+    Self = self(),
+    Scan = fun(From, To) -> Self ! {window, From, To}, {ok, [From]} end,
+    C = #{ <<"log-range">> => 1000, <<"log-windows">> => 3 },
+    % 2,500 blocks behind: three windows reach the head in one pass.
+    ?assertEqual({ok, [1001, 2001, 3001], 3500}, scan_base_with(C, 1000, 3500, Scan)),
+    ?assertEqual([{1001, 2000}, {2001, 3000}, {3001, 3500}], windows_read()),
+    % Further behind than the cap: stop after three, the next pass resumes.
+    ?assertEqual({ok, [1001, 2001, 3001], 4000}, scan_base_with(C, 1000, 9000, Scan)),
+    ?assertEqual(3, length(windows_read())),
+    % At the head: nothing read, the cursor stays.
+    ?assertEqual({ok, [], 9000}, scan_base_with(C, 9000, 9000, Scan)),
+    ?assertEqual([], windows_read()),
+    % The first window failing is the scan failing.
+    ?assertEqual({error, rpc}, scan_base_with(C, 1000, 9000, fun(_, _) -> {error, rpc} end)),
+    % A later window failing keeps what was read, cursor at its end.
+    Later = fun(From, _To) when From > 2000 -> {error, rpc};
+               (From, _To) -> {ok, [From]} end,
+    ?assertEqual({ok, [1001], 2000}, scan_base_with(C, 1000, 9000, Later)),
+    % No cursor yet: from `from-block'.
+    ?assertEqual({ok, [500, 1500, 2500], 3499},
+        scan_base_with(C#{ <<"from-block">> => 500 }, undefined, 9000, fun(F, _) -> {ok, [F]} end)),
+    % Unconfigured, a pass reads up to 50 windows of 2,000 blocks.
+    ?assertEqual({ok, [], 100000}, scan_base_with(#{}, 0, 200000, fun(_, _) -> {ok, []} end)).
+
+windows_read() ->
+    receive {window, From, To} -> [{From, To} | windows_read()] after 0 -> [] end.
 
 %% New work is a chain event or a key the last pass did not plan or sign;
 %% the same plan again, however long it stays pending, is none.
