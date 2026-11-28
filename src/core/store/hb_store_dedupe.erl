@@ -11,9 +11,11 @@
 %%%                     false), with the range's first slot; it names the
 %%%                     range whose file on the share to read
 %%%   segment filters   per process, blocked Bloom filters (4,096-bit blocks,
-%%%                     one block an ID, 16 probes in it) of `?CAPACITY' IDs
-%%%                     each, the newest filling: the first test of a new
-%%%                     message, one block read a segment
+%%%                     one block an ID, 16 probes in it), the newest filling.
+%%%                     The first holds `?BASE' IDs and each next twice the
+%%%                     last, so a process pays for the IDs it has and a new
+%%%                     message costs one block read per segment, a number
+%%%                     that grows with the log of the history
 %%%
 %%% `candidates/3' is what the scheduler asks once its own rows find nothing:
 %%% the ranges that may carry one of a message's IDs. No ID added here is
@@ -32,11 +34,12 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(PREFIX, "~cold@1.0/dedupe/").
-%% IDs per segment, and the blocks of 4,096 bits that hold them at 32 bits
-%% an ID.
--define(CAPACITY, 4194304).
+%% IDs in the first segment (each next holds twice the last), and the
+%% blocks of 4,096 bits that hold a segment's IDs at 32 bits an ID. A fixed
+%% segment of 4M IDs allocated its 16 MB within the first 100k IDs, for every
+%% process (AX102, 2026-11-28).
+-define(BASE, 65536).
 -define(BLOCK_BITS, 4096).
--define(BLOCKS, (?CAPACITY * 32 div ?BLOCK_BITS)).
 -define(PROBES, 16).
 -define(BITS_PER_ID, 32).
 
@@ -48,12 +51,12 @@ add(Store, P, From, To, IDs0) ->
     N = length(IDs),
     {Seg0, Count0} = count(Store, P),
     {Seg, Count} =
-        case Count0 > 0 andalso Count0 + N > ?CAPACITY of
+        case Count0 > 0 andalso Count0 + N > capacity(Seg0) of
             true -> {Seg0 + 1, 0};
             false -> {Seg0, Count0}
         end,
-    ByBlock = maps:groups_from_list(fun(ID) -> element(1, block_probes(ID)) end,
-        fun(ID) -> element(2, block_probes(ID)) end, IDs),
+    ByBlock = maps:groups_from_list(fun(ID) -> element(1, block_probes(ID, Seg)) end,
+        fun(ID) -> element(2, block_probes(ID, Seg)) end, IDs),
     Blocks =
         maps:from_list(
             [ {Key, set_bits(read_block(Store, Key), lists:append(Probes), ?BLOCK_BITS)}
@@ -77,7 +80,7 @@ candidates(Store, P, IDs) ->
     end.
 
 in_segment(Store, P, Seg, ID) ->
-    {B, Probes} = block_probes(ID),
+    {B, Probes} = block_probes(ID, Seg),
     case read(Store, block_key(P, Seg, B)) of
         not_found -> false;
         Block -> all_set(Block, Probes)
@@ -92,11 +95,14 @@ range_candidates(Store, P, Seg, ID) ->
 
 %%% Filters
 
-%% The block an ID falls in and its `?PROBES' bits there, from the SHA-256
-%% of the ID: 32 bits choose the block, then 12 bits a probe.
-block_probes(ID) ->
+capacity(Seg) -> ?BASE bsl Seg.
+blocks(Seg) -> capacity(Seg) * ?BITS_PER_ID div ?BLOCK_BITS.
+
+%% The block of segment `Seg' an ID falls in and its `?PROBES' bits there,
+%% from the SHA-256 of the ID: 32 bits choose the block, then 12 bits a probe.
+block_probes(ID, Seg) ->
     <<B:32, Rest:192/bitstring, _/bitstring>> = crypto:hash(sha256, ID),
-    {B rem ?BLOCKS, [ P || <<P:12>> <= Rest ]}.
+    {B rem blocks(Seg), [ P || <<P:12>> <= Rest ]}.
 
 %% A range filter's probes: double hashing over its `M' bits.
 range_probes(ID, M) ->
@@ -181,7 +187,7 @@ filters_test() ->
     % Another process shares nothing.
     ?assertEqual([], candidates(Store, ID(), [hd(element(3, hd(Ranges)))])).
 
-%% A full segment starts the next; both stay searched.
+%% A full segment starts the next, twice as large; both stay searched.
 segments_roll_test() ->
     Store = hb_test_utils:test_store(hb_store_lmdb, <<"dedupe-roll">>),
     ok = hb_store:start([Store], #{}, #{}),
@@ -189,9 +195,23 @@ segments_roll_test() ->
     A = hb_util:human_id(crypto:strong_rand_bytes(32)),
     B = hb_util:human_id(crypto:strong_rand_bytes(32)),
     ok = hb_store:write([Store], add(Store, P, 1, 10, [A]), #{}),
-    ok = hb_store:write([Store], #{ count_key(P) => term_to_binary({0, ?CAPACITY}) }, #{}),
+    ok = hb_store:write([Store], #{ count_key(P) => term_to_binary({0, capacity(0)}) }, #{}),
     ok = hb_store:write([Store], add(Store, P, 11, 20, [B]), #{}),
     ok = hb_store:flush([Store], #{}),
     ?assertEqual({1, 1}, count(Store, P)),
     ?assertEqual([{A, 1, 10}], candidates(Store, P, [A])),
-    ?assertEqual([{B, 11, 20}], candidates(Store, P, [B])).
+    ?assertEqual([{B, 11, 20}], candidates(Store, P, [B])),
+    ?assertEqual(2 * blocks(0), blocks(1)).
+
+%% A process pays for the IDs it has: 5,000 IDs stay in the first segment,
+%% at most its 512 blocks (256 KB), where a fixed 4M-ID segment was 16 MB.
+small_process_is_small_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb, <<"dedupe-small">>),
+    ok = hb_store:start([Store], #{}, #{}),
+    P = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    IDs = [ hb_util:human_id(crypto:strong_rand_bytes(32)) || _ <- lists:seq(1, 5000) ],
+    Rows = add(Store, P, 1, 5000, IDs),
+    Blocks = [ K || K <- maps:keys(Rows), binary:match(K, <<"/s/">>) =/= nomatch ],
+    ?assert(length(Blocks) =< blocks(0)),
+    ?assert(lists:sum([ byte_size(V) || {K, V} <- maps:to_list(Rows), lists:member(K, Blocks) ])
+        =< blocks(0) * ?BLOCK_BITS div 8).
