@@ -37,9 +37,12 @@
 %%%             and the `shipped' mark moved; nothing else may delete
 %%%
 %%% `verify' is `readback' (drop the client's cached pages, read the file
-%%% back, compare its hash) or `nas' (the share's own host hashes every file
-%%% from its disk and writes `<file>.ok', `scripts/cold-verify-nas.sh'; no
-%%% byte comes back over the link). A file's name is fixed by its process and
+%%% back, check its digest) or `coldcheck' (ask the share's own host, at
+%%% `verify-url', to read the file from its disk and check it: one round trip
+%%% for up to 64 files, and no byte of them comes back over the link; the
+%%% host's `coldcheck' service answers each node for its own folder only).
+%%% Either way the digest proven is the one the node wrote into the file's
+%%% header. A file's name is fixed by its process and
 %%% range, so a crash between the file and its mark writes the same file
 %%% again: shipping is exactly-once in effect. A range row is the only thing
 %%% a local delete is ever decided from, and a delete takes only the rows a
@@ -81,7 +84,11 @@
 %%%   hot-slots-floor          the same under disk pressure (2,000: the
 %%%                            lost-push repair window)
 %%%   prune-local-slots        false holds every local slot (true)
-%%%   verify                   `readback' or `nas' (`readback')
+%%%   verify                   `readback' or `coldcheck' (`readback')
+%%%   verify-url               the share host's `coldcheck' service, e.g.
+%%%                            `http://10.77.0.1:8099' (`coldcheck' only:
+%%%                            without it nothing is ever verified, so
+%%%                            nothing is deleted)
 %%%   checkpoint-every-seconds the newest snapshot is shipped at most this
 %%%                            often per process (3,600)
 %%%   checkpoint-thinning      [[Days, N], ...]: past Days, keep the
@@ -138,8 +145,13 @@ config(Opts) ->
                     hb_util:atom(maps:get(<<"prune-local-slots">>, C, true)) =:= true,
                 verify =>
                     case hb_util:bin(maps:get(<<"verify">>, C, <<"readback">>)) of
-                        <<"nas">> -> nas;
+                        <<"coldcheck">> -> coldcheck;
                         _ -> readback
+                    end,
+                verify_url =>
+                    case maps:get(<<"verify-url">>, C, undefined) of
+                        undefined -> undefined;
+                        U -> hb_util:list(U)
                     end,
                 checkpoint_every_ms => max(0, Int(<<"checkpoint-every-seconds">>, 3600)) * 1000,
                 thinning => thinning(maps:get(<<"checkpoint-thinning">>, C, [[30, 5], [365, 25]])),
@@ -299,23 +311,32 @@ run_phase(Name, Fun) ->
     Stats.
 
 %% `Fun' over `Items', at most `N' at once, each in a process of its own at
-%% low priority. A worker that crashes is that item's failure.
-pmap(Fun, Items, N) -> pmap(Fun, Items, N, #{}, []).
+%% low priority. A worker that crashes is that item's failure. Workers are
+%% linked to the round: whatever ends the round ends them, as a crash of the
+%% node would, so no worker outlives the round that planned its work.
+pmap(Fun, Items, N) ->
+    Trap = process_flag(trap_exit, true),
+    try pmap(Fun, Items, N, #{}, [])
+    after
+        process_flag(trap_exit, Trap)
+    end.
 pmap(_Fun, [], _N, Running, Acc) when map_size(Running) =:= 0 -> lists:reverse(Acc);
 pmap(Fun, [Item | Rest], N, Running, Acc) when map_size(Running) < N ->
-    {_, Ref} =
-        spawn_monitor(fun() ->
+    {Pid, Ref} =
+        spawn_opt(fun() ->
             process_flag(priority, low),
             exit({done, Fun(Item)})
-        end),
-    pmap(Fun, Rest, N, Running#{ Ref => Item }, Acc);
+        end, [link, monitor]),
+    pmap(Fun, Rest, N, Running#{ Ref => {Item, Pid} }, Acc);
 pmap(Fun, Items, N, Running, Acc) ->
     receive
         {'DOWN', Ref, process, _, Reason} when is_map_key(Ref, Running) ->
+            {Item, Pid} = maps:get(Ref, Running),
+            receive {'EXIT', Pid, _} -> ok end,
             R =
                 case Reason of
                     {done, Stats} -> Stats;
-                    Other -> #{ failures => [{maps:get(Ref, Running), Other}] }
+                    Other -> #{ failures => [{Item, Other}] }
                 end,
             pmap(Fun, Items, N, maps:remove(Ref, Running), [R | Acc])
     end.
@@ -344,48 +365,74 @@ io(Cfg, Fun) ->
     end.
 
 %% Write a term as a cold file, durably: `.tmp', synced, renamed. `{Bytes,
-%% Hash}', the SHA-256 of the whole file, which is what `verify' proves the
-%% share holds (`verified_file/4'). The call may take `io-timeout-ms' plus
-%% the file's bytes at `min-rate-bytes' a second.
+%% Digest}': `Digest' is the SHA-256 of the body, which the file's header
+%% carries and which `verify' proves the share holds (`verified_files/3').
+%% The call may take `io-timeout-ms' plus the file's bytes at
+%% `min-rate-bytes' a second.
 put_file(Cfg, Path, Term) ->
     Body = term_to_binary(Term, [{compressed, 6}]),
-    Bin = <<"HBC1", (crypto:hash(sha256, Body))/binary, Body/binary>>,
+    Digest = crypto:hash(sha256, Body),
+    Bin = <<"HBC1", Digest/binary, Body/binary>>,
     io(sized(Cfg, byte_size(Bin)), fun() ->
         Tmp = Path ++ ".tmp",
         ok = hb_file:ensure_dir(Path),
         ok = hb_file:write_file(Tmp, Bin, [binary, sync]),
-        % A hash the share's host wrote for an earlier file of this name is
-        % not this file's (`verify' `nas').
-        _ = maps:get(verify, Cfg, readback) =:= nas andalso hb_file:delete(Path ++ ".ok"),
         ok = hb_file:rename(Tmp, Path)
     end),
-    {byte_size(Bin), crypto:hash(sha256, Bin)}.
+    {byte_size(Bin), Digest}.
 
 %% The timeout of a call that moves `Bytes' over the link.
 sized(Cfg, Bytes) ->
     Cfg#{ io_timeout => maps:get(io_timeout, Cfg) + Bytes * 1000 div maps:get(min_rate, Cfg) }.
 
-%% Whether the share holds exactly the file whose hash is `Hash': `true',
-%% `false' (absent, or other bytes: write it again), or `pending' (`nas': its
-%% host has not hashed it yet). `readback' drops the client's cached pages of
-%% the file before reading it, so the bytes come from the server: a read
-%% just after a write is otherwise answered from the NFS client's own cache.
-%% `nas' reads `<file>.ok', the hash the share's host computed from its disk
-%% (`sha256sum' output: the hex digest first).
-verified_file(#{ verify := readback } = Cfg, Path, Hash, Bytes) ->
-    case io(sized(Cfg, Bytes), fun() -> hb_file:read_file_uncached(Path) end) of
-        {ok, Bin} -> crypto:hash(sha256, Bin) =:= Hash;
+%% Whether the share holds each file of `Files' (`[{RelPath, Digest,
+%% Bytes}]', paths relative to this node's folder) exactly as written: for
+%% each in order, `true', or `false' (absent, or other bytes: write it
+%% again). A share that cannot be asked throws `{cold_io, _}', and nothing is
+%% decided. `readback' drops the client's cached pages of a file before
+%% reading it, so its bytes come from the server: a read just after a write
+%% is otherwise answered from the NFS client's own cache. `coldcheck' asks
+%% the share's host (`verify-url'), 64 files to a request.
+verified_files(_Cfg, []) -> [];
+verified_files(#{ verify := readback } = Cfg, Files) ->
+    [ case io(sized(Cfg, Bytes), fun() -> hb_file:read_file_uncached(
+              filename:join(maps:get(path, Cfg), Rel)) end) of
+          {ok, <<"HBC1", Digest:32/binary, Body/binary>>} -> crypto:hash(sha256, Body) =:= Digest;
+          _ -> false
+      end
+    || {Rel, Digest, Bytes} <- Files ];
+verified_files(#{ verify := coldcheck, verify_url := undefined }, _Files) ->
+    throw({cold_io, no_verify_url});
+verified_files(#{ verify := coldcheck } = Cfg, Files) when length(Files) > 64 ->
+    {First, Rest} = lists:split(64, Files),
+    verified_files(Cfg, First) ++ verified_files(Cfg, Rest);
+verified_files(#{ verify := coldcheck, verify_url := Url } = Cfg, Files) ->
+    Query = lists:join("&", [ "path=" ++ uri_string:quote(Rel) || {Rel, _, _} <- Files ]),
+    Answer =
+        io(Cfg, fun() ->
+            hb_http_gate:httpc_request(get, {Url ++ "/verify?" ++ lists:flatten(Query), []},
+                [{timeout, maps:get(io_timeout, Cfg)}], [{body_format, binary}], #{})
+        end),
+    case Answer of
+        {ok, {{_, 200, _}, _, Json}} ->
+            Verdicts = hb_json:decode(Json),
+            [ coldcheck_verdict(maps:get(list_to_binary(Rel), Verdicts, #{}), Digest)
+            || {Rel, Digest, _} <- Files ];
+        Other -> throw({cold_io, {coldcheck, Other}})
+    end.
+
+%% A `coldcheck' answer for one file: proven only when the host read the
+%% digest we wrote; a missing file or other bytes is written again; anything
+%% else (a refused path: a misconfigured share) decides nothing.
+coldcheck_verdict(#{ <<"ok">> := true, <<"sha256">> := Hex }, Digest) ->
+    case catch binary:decode_hex(Hex) of
+        Digest -> true;
         _ -> false
     end;
-verified_file(#{ verify := nas } = Cfg, Path, Hash, _Bytes) ->
-    case io(Cfg, fun() -> hb_file:read_file(Path ++ ".ok") end) of
-        {ok, <<Hex:64/binary, _/binary>>} ->
-            case catch binary:decode_hex(Hex) of
-                Hash -> true;
-                _ -> false
-            end;
-        _ -> pending
-    end.
+coldcheck_verdict(#{ <<"error">> := Why }, _Digest)
+        when Why =:= <<"digest">>; Why =:= <<"header">>; Why =:= <<"No such file or directory">> ->
+    false;
+coldcheck_verdict(Other, _Digest) -> throw({cold_io, {coldcheck, Other}}).
 
 %% A cold file's term, or `error' if it is absent or damaged.
 get_file(Cfg, Path) ->
@@ -535,11 +582,11 @@ take_range(_Store, _P, _Slots, _MaxSlots, _MaxBytes, Range, Rows, _Bytes) ->
 write_range(Cfg, Store, P, Range, Rows, Opts) ->
     From = hd(Range), To = lists:last(Range),
     Ms = assignment_ms(P, To, Opts),
-    {Bytes, Hash} =
+    {Bytes, Digest} =
         put_file(Cfg, range_file(Cfg, P, From, To),
             #{ process => P, from => From, to => To, newest_ms => Ms, rows => Rows }),
     ok = hb_store:write([Store], #{
-        pending_key(P, To) => term_to_binary({From, To, Ms, Hash, Bytes}),
+        pending_key(P, To) => term_to_binary({From, To, Ms, Digest, Bytes}),
         mark_key(<<"written">>, P) => integer_to_binary(To) }, #{}),
     ok = hb_store:flush([Store], #{}),
     Bytes.
@@ -550,43 +597,41 @@ write_range(Cfg, Store, P, Range, Rows, Opts) ->
 %% (`elmdb:delete_batch/2' commits pending writes with its deletes), so a
 %% crash leaves one or the other, and a pending row left behind is confirmed
 %% again, to the same row. A file that does not hold what was written sends
-%% the `written' mark back before it, to be written again. `{Verified,
-%% Failures}'.
+%% the `written' mark back before it, to be written again; a share that
+%% cannot be asked decides nothing. `{Verified, Failures}'.
 confirm(Cfg, Store, P) ->
     #{ <<"db">> := DB } = hb_store:find(inner(Store)),
-    Names = lists:sort(list_names(Store, pending_prefix(P))),
-    confirm(Cfg, Store, DB, P, Names, 0).
-confirm(_Cfg, _Store, _DB, _P, [], N) -> {N, []};
-confirm(Cfg, Store, DB, P, [Name | Rest], N) ->
-    Key = <<(pending_prefix(P))/binary, "/", Name/binary>>,
-    case hb_store:read([Store], #{ <<"read">> => Key, <<"exact">> => true }, #{}) of
-        {ok, V} ->
-            {From, To, Ms, Hash, Bytes} = binary_to_term(V, [safe]),
-            try verified_file(Cfg, range_file(Cfg, P, From, To), Hash, Bytes) of
-                true ->
-                    Shipped = max(To, read_int(Store, mark_key(<<"shipped">>, P), -1)),
-                    ok = hb_store:write([Store], #{
-                        range_key(P, To) => term_to_binary({From, To, Ms}),
-                        mark_key(<<"shipped">>, P) => integer_to_binary(Shipped) }, #{}),
-                    {ok, _} = elmdb:delete_batch(DB, [Key]),
-                    confirm(Cfg, Store, DB, P, Rest, N + 1);
-                pending -> {N, []};
-                false ->
-                    ?event(warning, {cold_range_not_on_share, P, From, To}),
-                    ok = hb_store:write([Store], #{
-                        mark_key(<<"written">>, P) => integer_to_binary(From - 1) }, #{}),
-                    {ok, _} = elmdb:delete_batch(DB,
-                        [ <<(pending_prefix(P))/binary, "/", R/binary>> || R <- [Name | Rest] ]),
-                    {N, []}
-            catch
-                throw:{cold_io, Why} -> {N, [{P, Why}]}
-            end;
-        _ -> confirm(Cfg, Store, DB, P, Rest, N)
+    Pending =
+        [ {<<(pending_prefix(P))/binary, "/", Name/binary>>, binary_to_term(V, [safe])}
+        || Name <- lists:sort(list_names(Store, pending_prefix(P))),
+           {ok, V} <- [hb_store:read([Store], #{ <<"read">> => <<(pending_prefix(P))/binary,
+                "/", Name/binary>>, <<"exact">> => true }, #{})] ],
+    try verified_files(Cfg, [ {range_rel(P, From, To), Digest, Bytes}
+                             || {_, {From, To, _, Digest, Bytes}} <- Pending ]) of
+        Verdicts -> promote(Store, DB, P, lists:zip(Pending, Verdicts), 0)
+    catch
+        throw:{cold_io, Why} -> {0, [{P, Why}]}
     end.
 
-range_file(Cfg, P, From, To) ->
-    filename:join([maps:get(path, Cfg), "slots", hb_util:list(P),
-        pad(From) ++ "-" ++ pad(To) ++ ".hbc"]).
+promote(_Store, _DB, _P, [], N) -> {N, []};
+promote(Store, DB, P, [{{Key, {From, To, Ms, _, _}}, true} | Rest], N) ->
+    Shipped = max(To, read_int(Store, mark_key(<<"shipped">>, P), -1)),
+    ok = hb_store:write([Store], #{
+        range_key(P, To) => term_to_binary({From, To, Ms}),
+        mark_key(<<"shipped">>, P) => integer_to_binary(Shipped) }, #{}),
+    {ok, _} = elmdb:delete_batch(DB, [Key]),
+    promote(Store, DB, P, Rest, N + 1);
+promote(Store, DB, P, [{{_Key, {From, To, _, _, _}}, false} | _] = Rest, N) ->
+    ?event(warning, {cold_range_not_on_share, P, From, To}),
+    ok = hb_store:write([Store], #{
+        mark_key(<<"written">>, P) => integer_to_binary(From - 1) }, #{}),
+    {ok, _} = elmdb:delete_batch(DB, [ K || {{K, _}, _} <- Rest ]),
+    {N, []}.
+
+range_rel(P, From, To) ->
+    filename:join(["slots", hb_util:list(P), pad(From) ++ "-" ++ pad(To) ++ ".hbc"]).
+
+range_file(Cfg, P, From, To) -> filename:join(maps:get(path, Cfg), range_rel(P, From, To)).
 
 pending_prefix(P) -> mark_key(<<"pending">>, P).
 pending_key(P, To) -> <<(pending_prefix(P))/binary, "/", (list_to_binary(pad(To)))/binary>>.
@@ -1681,3 +1726,195 @@ signer_addresses_test() ->
         <<"owner">> => hb_util:encode(maps:get(<<"owner">>, Sched)) } } },
     ?assertEqual([], signer_addresses(Hmac, #{})).
 
+%%% Ownership, verification and crashes
+
+%% Write slot 0 of the environment's process as the scheduler does: the
+%% definition, then its assignment packed, which links the process's own ID
+%% to slot 0's row.
+assign_spawn(#{ irr := Irr, opts := Opts, p := P }) ->
+    {ok, Proc} = hb_cache:read(P, Opts),
+    A = hb_message:commit(#{ <<"type">> => <<"Assignment">>, <<"process">> => P,
+        <<"variant">> => <<"ao.N.1">>, <<"slot">> => 0,
+        <<"timestamp">> => erlang:system_time(millisecond) - 3600000, <<"body">> => Proc },
+        Opts#{ <<"cache-pack">> => true }, <<"ans104@1.0">>),
+    WOpts = Opts#{ <<"store">> => [Irr], <<"cache-pack">> => true },
+    {ok, _} = hb_cache:write(Proc, Opts#{ <<"store">> => [Irr] }),
+    {ok, _} = hb_cache:write(A, WOpts),
+    ok = hb_cache:link(hb_message:id(A, signed, Opts), slot_path(P, 0), WOpts),
+    ok = hb_store:flush([Irr], #{}).
+
+%% A second process in the same environment.
+another_process(Env = #{ main := Main, opts := Opts, sched := Sched }) ->
+    Proc = hb_message:commit(#{ <<"type">> => <<"Process">>,
+        <<"scheduler">> => hb_util:human_id(ar_wallet:to_address(Sched)),
+        <<"test-seed">> => integer_to_binary(erlang:unique_integer()) }, Opts, <<"ans104@1.0">>),
+    {ok, _} = hb_cache:write(Proc, Opts#{ <<"store">> => [Main] }),
+    Env#{ p => hb_message:id(Proc, signed, Opts) }.
+
+raw(Store, Key) ->
+    case hb_store:read([Store], #{ <<"read">> => Key, <<"exact">> => true }, #{}) of
+        {ok, V} -> {ok, V};
+        _ -> not_found
+    end.
+
+%% Every range row of the process names a file on the share that holds
+%% every slot of the range.
+ranges_hold(#{ irr := Irr, p := P }, Opts) ->
+    Cfg = config(Opts),
+    lists:foreach(
+        fun(Name) ->
+            {ok, V} = raw(Irr, <<(range_prefix(P))/binary, "/", Name/binary>>),
+            {From, To, _} = binary_to_term(V),
+            {ok, #{ from := From, to := To, rows := Rows }} =
+                get_file(Cfg, range_file(Cfg, P, From, To)),
+            Keys = [ K || {K, _} <- Rows ],
+            [ ?assert(lists:member(slot_path(P, S), Keys)) || S <- lists:seq(From, To) ]
+        end,
+        list_names(Irr, range_prefix(P))).
+
+%% Every slot of the process up to `Newest' is held locally or read back,
+%% verified, from the share.
+nothing_lost(Env = #{ p := P }, Opts, Newest) ->
+    [ ?assert(local(Env, S) orelse element(1, read_assignment(P, S, Opts)) =:= ok)
+    || S <- lists:seq(0, Newest) ],
+    ranges_hold(Env, Opts).
+
+%% @doc A prune deletes only the rows its slots own: never slot 0, never the
+%% process's own ID (which links to slot 0's row), never a row a slot's
+%% closure reaches that links somewhere else.
+prune_takes_only_owned_rows_test_() ->
+    {timeout, 120, fun() ->
+        Env = #{ irr := Irr, opts := Opts, p := P } = test_env("owned"),
+        assign_spawn(Env),
+        assign(Env, lists:seq(1, 39), 3600000),
+        IDRow = raw(Irr, P),
+        ?assertMatch({ok, <<"ao:", _/binary>>}, IDRow),
+        Rows5 = closure(Irr, slot_path(P, 5)),
+        [Packed5] = [ K || {K, <<?PACKED, _/binary>>} <- Rows5 ],
+        % One of its message's IDs (not the assignment's own, which the slot
+        % path links through).
+        {ok, <<"ao:", Signed5/binary>>} = raw(Irr, slot_path(P, 5)),
+        [Child | _] = [ K || {K, V} <- Rows5, V =:= <<"ao:", Packed5/binary>>, K =/= Signed5 ],
+        Other = hb_util:human_id(crypto:strong_rand_bytes(32)),
+        ok = hb_store:write([Irr], #{ Child => <<"ao:", Other/binary>>, Other => <<"kept">> }, #{}),
+        ok = hb_store:flush([Irr], #{}),
+        ok = tick(Opts),
+        ?assertNot(local(Env, 5)),
+        ?assertEqual(not_found, raw(Irr, Packed5)),
+        ?assertEqual({ok, <<"ao:", Other/binary>>}, raw(Irr, Child)),
+        ?assertEqual({ok, <<"kept">>}, raw(Irr, Other)),
+        ?assert(local(Env, 0)),
+        ?assertEqual(IDRow, raw(Irr, P)),
+        ?assertMatch({ok, _}, hb_cache:read(P, Opts#{ <<"store">> => [Irr] }))
+    end}.
+
+%% A stub of the share host's `coldcheck' service (`verify-url') over the
+%% share folder `Share': it reads each file asked for and checks its header's
+%% digest, except that it reports `{"ok": false, "error": "digest"}' for
+%% every path in the ETS table `Lies'.
+stub_coldcheck(Share, Lies) ->
+    stub_gateway(fun(_Method, Path) ->
+        [_, Query] = binary:split(Path, <<"?">>),
+        Rels = [ R || {<<"path">>, R} <- uri_string:dissect_query(Query) ],
+        Verdict =
+            fun(Rel) ->
+                case {ets:member(Lies, Rel), file:read_file(filename:join(Share, Rel))} of
+                    {true, _} -> #{ <<"ok">> => false, <<"error">> => <<"digest">> };
+                    {false, {ok, <<"HBC1", D:32/binary, Body/binary>>}} ->
+                        case crypto:hash(sha256, Body) of
+                            D -> #{ <<"ok">> => true, <<"sha256">> => binary:encode_hex(D, lowercase) };
+                            _ -> #{ <<"ok">> => false, <<"error">> => <<"digest">> }
+                        end;
+                    {false, _} -> #{ <<"ok">> => false, <<"error">> => <<"No such file or directory">> }
+                end
+            end,
+        {200, hb_json:encode(maps:from_list([ {R, Verdict(R)} || R <- Rels ]))}
+    end).
+
+%% @doc With `verify' `coldcheck', a range is deleted only once the share's
+%% host has read back the digest the node wrote. Without a host to ask
+%% nothing is deleted; a host that reads other bytes sends the range back to
+%% be written again.
+coldcheck_verify_test_() ->
+    {timeout, 120, fun() ->
+        Env = #{ opts := Opts0, p := P } = test_env("coldcheck"),
+        Cold = maps:get(<<"cold-tier">>, Opts0),
+        Share = share(Opts0),
+        Lies = ets:new(coldcheck_lies, [public, set]),
+        With = fun(Extra) -> Opts0#{ <<"cold-tier">> => maps:merge(Cold#{
+            <<"verify">> => <<"coldcheck">>, <<"range-slots">> => 10 }, Extra) } end,
+        assign(Env, lists:seq(0, 39), 3600000),
+        % No host to ask: written, never proven, never deleted.
+        ok = tick(With(#{})),
+        ?assert(local(Env, 5)),
+        ?assertMatch(#{ last_failures := [{_, no_verify_url} | _] }, status()),
+        Opts = With(#{ <<"verify-url">> => stub_coldcheck(Share, Lies) }),
+        Rel2 = list_to_binary(range_rel(P, 10, 19)),
+        ets:insert(Lies, {Rel2}),
+        ok = tick(Opts),
+        ?assertNot(local(Env, 5)),
+        ?assert(local(Env, 15)),
+        ets:delete(Lies, Rel2),
+        ok = tick(Opts),
+        ?assertNot(local(Env, 15)),
+        ?assertNot(local(Env, 23)),
+        ?assert(local(Env, 24)),
+        ?assertMatch({ok, _}, read_assignment(P, 15, Opts)),
+        ranges_hold(Env, Opts)
+    end}.
+
+%% @doc One process whose files cannot be written does not hold up another:
+%% the round succeeds for the rest, names the failure, and the stuck process
+%% catches up once it can.
+one_failure_is_one_item_test_() ->
+    {timeout, 120, fun() ->
+        Env1 = #{ opts := Opts, p := P1 } = test_env("one-failure"),
+        Env2 = #{ p := P2 } = another_process(Env1),
+        assign(Env1, lists:seq(0, 39), 3600000),
+        assign(Env2, lists:seq(0, 39), 3600000),
+        Blocked = share(Opts) ++ "/slots/" ++ binary_to_list(P2),
+        ok = filelib:ensure_dir(Blocked),
+        ok = file:write_file(Blocked, <<"not a folder">>),
+        ok = tick(Opts),
+        ?assertNot(local(Env1, 5)),
+        ?assert(local(Env2, 5)),
+        #{ last_failures := Failures } = status(),
+        ?assert(lists:keymember(P2, 1, Failures)),
+        ?assertNot(lists:keymember(P1, 1, Failures)),
+        ok = file:delete(Blocked),
+        ok = tick(Opts),
+        ?assertNot(local(Env2, 5)),
+        ?assertMatch({ok, _}, read_assignment(P2, 5, Opts))
+    end}.
+
+%% @doc A round killed at any moment -- mid-file, between a file and its
+%% mark, between a range row and its delete, mid-delete -- loses nothing and
+%% deletes nothing twice: after every kill each slot is local or on the
+%% share and every range row's file holds its slots; a clean round finishes
+%% the job, and a round after that has nothing left to delete.
+killed_rounds_lose_nothing_test_() ->
+    {timeout, 600, fun() ->
+        Env = #{ opts := Opts0 } = test_env("killed"),
+        Cold = maps:get(<<"cold-tier">>, Opts0),
+        Opts = Opts0#{ <<"cold-tier">> =>
+            Cold#{ <<"range-slots">> => 3, <<"ranges-per-round">> => 50 } },
+        Delays = [0, 1, 2, 3, 5, 8, 13, 20, 30, 50, 80, 130, 200, 320],
+        Newest =
+            lists:foldl(
+                fun(Delay, Next) ->
+                    assign(Env, lists:seq(Next, Next + 9), 3600000),
+                    Pid = spawn(fun() -> tick(Opts) end),
+                    timer:sleep(Delay),
+                    exit(Pid, kill),
+                    nothing_lost(Env, Opts, Next + 9),
+                    Next + 10
+                end,
+                0, Delays) - 1,
+        ok = tick(Opts),
+        nothing_lost(Env, Opts, Newest),
+        [ ?assertNot(local(Env, S)) || S <- lists:seq(1, Newest - 16) ],
+        [ ?assert(local(Env, S)) || S <- [0 | lists:seq(Newest - 15, Newest)] ],
+        Pruned = maps:get(pruned_slots, status()),
+        ok = tick(Opts),
+        ?assertEqual(Pruned, maps:get(pruned_slots, status()))
+    end}.
