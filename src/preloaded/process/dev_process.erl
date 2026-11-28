@@ -44,7 +44,7 @@
 %%% Public API
 -export([device_info/1]).
 -export([as/3, compute/3, schedule/3, slot/3, now/3, push/3, snapshot/3]).
--export([deliveries/3]).
+-export([deliveries/3, results/3]).
 -export([target_slot/2, request_slot/2, is_cached_state/1, is_live_state/1]).
 -export([default_device/3]).
 -include_lib("eunit/include/eunit.hrl").
@@ -83,7 +83,8 @@ device_info(_Base) ->
                 <<"slot">>,
                 <<"snapshot">>,
                 <<"push">>,
-                <<"deliveries">>
+                <<"deliveries">>,
+                <<"results">>
             ]
     }.
 
@@ -562,6 +563,27 @@ invalid_slot_error() ->
         <<"status">> => 400,
         <<"body">> => <<"Invalid slot: expected an integer of at least -1.">>
     }.
+
+%% @doc The `results' of a state. A request that names a slot as its value,
+%% `compute/results=<slot or message ID>' (the form upstream Lunar asks), gets
+%% THAT slot's results: the value used to be dropped and the newest slot's
+%% results served at 200 whatever it named. Without one, the state's own
+%% results, as the message device reads them.
+results(Base, Req, Opts) ->
+    case hb_maps:get(<<"results">>, Req, not_found, Opts) of
+        Named when is_integer(Named); is_binary(Named) ->
+            case compute(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => Named }, Opts) of
+                {ok, State} -> own_results(State, Opts);
+                Error -> Error
+            end;
+        _ -> own_results(Base, Opts)
+    end.
+
+own_results(State, Opts) ->
+    case hb_ao:get(<<"results">>, {as, <<"message@1.0">>, State}, not_found, Opts) of
+        not_found -> {error, not_found};
+        Results -> {ok, Results}
+    end.
 
 %% @doc The slot whose assignment carries message `ID', asked of the scheduler
 %% device (`dev_scheduler:assigned/3', its message index checked against the
@@ -1569,7 +1591,22 @@ compute_slot_by_message_id_test() ->
         hb_ao:get(<<"results/assignment-slot">>, ById, Opts)),
     Unknown = hb_util:human_id(crypto:strong_rand_bytes(32)),
     ?assertMatch({error, #{ <<"status">> := 404 }}, Compute(Unknown)),
-    ?assertMatch({error, #{ <<"status">> := 400 }}, Compute(<<"not-a-slot">>)).
+    ?assertMatch({error, #{ <<"status">> := 400 }}, Compute(<<"not-a-slot">>)),
+    % `compute/results=<x>' (upstream Lunar's form) answers slot x, by number
+    % or message ID, never the newest slot.
+    _Three = Schedule(<<"three">>),
+    ProcID = hb_message:id(Base, all, Opts),
+    {ok, _} = Compute(2),
+    Path = fun(Rest) ->
+        hb_ao:resolve_many(
+            hb_singleton:from(#{ <<"path">> => <<"/", ProcID/binary, "~process@1.0/", Rest/binary>> }, Opts),
+            Opts)
+    end,
+    Slot = fun({ok, R}) -> hb_ao:get(<<"assignment-slot">>, R, Opts) end,
+    ?assertEqual(1, Slot(Path(<<"compute/results=1">>))),
+    ?assertEqual(1, Slot(Path(<<"compute/results=", Two/binary>>))),
+    ?assertEqual(1, Slot(Path(<<"compute&slot=1/results">>))),
+    ?assertEqual(2, Slot(Path(<<"compute&slot=2/results">>))).
 
 %% @doc A device that returns the state without a delta of its own (here the
 %% test device) never carries the previous slot's delta, with its outbox, into
