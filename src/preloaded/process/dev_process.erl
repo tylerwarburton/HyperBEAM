@@ -245,8 +245,17 @@ compute(Base, Req, Opts) ->
     TargetSlot = request_slot(Req, Opts),
     case TargetSlot of
         {invalid, RawSlot} ->
-            ?event(compute, {invalid_slot_requested, {slot, RawSlot}}, Opts),
-            {error, invalid_slot_error()};
+            case slot_of_message(ProcID, RawSlot, Opts) of
+                {ok, Slot} -> compute(Base, with_slot(Req, Slot), Opts);
+                not_found ->
+                    {error, #{
+                        <<"status">> => 404,
+                        <<"body">> => <<"No assignment here carries that message ID.">>
+                    }};
+                invalid ->
+                    ?event(compute, {invalid_slot_requested, {slot, RawSlot}}, Opts),
+                    {error, invalid_slot_error()}
+            end;
         not_found ->
             % The slot is not set, so we need to serve the latest known state
             % unless the `init' key is set to a value aside from `now'.
@@ -553,6 +562,29 @@ invalid_slot_error() ->
         <<"status">> => 400,
         <<"body">> => <<"Invalid slot: expected an integer of at least -1.">>
     }.
+
+%% @doc The slot whose assignment carries message `ID', from the scheduler's
+%% message index (`dev_scheduler_cache:find_assigned/4'), which also checks
+%% that the assignment at that slot names the ID, and only up to the newest
+%% durable slot. `compute&slot=<message id>' is read this way, once, here:
+%% the worker, grouper and waiters keep their integer slots. Only the node
+%% that schedules the process holds the index, so any other answers 404.
+slot_of_message(ProcID, ID, Opts) when is_binary(ID) ->
+    case hb_util:is_human_id(ID) of
+        false -> invalid;
+        true ->
+            case dev_scheduler_cache:find_assigned(
+                    ProcID, [ID], dev_scheduler_cache:durable(ProcID), Opts) of
+                {ok, Slot, _} -> {ok, Slot};
+                _ -> not_found
+            end
+    end;
+slot_of_message(_ProcID, _ID, _Opts) -> invalid.
+
+%% @doc `Req' with its slot replaced by `Slot', under the key `literal_slot/1'
+%% reads first.
+with_slot(Req = #{ <<"compute">> := _ }, Slot) -> Req#{ <<"compute">> => Slot };
+with_slot(Req, Slot) -> (maps:remove(<<"compute+link">>, Req))#{ <<"slot">> => Slot }.
 
 %% @doc The error returned for a slot at or below the head that is no longer
 %% stored. It is gone, not missing: no later request will find it either.
@@ -1504,6 +1536,37 @@ snapshot_target_option_test() ->
         end,
         [{true, true}, {false, false}]
     ).
+
+%% @doc `compute&slot=<message id>' computes the slot whose assignment carries
+%% that message, the same as asking for the slot by number; an ID nothing here
+%% assigned is a 404, and anything else that is not a slot is still a 400.
+compute_slot_by_message_id_test() ->
+    application:ensure_all_started(hb),
+    Opts = #{ <<"store">> => hb_test_utils:test_store(hb_store_lmdb) },
+    Base = hb_process_test_vectors:test_process(),
+    Wallet = hb_opts:get(priv_wallet, hb:wallet(), Opts),
+    WOpts = Opts#{ <<"priv-wallet">> => Wallet },
+    Schedule = fun(Text) ->
+        Body = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"test-label">> => Text }, WOpts),
+        {ok, _} = hb_ao:resolve(Base,
+            hb_message:commit(#{ <<"path">> => <<"schedule">>, <<"method">> => <<"POST">>,
+                <<"body">> => Body }, WOpts), WOpts),
+        hb_message:id(Body, signed, Opts)
+    end,
+    _One = Schedule(<<"one">>),
+    Two = Schedule(<<"two">>),
+    Compute = fun(Slot) ->
+        hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, Opts)
+    end,
+    {ok, BySlot} = Compute(2),
+    {ok, ById} = Compute(Two),
+    ?assertEqual(2, hb_ao:get(<<"at-slot">>, ById, Opts)),
+    ?assertEqual(
+        hb_ao:get(<<"results/assignment-slot">>, BySlot, Opts),
+        hb_ao:get(<<"results/assignment-slot">>, ById, Opts)),
+    Unknown = hb_util:human_id(crypto:strong_rand_bytes(32)),
+    ?assertMatch({error, #{ <<"status">> := 404 }}, Compute(Unknown)),
+    ?assertMatch({error, #{ <<"status">> := 400 }}, Compute(<<"not-a-slot">>)).
 
 %% @doc A device that returns the state without a delta of its own (here the
 %% test device) never carries the previous slot's delta, with its outbox, into
