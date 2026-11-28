@@ -22,7 +22,7 @@
 %%% Local scheduling functions:
 -export([schedule/3, router/4, direct/3]).
 %%% CU-flow functions:
--export([slot/3, status/3, next/3]).
+-export([slot/3, status/3, next/3, assigned/3]).
 -export([start/0, checkpoint/1]).
 %%% Utility functions:
 -export([parse_schedulers/1]).
@@ -55,6 +55,7 @@ device_info() ->
                 <<"next">>,
                 <<"schedule">>,
                 <<"slot">>,
+                <<"assigned">>,
                 <<"init">>,
                 <<"checkpoint">>,
                 <<"direct">>
@@ -857,6 +858,25 @@ find_remote_scheduler(ProcID, Scheduler, Variant, Opts) ->
                     ?event({failed_to_find_scheduler_location, {error, Error}}),
                     {error, Error}
             end
+    end.
+
+%% @doc The slot of a process (`target') whose assignment carries message
+%% `id', from this node's scheduler index (`dev_scheduler_cache:find_assigned/4':
+%% the index row, checked against the assignment, up to the newest durable
+%% slot). A read: nothing is assigned. 404 when no assignment here carries it,
+%% which is every ID on a node that does not schedule the process.
+assigned(M1, M2, Opts) ->
+    ProcID = find_target_id(M1, M2, Opts),
+    case hb_maps:get(<<"id">>, M2, not_found, Opts) of
+        ID when is_binary(ID) ->
+            case dev_scheduler_cache:find_assigned(
+                    ProcID, [ID], dev_scheduler_cache:durable(ProcID), Opts) of
+                {ok, Slot, _} -> {ok, Slot};
+                _ ->
+                    {error, #{ <<"status">> => 404,
+                        <<"body">> => <<"No assignment here carries that message ID.">> }}
+            end;
+        _ -> {error, #{ <<"status">> => 400, <<"body">> => <<"`id' is required.">> }}
     end.
 
 %% @doc Returns information about the current slot for a process.

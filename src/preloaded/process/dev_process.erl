@@ -228,8 +228,8 @@ init(Base, Req, Opts) ->
 -spec compute(
     #{ 'at-slot' => integer(), _ => _ },
     #{
-        compute => integer(),
-        slot => integer(),
+        compute => integer() | binary(),
+        slot => integer() | binary(),
         init => binary(),
         push => _,
         'result-depth' => _,
@@ -563,19 +563,22 @@ invalid_slot_error() ->
         <<"body">> => <<"Invalid slot: expected an integer of at least -1.">>
     }.
 
-%% @doc The slot whose assignment carries message `ID', from the scheduler's
-%% message index (`dev_scheduler_cache:find_assigned/4'), which also checks
-%% that the assignment at that slot names the ID, and only up to the newest
-%% durable slot. `compute&slot=<message id>' is read this way, once, here:
-%% the worker, grouper and waiters keep their integer slots. Only the node
-%% that schedules the process holds the index, so any other answers 404.
+%% @doc The slot whose assignment carries message `ID', asked of the scheduler
+%% device (`dev_scheduler:assigned/3', its message index checked against the
+%% assignment, up to the newest durable slot; the scheduler is another
+%% package, so it is resolved, not called). `compute&slot=<message id>' is
+%% read this way, once, here: the worker, grouper and waiters keep their
+%% integer slots. Only the node that schedules the process holds the index,
+%% so any other answers 404.
 slot_of_message(ProcID, ID, Opts) when is_binary(ID) ->
     case hb_util:is_human_id(ID) of
         false -> invalid;
         true ->
-            case dev_scheduler_cache:find_assigned(
-                    ProcID, [ID], dev_scheduler_cache:durable(ProcID), Opts) of
-                {ok, Slot, _} -> {ok, Slot};
+            case hb_ao:resolve(
+                    #{ <<"device">> => <<"scheduler@1.0">> },
+                    #{ <<"path">> => <<"assigned">>, <<"target">> => ProcID, <<"id">> => ID },
+                    Opts) of
+                {ok, Slot} when is_integer(Slot) -> {ok, Slot};
                 _ -> not_found
             end
     end;
@@ -1558,9 +1561,9 @@ compute_slot_by_message_id_test() ->
     Compute = fun(Slot) ->
         hb_ao:resolve(Base, #{ <<"path">> => <<"compute">>, <<"slot">> => Slot }, Opts)
     end,
-    {ok, BySlot} = Compute(2),
+    {ok, BySlot} = Compute(1),
     {ok, ById} = Compute(Two),
-    ?assertEqual(2, hb_ao:get(<<"at-slot">>, ById, Opts)),
+    ?assertEqual(1, hb_ao:get(<<"at-slot">>, ById, Opts)),
     ?assertEqual(
         hb_ao:get(<<"results/assignment-slot">>, BySlot, Opts),
         hb_ao:get(<<"results/assignment-slot">>, ById, Opts)),
