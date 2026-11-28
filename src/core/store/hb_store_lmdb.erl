@@ -212,6 +212,7 @@ measure(Opts = #{ <<"name">> := Name }, Instance) ->
     set_gauge(hb_store_budget_level, Name, hb_store_budget:rank(Level)),
     case maps:find(live_bytes, Fill) of
         {ok, LiveBytes} ->
+            set_gauge(hb_store_live_bytes, Name, LiveBytes),
             set_gauge(hb_store_live_percent, Name,
                 round(100 * LiveBytes / max(1, maps:get(map_bytes, Fill))));
         error -> ok
@@ -630,6 +631,7 @@ init_prometheus() ->
         {hb_store_disk_used_percent, "Fill of the filesystem an LMDB store is on"},
         {hb_store_map_used_percent, "Fill of an LMDB store's map (file size / capacity)"},
         {hb_store_live_percent, "Live pages of an LMDB store against its map (file less free list)"},
+        {hb_store_live_bytes, "Bytes an LMDB store holds live (its file less its free list)"},
         {hb_store_pressure_percent, "An LMDB store's disk budget pressure (hb_store_budget)"},
         {hb_store_budget_level, "0 ok, 1 soft, 2 high, 3 hard (hb_store_budget)"},
         {hb_store_unhealthy, "1 while an LMDB store cannot commit its writes"}] ],
