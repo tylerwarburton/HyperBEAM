@@ -44,8 +44,11 @@
 %%% oldest snapshot of each of the newest N buckets of every tier in
 %%% `store-retention-checkpoint-tiers' (a list of `[BucketSeconds, N]'; e.g.
 %%% `[[3600, 24], [86400, 7]]': hourly for a day, daily for a week; default
-%%% `[]': none), and every snapshot whose time cannot be read. With a cold
-%%% tier (`hb_store_cold'), a snapshot it has not shipped yet is kept. The oldest of a bucket stays the oldest as time passes,
+%%% `[]': none), and every snapshot whose time cannot be read. A snapshot is
+%%% never kept for the cold tier (`hb_store_cold'): it ships a sample, the
+%%% newest when due, and a snapshot is derived (its process's messages
+%%% rebuild it), so a slow link must never cost local disk. The oldest of a
+%%% bucket stays the oldest as time passes,
 %%% so what a run keeps is never deleted by the next until its bucket ages
 %%% out. A slot whose state is gone is rebuilt on request by replay from the
 %%% nearest kept snapshot below it, or from the process's definition
@@ -99,6 +102,12 @@
 %%% deletes them, in the same throttled batches. Without the list nothing is
 %%% ever deleted this way: no process is judged dead by its looks.
 %%%
+%%% Under disk pressure (`hb_store_budget' at `high' or above) a run keeps
+%%% only what the node computes on: the newest snapshot of every process and
+%%% the rows above it (`store-retention-checkpoints' 1, no `keep-slots'
+%%% window, no age floor, no policy, no tiers), and runs every
+%%% `?PRESSURE_PAUSE_MS' until the pressure is gone.
+%%%
 %%% Configuration: `store-retention' (true to run), `store-retention-
 %%% interval-ms' (600,000), `store-retention-first-ms' (60,000), and the keys
 %%% above. The store is the first writable `hb_store_lmdb' of the node's
@@ -132,6 +141,8 @@
 %% this, not after the interval: a backlog is cleared in one sitting, at the
 %% run's CPU cap.
 -define(BACKLOG_PAUSE_MS, 1000).
+%% Between runs while the disk budget is at `high' or above.
+-define(PRESSURE_PAUSE_MS, 10000).
 %% A timestamp below this is in seconds (an Arweave block's, which the
 %% `arweave-scheduler@1.0' stamps its assignments with), not milliseconds:
 %% 10^11 is 1973 in milliseconds and the year 5138 in seconds.
@@ -192,9 +203,10 @@ server(Opts, Swept) ->
         run ->
             Report = safe_retain(Opts, Swept),
             Next =
-                case maps:get(backlog, Report, false) of
-                    true -> ?BACKLOG_PAUSE_MS;
-                    false -> int(<<"store-retention-interval-ms">>, 600000, Opts)
+                case {maps:get(backlog, Report, false), hb_store_budget:at_least(high)} of
+                    {true, _} -> ?BACKLOG_PAUSE_MS;
+                    {false, true} -> ?PRESSURE_PAUSE_MS;
+                    {false, false} -> int(<<"store-retention-interval-ms">>, 600000, Opts)
                 end,
             erlang:send_after(Next, self(), run),
             server(Opts, maps:get(swept, Report, Swept));
@@ -371,15 +383,23 @@ all_rows(Store, P) ->
                    is_retention_key(Key) ]
         || K <- ?ZONE_KINDS ]).
 
-%% The run's settings.
+%% The run's settings: the node's, or under disk pressure the least it can
+%% compute on.
 config(Opts) ->
+    case hb_store_budget:at_least(high) of
+        true ->
+            (config_of(Opts))#{ keep => 1, keep_slots => 0, recent => 1, keep_seconds => 0,
+                                full_keep_seconds => 0, tiers => [], policy => #{} };
+        false -> config_of(Opts)
+    end.
+
+config_of(Opts) ->
     {ok, Policy} = policy(Opts),
     {ok, Tiers} = tiers(Opts),
     KeepSecs = max(0, int(<<"store-retention-keep-seconds">>, ?KEEP_SECONDS, Opts)),
     #{
         keep => max(1, int(<<"store-retention-checkpoints">>, 2, Opts)),
         keep_slots => max(0, int(<<"store-retention-keep-slots">>, ?KEEP_SLOTS, Opts)),
-        shipped => cold_shipped(Opts),
         recent => max(1, int(<<"store-retention-recent-slots">>, ?RECENT, Opts)),
         keep_seconds => KeepSecs,
         % Never longer than the node's `keep-seconds' unless set.
@@ -480,7 +500,7 @@ walk(Store, P, Cfg0, Fun, Acc0) ->
     Snaps = lists:reverse(slots(Store, P, <<"s">>)),
     {AgeFloor, Unreadable} = floor(Store, P, Snaps, Cfg),
     Floor = below_window(AgeFloor, Snaps, head(Store, P), Cfg),
-    Kept = maps:merge(thin(Store, P, Snaps, Cfg), unshipped(P, Snaps, Cfg)),
+    Kept = thin(Store, P, Snaps, Cfg),
     Bottom = maps:get(P, maps:get(swept, Cfg, #{}), 0),
     Rule =
         keep_snapshots(
@@ -517,28 +537,6 @@ below_window({ok, F}, Snaps, Head, #{ keep_slots := KeepSlots }) ->
 %% The process's newest computed slot: of its deltas or its full states.
 head(Store, P) ->
     lists:max([-1 | rows_desc(Store, P, <<"d">>, 1) ++ rows_desc(Store, P, <<"f">>, 1)]).
-
-%% With a cold tier, the snapshots it has not shipped yet stay
-%% (`hb_store_cold' ships each in turn and marks the newest it shipped).
-unshipped(_P, _Snaps, #{ shipped := off }) -> #{};
-unshipped(P, Snaps, #{ shipped := Shipped }) ->
-    Mark = Shipped(P),
-    maps:from_list([ {S, true} || S <- Snaps, S > Mark ]).
-
-%% How far the cold tier has shipped each process, or `off'.
-cold_shipped(Opts) ->
-    case hb_store_cold:config(Opts) of
-        undefined -> off;
-        _ ->
-            Store = store(Opts),
-            fun(P) ->
-                Key = <<"~cold@1.0/checkpoint/", P/binary>>,
-                case hb_store:read([Store], #{ <<"read">> => Key, <<"exact">> => true }, Opts) of
-                    {ok, V} -> try binary_to_integer(V) catch _:_ -> -1 end;
-                    _ -> -1
-                end
-            end
-    end.
 
 %% The snapshot checkpoints `thin/4' keeps stay, at any age: their markers
 %% and their states. Below `Bottom' (the floor of the last finished walk)
@@ -1075,9 +1073,9 @@ backlog_runs_again_test() ->
     ?assertMatch(#{ backlog := false }, retain(Opts#{ <<"store-retention-max-candidates">> => 1000 })),
     ?assertEqual(40, floor_of(Store, P, Head)).
 
-%% @doc With a cold tier, a snapshot it has not shipped stays, below the
-%% floor or not; once shipped, the next run takes it.
-unshipped_snapshot_stays_test() ->
+%% @doc A snapshot the cold tier has not shipped does not stay: a snapshot
+%% is derived, and a slow link must never cost local disk.
+unshipped_snapshot_goes_test() ->
     Store = hb_test_utils:test_store(hb_store_lmdb, <<"ret-cold">>),
     ok = hb_store:start([Store], #{}, #{}),
     P = new_pid(),
@@ -1087,11 +1085,29 @@ unshipped_snapshot_stays_test() ->
     Opts = #{ <<"store">> => [Store], <<"store-retention-keep-slots">> => 0,
               <<"cold-tier">> => #{ <<"path">> => <<"/nonexistent-cold-share">> } },
     retain(Opts),
-    ?assertEqual([20, 30, 40, 50], slots(Store, P, <<"s">>)),
-    ?assertEqual(40, floor_of(Store, P, Head)),
-    ok = hb_store:write([Store], #{ Mark => <<"50">> }, #{}),
-    retain(Opts),
-    ?assertEqual([40, 50], slots(Store, P, <<"s">>)).
+    ?assertEqual([40, 50], slots(Store, P, <<"s">>)),
+    ?assertEqual(40, floor_of(Store, P, Head)).
+
+%% @doc Under disk pressure (`high') a run keeps only the newest snapshot and
+%% the rows above it, whatever the node's policy.
+pressure_keeps_only_the_newest_test() ->
+    Store = hb_test_utils:test_store(hb_store_lmdb, <<"ret-pressure">>),
+    ok = hb_store:start([Store], #{}, #{}),
+    P = new_pid(),
+    Head = age_layout(Store, P, lists:duplicate(6, 0)),
+    Opts = #{ <<"store">> => [Store], <<"store-retention-keep-seconds">> => 86400 * 365,
+              <<"store-retention-checkpoint-tiers">> => [[3600, 24]] },
+    try
+        hb_store_budget:override(soft),
+        retain(Opts),
+        ?assertEqual(6, length(slots(Store, P, <<"s">>))),
+        hb_store_budget:override(high),
+        retain(Opts),
+        ?assertEqual([50], slots(Store, P, <<"s">>)),
+        ?assertEqual(50, floor_of(Store, P, Head))
+    after
+        hb_store_budget:override(undefined)
+    end.
 
 %% @doc Under the default policy too, whatever prefix of a run's deletions
 %% lands, every remaining delta chains down to a full state and every `s'

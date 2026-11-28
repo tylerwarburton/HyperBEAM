@@ -1,37 +1,67 @@
 %%% @doc The cold tier: a node's history on a shared filesystem (an NFS share
 %%% mounted on every node), so that its local disk holds only hot data.
 %%%
-%%% A process is its spawn and its ordered signed messages; everything else
-%%% is cache. Locally a node keeps its head states, its newest checkpoints and
-%%% its recent messages. On the share, in its own folder, it keeps:
+%%% One invariant: local disk is bounded at steady state, whatever the length
+%%% of the history. A process is its spawn and its ordered signed messages;
+%%% everything else is cache. So:
+%%%
+%%%   - a signed row (an assignment and its message) leaves local disk only
+%%%     below the process's hot window (`hot-slots', its newest slots) and
+%%%     only once a verified copy of it is on the share;
+%%%   - a derived row (a computed state, a snapshot) never waits for the
+%%%     share (`hb_store_retention'); the share gets a sample of snapshots,
+%%%     the newest one at most every `checkpoint-every-seconds', so a slow
+%%%     link costs replay depth for old reads, never local disk.
+%%%
+%%% On the share, in its own folder, a node keeps:
 %%%
 %%%   slots/<pid>/<from>-<to>.hbc    every assignment and its message, as the
 %%%                                  rows the scheduler wrote (packed:
 %%%                                  `hb_cache'), a range per file
 %%%   checkpoints/<pid>/<slot>-<ms>-<seq>.hbc
-%%%                                  every snapshot checkpoint (the `seq'th
-%%%                                  of the process), thinned with age but
-%%%                                  never to none: by default every one for
-%%%                                  30 days, 1 in 5 after, 1 in 25 after a
-%%%                                  year (`checkpoint-thinning'), so an old
-%%%                                  read replays at most 1, 5 or 25 snapshot
-%%%                                  intervals
+%%%                                  the sampled snapshot checkpoints (the
+%%%                                  `seq'th of the process), thinned with
+%%%                                  age but never to none: by default every
+%%%                                  one for 30 days, 1 in 5 after, 1 in 25
+%%%                                  after a year (`checkpoint-thinning')
 %%%   replica/<pusd>/<slot>.hbc      the newest snapshot of each bridge
 %%%                                  replica (`lib_bridge_replica'), two kept
 %%%
-%%% Each file is `HBC1', the SHA-256 of the rest, then a compressed term. A
-%%% file is written to `.tmp', synced, renamed and read back before anything
-%%% counts it as shipped.
+%%% Each file is `HBC1', the SHA-256 of the rest, then a compressed term,
+%%% written to `.tmp', synced and renamed. A slot range then goes through two
+%%% marks, both rows of the scheduler store beside the slots:
+%%%
+%%%   written   the file is on the share (`~cold@1.0/pending/<pid>/<to>')
+%%%   verified  its bytes were proven to be the share's (`verify'), and only
+%%%             then is the range row (`~cold@1.0/range/<pid>/<to>') written
+%%%             and the `shipped' mark moved; nothing else may delete
+%%%
+%%% `verify' is `readback' (drop the client's cached pages, read the file
+%%% back, compare its hash) or `nas' (the share's own host hashes every file
+%%% from its disk and writes `<file>.ok', `scripts/cold-verify-nas.sh'; no
+%%% byte comes back over the link). A file's name is fixed by its process and
+%%% range, so a crash between the file and its mark writes the same file
+%%% again: shipping is exactly-once in effect. A range row is the only thing
+%%% a local delete is ever decided from, and a delete takes only the rows a
+%%% slot owns (`owned/3'), never slot 0 (whose packed row the process's own ID
+%%% links to), in one LMDB transaction.
 %%%
 %%% The share is a residential link and goes away. Nothing on a request path
-%%% writes to it: a server ships on a timer, and every filesystem call is
-%%% made in a process of its own and abandoned after `io-timeout-ms', so a
-%%% hung mount costs a timeout, never a blocked node. A failed tick marks the
-%%% share unavailable (`status/0', the `hb_cold_available' gauge) and the next
-%%% tries again, backing off to `?MAX_BACKOFF_MS'. Local data is deleted only
-%%% after its copy was confirmed, and only once it is older than
-%%% `keep-local-seconds': an outage costs local disk, never data, and the
-%%% shipper catches up from its markers when the share is back.
+%%% writes to it. A server ships continuously: each round gives every process
+%%% a few ranges, `concurrency' processes at a time, each range a work item
+%%% with its own timeout (`io-timeout-ms' plus its bytes at `min-rate-bytes'
+%%% a second) and its own mark, so a timeout costs one item, never the round.
+%%% Every filesystem call runs in a process of its own and is abandoned at its
+%%% timeout: a hung mount costs a timeout, never a blocked node. A round in
+%%% which every item failed marks the share unavailable (`status/0', the
+%%% `hb_cold_available' gauge) and the next backs off to `?MAX_BACKOFF_MS'. An
+%%% outage costs local disk, never data: the hot window and the disk budget
+%%% (`hb_store_budget') decide what may go, and an unshipped signed row never
+%%% does.
+%%%
+%%% Under disk pressure (`hb_store_budget' at `soft' or above) the hot window
+%%% shrinks to `hot-slots-floor' and no checkpoint is shipped, so the link
+%%% carries only what local disk is waiting on.
 %%%
 %%% Reads fall back: a slot not held locally is read from this node's folder,
 %%% then from the other nodes' folders (`peers'), then from Arweave (the
@@ -43,18 +73,29 @@
 %%% only if the same build wrote it.
 %%%
 %%% Configuration, `cold-tier' (off when unset):
-%%%   path                the node's own folder (read and written)
-%%%   peers               [#{ node, path, trusted }]: other nodes' folders,
-%%%                       read only
-%%%   keep-local-seconds  messages and assignments kept locally (604,800)
-%%%   checkpoint-thinning [[Days, N], ...]: past Days, keep the checkpoints
-%%%                       whose `seq' is a multiple of N, and in every age
-%%%                       band at least one ([[30, 5], [365, 25]])
-%%%   interval-ms         time between ticks (60,000)
-%%%   io-timeout-ms       one filesystem call, at most (10,000)
-%%%   range-slots         slots per file, at most (1,000)
-%%%   arweave-gateway     for the last fallback (`https://arweave.net'),
-%%%                       `false' to never ask
+%%%   path                     the node's own folder (read and written)
+%%%   peers                    [#{ node, path, trusted }]: other nodes'
+%%%                            folders, read only
+%%%   hot-slots                newest slots of each process kept locally
+%%%                            (10,000)
+%%%   hot-slots-floor          the same under disk pressure (2,000: the
+%%%                            lost-push repair window)
+%%%   prune-local-slots        false holds every local slot (true)
+%%%   verify                   `readback' or `nas' (`readback')
+%%%   checkpoint-every-seconds the newest snapshot is shipped at most this
+%%%                            often per process (3,600)
+%%%   checkpoint-thinning      [[Days, N], ...]: past Days, keep the
+%%%                            checkpoints whose `seq' is a multiple of N,
+%%%                            and in every age band at least one
+%%%                            ([[30, 5], [365, 25]])
+%%%   concurrency              processes shipped at once (4)
+%%%   ranges-per-round         ranges per process per round (4)
+%%%   range-slots, range-bytes a range's size, at most (1,000; 8 MiB)
+%%%   interval-ms              time between rounds once caught up (60,000)
+%%%   io-timeout-ms            one filesystem call, at most, plus its bytes
+%%%                            at `min-rate-bytes' a second (10,000; 262,144)
+%%%   arweave-gateway          for the last fallback (`https://arweave.net'),
+%%%                            `false' to never ask
 -module(hb_store_cold).
 -export([maybe_start/1, status/0, tick/1, config/1]).
 -export([read_assignment/3, restore_checkpoint/3, ship_replica/3, restore_replica/4]).
@@ -68,8 +109,12 @@
 -define(STATUS, {?MODULE, status}).
 -define(ASSIGNMENTS, <<"~scheduler@1.0/assignments">>).
 -define(MARK, <<"~cold@1.0">>).
+-define(PACKED, "hbpk1:").
 -define(LAG, 16).
 -define(MAX_BACKOFF_MS, 600000).
+%% Between rounds while a backlog remains: the shipper runs flat out, at low
+%% priority, and yields this long so a round's bookkeeping never spins.
+-define(BUSY_PAUSE_MS, 200).
 -define(DAY_MS, 86400000).
 
 %%% Configuration
@@ -79,6 +124,7 @@ config(Opts) ->
     case hb_opts:get(<<"cold-tier">>, undefined, Opts) of
         C = #{ <<"path">> := Path } ->
             Int = fun(K, D) -> hb_util:int(maps:get(K, C, D)) end,
+            Floor = max(1, Int(<<"hot-slots-floor">>, 2000)),
             #{
                 path => hb_util:list(Path),
                 peers =>
@@ -86,11 +132,24 @@ config(Opts) ->
                          path => hb_util:list(maps:get(<<"path">>, P)),
                          trusted => hb_util:atom(maps:get(<<"trusted">>, P, false)) =:= true }
                     || P <- peers(maps:get(<<"peers">>, C, [])) ],
-                keep_local_ms => Int(<<"keep-local-seconds">>, 604800) * 1000,
+                hot_slots => max(Floor, Int(<<"hot-slots">>, 10000)),
+                hot_floor => Floor,
+                prune_local_slots =>
+                    hb_util:atom(maps:get(<<"prune-local-slots">>, C, true)) =:= true,
+                verify =>
+                    case hb_util:bin(maps:get(<<"verify">>, C, <<"readback">>)) of
+                        <<"nas">> -> nas;
+                        _ -> readback
+                    end,
+                checkpoint_every_ms => max(0, Int(<<"checkpoint-every-seconds">>, 3600)) * 1000,
                 thinning => thinning(maps:get(<<"checkpoint-thinning">>, C, [[30, 5], [365, 25]])),
+                concurrency => max(1, Int(<<"concurrency">>, 4)),
+                ranges_per_round => max(1, Int(<<"ranges-per-round">>, 4)),
+                range => max(1, Int(<<"range-slots">>, 1000)),
+                range_bytes => max(1, Int(<<"range-bytes">>, 8388608)),
                 interval => Int(<<"interval-ms">>, 60000),
                 io_timeout => Int(<<"io-timeout-ms">>, 10000),
-                range => max(1, Int(<<"range-slots">>, 1000)),
+                min_rate => max(1, Int(<<"min-rate-bytes">>, 262144)),
                 gateway =>
                     case maps:get(<<"arweave-gateway">>, C, <<"https://arweave.net">>) of
                         false -> false;
@@ -127,63 +186,141 @@ maybe_start(Opts) ->
             ok
     end.
 
-%% A failed tick backs off, doubling up to `?MAX_BACKOFF_MS'.
+%% Rounds back to back while a backlog remains, then one every
+%% `interval-ms'. A round in which nothing could be done backs off, doubling
+%% up to `?MAX_BACKOFF_MS'.
 server(Opts, Backoff) ->
-    Interval = maps:get(interval, config(Opts)),
-    Next =
-        case catch tick(Opts) of
-            ok -> 0;
-            _ -> min(?MAX_BACKOFF_MS, max(Interval, Backoff * 2))
+    process_flag(priority, low),
+    Cfg = config(Opts),
+    Interval = maps:get(interval, Cfg),
+    {Wait, Next} =
+        case catch round(Cfg, Opts) of
+            {ok, true} -> {?BUSY_PAUSE_MS, 0};
+            {ok, false} -> {Interval, 0};
+            _ ->
+                B = min(?MAX_BACKOFF_MS, max(Interval, Backoff * 2)),
+                {B, B}
         end,
     receive
         {tick_now, From, Ref} -> From ! {Ref, ok}, server(Opts, Next)
-    after max(Interval, Next) -> server(Opts, Next)
+    after Wait -> server(Opts, Next)
     end.
 
-%% @doc The share's state: whether the last tick reached it, since when not,
+%% @doc The share's state: whether the last round reached it, since when not,
 %% what this node still has to ship, and what it shipped.
 status() -> persistent_term:get(?STATUS, #{ available => true }).
 
 status_update(Fun) -> persistent_term:put(?STATUS, Fun(status())).
 
-%% @doc One tick: ship new slots, delete local slots that are shipped and
-%% old, ship daily checkpoints. `ok', or the first failure (the share is then
-%% marked unavailable; nothing local was touched past what was confirmed).
+%% @doc One round (`round/2'): `ok', or why nothing at all could be done.
 tick(Opts) ->
-    Cfg = config(Opts),
-    Result =
-        try
-            ok = ship_slots(Cfg, Opts),
-            ok = prune_slots(Cfg, Opts),
-            ok = ship_checkpoints(Cfg, Opts)
-        catch
-            throw:{cold_io, IOWhy} -> {error, IOWhy};
-            C:E -> {error, {C, E}}
+    case round(config(Opts), Opts) of
+        {ok, _} -> ok;
+        Error -> Error
+    end.
+
+%% Ship signed rows (every process, a few ranges each, and confirm what was
+%% written), delete what is verified and below the hot window, then ship the
+%% checkpoints that are due. `{ok, More}', `More' when a backlog remains, if
+%% anything reached the share or nothing failed; else the first failure, and
+%% the share is marked unavailable. Local deletes are decided from verified
+%% range rows only, so they run whatever the share's state.
+round(Cfg, Opts) ->
+    Level = hb_store_budget:level(),
+    Slots = run_phase(slots, fun() -> ship_slots(Cfg, Opts) end),
+    Prune =
+        case maps:get(prune_local_slots, Cfg) of
+            true -> run_phase(prune, fun() -> prune_slots(Cfg, Level, Opts) end);
+            false -> #{}
         end,
-    case Result of
-        ok ->
-            case maps:get(available, status(), true) of
-                false -> ?event(warning, {cold_tier_available_again});
-                true -> ok
-            end,
-            set_gauge(hb_cold_available, 1),
-            status_update(fun(S) ->
-                maps:without([unavailable_since, last_error],
-                    S#{ available => true, last_tick => erlang:system_time(millisecond) })
-            end);
-        {error, Why} ->
-            case maps:get(available, status(), true) of
-                true -> ?event(error, {cold_tier_unavailable, Why});
-                false -> ok
-            end,
-            set_gauge(hb_cold_available, 0),
-            status_update(fun(S) ->
-                S#{ available => false, last_error => Why,
-                    unavailable_since =>
-                        maps:get(unavailable_since, S, erlang:system_time(millisecond)) }
-            end)
-    end,
+    Checkpoints =
+        case hb_store_budget:rank(Level) >= hb_store_budget:rank(soft) of
+            true -> #{ skipped => Level };
+            false -> run_phase(checkpoints, fun() -> ship_checkpoints(Cfg, Opts) end)
+        end,
+    Reached = maps:get(done, Slots, 0) + maps:get(done, Checkpoints, 0),
+    Failures = lists:append([ maps:get(failures, R, []) || R <- [Slots, Prune, Checkpoints] ]),
+    Result =
+        case {Failures, Reached} of
+            {[{_, Why} | _], 0} -> {error, Why};
+            _ -> {ok, maps:get(more, Slots, false)}
+        end,
+    status_update(fun(S) ->
+        S#{ level => Level,
+            last_round => erlang:system_time(millisecond),
+            last_failures => lists:sublist(Failures, 8),
+            shipped_bytes => maps:get(shipped_bytes, S, 0)
+                + maps:get(bytes, Slots, 0) + maps:get(bytes, Checkpoints, 0),
+            slot_bytes => maps:get(slot_bytes, S, 0) + maps:get(bytes, Slots, 0),
+            checkpoint_bytes => maps:get(checkpoint_bytes, S, 0) + maps:get(bytes, Checkpoints, 0),
+            verified_ranges => maps:get(verified_ranges, S, 0) + maps:get(verified, Slots, 0),
+            verified_checkpoints => maps:get(verified_checkpoints, S, 0) + maps:get(done, Checkpoints, 0),
+            pruned_slots => maps:get(pruned_slots, S, 0) + maps:get(pruned, Prune, 0) }
+    end),
+    available(Result),
     Result.
+
+available({ok, _}) ->
+    case maps:get(available, status(), true) of
+        false -> ?event(warning, {cold_tier_available_again});
+        true -> ok
+    end,
+    set_gauge(hb_cold_available, 1),
+    status_update(fun(S) ->
+        maps:without([unavailable_since, last_error],
+            S#{ available => true, last_tick => erlang:system_time(millisecond) })
+    end);
+available({error, Why}) ->
+    case maps:get(available, status(), true) of
+        true -> ?event(error, {cold_tier_unavailable, Why});
+        false -> ok
+    end,
+    set_gauge(hb_cold_available, 0),
+    status_update(fun(S) ->
+        S#{ available => false, last_error => Why,
+            unavailable_since => maps:get(unavailable_since, S, erlang:system_time(millisecond)) }
+    end).
+
+%% A phase's stats (`#{ done, failures, ... }'); a phase that crashes is one
+%% failure. Its last stats and duration are in `status/0'.
+run_phase(Name, Fun) ->
+    Started = erlang:monotonic_time(millisecond),
+    Stats =
+        try Fun()
+        catch
+            throw:{cold_io, Why} -> #{ failures => [{Name, Why}] };
+            C:E -> #{ failures => [{Name, {C, E}}] }
+        end,
+    Ms = erlang:monotonic_time(millisecond) - Started,
+    status_update(fun(S) ->
+        Phases = maps:get(phases, S, #{}),
+        S#{ phases => Phases#{ Name => maps:without([failures], Stats#{ ms => Ms }) } }
+    end),
+    Stats.
+
+%% `Fun' over `Items', at most `N' at once, each in a process of its own at
+%% low priority. A worker that crashes is that item's failure.
+pmap(Fun, Items, N) -> pmap(Fun, Items, N, #{}, []).
+pmap(_Fun, [], _N, Running, Acc) when map_size(Running) =:= 0 -> lists:reverse(Acc);
+pmap(Fun, [Item | Rest], N, Running, Acc) when map_size(Running) < N ->
+    {_, Ref} =
+        spawn_monitor(fun() ->
+            process_flag(priority, low),
+            exit({done, Fun(Item)})
+        end),
+    pmap(Fun, Rest, N, Running#{ Ref => Item }, Acc);
+pmap(Fun, Items, N, Running, Acc) ->
+    receive
+        {'DOWN', Ref, process, _, Reason} when is_map_key(Ref, Running) ->
+            R =
+                case Reason of
+                    {done, Stats} -> Stats;
+                    Other -> #{ failures => [{maps:get(Ref, Running), Other}] }
+                end,
+            pmap(Fun, Items, N, maps:remove(Ref, Running), [R | Acc])
+    end.
+
+sum(Key, Stats) -> lists:sum([ maps:get(Key, S, 0) || S <- Stats ]).
 
 set_gauge(Name, Value) ->
     try
@@ -206,19 +343,49 @@ io(Cfg, Fun) ->
         {error, {'EXIT', Why}} -> throw({cold_io, Why})
     end.
 
-%% Write a term as a cold file, durably, and read it back.
+%% Write a term as a cold file, durably: `.tmp', synced, renamed. `{Bytes,
+%% Hash}', the SHA-256 of the whole file, which is what `verify' proves the
+%% share holds (`verified_file/4'). The call may take `io-timeout-ms' plus
+%% the file's bytes at `min-rate-bytes' a second.
 put_file(Cfg, Path, Term) ->
     Body = term_to_binary(Term, [{compressed, 6}]),
     Bin = <<"HBC1", (crypto:hash(sha256, Body))/binary, Body/binary>>,
-    io(Cfg, fun() ->
+    io(sized(Cfg, byte_size(Bin)), fun() ->
         Tmp = Path ++ ".tmp",
         ok = hb_file:ensure_dir(Path),
         ok = hb_file:write_file(Tmp, Bin, [binary, sync]),
-        ok = hb_file:rename(Tmp, Path),
-        {ok, Bin} = hb_file:read_file(Path),
-        ok
+        % A hash the share's host wrote for an earlier file of this name is
+        % not this file's (`verify' `nas').
+        _ = maps:get(verify, Cfg, readback) =:= nas andalso hb_file:delete(Path ++ ".ok"),
+        ok = hb_file:rename(Tmp, Path)
     end),
-    byte_size(Bin).
+    {byte_size(Bin), crypto:hash(sha256, Bin)}.
+
+%% The timeout of a call that moves `Bytes' over the link.
+sized(Cfg, Bytes) ->
+    Cfg#{ io_timeout => maps:get(io_timeout, Cfg) + Bytes * 1000 div maps:get(min_rate, Cfg) }.
+
+%% Whether the share holds exactly the file whose hash is `Hash': `true',
+%% `false' (absent, or other bytes: write it again), or `pending' (`nas': its
+%% host has not hashed it yet). `readback' drops the client's cached pages of
+%% the file before reading it, so the bytes come from the server: a read
+%% just after a write is otherwise answered from the NFS client's own cache.
+%% `nas' reads `<file>.ok', the hash the share's host computed from its disk
+%% (`sha256sum' output: the hex digest first).
+verified_file(#{ verify := readback } = Cfg, Path, Hash, Bytes) ->
+    case io(sized(Cfg, Bytes), fun() -> hb_file:read_file_uncached(Path) end) of
+        {ok, Bin} -> crypto:hash(sha256, Bin) =:= Hash;
+        _ -> false
+    end;
+verified_file(#{ verify := nas } = Cfg, Path, Hash, _Bytes) ->
+    case io(Cfg, fun() -> hb_file:read_file(Path ++ ".ok") end) of
+        {ok, <<Hex:64/binary, _/binary>>} ->
+            case catch binary:decode_hex(Hex) of
+                Hash -> true;
+                _ -> false
+            end;
+        _ -> pending
+    end.
 
 %% A cold file's term, or `error' if it is absent or damaged.
 get_file(Cfg, Path) ->
@@ -291,40 +458,140 @@ closure(Store, Path, {Rows, Seen0}) ->
         _ -> {Rows, Seen}
     end.
 
-%% Ship every slot older than the newest `?LAG' of each process, a range per
-%% file. The `shipped' mark moves only once the file is read back.
+%% Ship every process's slots past its `written' mark, all but its newest
+%% `?LAG', `ranges-per-round' ranges of it per round and `concurrency'
+%% processes at once, and confirm what was written before. Stats:
+%% `#{ done, verified, bytes, more, failures }'.
 ship_slots(Cfg, Opts) ->
     Store = irr(Opts),
-    Procs = list_names(Store, ?ASSIGNMENTS),
-    Lag = lists:sum(
-        [ ship_process(Cfg, Store, P, Opts) || P <- Procs, ?IS_ID(P) ]),
+    Procs = [ P || P <- list_names(Store, ?ASSIGNMENTS), ?IS_ID(P) ],
+    Stats =
+        pmap(fun(P) -> ship_process(Cfg, Store, P, Opts) end, Procs,
+            maps:get(concurrency, Cfg)),
+    Lag = sum(lag, Stats),
     set_gauge(hb_cold_lag_slots, Lag),
     status_update(fun(S) -> S#{ lag_slots => Lag } end),
-    ok.
+    #{ done => sum(done, Stats), verified => sum(verified, Stats), bytes => sum(bytes, Stats),
+       lag => Lag,
+       more => lists:any(fun(S) -> maps:get(more, S, false) end, Stats),
+       failures => lists:append([ maps:get(failures, S, []) || S <- Stats ]) }.
 
-%% The slots of `P' still to ship after this tick.
+%% One process: confirm its written ranges, write up to `ranges-per-round'
+%% more, and confirm again (`readback' confirms at once). A failure ends this
+%% process's turn, never another's.
 ship_process(Cfg, Store, P, Opts) ->
+    Slots = slots_of(Store, P),
+    {Verified0, Failed0} = confirm(Cfg, Store, P),
+    Written =
+        max(read_int(Store, mark_key(<<"shipped">>, P), -1),
+            read_int(Store, mark_key(<<"written">>, P), -1)),
+    Unwritten = [ S || S <- Slots, S > Written ],
+    Ready = lists:sublist(Unwritten, max(0, length(Unwritten) - ?LAG)),
+    {Done, Bytes, Used, Failed1} =
+        case Failed0 of
+            [] -> write_ranges(Cfg, Store, P, Ready, maps:get(ranges_per_round, Cfg), Opts, {0, 0, 0});
+            _ -> {0, 0, 0, []}
+        end,
+    {Verified1, Failed2} =
+        case Done of
+            0 -> {0, []};
+            _ -> confirm(Cfg, Store, P)
+        end,
     Shipped = read_int(Store, mark_key(<<"shipped">>, P), -1),
-    Slots = [ S || S <- slots_of(Store, P), S > Shipped ],
-    case length(Slots) > ?LAG of
-        false -> length(Slots);
-        true ->
-            Ready = lists:sublist(Slots, min(maps:get(range, Cfg), length(Slots) - ?LAG)),
-            From = hd(Ready), To = lists:last(Ready),
-            Rows = lists:append([ closure(Store, slot_path(P, S)) || S <- Ready ]),
-            Ms = assignment_ms(P, To, Opts),
-            File = filename:join([maps:get(path, Cfg), "slots", hb_util:list(P),
-                pad(From) ++ "-" ++ pad(To) ++ ".hbc"]),
-            Bytes = put_file(Cfg, File,
-                #{ process => P, from => From, to => To, newest_ms => Ms, rows => Rows }),
-            ok = hb_store:write([Store], #{
-                mark_key(<<"shipped">>, P) => integer_to_binary(To),
-                <<(mark_key(<<"range">>, P))/binary, "/", (list_to_binary(pad(To)))/binary>> =>
-                    term_to_binary({From, To, Ms}) }, #{}),
-            ok = hb_store:flush([Store], #{}),
-            status_update(fun(S) -> S#{ shipped_bytes => maps:get(shipped_bytes, S, 0) + Bytes } end),
-            length(Slots) - length(Ready)
+    #{ done => Done + Verified0 + Verified1, verified => Verified0 + Verified1,
+       bytes => Bytes, more => Used < length(Ready),
+       lag => length([ S || S <- Slots, S > Shipped ]),
+       failures => Failed0 ++ Failed1 ++ Failed2 }.
+
+%% Write ranges of `Slots', each at most `range-slots' slots and about
+%% `range-bytes' bytes, `N' of them at most. `{Ranges, Bytes, SlotsUsed,
+%% Failures}'.
+write_ranges(_Cfg, _Store, _P, [], _N, _Opts, {D, B, U}) -> {D, B, U, []};
+write_ranges(_Cfg, _Store, _P, _Slots, 0, _Opts, {D, B, U}) -> {D, B, U, []};
+write_ranges(Cfg, Store, P, Slots, N, Opts, {D, B, U}) ->
+    {Range, Rows} = take_range(Store, P, Slots, maps:get(range, Cfg), maps:get(range_bytes, Cfg)),
+    try write_range(Cfg, Store, P, Range, Rows, Opts) of
+        Bytes ->
+            write_ranges(Cfg, Store, P, lists:nthtail(length(Range), Slots), N - 1, Opts,
+                {D + 1, B + Bytes, U + length(Range)})
+    catch
+        throw:{cold_io, Why} -> {D, B, U, [{P, Why}]};
+        C:E -> {D, B, U, [{P, {C, E}}]}
     end.
+
+%% The first slots of `Slots' for one file, and their rows.
+take_range(Store, P, Slots, MaxSlots, MaxBytes) ->
+    take_range(Store, P, Slots, MaxSlots, MaxBytes, [], [], 0).
+take_range(Store, P, [S | Rest], MaxSlots, MaxBytes, Range, Rows, Bytes)
+        when MaxSlots > 0, (Range =:= [] orelse Bytes < MaxBytes) ->
+    R = closure(Store, slot_path(P, S)),
+    Size = lists:sum([ byte_size(K) + byte_size(V) || {K, V} <- R ]),
+    take_range(Store, P, Rest, MaxSlots - 1, MaxBytes, [S | Range], [R | Rows], Bytes + Size);
+take_range(_Store, _P, _Slots, _MaxSlots, _MaxBytes, Range, Rows, _Bytes) ->
+    {lists:reverse(Range), lists:append(lists:reverse(Rows))}.
+
+%% One range's file, and its `written' mark: a `pending' row naming the
+%% file's hash, which `confirm/3' turns into a range row once it is proven.
+write_range(Cfg, Store, P, Range, Rows, Opts) ->
+    From = hd(Range), To = lists:last(Range),
+    Ms = assignment_ms(P, To, Opts),
+    {Bytes, Hash} =
+        put_file(Cfg, range_file(Cfg, P, From, To),
+            #{ process => P, from => From, to => To, newest_ms => Ms, rows => Rows }),
+    ok = hb_store:write([Store], #{
+        pending_key(P, To) => term_to_binary({From, To, Ms, Hash, Bytes}),
+        mark_key(<<"written">>, P) => integer_to_binary(To) }, #{}),
+    ok = hb_store:flush([Store], #{}),
+    Bytes.
+
+%% Turn `P''s written ranges whose files are verified, oldest first, into
+%% range rows, moving the `shipped' mark, until the first that is not. The
+%% range row is written and the pending row deleted in ONE transaction
+%% (`elmdb:delete_batch/2' commits pending writes with its deletes), so a
+%% crash leaves one or the other, and a pending row left behind is confirmed
+%% again, to the same row. A file that does not hold what was written sends
+%% the `written' mark back before it, to be written again. `{Verified,
+%% Failures}'.
+confirm(Cfg, Store, P) ->
+    #{ <<"db">> := DB } = hb_store:find(inner(Store)),
+    Names = lists:sort(list_names(Store, pending_prefix(P))),
+    confirm(Cfg, Store, DB, P, Names, 0).
+confirm(_Cfg, _Store, _DB, _P, [], N) -> {N, []};
+confirm(Cfg, Store, DB, P, [Name | Rest], N) ->
+    Key = <<(pending_prefix(P))/binary, "/", Name/binary>>,
+    case hb_store:read([Store], #{ <<"read">> => Key, <<"exact">> => true }, #{}) of
+        {ok, V} ->
+            {From, To, Ms, Hash, Bytes} = binary_to_term(V, [safe]),
+            try verified_file(Cfg, range_file(Cfg, P, From, To), Hash, Bytes) of
+                true ->
+                    Shipped = max(To, read_int(Store, mark_key(<<"shipped">>, P), -1)),
+                    ok = hb_store:write([Store], #{
+                        range_key(P, To) => term_to_binary({From, To, Ms}),
+                        mark_key(<<"shipped">>, P) => integer_to_binary(Shipped) }, #{}),
+                    {ok, _} = elmdb:delete_batch(DB, [Key]),
+                    confirm(Cfg, Store, DB, P, Rest, N + 1);
+                pending -> {N, []};
+                false ->
+                    ?event(warning, {cold_range_not_on_share, P, From, To}),
+                    ok = hb_store:write([Store], #{
+                        mark_key(<<"written">>, P) => integer_to_binary(From - 1) }, #{}),
+                    {ok, _} = elmdb:delete_batch(DB,
+                        [ <<(pending_prefix(P))/binary, "/", R/binary>> || R <- [Name | Rest] ]),
+                    {N, []}
+            catch
+                throw:{cold_io, Why} -> {N, [{P, Why}]}
+            end;
+        _ -> confirm(Cfg, Store, DB, P, Rest, N)
+    end.
+
+range_file(Cfg, P, From, To) ->
+    filename:join([maps:get(path, Cfg), "slots", hb_util:list(P),
+        pad(From) ++ "-" ++ pad(To) ++ ".hbc"]).
+
+pending_prefix(P) -> mark_key(<<"pending">>, P).
+pending_key(P, To) -> <<(pending_prefix(P))/binary, "/", (list_to_binary(pad(To)))/binary>>.
+range_prefix(P) -> mark_key(<<"range">>, P).
+range_key(P, To) -> <<(range_prefix(P))/binary, "/", (list_to_binary(pad(To)))/binary>>.
 
 assignment_ms(P, S, Opts) ->
     case hb_store_retention:assignment_time(P, S, Opts#{ <<"scheduler-store">> => [irr(Opts)] }) of
@@ -332,36 +599,61 @@ assignment_ms(P, S, Opts) ->
         _ -> erlang:system_time(millisecond)
     end.
 
-%% Delete, locally, the slots of every shipped range whose newest assignment
-%% is older than `keep-local-seconds'. Each process's newest slot stays, and
-%% so does every `message-slots' row (the scheduler's dedupe index).
-prune_slots(Cfg, Opts) ->
+%% Delete, locally, every verified range that lies wholly below its
+%% process's hot window (`hot-slots' newest slots; `hot-slots-floor' under
+%% disk pressure): the rows its slots own and its range row, in one LMDB
+%% transaction. Slot 0 stays, and so does every `message-slots' row (the
+%% scheduler's dedupe index). `#{ done, pruned }'.
+prune_slots(Cfg, Level, Opts) ->
     Store = irr(Opts),
     #{ <<"db">> := DB } = hb_store:find(inner(Store)),
-    Old = erlang:system_time(millisecond) - maps:get(keep_local_ms, Cfg),
-    lists:foreach(
-        fun(P) ->
-            Ranges = list_names(Store, mark_key(<<"range">>, P)),
-            Newest = lists:max([-1 | slots_of(Store, P)]),
-            lists:foreach(
-                fun(Name) ->
-                    Key = <<(mark_key(<<"range">>, P))/binary, "/", Name/binary>>,
-                    {ok, V} = hb_store:read([Store], #{ <<"read">> => Key, <<"exact">> => true }, #{}),
-                    {From, To, Ms} = binary_to_term(V, [safe]),
-                    case Ms < Old andalso To < Newest of
-                        true ->
-                            Keys = lists:usort([ K || S <- lists:seq(From, To),
-                                                      {K, _} <- closure(Store, slot_path(P, S)) ]),
-                            {ok, _} = elmdb:delete_batch(DB, Keys ++ [Key]),
-                            status_update(fun(St) ->
-                                St#{ pruned_slots => maps:get(pruned_slots, St, 0) + To - From + 1 } end);
-                        false -> ok
-                    end
-                end,
-                lists:sort(Ranges))
+    Hot =
+        case hb_store_budget:rank(Level) >= hb_store_budget:rank(soft) of
+            true -> maps:get(hot_floor, Cfg);
+            false -> maps:get(hot_slots, Cfg)
         end,
-        [ P || P <- list_names(Store, ?ASSIGNMENTS), ?IS_ID(P) ]),
-    ok.
+    Counts =
+        [ prune_process(Store, DB, P, Hot)
+        || P <- list_names(Store, ?ASSIGNMENTS), ?IS_ID(P) ],
+    #{ done => length([ C || C <- Counts, C > 0 ]), pruned => lists:sum(Counts) }.
+
+prune_process(Store, DB, P, Hot) ->
+    case lists:sort(list_names(Store, range_prefix(P))) of
+        [] -> 0;
+        Ranges ->
+            Below = lists:max([-1 | slots_of(Store, P)]) - Hot,
+            prune_ranges(Store, DB, P, Below, Ranges, 0)
+    end.
+
+prune_ranges(_Store, _DB, _P, _Below, [], N) -> N;
+prune_ranges(Store, DB, P, Below, [Name | Rest], N) ->
+    Key = <<(range_prefix(P))/binary, "/", Name/binary>>,
+    case hb_store:read([Store], #{ <<"read">> => Key, <<"exact">> => true }, #{}) of
+        {ok, V} ->
+            {From, To, _Ms} = binary_to_term(V, [safe]),
+            case To =< Below of
+                false -> N;
+                true ->
+                    Slots = lists:seq(max(1, From), To),
+                    Keys = lists:usort(lists:append([ owned(Store, P, S) || S <- Slots ])),
+                    {ok, _} = elmdb:delete_batch(DB, Keys ++ [Key]),
+                    prune_ranges(Store, DB, P, Below, Rest, N + length(Slots))
+            end;
+        _ -> prune_ranges(Store, DB, P, Below, Rest, N)
+    end.
+
+%% The rows slot `S' of `P' owns: its slot path, its packed row (`hb_cache',
+%% `cache-pack'), and every row that links to that packed row (its other
+%% IDs, its message's IDs). A row its closure reaches that links anywhere
+%% else is another's and stays: a process's own ID, which links to the
+%% packed row of its slot 0, or a message stored exploded. An assignment
+%% stored exploded owns only its slot path here.
+owned(Store, P, S) ->
+    Rows = closure(Store, slot_path(P, S)),
+    Packed = [ K || {K, <<?PACKED, _/binary>>} <- Rows ],
+    Links = [ <<"ao:", K/binary>> || K <- Packed ],
+    [ slot_path(P, S) |
+        [ K || {K, V} <- Rows, lists:member(K, Packed) orelse lists:member(V, Links) ] ].
 
 %% @doc An assignment of `P' that this node does not hold: from its own
 %% folder, then the peers' (verified), then Arweave (verified). `{ok, Msg}'
@@ -553,39 +845,57 @@ gateway(Method, Gateway, Path, Body) ->
 
 %%% Checkpoints
 
-%% Ship, per process, the oldest snapshot checkpoint of each UTC day that is
-%% not shipped yet: the daily and weekly ones retention keeps.
+%% Ship, per process, its newest snapshot checkpoint when it is newer than
+%% the last one shipped and at least `checkpoint-every-seconds' younger.
+%% Only the newest is ever a candidate: retention always keeps it, and a link
+%% that falls behind skips snapshots instead of queueing them. A snapshot is
+%% derived (its process's messages rebuild it), so nothing local waits for
+%% one to ship. `#{ done, bytes, failures }'.
 ship_checkpoints(Cfg, Opts) ->
     case catch hb_store_retention:store(Opts) of
-        Main = #{} -> ship_checkpoints(Cfg, Main, Opts);
-        _ -> ok
+        Main = #{} ->
+            Results =
+                [ ship_newest(Cfg, Main, P) || P <- list_names(Main, <<"pstate">>), ?IS_ID(P) ],
+            #{ done => length([ ok || {ok, _} <- Results ]),
+               bytes => lists:sum([ B || {ok, B} <- Results ]),
+               failures => [ F || {error, F} <- Results ] };
+        _ -> #{}
     end.
-ship_checkpoints(Cfg, Main, _Opts) ->
-    lists:foreach(
-        fun(P) ->
-            Mark = mark_key(<<"checkpoint">>, P),
-            Shipped = read_int(Main, Mark, -1),
-            New = [ S || S <- pstate_slots(Main, P, <<"s">>), S > Shipped ],
-            [ ship_checkpoint(Cfg, Main, P, S) || S <- New ],
-            thin_checkpoints(Cfg, P)
-        end,
-        [ P || P <- list_names(Main, <<"pstate">>), ?IS_ID(P) ]),
-    ok.
 
-%% Every snapshot checkpoint is shipped, so an old read replays at most the
-%% slots between two snapshots (`dev_process', `process-snapshot-slots' and
-%% `-replay-ms'); the `checkpoint' mark is the newest shipped.
-ship_checkpoint(Cfg, Main, P, S) ->
+ship_newest(Cfg, Main, P) ->
+    Mark = read_int(Main, mark_key(<<"checkpoint">>, P), -1),
+    case lists:reverse(pstate_slots(Main, P, <<"s">>)) of
+        [S | _] when S > Mark ->
+            Ms = case snap_ms(Main, P, S) of {ok, T} -> T; error -> erlang:system_time(millisecond) end,
+            Last = read_int(Main, mark_key(<<"checkpoint-ms">>, P), -1),
+            case Last < 0 orelse Ms - Last >= maps:get(checkpoint_every_ms, Cfg) of
+                true ->
+                    try
+                        Bytes = ship_checkpoint(Cfg, Main, P, S, Ms),
+                        thin_checkpoints(Cfg, P),
+                        {ok, Bytes}
+                    catch
+                        throw:{cold_io, Why} -> {error, {P, Why}};
+                        C:E -> {error, {P, {C, E}}}
+                    end;
+                false -> skip
+            end;
+        _ -> skip
+    end.
+
+%% One checkpoint file; the `checkpoint' mark is the newest shipped, and
+%% `checkpoint-ms' its time.
+ship_checkpoint(Cfg, Main, P, S, Ms) ->
     Rows = snapshot_rows(Main, P, S),
-    Ms = case snap_ms(Main, P, S) of {ok, T} -> T; error -> erlang:system_time(millisecond) end,
     Seq = read_int(Main, mark_key(<<"checkpoint-seq">>, P), -1) + 1,
     File = filename:join([maps:get(path, Cfg), "checkpoints", hb_util:list(P),
         pad(S) ++ "-" ++ integer_to_list(Ms) ++ "-" ++ integer_to_list(Seq) ++ ".hbc"]),
-    Bytes = put_file(Cfg, File, #{ process => P, slot => S, rows => Rows }),
+    {Bytes, _Hash} = put_file(Cfg, File, #{ process => P, slot => S, rows => Rows }),
     ok = hb_store:write([Main], #{ mark_key(<<"checkpoint">>, P) => integer_to_binary(S),
-                                  mark_key(<<"checkpoint-seq">>, P) => integer_to_binary(Seq) }, #{}),
+                                  mark_key(<<"checkpoint-seq">>, P) => integer_to_binary(Seq),
+                                  mark_key(<<"checkpoint-ms">>, P) => integer_to_binary(Ms) }, #{}),
     ok = hb_store:flush([Main], #{}),
-    status_update(fun(St) -> St#{ shipped_bytes => maps:get(shipped_bytes, St, 0) + Bytes } end).
+    Bytes.
 
 %% On the share, checkpoints are thinned with age, never to none
 %% (`thin_plan/3').
@@ -861,7 +1171,9 @@ test_env(Name, KeyType) ->
               <<"scheduler-store">> => [Irr], <<"priv-wallet">> => Sched,
               <<"match-index">> => false,
               <<"cold-tier">> => #{ <<"path">> => list_to_binary(Dir ++ "/share/me"),
-                                    <<"keep-local-seconds">> => 1,
+                                    <<"hot-slots">> => 16,
+                                    <<"hot-slots-floor">> => 16,
+                                    <<"checkpoint-every-seconds">> => 0,
                                     <<"io-timeout-ms">> => 2000,
                                     <<"arweave-gateway">> => false } },
     Address = hb_util:human_id(ar_wallet:to_address(Sched)),
@@ -904,8 +1216,10 @@ slots_shipped_pruned_and_read_back_test_() ->
         Env = #{ opts := Opts, p := P } = test_env("ship"),
         assign(Env, lists:seq(0, 39), 3600000),
         ok = tick(Opts),
-        % The newest `?LAG' are not shipped; the rest are, and are gone here.
-        ?assertNot(local(Env, 0)),
+        % The newest `?LAG' are not shipped; the rest are, and lie below the
+        % hot window (16), so are gone here. Slot 0 (the spawn) always stays.
+        ?assert(local(Env, 0)),
+        ?assertNot(local(Env, 1)),
         ?assertNot(local(Env, 23)),
         ?assert(local(Env, 24)),
         ?assert(local(Env, 39)),
@@ -914,11 +1228,39 @@ slots_shipped_pruned_and_read_back_test_() ->
         ?assert(hb_message:verify(A, all, Opts)),
         ?assertEqual(<<"5">>, hb_ao:get(<<"body/n">>, A, Opts)),
         ?assertMatch(#{ available := true, lag_slots := 16 }, status()),
-        % Young slots are shipped but kept.
+        % A range inside the hot window is shipped and kept, whatever its age.
         assign(Env, lists:seq(40, 79), 0),
-        ok = tick(Opts),
+        Cold = maps:get(<<"cold-tier">>, Opts),
+        Hot = fun(N) -> Opts#{ <<"cold-tier">> => Cold#{ <<"hot-slots">> => N } } end,
+        ok = tick(Hot(40)),
         ?assert(local(Env, 50)),
-        ?assertMatch({ok, _}, read_assignment(P, 10, Opts))
+        ?assertMatch({ok, _}, read_assignment(P, 50, Opts)),
+        % Once the window passes it, it goes.
+        ok = tick(Hot(16)),
+        ?assertNot(local(Env, 50)),
+        ?assert(local(Env, 64)),
+        ?assertMatch({ok, _}, read_assignment(P, 10, Opts)),
+        ?assertMatch({ok, _}, read_assignment(P, 50, Opts))
+    end}.
+
+%% @doc Under disk pressure the hot window shrinks to its floor.
+pressure_shrinks_the_hot_window_test_() ->
+    {timeout, 120, fun() ->
+        Env = #{ opts := Opts0 } = test_env("pressure"),
+        Cold = maps:get(<<"cold-tier">>, Opts0),
+        Opts = Opts0#{ <<"cold-tier">> => Cold#{ <<"hot-slots">> => 1000 } },
+        assign(Env, lists:seq(0, 59), 0),
+        ok = tick(Opts),
+        ?assert(local(Env, 10)),
+        try
+            hb_store_budget:override(soft),
+            ok = tick(Opts),
+            ?assertNot(local(Env, 10)),
+            ?assert(local(Env, 44)),
+            ?assertMatch(#{ level := soft, phases := #{ checkpoints := _ } }, status())
+        after
+            hb_store_budget:override(undefined)
+        end
     end}.
 
 %% @doc The share goes away mid-run: the tick fails, the node keeps every
@@ -1007,8 +1349,8 @@ peer_slots_verified(KeyType) ->
         ?assertEqual(not_found, read_assignment(P, 2, MOpts2)).
 
 
-%% @doc Daily checkpoints are shipped; one is put back where none is held,
-%% from this node's folder or a trusted peer's only.
+%% @doc The newest checkpoint is shipped when it is due; one is put back where
+%% none is held, from this node's folder or a trusted peer's only.
 checkpoints_test_() ->
     {timeout, 120, fun() ->
         #{ main := Main, opts := Opts } = test_env("ckpt"),
@@ -1018,30 +1360,45 @@ checkpoints_test_() ->
         State20 = test_snapshot(20, <<"state-20">>),
         State30 = test_snapshot(30, crypto:strong_rand_bytes(6010)),
         <<Part1:4000/binary, Part2/binary>> = State30,
-        ok = hb_store:write([Main], #{
-            blob_key(Q, <<"s">>, 10) => Marker(Now - 2 * Day),
-            blob_key(Q, <<"f">>, 10) => test_snapshot(10, <<"state-10">>),
-            blob_key(Q, <<"s">>, 20) => Marker(Now - 2 * Day + 1000),
-            blob_key(Q, <<"f">>, 20) => State20,
-            blob_key(Q, <<"s">>, 30) => Marker(Now),
-            blob_key(Q, <<"f">>, 30) => <<"pstate-chunks:2">>,
-            <<(blob_key(Q, <<"f">>, 30))/binary, ".1">> => Part1,
-            <<(blob_key(Q, <<"f">>, 30))/binary, ".2">> => Part2 }, #{}),
-        ok = hb_store:flush([Main], #{}),
-        ok = tick(Opts),
         Share = share(Opts),
-        Shipped = filelib:wildcard(Share ++ "/checkpoints/" ++ binary_to_list(Q) ++ "/*.hbc"),
-        % Every snapshot is shipped.
-        ?assertEqual(3, length(Shipped)),
+        Files = fun() -> filelib:wildcard(Share ++ "/checkpoints/" ++ binary_to_list(Q) ++ "/*.hbc") end,
+        Write = fun(Rows) -> ok = hb_store:write([Main], Rows, #{}), ok = hb_store:flush([Main], #{}) end,
+        % Two snapshots at once: only the newest is a candidate.
+        Write(#{ blob_key(Q, <<"s">>, 5) => Marker(Now - 3 * Day),
+                 blob_key(Q, <<"f">>, 5) => test_snapshot(5, <<"state-5">>),
+                 blob_key(Q, <<"s">>, 10) => Marker(Now - 2 * Day),
+                 blob_key(Q, <<"f">>, 10) => test_snapshot(10, <<"state-10">>) }),
+        ok = tick(Opts),
+        ?assertEqual(1, length(Files())),
+        Write(#{ blob_key(Q, <<"s">>, 20) => Marker(Now - 2 * Day + 1000),
+                 blob_key(Q, <<"f">>, 20) => State20 }),
+        ok = tick(Opts),
+        Write(#{ blob_key(Q, <<"s">>, 30) => Marker(Now),
+                 blob_key(Q, <<"f">>, 30) => <<"pstate-chunks:2">>,
+                 <<(blob_key(Q, <<"f">>, 30))/binary, ".1">> => Part1,
+                 <<(blob_key(Q, <<"f">>, 30))/binary, ".2">> => Part2 }),
+        ok = tick(Opts),
+        ?assertEqual(3, length(Files())),
+        % Not yet due: a snapshot an hour or less after the last one shipped.
+        ColdH = maps:get(<<"cold-tier">>, Opts),
+        Hourly = Opts#{ <<"cold-tier">> => ColdH#{ <<"checkpoint-every-seconds">> => 3600 } },
+        Write(#{ blob_key(Q, <<"s">>, 40) => Marker(Now + 1000),
+                 blob_key(Q, <<"f">>, 40) => test_snapshot(40, <<"state-40">>) }),
+        ok = tick(Hourly),
+        ?assertEqual(3, length(Files())),
+        #{ <<"db">> := DB0 } = hb_store:find(Main),
+        {ok, _} = elmdb:delete_batch(DB0, [ blob_key(Q, K, S) || K <- [<<"s">>, <<"f">>], S <- [5, 40] ]),
         #{ <<"db">> := DB } = hb_store:find(Main),
         {ok, _} = elmdb:delete_batch(DB, [ blob_key(Q, K, S) || K <- [<<"s">>, <<"f">>], S <- [10, 20, 30] ]),
         ?assertEqual({ok, 20}, restore_checkpoint(Q, 25, Opts)),
         ?assertEqual({ok, State20}, hb_store:read([Main], blob_key(Q, <<"f">>, 20), #{})),
-        % Past one day, 1 in 2: of 10 (seq 0) and 20 (seq 1), 10 stays; 30
-        % is younger and stays.
+        % Thinned as the next one ships. Past one day, 1 in 2: of 10 (seq 0)
+        % and 20 (seq 1), 10 stays; 30 and 50 are younger and stay.
         Cold0 = maps:get(<<"cold-tier">>, Opts),
+        Write(#{ blob_key(Q, <<"s">>, 50) => Marker(Now + 2000),
+                 blob_key(Q, <<"f">>, 50) => test_snapshot(50, <<"state-50">>) }),
         ok = tick(Opts#{ <<"cold-tier">> => Cold0#{ <<"checkpoint-thinning">> => [[1, 2]] } }),
-        ?assertEqual([10, 30], lists:sort([ S || F <- filelib:wildcard(Share ++ "/checkpoints/"
+        ?assertEqual([10, 30, 50], lists:sort([ S || F <- filelib:wildcard(Share ++ "/checkpoints/"
             ++ binary_to_list(Q) ++ "/*.hbc"), {S, _, _} <- [checkpoint_name(filename:basename(F))] ])),
         % From a peer only when trusted.
         #{ opts := ROpts0 } = test_env("ckpt-reader"),
@@ -1049,11 +1406,12 @@ checkpoints_test_() ->
         Peer = fun(T) -> ROpts0#{ <<"cold-tier">> => Cold#{ <<"peers">> =>
             [#{ <<"node">> => <<"p">>, <<"path">> => list_to_binary(Share), <<"trusted">> => T }] } } end,
         ?assertEqual(not_found, restore_checkpoint(Q, 100, Peer(false))),
-        ?assertEqual({ok, 30}, restore_checkpoint(Q, 100, Peer(true)))
+        ?assertEqual({ok, 30}, restore_checkpoint(Q, 45, Peer(true))),
+        ?assertEqual({ok, 50}, restore_checkpoint(Q, 100, Peer(true)))
     end}.
 
-%% @doc A missing checkpoint row blocks shipment of this and later snapshots
-%% until the row is available. After it is repaired, restore reproduces the
+%% @doc A newest snapshot with a row missing or damaged is not shipped until
+%% it is whole. After it is repaired, restore reproduces the
 %% complete rows of either form of checkpoint.
 incomplete_checkpoints_stop_shipping_test_() ->
     [ {atom_to_list(Missing), {timeout, 120, fun() -> incomplete_checkpoint(Missing) end}}
@@ -1093,8 +1451,7 @@ incomplete_checkpoint(Missing) ->
                 {#{ (S(20)) => Marker(Large), F20 => <<"pstate-chunks:2">>,
                     Chunk1 => Part1, Chunk2 => <<"damaged">> }, #{ Chunk2 => Part2 }}
         end,
-    ok = hb_store:write([Main], Rows#{
-        (S(30)) => Marker(State30), (F(30)) => State30 }, #{}),
+    ok = hb_store:write([Main], Rows, #{}),
     ok = hb_store:flush([Main], #{}),
     Dir = filename:join([share(Opts), "checkpoints", hb_util:list(P)]),
     Result = tick(Opts),
@@ -1102,6 +1459,11 @@ incomplete_checkpoint(Missing) ->
         {Result, read_int(Main, Mark, -1), read_int(Main, Seq, -1),
             length(list_dir(Cfg, Dir))}),
     ok = hb_store:write([Main], Repaired, #{}),
+    ok = hb_store:flush([Main], #{}),
+    ok = tick(Opts),
+    ?assertEqual({20, 1, 2},
+        {read_int(Main, Mark, -1), read_int(Main, Seq, -1), length(list_dir(Cfg, Dir))}),
+    ok = hb_store:write([Main], #{ (S(30)) => Marker(State30), (F(30)) => State30 }, #{}),
     ok = hb_store:flush([Main], #{}),
     ok = tick(Opts),
     ?assertEqual({30, 2, 3},
@@ -1318,3 +1680,4 @@ signer_addresses_test() ->
     Hmac = #{ <<"commitments">> => #{ <<"h">> => #{ <<"type">> => <<"hmac-sha256">>,
         <<"owner">> => hb_util:encode(maps:get(<<"owner">>, Sched)) } } },
     ?assertEqual([], signer_addresses(Hmac, #{})).
+

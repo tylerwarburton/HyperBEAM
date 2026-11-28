@@ -22,7 +22,7 @@
 %%% also serve every local file and LMDB call. The bound keeps a hung share
 %%% from taking them all.
 -module(hb_file).
--export([read_file/1, write_file/2, write_file/3, list_dir/1, list_dir_all/1]).
+-export([read_file/1, read_file_uncached/1, write_file/2, write_file/3, list_dir/1, list_dir_all/1]).
 -export([rename/2, delete/1, make_dir/1, ensure_dir/1]).
 -export([read_file_info/1, read_link_info/1, is_file/1, is_regular/1, file_size/1]).
 -export([bounded/2, in_flight/0]).
@@ -47,6 +47,28 @@ init() ->
 %%% Plain calls, in the caller.
 
 read_file(Name) -> prim_file:read_file(name(Name)).
+
+%% @doc A file's bytes as its filesystem's server holds them: the page cache's
+%% copy of the file is dropped first (`posix_fadvise' `DONTNEED'), so on NFS
+%% the read goes to the server instead of being answered by this client.
+read_file_uncached(Name) ->
+    case prim_file:open(name(Name), [read, binary]) of
+        {ok, Fd} ->
+            try
+                _ = prim_file:advise(Fd, 0, 0, dont_need),
+                read_all(Fd, [])
+            after
+                prim_file:close(Fd)
+            end;
+        Error -> Error
+    end.
+
+read_all(Fd, Acc) ->
+    case prim_file:read(Fd, 1 bsl 20) of
+        {ok, Bin} -> read_all(Fd, [Bin | Acc]);
+        eof -> {ok, iolist_to_binary(lists:reverse(Acc))};
+        Error -> Error
+    end.
 
 write_file(Name, Data) -> write_file(Name, Data, []).
 write_file(Name, Data, Modes) -> file:write_file(name(Name), Data, [raw | Modes -- [raw]]).

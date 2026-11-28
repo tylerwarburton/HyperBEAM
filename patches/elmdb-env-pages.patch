@@ -1,0 +1,81 @@
+diff -ruN pa/native/elmdb_nif/src/lib.rs pb/native/elmdb_nif/src/lib.rs
+--- a/native/elmdb_nif/src/lib.rs	2026-11-28 12:38:07.944277430 +0000
++++ b/native/elmdb_nif/src/lib.rs	2026-11-28 12:38:08.034285606 +0000
+@@ -2615,4 +2615,52 @@
+     Ok((atoms::ok(), closed, ref_count, env_handle.path.clone()).encode(env))
+ }
+ 
++/// Page accounting for a disk budget: `{ok, PageSize, LastPage, MapSize,
++/// FreePages}`. The file only ever grows; what it holds live is
++/// `(LastPage + 1 - FreePages) * PageSize`. Free pages are counted from the
++/// free list (`FREE_DBI`, every record an IDL whose first word is its
++/// count) in one read transaction.
++#[rustler::nif(schedule = "DirtyIo")]
++fn env_pages<'a>(env: Env<'a>, env_handle: ResourceArc<LmdbEnv>) -> NifResult<Term<'a>> {
++    let (live, _) = env_handle.ensure_open().map_err(|_| Error::BadArg)?;
++    unsafe {
++        let raw = live.env();
++        let mut info: lmdb_sys::MDB_envinfo = std::mem::zeroed();
++        if lmdb_sys::mdb_env_info(raw, &mut info) != 0 {
++            return Err(Error::BadArg);
++        }
++        let mut stat: lmdb_sys::MDB_stat = std::mem::zeroed();
++        if lmdb_sys::mdb_env_stat(raw, &mut stat) != 0 {
++            return Err(Error::BadArg);
++        }
++        let mut txn: *mut lmdb_sys::MDB_txn = std::ptr::null_mut();
++        if lmdb_sys::mdb_txn_begin(raw, std::ptr::null_mut(), lmdb_sys::MDB_RDONLY, &mut txn) != 0 {
++            return Err(Error::BadArg);
++        }
++        let mut free: u64 = 0;
++        let mut cursor: *mut lmdb_sys::MDB_cursor = std::ptr::null_mut();
++        if lmdb_sys::mdb_cursor_open(txn, 0, &mut cursor) == 0 {
++            let mut key = lmdb_sys::MDB_val { mv_size: 0, mv_data: std::ptr::null_mut() };
++            let mut val = lmdb_sys::MDB_val { mv_size: 0, mv_data: std::ptr::null_mut() };
++            let mut op = lmdb_sys::MDB_FIRST;
++            while lmdb_sys::mdb_cursor_get(cursor, &mut key, &mut val, op) == 0 {
++                if val.mv_size >= std::mem::size_of::<usize>() {
++                    free += std::ptr::read_unaligned(val.mv_data as *const usize) as u64;
++                }
++                op = lmdb_sys::MDB_NEXT;
++            }
++            lmdb_sys::mdb_cursor_close(cursor);
++        }
++        lmdb_sys::mdb_txn_abort(txn);
++        Ok((
++            atoms::ok(),
++            stat.ms_psize as u64,
++            info.me_last_pgno as u64,
++            info.me_mapsize as u64,
++            free,
++        )
++            .encode(env))
++    }
++}
++
+ rustler::init!("elmdb", load = init);
+diff -ruN pa/src/elmdb.erl pb/src/elmdb.erl
+--- a/src/elmdb.erl	2026-11-28 12:38:07.944277430 +0000
++++ b/src/elmdb.erl	2026-11-28 12:38:08.034285606 +0000
+@@ -10,6 +10,7 @@
+ 
+ %% Environment management
+ -export([env_open/2, env_sync/1, env_close/1, env_close_by_name/1, env_status/1]).
++-export([env_pages/1]).
+ 
+ %% Database operations
+ -export([db_open/2, db_close/1]).
+@@ -125,6 +126,13 @@
+ env_status(_Env) ->
+     erlang:nif_error(nif_not_loaded).
+ 
++%% @doc Page accounting: `{ok, PageSize, LastPage, MapSize, FreePages}'.
++%% Live bytes are `(LastPage + 1 - FreePages) * PageSize'.
++-spec env_pages(Env :: term()) ->
++    {ok, non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()}.
++env_pages(_Env) ->
++    erlang:nif_error(nif_not_loaded).
++
+ 
+ %%%===================================================================
+ %%% Database Operations

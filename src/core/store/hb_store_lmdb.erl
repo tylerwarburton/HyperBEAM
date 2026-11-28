@@ -20,7 +20,7 @@
 %% Public API exports
 -export([start/3, stop/3, flush/3, scope/0, scope/1, reset/3]).
 -export([read/3, write/3, list/3, match/3]).
--export([health/0, fill/1]).
+-export([health/0, fill/1, fill/2]).
 
 %% Test framework and project includes
 -include_lib("eunit/include/eunit.hrl").
@@ -130,7 +130,7 @@ flusher(Opts, Instance, FlushEvery, Ticks) ->
     after FlushEvery ->
         note(Opts, commit(Instance)),
         case Ticks rem max(1, ?MONITOR_MS div max(1, FlushEvery)) of
-            0 -> catch monitor(Opts);
+            0 -> catch measure(Opts, Instance);
             _ -> ok
         end,
         flusher(Opts, Instance, FlushEvery, Ticks + 1)
@@ -172,8 +172,12 @@ note(#{ <<"name">> := Name }, {error, Reason}) ->
     end;
 note(_, _) -> ok.
 
-%% @doc A store's fill: of its filesystem (`df'), and of its LMDB map.
-fill(#{ <<"name">> := Name } = Opts) ->
+%% @doc A store's fill: of its filesystem (`df'), and of its LMDB map. With
+%% the store's environment, also what the file holds live (`live_bytes': its
+%% pages less its free list, `elmdb:env_pages/1'); the file itself never
+%% shrinks, so only the live count falls when rows are deleted.
+fill(Opts) -> fill(Opts, #{}).
+fill(#{ <<"name">> := Name } = Opts, Instance) ->
     Dir = hb_util:list(Name),
     File = filelib:file_size(filename:join(Dir, "data.mdb")),
     Map = hb_util:int(maps:get(<<"capacity">>, Opts, ?DEFAULT_SIZE)),
@@ -181,14 +185,42 @@ fill(#{ <<"name">> := Name } = Opts) ->
         case string:lexemes(os:cmd("df -Pk " ++ Dir ++ " 2>/dev/null | tail -1"), " \n") of
             [_, Total, _Used, Avail, _Pct | _] ->
                 T = list_to_integer(Total), A = list_to_integer(Avail),
-                #{ disk_used_pct => round(100 * (T - A) / max(1, T)), disk_free_bytes => A * 1024 };
+                #{ disk_used_pct => round(100 * (T - A) / max(1, T)), disk_free_bytes => A * 1024,
+                   disk_total_bytes => T * 1024 };
             _ -> #{}
         end,
-    Disk#{ file_bytes => File, map_used_pct => round(100 * File / max(1, Map)) }.
+    Live =
+        case Instance of
+            #{ <<"env">> := Env } ->
+                try elmdb:env_pages(Env) of
+                    {ok, Page, Last, _MapSize, Free} ->
+                        #{ live_bytes => (Last + 1 - Free) * Page, free_bytes => Free * Page };
+                    _ -> #{}
+                catch _:_ -> #{}
+                end;
+            _ -> #{}
+        end,
+    maps:merge(Disk, Live#{ file_bytes => File, map_bytes => Map,
+        map_used_pct => round(100 * File / max(1, Map)) }).
 
-monitor(Opts = #{ <<"name">> := Name }) ->
-    Fill = fill(Opts),
+measure(Opts = #{ <<"name">> := Name }, Instance) ->
+    Fill0 = fill(Opts, Instance),
+    Level = hb_store_budget:store_level(Fill0, Opts),
+    Fill = Fill0#{ level => Level, pressure_pct => round(hb_store_budget:pressure(Fill0)) },
     set_gauge(hb_store_map_used_percent, Name, maps:get(map_used_pct, Fill)),
+    set_gauge(hb_store_pressure_percent, Name, maps:get(pressure_pct, Fill)),
+    set_gauge(hb_store_budget_level, Name, hb_store_budget:rank(Level)),
+    case maps:find(live_bytes, Fill) of
+        {ok, LiveBytes} ->
+            set_gauge(hb_store_live_percent, Name,
+                round(100 * LiveBytes / max(1, maps:get(map_bytes, Fill))));
+        error -> ok
+    end,
+    case Level =/= maps:get(level, maps:get(Name, health(), #{}), ok) of
+        true ->
+            ?event(warning, {lmdb_store_budget_level, {store, Name}, {level, Level}, {fill, Fill}});
+        false -> ok
+    end,
     Alarm = hb_util:int(maps:get(<<"disk-alarm-pct">>, Opts, ?DISK_ALARM_PCT)),
     case maps:find(disk_used_pct, Fill) of
         {ok, Pct} ->
@@ -597,6 +629,9 @@ init_prometheus() ->
     || {G, H} <- [
         {hb_store_disk_used_percent, "Fill of the filesystem an LMDB store is on"},
         {hb_store_map_used_percent, "Fill of an LMDB store's map (file size / capacity)"},
+        {hb_store_live_percent, "Live pages of an LMDB store against its map (file less free list)"},
+        {hb_store_pressure_percent, "An LMDB store's disk budget pressure (hb_store_budget)"},
+        {hb_store_budget_level, "0 ok, 1 soft, 2 high, 3 hard (hb_store_budget)"},
         {hb_store_unhealthy, "1 while an LMDB store cannot commit its writes"}] ],
     ok.
 

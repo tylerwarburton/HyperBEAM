@@ -431,6 +431,20 @@ direct(ProcID, Req, Opts) ->
         _ -> {ok, miss}
     end.
 
+%% A node whose disk budget is at its hard mark (`hb_store_budget') refuses a
+%% new message with a 503 and `retry-after', before anything is written: a
+%% sender waits for room instead of the store filling. Reads go on.
+disk_room() ->
+    case hb_store_budget:at_least(hard) of
+        false -> ok;
+        true ->
+            {error, #{
+                <<"status">> => 503,
+                <<"retry-after">> => 30,
+                <<"body">> => <<"This node's storage is at its limit. Retry later.">>
+            }}
+    end.
+
 %% @doc Schedules a new message on the SU. Searches Base for the appropriate ID,
 %% then uses the wallet address of the scheduler to determine if the message is
 %% for this scheduler. If so, it schedules the message and returns the assignment.
@@ -536,8 +550,9 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
             false -> true
         end,
     ?event({verified, Verified}),
-    % Handle scheduling of the message if the message is valid. A denied
-    % process is refused before anything else; a message that claims a
+    % Handle scheduling of the message if the message is valid. A node whose
+    % disk is at its budget's hard mark takes no new message (`disk_room/0');
+    % a denied process is refused before anything else; a message that claims a
     % process origin (`from-process') is admitted or refused here, never
     % assigned bare (`dev_scheduler_admission'); then the node's policy says
     % whether it schedules the process at all (`dev_scheduler_policy').
@@ -552,6 +567,7 @@ post_local_schedule(ProcID, PID, Req, Opts) ->
             };
         {true, Type} ->
             maybe
+                ok ?= disk_room(),
                 ok ?= dev_scheduler_policy:deny(ProcID, Opts),
                 {ok, Admitted} ?= dev_scheduler_admission:admit(ProcID, Req, Opts),
                 ok ?= dev_scheduler_policy:admit(ProcID, Type, Admitted, Opts),
@@ -2645,6 +2661,35 @@ spawn_with_json_store_config_test_() ->
                 hb_ao:resolve(Base, #{ <<"method">> => <<"POST">>,
                     <<"path">> => <<"schedule">>, <<"body">> => Msg }, Opts)
             end))
+    end}.
+
+%% @doc At the disk budget's hard mark a new message is refused with a 503
+%% and nothing is written; once there is room it is scheduled.
+disk_full_refuses_new_messages_test_() ->
+    {timeout, 60, fun() ->
+        start(),
+        Wallet = hb:wallet(),
+        Sched = hb_test_utils:test_store(hb_store_lmdb, <<"disk-full-sched">>),
+        Main = hb_test_utils:test_store(hb_store_lmdb, <<"disk-full-main">>),
+        Opts = #{ <<"priv-wallet">> => Wallet, <<"store">> => [Main],
+                  <<"scheduler-store">> => [Sched] },
+        ok = hb_store:start([Sched, Main], #{}, Opts),
+        Base = hb_message:commit(test_process(Opts), Opts),
+        Post = fun(M) ->
+            hb_ao:resolve(Base, #{ <<"method">> => <<"POST">>,
+                <<"path">> => <<"schedule">>, <<"body">> => M }, Opts)
+        end,
+        ?assertMatch({ok, _}, Post(Base)),
+        Msg = hb_message:commit(#{ <<"type">> => <<"Message">>, <<"n">> => <<"1">> }, Opts),
+        ProcID = hb_util:human_id(hb_message:id(Base, all, Opts)),
+        try
+            hb_store_budget:override(hard),
+            ?assertMatch({error, #{ <<"status">> := 503, <<"retry-after">> := 30 }}, Post(Msg)),
+            ?assertEqual(not_found, dev_scheduler_cache:read(ProcID, 1, Opts))
+        after
+            hb_store_budget:override(undefined)
+        end,
+        ?assertMatch({ok, _}, Post(Msg))
     end}.
 
 %% @doc Nothing is computed from, or served for, a slot whose assignment is
