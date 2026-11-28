@@ -162,3 +162,21 @@ about 400 s.
   messages in its main store, which points to the HTTP path not doing this.
   Confirm on the AX102 with a real swarm (`hb_store_live_percent`, a prefix
   scan) before relying on it.
+
+## AX102 run (2026-11-28, image `4ce56475e`, real NFS share and coldcheck)
+
+The setup was two `load-gate` game shards at 75 writes/s each, 150/s in
+total, for 35 minutes. The cold tier was a lab folder on the home share,
+verified by `coldcheck`, and the config was derived from the live one.
+
+- **The irreplaceable store levelled off** at about 170 to 190 MB once each
+  shard passed 10,000 slots.
+- **The main LMDB file stayed flat** at 212 to 214 MB from minute 5.
+- **The cold folder grew 0.79 MB/s**: about 2.9 KB of slot ranges and 3 KB of
+  journal per write. Ship lag held at 34 slots.
+- **The dedupe filters were the only rows still growing.** A fixed
+  4M-ID first segment filled 16 MB per process; `8412b45f8` fixed it after
+  the run.
+- **`kill -9` three times under load**, the last two while pruning was
+  running: each restart took 3 s, every sampled slot of all 8 processes read
+  back (the pruned ones from the share), and shipping resumed by itself.
