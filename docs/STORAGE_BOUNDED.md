@@ -70,6 +70,40 @@ The shipper runs continuously. Each round gives every process
 has its own timeout (`io-timeout-ms` plus its bytes at `min-rate-bytes`) and
 its own mark. A timeout costs one item. The round's workers are linked to it.
 
+## Reads by ID after a prune
+
+Lunar, the sites' history and the bridge read messages by ID, so a message
+whose slot left local disk is still served by ID:
+
+- Each range file has a sidecar, `<from>-<to>.ids`, listing the IDs its rows
+  answer for.
+- The share's host indexes the sidecars in SQLite on its own disk
+  (`coldcheck` v2, `GET /locate?id=`), so the ID index grows on the share,
+  never locally.
+- `hb_store_cold` is also a read-only store of `remote` scope. Add
+  `{"store-module": "hb_store_cold"}` to the node's `store` list after its
+  local stores.
+- A read of an ID asks the host where it is, reads that range file (its
+  digest checked), and returns the ID's row, which `hb_cache` unpacks. The
+  newest 8 files read are cached.
+- An index entry can only cause a miss: every answer is read back from the
+  file.
+
+## Replica stores
+
+The bridge and admission replicas keep the schedule they verified in a store
+of their own, in the scheduler's layout. On Paralith that store was where
+the disk went. Each replica now registers its verified store with the cold
+tier at load, and it follows the same rules:
+
+- its ranges ship to `slots/<pid>/<from>-<to>-<tag>.hbc` (`tag` from the
+  store's name, so its files never replace the scheduler's own);
+- they are verified the same way;
+- they leave local disk below the same hot window.
+
+A replica that recomputes old slots after a new build reads them back from
+the share.
+
 ## The disk budget (`hb_store_budget`)
 
 An LMDB file never shrinks, so file size cannot show pruning. Each store's
