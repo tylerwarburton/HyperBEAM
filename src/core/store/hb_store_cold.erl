@@ -85,6 +85,15 @@
 %%% are kept in memory, so a page of history costs one file read. An index can
 %%% only cause a miss: every answer is read back from the file.
 %%%
+%%% A bridge or admission replica keeps the schedule it verified in a store of
+%%% its own (`lib_bridge_replica'), in the scheduler's layout, and that store
+%%% follows the same rules: a replica registers it (`register_source/1'), and
+%%% its ranges ship to the same `slots/<pid>/' folder, named
+%%% `<from>-<to>-<tag>.hbc' (`tag' from the store's name, so a replica's file
+%%% never replaces the scheduler's own), and leave local disk below the same
+%%% hot window once verified. A replica that recomputes from an old slot (a
+%%% new build) reads it back from there, as any old read does.
+%%%
 %%% Reads fall back: a slot not held locally is read from this node's folder,
 %%% then from the other nodes' folders (`peers'), then from Arweave (the
 %%% schedule's archive windows, `dev_scheduler_uploader'). Anything read from
@@ -128,7 +137,7 @@
 -module(hb_store_cold).
 -export([maybe_start/1, status/0, tick/1, config/1]).
 -export([read_assignment/3, restore_checkpoint/3, ship_replica/3, restore_replica/4]).
--export([seen/4]).
+-export([seen/4, register_source/1]).
 %% A read-only store (`store-module' `hb_store_cold'): reads by ID from the share.
 -export([scope/1, read/3]).
 -ifdef(TEST).
@@ -542,10 +551,11 @@ closure(Store, Path, {Rows, Seen0}) ->
 %% processes at once, and confirm what was written before. Stats:
 %% `#{ done, verified, bytes, more, failures }'.
 ship_slots(Cfg, Opts) ->
-    Store = irr(Opts),
-    Procs = [ P || P <- list_names(Store, ?ASSIGNMENTS), ?IS_ID(P) ],
+    Work =
+        [ {Cfg#{ tag => Tag }, Store, P}
+        || {Store, Tag} <- sources(Opts), P <- list_names(Store, ?ASSIGNMENTS), ?IS_ID(P) ],
     Stats =
-        pmap(fun(P) -> ship_process(Cfg, Store, P, Opts) end, Procs,
+        pmap(fun({SCfg, Store, P}) -> ship_process(SCfg, Store, P, Opts) end, Work,
             maps:get(concurrency, Cfg)),
     Lag = sum(lag, Stats),
     set_gauge(hb_cold_lag_slots, Lag),
@@ -613,7 +623,7 @@ take_range(_Store, _P, _Slots, _MaxSlots, _MaxBytes, Range, Rows, _Bytes) ->
 %% file's hash, which `confirm/3' turns into a range row once it is proven.
 write_range(Cfg, Store, P, Range, Rows, Opts) ->
     From = hd(Range), To = lists:last(Range),
-    Ms = assignment_ms(P, To, Opts),
+    Ms = assignment_ms(Store, P, To, Opts),
     File = range_file(Cfg, P, From, To),
     {Bytes, Digest} =
         put_file(Cfg, File,
@@ -646,7 +656,7 @@ confirm(Cfg, Store, P) ->
         || Name <- lists:sort(list_names(Store, pending_prefix(P))),
            {ok, V} <- [hb_store:read([Store], #{ <<"read">> => <<(pending_prefix(P))/binary,
                 "/", Name/binary>>, <<"exact">> => true }, #{})] ],
-    try verified_files(Cfg, [ {range_rel(P, From, To), Digest, Bytes}
+    try verified_files(Cfg, [ {range_rel(Cfg, P, From, To), Digest, Bytes}
                              || {_, {From, To, _, Digest, Bytes}} <- Pending ]) of
         Verdicts -> promote(Store, DB, P, lists:zip(Pending, Verdicts), 0)
     catch
@@ -668,18 +678,38 @@ promote(Store, DB, P, [{{_Key, {From, To, _, _, _}}, false} | _] = Rest, N) ->
     {ok, _} = elmdb:delete_batch(DB, [ K || {{K, _}, _} <- Rest ]),
     {N, []}.
 
-range_rel(P, From, To) ->
-    filename:join(["slots", hb_util:list(P), pad(From) ++ "-" ++ pad(To) ++ ".hbc"]).
+%% A range's file below this node's folder: `<from>-<to>.hbc' for the
+%% scheduler's own store, `<from>-<to>-<tag>.hbc' for a replica's.
+range_rel(Cfg, P, From, To) ->
+    Tag = case maps:get(tag, Cfg, "") of "" -> ""; T -> "-" ++ T end,
+    filename:join(["slots", hb_util:list(P), pad(From) ++ "-" ++ pad(To) ++ Tag ++ ".hbc"]).
 
-range_file(Cfg, P, From, To) -> filename:join(maps:get(path, Cfg), range_rel(P, From, To)).
+range_file(Cfg, P, From, To) -> filename:join(maps:get(path, Cfg), range_rel(Cfg, P, From, To)).
+
+%% The stores whose slots ship: the scheduler's own, and each replica store
+%% registered (`register_source/1'), with its file tag.
+-define(SOURCES, {?MODULE, sources}).
+sources(Opts) ->
+    [ {irr(Opts), ""} |
+      [ {Store, Tag} || {Tag, Store} <- maps:to_list(persistent_term:get(?SOURCES, #{})) ] ].
+
+%% @doc Ship and prune `Store' too: a replica's verified schedule, in the
+%% scheduler's layout. Its files are tagged with a digest of its name.
+register_source(Store = #{ <<"name">> := Name }) ->
+    Tag = lists:sublist(binary_to_list(binary:encode_hex(crypto:hash(sha256, Name), lowercase)), 8),
+    Sources = persistent_term:get(?SOURCES, #{}),
+    case maps:get(Tag, Sources, undefined) =:= Store of
+        true -> ok;
+        false -> persistent_term:put(?SOURCES, Sources#{ Tag => Store })
+    end.
 
 pending_prefix(P) -> mark_key(<<"pending">>, P).
 pending_key(P, To) -> <<(pending_prefix(P))/binary, "/", (list_to_binary(pad(To)))/binary>>.
 range_prefix(P) -> mark_key(<<"range">>, P).
 range_key(P, To) -> <<(range_prefix(P))/binary, "/", (list_to_binary(pad(To)))/binary>>.
 
-assignment_ms(P, S, Opts) ->
-    case hb_store_retention:assignment_time(P, S, Opts#{ <<"scheduler-store">> => [irr(Opts)] }) of
+assignment_ms(Store, P, S, Opts) ->
+    case hb_store_retention:assignment_time(P, S, Opts#{ <<"scheduler-store">> => [Store] }) of
         {ok, Ms} -> Ms;
         _ -> erlang:system_time(millisecond)
     end.
@@ -690,8 +720,6 @@ assignment_ms(P, S, Opts) ->
 %% transaction. Slot 0 stays, and so does every `message-slots' row (the
 %% scheduler's dedupe index). `#{ done, pruned }'.
 prune_slots(Cfg, Level, Opts) ->
-    Store = irr(Opts),
-    #{ <<"db">> := DB } = hb_store:find(inner(Store)),
     Hot =
         case hb_store_budget:rank(Level) >= hb_store_budget:rank(soft) of
             true -> maps:get(hot_floor, Cfg);
@@ -699,7 +727,9 @@ prune_slots(Cfg, Level, Opts) ->
         end,
     Counts =
         [ prune_process(Store, DB, P, Hot)
-        || P <- list_names(Store, ?ASSIGNMENTS), ?IS_ID(P) ],
+        || {Store, _} <- sources(Opts),
+           #{ <<"db">> := DB } <- [hb_store:find(inner(Store))],
+           P <- list_names(Store, ?ASSIGNMENTS), ?IS_ID(P) ],
     #{ done => length([ C || C <- Counts, C > 0 ]), pruned => lists:sum(Counts) }.
 
 prune_process(Store, DB, P, Hot) ->
@@ -846,7 +876,7 @@ from_folder(Cfg, Dir, P, Slot, Opts) ->
     Files = list_dir(Cfg, filename:join([Dir, "slots", hb_util:list(P)])),
     Covering =
         [ F || F <- Files,
-               [A, B] <- [string:split(filename:rootname(F), "-")],
+               [A, B | _] <- [string:split(filename:rootname(F), "-", all)],
                list_to_integer(A) =< Slot, Slot =< list_to_integer(B) ],
     case Covering of
         [] -> not_found;
@@ -1966,8 +1996,9 @@ raw(Store, Key) ->
 
 %% Every range row of the process names a file on the share that holds
 %% every slot of the range.
-ranges_hold(#{ irr := Irr, p := P }, Opts) ->
-    Cfg = config(Opts),
+ranges_hold(Env, Opts) -> ranges_hold(Env, Opts, "").
+ranges_hold(#{ irr := Irr, p := P }, Opts, Tag) ->
+    Cfg = (config(Opts))#{ tag => Tag },
     lists:foreach(
         fun(Name) ->
             {ok, V} = raw(Irr, <<(range_prefix(P))/binary, "/", Name/binary>>),
@@ -2063,7 +2094,7 @@ coldcheck_verify_test_() ->
         % The host answers for the folder above this node's (`verify-prefix').
         Opts = With(#{ <<"verify-url">> => stub_coldcheck(filename:dirname(Share), Lies),
                        <<"verify-prefix">> => list_to_binary(filename:basename(Share)) }),
-        Rel2 = list_to_binary(filename:join(filename:basename(Share), range_rel(P, 10, 19))),
+        Rel2 = list_to_binary(filename:join(filename:basename(Share), range_rel(#{}, P, 10, 19))),
         ets:insert(Lies, {Rel2}),
         ok = tick(Opts),
         ?assertNot(local(Env, 5)),
@@ -2211,4 +2242,36 @@ read_by_id_after_prune_test_() ->
         ?assertEqual(5, hb_util:int(hb_ao:get(<<"slot">>, ReadA, Reader))),
         ?assertEqual({error, not_found},
             read(#{}, #{ <<"read">> => hb_util:human_id(crypto:strong_rand_bytes(32)) }, Reader))
+    end}.
+
+%% @doc A replica's verified store follows the scheduler's rules: registered,
+%% its ranges ship to the process's folder under their own tag (never over
+%% the scheduler's files for the same slots), leave local disk below the hot
+%% window, and read back from the share.
+replica_store_ships_and_prunes_test_() ->
+    {timeout, 120, fun() ->
+        Env = #{ dir := Dir, opts := Opts, p := P } = test_env("replica"),
+        Rep = #{ <<"store-module">> => hb_store_lmdb, <<"name">> => list_to_binary(Dir ++ "/replica/" ++ binary_to_list(P)) },
+        ok = hb_store:start([Rep]),
+        RepEnv = Env#{ irr => Rep },
+        assign(Env, lists:seq(0, 39), 3600000),
+        assign(RepEnv, lists:seq(0, 39), 3600000),
+        ok = register_source(Rep),
+        try
+            ok = tick(Opts),
+            Files = [ filename:basename(F) || F <- filelib:wildcard(share(Opts) ++ "/slots/" ++ binary_to_list(P) ++ "/*.hbc") ],
+            Tagged = [ F || F <- Files, length(string:split(filename:rootname(F), "-", all)) =:= 3 ],
+            ?assert(length(Tagged) >= 1),
+            ?assert(length(Files) > length(Tagged)),
+            ?assertNot(local(RepEnv, 5)),
+            ?assert(local(RepEnv, 0)),
+            ?assert(local(RepEnv, 39)),
+            ?assertNot(local(Env, 5)),
+            {ok, A} = read_assignment(P, 5, Opts),
+            ?assertEqual(5, hb_util:int(hb_ao:get(<<"slot">>, A, Opts))),
+            [Tag] = maps:keys(persistent_term:get(?SOURCES)),
+            ranges_hold(RepEnv, Opts, Tag)
+        after
+            persistent_term:erase(?SOURCES)
+        end
     end}.

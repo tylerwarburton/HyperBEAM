@@ -40,7 +40,8 @@
 %%%
 %%% Two stores, kept beside a cursor (slot, chain, last assignment, build):
 %%% `<pusd>' holds what was verified (the process, its module, each accepted
-%%% assignment), which no build changes; `<pusd>.computed' holds the newest
+%%% assignment), which no build changes, and which the cold tier ships and
+%%% trims to its hot window like the node's own schedule; `<pusd>.computed' holds the newest
 %%% computed states, the work of the build that computed it: the head and
 %%% the newest snapshots, pruned every `?PRUNE_SLOTS' slots (`prune/1'),
 %%% since the attestor acts on the head alone and any other slot is
@@ -320,6 +321,11 @@ load(Pusd, Url, NodeOpts, Dir, OnOtherBuild) ->
     ok = filelib:ensure_dir(binary_to_list(<<Base/binary, ".computed/">>)),
     ComputedTo = same_build(Cursor, Build, Verified, Computed, OnOtherBuild),
     ok = hb_store:start([Verified, Computed]),
+    % What was verified follows the node's own schedule rules: shipped to the
+    % cold tier and gone locally below the hot window once its copy is proven
+    % (`hb_store_cold'). An old slot, for a recompute after a new build, is
+    % read back from the share.
+    ok = hb_store_cold:register_source(Verified),
     % Nothing computed here: start from this build's newest replica snapshot
     % on the cold tier, if there is one (`hb_store_cold').
     case ComputedTo =:= -1 andalso newest_snapshot(Computed, Pusd) =:= -1 of
